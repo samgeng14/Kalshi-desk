@@ -1,0 +1,24 @@
+#include "desk/strategies.h"
+
+namespace desk {
+
+std::vector<std::unique_ptr<Strategy>> build_strategies(const Config& cfg) {
+  std::vector<std::unique_ptr<Strategy>> v;
+  const json& P = cfg.strategy_params;
+  auto params = [&](const char* name) -> json {
+    return P.is_object() && P.contains(name) ? P[name] : json::object();
+  };
+  // Order matters: the first strategy that covers a market wins.
+  v.push_back(std::make_unique<ManualFair>());
+  v.push_back(std::make_unique<WeatherNws>(params("weather_nws"), cfg.user_agent));
+  v.push_back(std::make_unique<CryptoLognormal>(params("crypto_lognormal"), cfg.user_agent));
+  v.push_back(std::make_unique<SportsInplay>(params("sports_inplay"), cfg.user_agent));
+  v.push_back(std::make_unique<SportsLive>(params("sports_live"), cfg.user_agent));
+  v.push_back(std::make_unique<EconNowcast>());
+  v.push_back(std::make_unique<CommodityFutures>());
+  v.push_back(std::make_unique<IndexClose>());
+  v.push_back(std::make_unique<SciTech>());
+  return v;
+}
+
+}  // namespace desk

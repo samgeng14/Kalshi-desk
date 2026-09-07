@@ -1,0 +1,120 @@
+#!/usr/bin/env python3
+"""Start, inspect, or stop the local Kalshi desk."""
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import signal
+import socket
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+ROOT = Path(__file__).resolve().parent.parent
+CONFIG = ROOT / 'config/desk.json'
+BINARY = ROOT / 'build/kalshi-desk'
+
+def config():
+    # Strip comments without touching quoted strings (including URLs).
+    text = re.sub(r'"(?:\\.|[^"\\])*"|//[^\n]*|/\*[\s\S]*?\*/',
+                  lambda m: '' if m[0].startswith('/') else m[0], CONFIG.read_text())
+    return json.loads(text)
+
+def state(url):
+    try:
+        with urllib.request.urlopen(url + '/api/state', timeout=3) as response:
+            data = json.load(response)
+        if not isinstance(data, dict) or not {'env', 'config', 'cycle'} <= data.keys():
+            raise RuntimeError('Port is serving something other than kalshi-desk.')
+        return data
+    except urllib.error.URLError:
+        return None
+
+def listeners(port):
+    result = subprocess.run(['/usr/sbin/lsof', '-nP', f'-iTCP:{port}', '-sTCP:LISTEN', '-t'],
+                            capture_output=True, text=True)
+    pids = set(int(x) for x in result.stdout.split())
+    for pid in pids:
+        command = subprocess.check_output(['/bin/ps', '-p', str(pid), '-o', 'comm='], text=True).strip()
+        if Path(command).name != 'kalshi-desk':
+            raise RuntimeError(f'Port {port} belongs to another program; leaving it alone.')
+    return pids
+
+def show(data, url):
+    if data is None:
+        print('Desk is stopped. Start it with: tradeit up')
+        return
+    age = int(time.time()) - data.get('last_cycle_ts', 0) if data.get('last_cycle_ts') else None
+    print(f"{data['env'].upper()} | {url}")
+    if data.get('account_ts'):
+        print(f"Balance ${data['balance']:.2f} | {len(data.get('orders', []))} open orders | {len(data.get('positions', []))} positions")
+    else:
+        print('Account sync pending.')
+    print(f"Markets {data.get('markets_seen', 0)} | cycle {data['cycle']} | age {str(age) + 's' if age is not None else 'starting'}")
+    print('Modes: ' + ', '.join(f'{k}={v}' for k, v in data['config']['strategies'].items() if v != 'off'))
+    if data.get('last_error'):
+        print('Last error: ' + data['last_error'])
+    if data['env'] == 'prod':
+        print('LIVE ACCOUNT: approved orders use real money.')
+
+def main():
+    action = sys.argv[1] if len(sys.argv) == 2 else 'help'
+    if action not in ('up', 'down', 'status', 'logs'):
+        print('Usage: tradeit up | down | status | logs\nup opens Safari; down stops the desk but does not cancel exchange orders.')
+        return
+    cfg = config()
+    port = int(cfg.get('http_port', 8787))
+    url = f'http://127.0.0.1:{port}'
+    log = ROOT / 'data' / (cfg['env'] + '.log')
+    log.parent.mkdir(exist_ok=True)
+    if action == 'logs':
+        log.touch(exist_ok=True)
+        os.execl('/usr/bin/tail', 'tail', '-n', '50', '-f', str(log))
+    if action == 'status':
+        show(state(url), url)
+        return
+    with (ROOT / 'data/tradeit.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        pids = listeners(port)
+        if action == 'down':
+            for pid in pids:
+                os.kill(pid, signal.SIGTERM)
+            deadline = time.monotonic() + 45
+            while listeners(port):
+                if time.monotonic() > deadline:
+                    raise RuntimeError('Shutdown is still finishing. Check tradeit status; no forced kill sent.')
+                time.sleep(.5)
+            print('Desk stopped. Orders already on Kalshi remain active; positions remain open.')
+            return
+        data = state(url)
+        if pids and data is None:
+            raise RuntimeError('Desk process exists but is not responding. Check tradeit logs.')
+        if data and (data['env'] != cfg['env'] or data['config'].get('db_path') != cfg.get('db_path')):
+            raise RuntimeError('Running desk uses a different environment/database. Stop it before starting this config.')
+        if not data:
+            if not BINARY.is_file():
+                raise RuntimeError('Build is missing. Build kalshi-desk before launching.')
+            with log.open('ab', buffering=0) as output:
+                process = subprocess.Popen([str(BINARY), '--config', str(CONFIG), 'serve'], cwd=ROOT,
+                    stdin=subprocess.DEVNULL, stdout=output, stderr=output, start_new_session=True)
+            deadline = time.monotonic() + 45
+            while not data:
+                if process.poll() is not None:
+                    raise RuntimeError(f'Desk exited. See {log}')
+                if time.monotonic() > deadline:
+                    raise RuntimeError(f'Dashboard not ready yet. See {log}')
+                time.sleep(.5)
+                data = state(url)
+        show(data, url)
+        subprocess.run(['/usr/bin/open', '-a', 'Safari', url], check=True)
+        print('Opened Safari. The desk keeps running after this terminal closes.')
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+        print(f'tradeit: {error}', file=sys.stderr)
+        sys.exit(1)

@@ -1,0 +1,108 @@
+{
+  // Copy to config/desk.json. Comments are allowed.
+  "env": "demo",                       // demo | prod  (start on demo)
+  "key_id": "",                        // Kalshi -> Settings -> API -> Key ID (demo keys for demo env)
+  "pem_path": "~/.kalshi/demo.pem",    // the private key file you downloaded
+  "db_path": "data/desk.sqlite",
+  "http_port": 8787,
+  "poll_seconds": 5,
+  "reconcile_every": 6,                // cycles between portfolio syncs
+  "bankroll_dollars": 100.0,           // sizing base; keep it at what you actually deposited
+
+  "risk": {
+    "kelly_frac": 0.25,
+    "max_event_frac": 0.10,            // all brackets of one event
+    "max_cluster_frac": 0.25,          // correlated cluster (same coin+day, all weather same day)
+    "max_open_frac": 0.60,
+    "daily_loss_stop_frac": 0.10,      // trips the kill switch
+    "min_edge_maker": 0.03,            // dollars per contract, net of fee
+    "min_edge_taker": 0.05,
+    "sigma_mult": 1.0,                 // edge must also exceed sigma_mult * model sigma
+    "min_price": 0.05,                 // never trade outside [0.05, 0.95]
+    "proposal_ttl_seconds": 300,
+    "max_orders_per_cycle": 5,
+    "max_disagreement": 0.30,          // a model this far from a two-sided market is research-only (2026-09-05: 5 for 5 the market was right)
+    "max_auto_dollars_per_day": 20.0,  // unattended entries (auto/bot) stop for the day past this purchase cost; exits/targets/stops still run
+    "day_tz": "America/Chicago",       // "P&L today", the daily stop baseline and the auto budget reset at this zone's midnight
+    "shard_topup": {"2": 20.0}         // keep $20 on the crypto shard, moved from shard 0 by Kalshi's intra-account transfer when short
+  },
+
+  // Series the desk pulls every cycle. Add/remove from the dashboard too.
+  "watch_series": [
+    "KXHIGHNY", "KXHIGHCHI", "KXHIGHMIA", "KXHIGHLAX", "KXHIGHHOU", "KXHIGHAUS", "KXHIGHPHIL", "KXDENHIGH",
+    "KXBTC", "KXETH",
+    "KXWTI",
+    "KXNASDAQ100",
+    "KXCPI",
+    "KXEPLGAME", "KXLALIGAGAME", "KXSERIEAGAME", "KXBUNDESLIGAGAME", "KXLIGUE1GAME", "KXMLSGAME",
+    "KXNFLGAME", "KXNCAAFGAME", "KXMLBGAME", "KXNBAGAME", "KXWNBAGAME", "KXNHLGAME", "KXNCAAMBGAME", "KXNCAAWBGAME"
+  ],
+
+  // off | research (collect data, log fairs, never propose) | manual (every proposal waits for you)
+  // | auto (proposals passing params.<s>.auto go alone, the rest wait) | bot (everything goes;
+  // risk caps, kill switch, daily stop still apply)
+  "strategies": {
+    "manual_fair":      "manual",
+    "weather_nws":      "manual",      // day-ahead brackets propose; same-day is research-only until WX-1c (see params)
+    "crypto_lognormal": "research",    // CRYPTO-2 first look: DVOL is the wrong vol for 1-hour brackets; needs shard collateral too
+    "sports_inplay":    "research",    // keeps the ext_sports collector running; the account cannot open Sports positions
+    "sports_live":      "research",    // ESPN win probability / lead-time model for US sports; research until the gate report clears
+    "econ_nowcast":     "off",
+    "commodity_futures":"off",
+    "index_close":      "off",
+    "scitech":          "off"
+  },
+
+  "params": {
+    "crypto_lognormal": {
+      "auto": {"min_edge": 0.05, "max_cost": 4.0, "max_sigma": 0.12, "min_minutes_to_close": 8, "styles": ["maker"]},
+      "annual_vol": {"BTC": 0.55, "ETH": 0.75},   // fallback only; Deribit DVOL overrides when reachable
+      "vol_band": 0.40,                            // vol uncertainty -> sigma on p (short-horizon realized vol is noisy)
+      "refresh_seconds": 20,
+      "market_weight": 0.5                        // shrink model p toward the market mid until proven
+    },
+    "sports_inplay": {
+      "lambda_home": 1.45, "lambda_away": 1.15,   // fallback goal rates when no pre-match prices
+      "red_self": 0.65, "red_opp": 1.25,          // goal-rate multipliers after a red card
+      "late_boost": 0.2,                           // scoring rate +20% by the 90th minute
+      "t_eff": 95,                                 // effective match length incl. stoppage
+      "rho": -0.13,                                // Dixon-Coles low-score correction in the pre-match fit
+      "log_seconds": 30,
+      "market_weight": 0.5,
+      "auto": {"min_edge": 0.06, "max_cost": 4.0, "max_sigma": 0.12, "min_minutes_to_close": 5, "styles": ["maker"]}
+    },
+    "sports_live": {
+      // Maker-only liquidity provision around ESPN's live win probability, only where the book is
+      // wide (min_spread) and only small ($3 a game). Exits are automatic in auto/bot mode.
+      "auto": {"min_edge": 0.06, "max_cost": 3.0, "max_sigma": 0.10, "min_minutes_to_close": 5, "styles": ["maker"], "min_spread": 0.06},
+      "market_weight": 0.5,
+      "scoreboard_refresh_seconds": 20,
+      "wp_refresh_seconds": 30,
+      "log_seconds": 30,
+      "sigma_wp": 0.04,               // model sigma on ESPN's number (scaled by time left)
+      "sigma_leadtime": 0.07,         // lead/time model without ESPN's play-by-play
+      "sigma_pregame": 0.10,
+      // Override/add leagues: series -> ESPN sport/league, final-margin sd, clock.
+      "leagues": {
+        "KXNFLGAME": {"sport": "football", "league": "nfl", "sigma_game": 13.5, "periods": 4, "minutes_per_period": 15}
+      }
+    },
+    "weather_nws": {
+      "auto": {"min_edge": 0.05, "max_cost": 5.0, "max_sigma": 0.15, "min_minutes_to_close": 30, "styles": ["maker"]},
+      "sigma_f": 2.5,                  // day-ahead forecast error, deg F (fallback when no ensemble)
+      "bias_f": 0.4,                   // hourly forecast max understates the continuous daily max (wx-settle study)
+      "same_day_trading": false,       // WX-1b: the tape beat the intraday model at every hour; flip only after WX-1c
+      "resid_k": 0.6,                  // carry of today's obs-minus-forecast residual into the remaining hours
+      "same_day_sd_floor": 2.0,        // deg F; 1.5 was too tight (AUS 2026-09-05 ran +4F over the forecast)
+      "refresh_seconds": 600,
+      "ens_model": "ecmwf_ifs025",     // Open-Meteo ensemble; "" disables
+      "ens_weight": 0.5,               // weight on ensemble mean (ignored when it disagrees with NWS by >4F)
+      "ens_sd_inflate": 1.6,           // ensembles are under-dispersed
+      "market_weight": 0.5,
+      // Override or add stations. Check each series' rules for the climate station it settles on.
+      "stations": {
+        "KXHIGHNY": {"lat": 40.7789, "lon": -73.9692, "obs_station": "KNYC"}
+      }
+    }
+  }
+}

@@ -1,0 +1,31 @@
+// Run the dashboard's actual date helpers and polling scheduler without a browser or network.
+const fs=require('node:fs'), vm=require('node:vm'), assert=require('node:assert/strict');
+const html=fs.readFileSync(require('node:path').join(__dirname,'../ui/index.html'),'utf8');
+const section=(start,end)=>html.slice(html.indexOf(start),html.indexOf(end,html.indexOf(start)));
+const context={Intl,Date,state:{config:{risk:{day_tz:'America/Chicago'}}},$:()=>({value:'weather',classList:{contains:()=>true}}),document:{hidden:false},console,renderFeedStatus:()=>{}};
+vm.createContext(context);
+vm.runInContext(section('  const localDay =','  const ageText =')+'\nthis.helpers={localDay,nextDay,category,matchesCategory};',context);
+const {localDay,nextDay,category}=context.helpers;
+assert.equal(localDay(Date.parse('2026-09-07T04:59:59Z')),'2026-09-06');
+assert.equal(localDay(Date.parse('2026-09-07T05:00:00Z')),'2026-09-07');
+assert.equal(localDay(Date.parse('2026-01-02T05:59:59Z')),'2026-01-01');
+assert.equal(localDay(Date.parse('2026-01-02T06:00:00Z')),'2026-01-02');
+assert.equal(nextDay('2026-12-31'),'2027-01-01');
+assert.equal(nextDay('2028-02-28'),'2028-02-29');
+assert.equal(category({ticker:'KXHIGHNY-26SEP06-B75.5'}),'weather');
+assert.equal(category({strategy:'crypto_lognormal'}),'crypto');
+assert.equal(category({series_ticker:'KXNFLGAME'}),'sports');
+let calls=0,release;
+context.refreshState=()=>{calls++;return new Promise(resolve=>{release=resolve;});};
+for(const key of ['refreshWeather','refreshMarkets','refreshLadder','refreshRiskPnl','refreshBlotter','refreshRiskBook','loadSports'])context[key]=()=>Promise.resolve();
+vm.runInContext(section('  const jobs={',"  document.addEventListener('visibilitychange'")+'\nthis.scheduler={poll,requestRefresh,jobs};',context);
+const flush=()=>new Promise(resolve=>setImmediate(resolve));
+(async()=>{
+ const s=context.scheduler;
+ s.requestRefresh('state');await flush();assert.equal(calls,1);
+ s.requestRefresh('state');s.poll();await flush();assert.equal(calls,1,'overlapping reads must share one in-flight job');
+ release();await flush();s.poll();await flush();assert.equal(calls,2,'manual refresh requested in flight must run afterward');
+ release();await flush();context.document.hidden=true;s.requestRefresh('state');await flush();assert.equal(calls,2,'hidden pages should pause polling');
+ context.document.hidden=false;s.requestRefresh('state');await flush();assert.equal(calls,3,'waking a page must refresh immediately');
+ release();await flush();console.log('13 dashboard rollover/filter/polling checks passed');
+})().catch(e=>{console.error(e);process.exitCode=1;});

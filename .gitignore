@@ -1,0 +1,8 @@
+build/
+build-ci/
+data/
+config/desk.json
+*.pem
+.DS_Store
+research/asos_*.csv
+research/wx_rise_tables.json
