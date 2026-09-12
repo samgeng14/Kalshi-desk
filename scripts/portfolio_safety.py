@@ -258,8 +258,16 @@ def main():
                     help='ACTUALLY close every open position. Needs --live as well as the '
                          'right machine and KALSHI_ARM.')
     ap.add_argument('--live', action='store_true')
-    ap.add_argument('--equity-start', type=float, default=None)
+    ap.add_argument('--equity-start', type=float, default=None,
+                    help='defaults to the baseline captured in reports/canary_state.json')
     args = ap.parse_args()
+    if args.equity_start is None:
+        # The canary drawdown guard measures against the equity it STARTED with. Defaulting to
+        # "whatever equity is right now" would re-baseline on every run and the guard would never
+        # fire, which is the quietest way for a risk limit to be useless.
+        _st = os.path.join(ROOT, 'reports', 'canary_state.json')
+        if os.path.exists(_st):
+            args.equity_start = json.load(open(_st)).get('equity_start')
 
     cfg = json.load(open(os.path.join(ROOT, 'config', 'portfolio_v1.json')))
     want_hash = open(os.path.join(ROOT, 'config', 'portfolio_v1.sha256')).read().strip()
@@ -312,7 +320,8 @@ def main():
                 if args.live:
                     try:
                         pr = k.perp_positions()
-                        live_pos = {p['ticker']: float(p['position'])
+                        live_pos = {(p.get('market_ticker') or p.get('ticker')):
+                                    float(p['position'])
                                     for p in (pr.get('positions') or pr.get('market_positions')
                                               or [])
                                     if abs(float(p.get('position') or 0)) > 0}
@@ -347,8 +356,14 @@ def main():
                 if done or not args.live:
                     break
                 print('  attempt %d left size unfilled; re-reading the book' % (attempt + 1))
-            print('\n  An IOC that returns fill_count 0 with remaining_count 0 did NOT trade.')
-            print('  Confirm with: python3 scripts/kalshi_client.py /margin/positions')
+            if args.live:
+                if done:
+                    print('\n  FLAT — every leg filled in full.')
+                else:
+                    print('\n  NOT FLAT. An IOC returning fill_count 0 with remaining_count 0')
+                    print('  did not trade; size remains open.')
+                print('  Verify independently: '
+                      'python3 scripts/kalshi_client.py /margin/positions')
         except SystemExit as e:
             print('  %s' % e)
         return 0

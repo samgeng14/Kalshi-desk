@@ -1,0 +1,112 @@
+{
+  "KXHIGHCHI": {
+    "cli_product": "CLIMDW",
+    "low": false,
+    "obs_station": "KMDW"
+  },
+  "KXHIGHDEN": {
+    "cli_product": "CLIDEN",
+    "low": false,
+    "obs_station": "KDEN"
+  },
+  "KXHIGHLAX": {
+    "cli_product": "CLILAX",
+    "low": false,
+    "obs_station": "KLAX"
+  },
+  "KXHIGHMIA": {
+    "cli_product": "CLIMIA",
+    "low": false,
+    "obs_station": "KMIA"
+  },
+  "KXHIGHNY": {
+    "cli_product": "CLINYC",
+    "low": false,
+    "obs_station": "KNYC"
+  },
+  "KXHIGHPHIL": {
+    "cli_product": "CLIPHL",
+    "low": false,
+    "obs_station": "KPHL"
+  },
+  "KXHIGHTATL": {
+    "cli_product": "CLIATL",
+    "low": false,
+    "obs_station": "KATL"
+  },
+  "KXHIGHTBOS": {
+    "cli_product": "CLIBOS",
+    "low": false,
+    "obs_station": "KBOS"
+  },
+  "KXHIGHTDAL": {
+    "cli_product": "CLIDFW",
+    "low": false,
+    "obs_station": "KDFW"
+  },
+  "KXHIGHTDC": {
+    "cli_product": "CLIDCA",
+    "low": false,
+    "obs_station": "KDCA"
+  },
+  "KXHIGHTEWR": {
+    "cli_product": "CLIEWR",
+    "low": false,
+    "obs_station": "KEWR"
+  },
+  "KXHIGHTHOU": {
+    "cli_product": "CLIHOU",
+    "low": false,
+    "obs_station": "KHOU"
+  },
+  "KXHIGHTMIN": {
+    "cli_product": "CLIMSP",
+    "low": false,
+    "obs_station": "KMSP"
+  },
+  "KXHIGHTOKC": {
+    "cli_product": "CLIOKC",
+    "low": false,
+    "obs_station": "KOKC"
+  },
+  "KXHIGHTPHX": {
+    "cli_product": "CLIPHX",
+    "low": false,
+    "obs_station": "KPHX"
+  },
+  "KXHIGHTSAN": {
+    "cli_product": "CLISAN",
+    "low": false,
+    "obs_station": "KSAN"
+  },
+  "KXHIGHTSATX": {
+    "cli_product": "CLISAT",
+    "low": false,
+    "obs_station": "KSAT"
+  },
+  "KXHIGHTSEA": {
+    "cli_product": "CLISEA",
+    "low": false,
+    "obs_station": "KSEA"
+  },
+  "KXLOWTBOS": {
+    "cli_product": "CLIBOS",
+    "low": true,
+    "obs_station": "KBOS"
+  },
+  "KXLOWTDC": {
+    "cli_product": "CLIDCA",
+    "low": true,
+    "obs_station": "KDCA"
+  },
+  "KXLOWTPHIL": {
+    "cli_product": "CLIPHL",
+    "low": true,
+    "obs_station": "KPHL"
+  },
+  "KXLOWTTTN": {
+    "cli_product": "CLITTN",
+    "low": true,
+    "obs_station": "KTTN"
+  }
+}

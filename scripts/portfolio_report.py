@@ -180,9 +180,17 @@ def main():
     ap.add_argument('--decision', default=os.path.join(ROOT, 'reports', 'decisions', 'latest.json'))
     ap.add_argument('--snapshot', default=os.path.join(ROOT, 'data', 'snapshots',
                                                        'kalshi_perp_snapshot.json'))
-    ap.add_argument('--equity-start', type=float, default=None)
+    ap.add_argument('--equity-start', type=float, default=None,
+                    help='defaults to the baseline captured in reports/canary_state.json')
     ap.add_argument('--append-ledger', action='store_true')
     args = ap.parse_args()
+    if args.equity_start is None:
+        # The canary drawdown guard measures against the equity it STARTED with. Defaulting to
+        # "whatever equity is right now" would re-baseline on every run and the guard would never
+        # fire, which is the quietest way for a risk limit to be useless.
+        _st = os.path.join(ROOT, 'reports', 'canary_state.json')
+        if os.path.exists(_st):
+            args.equity_start = json.load(open(_st)).get('equity_start')
 
     cfg = json.load(open(os.path.join(ROOT, 'config', 'portfolio_v1.json')))
     decision = json.load(open(args.decision))
