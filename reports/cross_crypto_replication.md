@@ -117,6 +117,8 @@ Now the rules that encode what the papers actually claim:
 **The LASSO is the worst model class in the sweep** — mean ratio −0.1187 against −0.0376 for the
 field, only 21.4% of its specifications positive, and its single best result reaching 49% of the
 required effect. The seesaw rule clears zero times out of 42 and its best result reaches 79%.
+Between them, the two mechanisms the papers actually propose clear the hurdle **zero times out of
+84 specifications**.
 
 So the leaderboard never contained a cross-crypto replication. It contained a single-asset
 momentum rule and a market-factor rule sitting above the cross-asset rules, and then the null
