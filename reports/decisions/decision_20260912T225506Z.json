@@ -1,0 +1,254 @@
+{
+ "decided_at_utc": "2026-09-12T22:55:06Z",
+ "config_hash": "71ecd439009947ad9949895f7060621c317e094d54ae0156bad65630b1675513",
+ "spec_name": "PORTFOLIO_V1",
+ "mode": "SHADOW_V1 + EXECUTION_CANARY",
+ "pnl_label": "EXECUTION_CANARY",
+ "data": {
+  "recorder": "ext_prices contributed 1940 observations",
+  "recorder_bars_added": 16,
+  "last_bar_ms": 1789167600000,
+  "stale_hours": 23.918641666666666,
+  "bars": 6839,
+  "names": [
+   "AAVEUSDT",
+   "ADAUSDT",
+   "AVAXUSDT",
+   "BCHUSDT",
+   "BNBUSDT",
+   "BTCUSDT",
+   "DOGEUSDT",
+   "ETHUSDT",
+   "LINKUSDT",
+   "LTCUSDT",
+   "NEARUSDT",
+   "SOLUSDT",
+   "XRPUSDT"
+  ]
+ },
+ "account": {
+  "ts": 1789253691,
+  "settled_funds": 49.7537,
+  "position_value": 0.0,
+  "equity": 49.8588,
+  "maintenance_margin": 0.0,
+  "initial_margin": 0.0,
+  "resting_orders_margin": 0.0,
+  "available": 49.8588,
+  "equity_source": "sum of subaccount account_equity",
+  "subaccounts": 4
+ },
+ "universe": [
+  "AAVEUSDT",
+  "ADAUSDT",
+  "AVAXUSDT",
+  "BCHUSDT",
+  "BNBUSDT",
+  "BTCUSDT",
+  "DOGEUSDT",
+  "ETHUSDT",
+  "LINKUSDT",
+  "LTCUSDT",
+  "NEARUSDT",
+  "SOLUSDT",
+  "XRPUSDT"
+ ],
+ "composite_score": {
+  "AAVEUSDT": 0.18671070352363708,
+  "ADAUSDT": -0.22302729670004914,
+  "AVAXUSDT": -0.15893165903832757,
+  "BCHUSDT": -1.9178944465052088,
+  "BNBUSDT": 0.11960379478771907,
+  "BTCUSDT": -0.28497079649350815,
+  "DOGEUSDT": -0.26771676616539963,
+  "ETHUSDT": 0.3651742079853295,
+  "LINKUSDT": -0.25768983319957545,
+  "LTCUSDT": 0.4849474026412185,
+  "NEARUSDT": 2.0185166478632928,
+  "SOLUSDT": 0.07887413270243984,
+  "XRPUSDT": -0.14359609140156918
+ },
+ "beta1": {
+  "AAVEUSDT": 0.2489729705584681,
+  "ADAUSDT": 0.3034404347677617,
+  "AVAXUSDT": 0.29658946756440485,
+  "BCHUSDT": 0.24660763437755823,
+  "BNBUSDT": 0.28700019965994983,
+  "BTCUSDT": 0.27898657530967175,
+  "DOGEUSDT": 0.29434624877283055,
+  "ETHUSDT": 0.2823814093131626,
+  "LINKUSDT": 0.27495291990803006,
+  "LTCUSDT": 0.26431961029145323,
+  "NEARUSDT": 0.23703880495386953,
+  "SOLUSDT": 0.29510671831081225,
+  "XRPUSDT": 0.2860678097565401
+ },
+ "target_weights": {
+  "AAVEUSDT": 0.0014846429789424753,
+  "ADAUSDT": 0.0018094362211074448,
+  "AVAXUSDT": 0.001768583431607388,
+  "BCHUSDT": -0.1632522375691137,
+  "BNBUSDT": 0.0017114019663438554,
+  "BTCUSDT": -0.163059159713262,
+  "DOGEUSDT": -0.16296756892204167,
+  "ETHUSDT": 0.16640663568667355,
+  "LINKUSDT": 0.0016395632070643886,
+  "LTCUSDT": 0.1662989319345574,
+  "NEARUSDT": 0.16613625461254333,
+  "SOLUSDT": 0.0017597416956392602,
+  "XRPUSDT": 0.0017058420611034228
+ },
+ "current_weights": {
+  "AAVEUSDT": 0.0,
+  "ADAUSDT": 0.0,
+  "AVAXUSDT": 0.0,
+  "BCHUSDT": 0.0,
+  "BNBUSDT": 0.0,
+  "BTCUSDT": 0.0,
+  "DOGEUSDT": 0.0,
+  "ETHUSDT": 0.0,
+  "LINKUSDT": 0.0,
+  "LTCUSDT": 0.0,
+  "NEARUSDT": 0.0,
+  "SOLUSDT": 0.0,
+  "XRPUSDT": 0.0
+ },
+ "live_weights": {
+  "AAVEUSDT": 0.0,
+  "ADAUSDT": 0.0,
+  "AVAXUSDT": 0.0,
+  "BCHUSDT": -0.13570122024597464,
+  "BNBUSDT": 0.0,
+  "BTCUSDT": -0.0,
+  "DOGEUSDT": -0.0,
+  "ETHUSDT": 0.10120179386587723,
+  "LINKUSDT": 0.0,
+  "LTCUSDT": 0.10737322197886832,
+  "NEARUSDT": 0.0,
+  "SOLUSDT": 0.0,
+  "XRPUSDT": 0.0
+ },
+ "integer_book": [
+  {
+   "symbol": "BCHUSDT",
+   "kalshi": "KXBCHPERP",
+   "contracts": -3,
+   "price": 2.2553,
+   "notional": -6.7659,
+   "leverage": 1.0
+  },
+  {
+   "symbol": "BTCUSDT",
+   "kalshi": "KXBTCPERP",
+   "contracts": 0,
+   "price": 7.7235,
+   "notional": -0.0,
+   "leverage": 1.0
+  },
+  {
+   "symbol": "DOGEUSDT",
+   "kalshi": "KXDOGEPERP",
+   "contracts": 0,
+   "price": 8.4636,
+   "notional": -0.0,
+   "leverage": 1.0
+  },
+  {
+   "symbol": "ETHUSDT",
+   "kalshi": "KXETHPERP",
+   "contracts": 2,
+   "price": 2.5229,
+   "notional": 5.0458,
+   "leverage": 1.0
+  },
+  {
+   "symbol": "LTCUSDT",
+   "kalshi": "KXLTCPERP",
+   "contracts": 1,
+   "price": 5.3535,
+   "notional": 5.3535,
+   "leverage": 1.0
+  },
+  {
+   "symbol": "NEARUSDT",
+   "kalshi": "KXNEARPERP",
+   "contracts": 0,
+   "price": 2.3561,
+   "notional": 0.0,
+   "leverage": 1.0
+  }
+ ],
+ "unlisted_legs": [],
+ "feasibility": {
+  "relative_weight_tracking_error": {
+   "value": 0.7405000975315903,
+   "threshold": 0.3,
+   "pass": false
+  },
+  "net_exposure_over_gross": {
+   "value": 0.21167245356884853,
+   "threshold": 0.2,
+   "pass": false
+  },
+  "pc1_exposure_over_gross": {
+   "value": 0.24670916349845565,
+   "threshold": 0.25,
+   "pass": true
+  },
+  "representable_legs": {
+   "value": 3,
+   "threshold": 4,
+   "pass": false
+  }
+ },
+ "feasible": false,
+ "gross_over_equity": 0.34427623609072017,
+ "margin_utilisation": 0.34427623609072017,
+ "no_trade_test": [
+  {
+   "symbol": "BCHUSDT",
+   "kalshi": "KXBCHPERP",
+   "w_current": 0.0,
+   "w_target": -0.13570122024597464,
+   "delta_w": -0.13570122024597464,
+   "score": -1.9178944465052088,
+   "expected_benefit_bps": 20.553973625340056,
+   "expected_cost_bps": 2.734379587956389,
+   "benefit_over_cost": 7.516869170568089,
+   "required_ratio": 1.5,
+   "trade": true
+  },
+  {
+   "symbol": "ETHUSDT",
+   "kalshi": "KXETHPERP",
+   "w_current": 0.0,
+   "w_target": 0.10120179386587723,
+   "delta_w": 0.10120179386587723,
+   "score": 0.3651742079853295,
+   "expected_benefit_bps": 2.9186071839073096,
+   "expected_cost_bps": 1.2650224233234653,
+   "benefit_over_cost": 2.3071584582979554,
+   "required_ratio": 1.5,
+   "trade": true
+  },
+  {
+   "symbol": "LTCUSDT",
+   "kalshi": "KXLTCPERP",
+   "w_current": 0.0,
+   "w_target": 0.10737322197886832,
+   "delta_w": 0.10737322197886832,
+   "score": 0.4849474026412185,
+   "expected_benefit_bps": 4.112235361490216,
+   "expected_cost_bps": 1.6728747984307686,
+   "benefit_over_cost": 2.4581847759005493,
+   "required_ratio": 1.5,
+   "trade": true
+  }
+ ],
+ "legs_to_trade": [
+  "BCHUSDT",
+  "ETHUSDT",
+  "LTCUSDT"
+ ],
+ "horizon_dispersion_bps": 310.8764239476031
+}

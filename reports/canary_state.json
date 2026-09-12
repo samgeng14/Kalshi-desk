@@ -1,5 +1,5 @@
 {
- "equity_start": 49.8595,
- "started_utc": "2026-09-12T22:47:00Z",
- "note": "captured flat, before the first PORTFOLIO_V1 rebalance. The drawdown guard measures against this and it must not be rewritten."
+ "equity_start": 49.8588,
+ "started_utc": 1789253691,
+ "note": "captured flat from the exchange, before the first PORTFOLIO_V1 rebalance"
 }

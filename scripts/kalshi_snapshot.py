@@ -93,24 +93,70 @@ def from_api():
                           'is_portfolio': p.get('is_portfolio'),
                           'updated_ts': int(time.time())})
 
+    # Field names read from src/perps.cpp parse_perp_market, not guessed. The list endpoint
+    # calls them tick_size, price, leverage_estimate, and wraps the three marks in objects of
+    # {price, ts_ms}. Storing them under the recorder's shorter names keeps every consumer working
+    # against one vocabulary.
+    def tp(m, key):
+        """settlement_mark_price and friends arrive as {price, ts_ms}, not as bare numbers."""
+        v = m.get(key)
+        if isinstance(v, dict):
+            try:
+                return float(v.get('price'))
+            except (TypeError, ValueError):
+                return None
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    def side(v):
+        """Kalshi sends INT64_MAX for 'no order on this side', which parses as 9.2e14.
+
+        Recorded straight through it made the basis read 6.8e16 bps on a dozen instruments. A
+        price that large is not a price; absent is absent.
+        """
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            return None
+        return v if (v == v and 0 < v < 1e9) else None
+
     mr = k.perp_markets(status='active')
     markets = []
     for m in (mr.get('markets') or []):
-        m = num(m)
         tk = m.get('ticker')
         if not tk:
             continue
+        sched = m.get('schedule') if isinstance(m.get('schedule'), dict) else {}
+        bid, ask = side(m.get('bid')), side(m.get('ask'))
+        mark = tp(m, 'settlement_mark_price')
+        if mark is None and bid is not None and ask is not None:
+            mark = (bid + ask) / 2.0
         markets.append({'ticker': tk, 'title': m.get('title'), 'status': m.get('status'),
-                        'asset_class': m.get('asset_class'), 'tick': m.get('tick'),
-                        'contract_size': m.get('contract_size'), 'bid': m.get('bid'),
-                        'ask': m.get('ask'), 'last': m.get('last'), 'mark': m.get('mark'),
-                        'reference': m.get('reference'), 'leverage': m.get('leverage'),
+                        'asset_class': m.get('asset_class'),
+                        'tick': float(m.get('tick_size') or 0.0001),
+                        'contract_size': m.get('contract_size'),
+                        'bid': bid, 'ask': ask,
+                        'last': tp(m, 'price'),
+                        'mark': mark,
+                        'liquidation_mark': tp(m, 'liquidation_mark_price'),
+                        'reference': tp(m, 'reference_price'),
+                        'leverage': float(m.get('leverage_estimate') or 0) or None,
                         'volume_24h': m.get('volume_24h'),
                         'open_interest': m.get('open_interest'),
-                        'is_open': m.get('is_open', True),
+                        'is_open': bool(sched.get('is_open', True)),
+                        'fractional': bool(m.get('fractional_trading_enabled', False)),
                         'funding_rate': m.get('funding_rate'),
                         'next_funding': m.get('next_funding'),
                         'updated_ts': int(time.time())})
+
+    bad = [m['ticker'] for m in markets
+           if m['bid'] is None or m['ask'] is None or m['mark'] is None or not m['leverage']]
+    if bad:
+        print('markets missing a price or leverage (excluded from sizing): %s'
+              % ', '.join(sorted(bad)[:8]))
+
     return acct, positions, markets
 
 

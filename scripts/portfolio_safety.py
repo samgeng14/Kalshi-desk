@@ -135,14 +135,24 @@ def pre_trade_screen(order, ctx):
     if notional_after > eq * lim['single_name_notional_over_equity_max'] + 1e-9:
         fails.append('single-name notional $%.2f exceeds %.0f%% of equity'
                      % (notional_after, 100 * lim['single_name_notional_over_equity_max']))
+    def _px(mk):
+        for key in ('mark', 'last', 'reference'):
+            v = mk.get(key)
+            if v is not None:
+                return float(v)
+        b, a = mk.get('bid'), mk.get('ask')
+        if b is not None and a is not None:
+            return (float(b) + float(a)) / 2.0
+        return 0.0
+
     gross_after = sum(abs(ctx['positions'].get(k, 0.0) + (signed if k == tk else 0)) *
-                      float(ctx['markets'][k]['mark'])
+                      _px(ctx['markets'][k])
                       for k in set(list(ctx['positions']) + [tk]) if k in ctx['markets'])
     if gross_after > eq * lim['gross_over_equity_max'] + 1e-9:
         fails.append('gross $%.2f exceeds %.1fx equity'
                      % (gross_after, lim['gross_over_equity_max']))
     margin_after = sum(abs(ctx['positions'].get(k, 0.0) + (signed if k == tk else 0)) *
-                       float(ctx['markets'][k]['mark']) /
+                       _px(ctx['markets'][k]) /
                        float(ctx['markets'][k].get('leverage') or 1.0)
                        for k in set(list(ctx['positions']) + [tk]) if k in ctx['markets'])
     if margin_after > eq * lim['margin_utilization_max'] + 1e-9:
@@ -199,11 +209,28 @@ def refresh_markets(client, tickers, markets, verbose=True):
         try:
             r = client.perp_market(tk)
             m = r.get('market') or r
-            fresh = {k: m[k] for k in ('bid', 'ask', 'mark', 'tick') if k in m}
-            if 'bid' in fresh and 'ask' in fresh:
-                markets[tk] = dict(markets.get(tk, {}), **fresh)
-            else:
+            # Same vocabulary problem as the snapshot: the API says tick_size and wraps the mark
+            # in an object, and sends INT64_MAX (9.2e14) for an empty side.
+            def _side(v):
+                try:
+                    v = float(v)
+                except (TypeError, ValueError):
+                    return None
+                return v if (v == v and 0 < v < 1e9) else None
+            mk = m.get('settlement_mark_price')
+            mark = float(mk['price']) if isinstance(mk, dict) and mk.get('price') else None
+            bid, ask = _side(m.get('bid')), _side(m.get('ask'))
+            if bid is None or ask is None:
                 stale.append(tk)
+                continue
+            fresh = {'bid': bid, 'ask': ask,
+                     'mark': mark if mark is not None else (bid + ask) / 2.0,
+                     'tick': float(m.get('tick_size') or markets.get(tk, {}).get('tick')
+                                   or 0.0001)}
+            lev = float(m.get('leverage_estimate') or 0)
+            if lev:
+                fresh['leverage'] = lev
+            markets[tk] = dict(markets.get(tk, {}), **fresh)
         except (RuntimeError, KeyError, TypeError) as e:
             stale.append('%s (%s)' % (tk, str(e)[:60]))
     if verbose:

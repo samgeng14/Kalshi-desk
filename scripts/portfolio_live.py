@@ -148,7 +148,7 @@ def solve_integer_book(names, w, beta1, markets, equity, lim):
     occasionally pick a book that the gross cap makes worse than an alternative.
     """
     legs = [i for i in range(len(names)) if abs(w[i]) > 0.01]
-    meta, grids, unlisted = [], [], []
+    meta, grids, unlisted, missing_lev = [], [], [], []
     for i in legs:
         tk = KALSHI_TICKER.get(names[i])
         if not tk or tk not in markets:
@@ -157,7 +157,15 @@ def solve_integer_book(names, w, beta1, markets, equity, lim):
         m = markets[tk]
         px = m['ask'] if w[i] > 0 else m['bid']
         tgt = abs(w[i]) * equity * lim['gross_over_equity_max']
-        meta.append((i, tk, float(px), float(m.get('leverage') or 1.0), float(np.sign(w[i]))))
+        lev = float(m.get('leverage') or 0)
+        if lev <= 0:
+            # Defaulting a missing leverage to 1.0 makes margin equal full notional, the 35% cap
+            # then binds on every leg, and the book silently shrinks from six names to three and
+            # fails feasibility. That looks like the signal changing its mind. It is a missing
+            # field. Refuse to size the leg rather than size it wrongly.
+            missing_lev.append(names[i])
+            continue
+        meta.append((i, tk, float(px), lev, float(np.sign(w[i]))))
         grids.append(candidate_counts(px, tgt, equity,
                                       lim['single_name_notional_over_equity_max']))
     best = None
@@ -175,7 +183,7 @@ def solve_integer_book(names, w, beta1, markets, equity, lim):
         e = float(np.linalg.norm(wl - w))
         if best is None or e < best[0]:
             best = (e, counts, wl, gross, margin)
-    return best, meta, unlisted
+    return best, meta, unlisted, missing_lev
 
 
 def score_feasibility(w, wl, beta1, counts, thr):
@@ -271,7 +279,10 @@ def main():
         if tk and tk in held and tk in markets:
             w_current[i] = held[tk] * float(markets[tk]['mark']) / equity
 
-    best, meta, unlisted = solve_integer_book(names, w, beta1, markets, equity, lim)
+    best, meta, unlisted, missing_lev = solve_integer_book(names, w, beta1, markets, equity, lim)
+    if missing_lev:
+        print('\nREFUSING TO SIZE: no leverage figure for %s' % ', '.join(missing_lev))
+        print('Re-run scripts/kalshi_snapshot.py; a null leverage silently shrinks the book.')
     if best is None:
         feasible, checks, wl, counts, gross, margin = False, {}, np.zeros(len(names)), (), 0.0, 0.0
     else:
@@ -300,8 +311,11 @@ def main():
                            'contracts': int(c * m[4]), 'price': m[2],
                            'notional': c * m[2] * m[4], 'leverage': m[3]}
                           for m, c in zip(meta, counts)] if best else []),
-        'unlisted_legs': [{'symbol': names[i], 'target_weight': float(w[i]),
-                           'reason': 'no Kalshi perp contract exists'} for i in unlisted],
+        'unlisted_legs': ([{'symbol': names[i], 'target_weight': float(w[i]),
+                            'reason': 'no Kalshi perp contract exists'} for i in unlisted] +
+                          [{'symbol': nm, 'target_weight': None,
+                            'reason': 'snapshot carried no leverage figure for this market'}
+                           for nm in missing_lev]),
         'feasibility': checks,
         'feasible': bool(feasible),
         'gross_over_equity': (gross / equity) if equity else None,
