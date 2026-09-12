@@ -117,7 +117,7 @@ def execute(plan, decision, snap, cfg, client=None, journal=None, live=False, qu
     ctx = {'markets': markets, 'positions': dict(positions),
            'targets': {r['kalshi']: int(r['contracts'])
                        for r in decision.get('integer_book', []) if r['kalshi']},
-           'equity': float(snap['account']['equity']),
+           'equity': float(snap['account']['equity'] or 0),
            'limits': cfg['canary_risk_limits']}
     ex = cfg['execution']
     window = 1 if quick else int(ex['maker_window_seconds'])

@@ -1,5 +1,7 @@
 #include "desk/universe.h"
 
+#include "desk/log.h"
+
 #include <cstring>
 #include <map>
 
@@ -33,8 +35,55 @@ const std::vector<SettlementSpec>& settlement_specs() {
   return v;
 }
 
+// Discovered specs live beside the compiled table rather than inside it, so that reading the
+// source still shows exactly which mappings a person verified by hand. The strings are owned here
+// because SettlementSpec holds `const char*`: a spec pointing into a temporary json would dangle
+// the moment config went out of scope, and the pointer would still look valid.
+static std::vector<std::string>& spec_strings() {
+  static std::vector<std::string> v;
+  v.reserve(4096);
+  return v;
+}
+static std::vector<SettlementSpec>& discovered_specs() {
+  static std::vector<SettlementSpec> v;
+  return v;
+}
+static const char* own(const std::string& s) {
+  spec_strings().push_back(s);
+  return spec_strings().back().c_str();
+}
+
+int add_settlement_specs(const nlohmann::json& j) {
+  if (!j.is_object()) return 0;
+  int added = 0;
+  for (const auto& [series, v] : j.items()) {
+    if (!v.is_object()) continue;
+    if (settlement_for(series)) continue;          // hand-read mappings always win
+    const std::string kind = v.value("kind", ""), product = v.value("product", ""),
+                      station = v.value("station", ""), tz = v.value("tz", "");
+    if (series.empty() || kind.empty() || product.empty() || station.empty() || tz.empty()) {
+      LOG_WARN("settlement spec for %s ignored: needs kind, product, station and tz", series.c_str());
+      continue;
+    }
+    SettlementSpec s{};
+    s.series = own(series);
+    s.kind = own(kind);
+    s.product = own(product);
+    s.station = own(station);
+    s.tz = own(tz);
+    s.sparse = v.value("sparse", false);
+    s.low = v.value("low", false);
+    discovered_specs().push_back(s);
+    ++added;
+  }
+  if (added) LOG_INFO("settlement: %d discovered mappings added", added);
+  return added;
+}
+
 const SettlementSpec* settlement_for(const std::string& series) {
   for (const auto& s : settlement_specs())
+    if (series == s.series) return &s;
+  for (const auto& s : discovered_specs())
     if (series == s.series) return &s;
   return nullptr;
 }

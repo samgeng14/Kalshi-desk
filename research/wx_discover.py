@@ -116,7 +116,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out-db", default=os.path.join(ROOT, "data", "wx_settlement.sqlite"))
     ap.add_argument("--out", default=os.path.join(ROOT, "reports", "weather_city_coverage.md"))
-    ap.add_argument("--config-out", default=os.path.join(ROOT, "reports", "wx_discovered_stations.json"))
+    ap.add_argument("--config-out", default=os.path.join(ROOT, "config", "weather_discovered.json"))
     ap.add_argument("--desk-db", default=os.path.join(ROOT, "data", "prod.sqlite"))
     ap.add_argument("--limit", type=int, default=8)
     a = ap.parse_args()
@@ -188,9 +188,66 @@ def main():
              "discovery before anything else.\n")
     out = "\n".join(L)
     open(a.out, "w").write(out)
-    cfg = {r["series"]: {"cli_product": r["cli_product"], "obs_station": r["station"],
-                         "low": r["kind"] == "low"} for r in ver}
-    json.dump(cfg, open(a.config_out, "w"), indent=2, sort_keys=True)
+    # A verified series is still unreachable by the pricing path without a grid point to fetch a
+    # forecast for, a zone to measure its day in, and a reading of how often the station reports -
+    # the last because the settlement shift is a property of reporting frequency, not of weather.
+    cfg = {"stations": {}, "settlement_specs": {}}
+    meta = {}
+    for r in ver:
+        st = r["station"]
+        if st not in meta:
+            lat = lon = None; tz = ""; per_day = 0
+            try:
+                g = get("%s/stations/%s" % (NWS, st), accept="application/geo+json")
+                lon, lat = g["geometry"]["coordinates"][:2]
+            except Exception:
+                pass
+            if lat is not None:
+                try:
+                    pt = get("%s/points/%.4f,%.4f" % (NWS, lat, lon), accept="application/geo+json")
+                    tz = pt.get("properties", {}).get("timeZone", "")
+                except Exception:
+                    pass
+                try:
+                    import datetime as _dt
+                    end = _dt.datetime.now(_dt.timezone.utc)
+                    beg = end - _dt.timedelta(days=3)
+                    obs = get("%s/stations/%s/observations?start=%s&end=%s&limit=500"
+                              % (NWS, st, beg.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                                 end.strftime("%Y-%m-%dT%H:%M:%SZ")), accept="application/geo+json")
+                    per_day = len(obs.get("features", [])) / 3.0
+                except Exception:
+                    per_day = 0
+            meta[st] = (lat, lon, tz, per_day)
+        lat, lon, tz, per_day = meta[st]
+        if lat is None or not tz:
+            r["note"] = (r["note"] + "; " if r["note"] else "") + "no grid point or zone: unreachable"
+            r["verified"] = 0
+            continue
+        # Central Park files roughly 38 observations a day against an airport's 250. The hourly
+        # series at a sparse site misses the day's peak far more often, which is the whole reason
+        # the settlement shift is per station.
+        sparse = per_day > 0 and per_day < 100
+        cfg["stations"][r["series"]] = {"lat": round(lat, 4), "lon": round(lon, 4),
+                                        "obs_station": st, "cli_product": r["cli_product"],
+                                        "low": r["kind"] == "low"}
+        cfg["settlement_specs"][r["series"]] = {
+            "kind": "weather_cli", "product": r["cli_product"], "station": st, "tz": tz,
+            "sparse": bool(sparse), "low": r["kind"] == "low",
+            "observations_per_day": round(per_day, 1)}
+    cfg["watch"] = sorted(cfg["settlement_specs"])
+    cfg["_generated"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    cfg["_source"] = ("research/wx_discover.py: settlement product read from each contract's own "
+                      "rules_primary, then checked against api.weather.gov. Regenerated daily; "
+                      "safe to delete, the desk falls back to config/desk.json alone.")
+    cfg["_observations_per_day_note"] = ("counted over 3 days with the API's 500-row cap, so any "
+                                         "value at 166.7 is censored rather than measured; only "
+                                         "the sparse/dense split below 100 is meaningful")
+    # Write through a temp file: the desk reads this at startup and a half-written JSON would be
+    # a config parse failure rather than a missing file.
+    tmp = a.config_out + ".tmp"
+    json.dump(cfg, open(tmp, "w"), indent=2, sort_keys=True)
+    os.replace(tmp, a.config_out)
     print(out)
     print("\nwrote %s and %s" % (a.out, a.config_out))
 

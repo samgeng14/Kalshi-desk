@@ -38,23 +38,45 @@ def num(d):
 
 
 def from_api():
+    """Mirror src/perps.cpp parse_perp_balance exactly, rather than guessing field names.
+
+    /margin/balance does NOT report equity at the top level. It returns settled_funds plus a
+    subaccount_balances array, and equity is the sum of account_equity across those subaccounts.
+    Retail members see per-subaccount equity; a self-clearing member sees zeros there, in which
+    case settled funds plus position value is the honest fallback. Guessing at 'equity',
+    'portfolio_value' and 'total_value' produced a snapshot with equity None, which the kill
+    switches caught but two downstream tools crashed on.
+    """
     from kalshi_client import Kalshi
     k = Kalshi()
-    bal = num(k.perp_balance())
-    acct = {'ts': int(time.time()),
-            'equity': bal.get('equity'),
-            'available': bal.get('available_balance', bal.get('available')),
-            'settled_funds': bal.get('settled_funds'),
-            'position_value': bal.get('position_value'),
-            'maintenance_margin': bal.get('maintenance_margin'),
-            'initial_margin': bal.get('initial_margin')}
-    if acct['equity'] is None:
-        # Field names vary; keep the raw payload so nothing is silently lost.
-        acct['raw'] = bal
-        for key in ('portfolio_value', 'total_value', 'balance'):
-            if bal.get(key) is not None:
-                acct['equity'] = float(bal[key])
-                break
+    bal = k.perp_balance()
+
+    def f(d, key):
+        v = d.get(key)
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return 0.0
+
+    acct = {'ts': int(time.time()), 'settled_funds': f(bal, 'settled_funds'),
+            'position_value': 0.0, 'equity': 0.0, 'maintenance_margin': 0.0,
+            'initial_margin': 0.0, 'resting_orders_margin': 0.0, 'available': 0.0}
+    subs = bal.get('subaccount_balances') or []
+    for sub in subs:
+        acct['position_value'] += f(sub, 'position_value')
+        acct['equity'] += f(sub, 'account_equity')
+        acct['maintenance_margin'] += f(sub, 'maintenance_margin')
+        acct['initial_margin'] += f(sub, 'initial_margin')
+        acct['resting_orders_margin'] += f(sub, 'resting_orders_margin')
+        acct['available'] += f(sub, 'available_balance')
+    if acct['equity'] <= 0:
+        acct['equity'] = acct['settled_funds'] + acct['position_value']
+        acct['equity_source'] = 'settled_funds + position_value (subaccount equity reported zero)'
+    else:
+        acct['equity_source'] = 'sum of subaccount account_equity'
+    if acct['available'] <= 0:
+        acct['available'] = acct['equity'] - acct['initial_margin']
+    acct['subaccounts'] = len(subs)
 
     pr = k.perp_positions()
     positions = []
@@ -122,6 +144,11 @@ def main():
     else:
         acct, positions, markets = from_recorder()
 
+    eq = acct.get('equity')
+    if eq is None or float(eq) <= 0:
+        raise SystemExit('refusing to write a snapshot with unusable equity (%r). Everything '
+                         'downstream prices against this field; a null here is how three tools '
+                         'crash at once.' % eq)
     snap = {'captured_ts': int(time.time()), 'source': source,
             'account': acct, 'markets': markets, 'positions': positions}
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
@@ -130,8 +157,11 @@ def main():
 
     print('snapshot source: %s   %s'
           % (source.upper(), dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')))
-    print('equity $%s   markets %d   open positions %d'
-          % (acct.get('equity'), len(markets), len(positions)))
+    print('equity $%.4f   available $%.4f   markets %d   open positions %d'
+          % (float(acct['equity']), float(acct.get('available') or 0),
+             len(markets), len(positions)))
+    if acct.get('equity_source'):
+        print('equity from: %s' % acct['equity_source'])
     for p in positions:
         print('  %-13s %+g @ %s' % (p['ticker'], p['position'], p.get('entry_price')))
     if not positions:

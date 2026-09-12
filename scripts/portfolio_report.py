@@ -92,6 +92,8 @@ def dashboard(decision, snap, cfg, equity_start=None):
     acct = snap['account']
     markets = {m['ticker']: m for m in snap['markets']}
     pos = {p['ticker']: p for p in snap.get('positions', [])}
+    if acct.get('equity') is None:
+        raise SystemExit('snapshot has no equity — re-run scripts/kalshi_snapshot.py')
     eq = float(acct['equity'])
     lines = []
     A = lines.append

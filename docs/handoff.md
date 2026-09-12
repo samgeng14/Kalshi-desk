@@ -1848,3 +1848,52 @@ contract per timestamp, chosen as the side the desk would take.
 
 The maker column remains conditional on fills, which are not modelled. Section 11 of the brief says
 not to credit quoted spread mechanically, and that is exactly what a fill-free maker backtest does.
+
+## Session 23, part 5: all-city discovery
+
+`research/wx_discover.py` -> `reports/weather_city_coverage.md` + `config/weather_discovered.json`.
+Runs hourly from `scripts/wx_watch_loop.sh` beside the settlement watch.
+
+Kalshi lists **391** Climate and Weather series and about a hundred daily high/low temperature
+ones. Whichever of those has an open market is a city-day the desk could price, and a city-day is
+the unit the minimum detectable edge shrinks with - which is why discovery comes before any model
+work. It needs nothing to be right.
+
+**Settlement is verified from the contract's own words, not from a table.** Every US temperature
+contract names its NWS climate product inline ("the maximum temperature recorded at Chicago
+(CLIMDW)"), so the product is parsed out of `rules_primary` and then checked against
+api.weather.gov, which either serves that product and that station or does not. International
+cities (London, Tokyo, Singapore, Sydney, ...) list markets but name no CLI product, so they fall
+out by construction rather than by an opinion.
+
+Result: **25 verified cities against 5 the desk was actually covering.**
+
+And the watchlist was wrong in both directions. `KXDENHIGH`, `KXHIGHAUS` and `KXHIGHHOU` are in
+`config/desk.json` and had no open market under those tickers - Denver actually lists as
+`KXHIGHDEN`. The desk believed it was covering three cities it was not. Those entries are left in
+place because a series with no listing today may list tomorrow; the report names them each run.
+
+Two C++ changes, both additive:
+
+- `add_settlement_specs(json)` in `universe.cpp`. Discovered mappings live in their own vector
+  beside the compiled table, with their strings owned there because `SettlementSpec` holds
+  `const char*` and a spec pointing into a temporary json would dangle while still looking valid.
+  **Additive only**: a series already in `settlement_specs()` is ignored rather than merged, so
+  nothing in config can re-point a hand-read mapping. An entry missing kind, product, station or
+  tz is rejected outright, because an empty product is exactly what `settlement_verified_for()`
+  reads as "rules unread" and a half-filled entry would claim verification it does not have.
+- `config.cpp` loads `config/weather_discovered.json` beside `desk.json`. Separate file on
+  purpose: discovery never edits the file holding the API key, and a bad run can be deleted rather
+  than unpicked from hand-written config. Hand-written station entries win; only series whose
+  mapping actually resolved are added to `watch_series`.
+
+Tests added to `test_main.cpp`: a discovered city resolves and clears the settlement gate; a
+discovered entry cannot re-point `KXHIGHNY`; incomplete and empty-product entries are rejected;
+non-object input returns 0; the owned strings outlive the json.
+
+Measured rather than assumed: KDEN files ~24 observations a day, so Denver is a SPARSE station and
+gets the sparse settlement shift - the same property that makes Central Park sparse. Observation
+counts at 166.7 are censored by the API's 500-row cap, not measured, and the JSON says so.
+
+All six touched translation units and the test file compile clean under g++ -std=c++17.
+**Needs a rebuild and restart on the Mac before any of it takes effect.**

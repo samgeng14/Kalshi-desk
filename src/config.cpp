@@ -1,4 +1,7 @@
 #include "desk/config.h"
+#include <algorithm>
+#include "desk/log.h"
+#include "desk/universe.h"
 
 #include <cstdlib>
 #include <fstream>
@@ -19,6 +22,13 @@ template <typename T>
 static void take(const json& j, const char* key, T& out) {
   auto it = j.find(key);
   if (it != j.end() && !it->is_null()) out = it->get<T>();
+}
+
+// config/desk.json -> config/weather_discovered.json, beside it whatever it is called.
+static std::string discovered_path(const std::string& path) {
+  const size_t slash = path.find_last_of("/\\");
+  return (slash == std::string::npos ? std::string() : path.substr(0, slash + 1)) +
+         "weather_discovered.json";
 }
 
 Config load_config(const std::string& path) {
@@ -105,6 +115,40 @@ Config load_config(const std::string& path) {
   if (j.contains("systematic") && j["systematic"].is_object()) c.systematic_settings = j["systematic"];
   if (j.contains("params") && j["params"].is_object()) {
     for (auto& [k, v] : j["params"].items()) c.strategy_params[k] = v;
+  }
+  // Cities discovered at runtime, in their own file. research/wx_discover.py rewrites it daily;
+  // keeping it separate from desk.json means discovery never has to edit a file holding the API
+  // key, and a bad discovery run can be deleted rather than unpicked from hand-written config.
+  // Absent or unreadable is normal and silent: the desk simply covers what it covered before.
+  {
+    const std::string dpath = expand_home(discovered_path(path));
+    std::ifstream din(dpath);
+    if (din) {
+      json d = json::parse(din, nullptr, false);
+      if (d.is_object()) {
+        if (d.contains("settlement_specs")) add_settlement_specs(d["settlement_specs"]);
+        if (d.contains("stations") && d["stations"].is_object()) {
+          json& wx = c.strategy_params["weather_nws"];
+          if (!wx.is_object()) wx = json::object();
+          json& st = wx["stations"];
+          if (!st.is_object()) st = json::object();
+          // A hand-written station entry wins: discovery adds cities, it never re-points one.
+          for (auto& [series, v] : d["stations"].items())
+            if (!st.contains(series)) st[series] = v;
+        }
+        // Only series whose settlement mapping actually resolved get watched. A discovered series
+        // with no spec would be polled every cycle and refused at the gate every cycle.
+        for (const auto& series : d.value("watch", json::array())) {
+          if (!series.is_string()) continue;
+          const std::string s2 = series.get<std::string>();
+          if (!settlement_for(s2)) continue;
+          if (std::find(c.watch_series.begin(), c.watch_series.end(), s2) == c.watch_series.end())
+            c.watch_series.push_back(s2);
+        }
+      } else {
+        LOG_WARN("discovered weather config at %s is not readable JSON; ignoring", dpath.c_str());
+      }
+    }
   }
   c.pem_path = expand_home(c.pem_path);
   c.db_path = expand_home(c.db_path);

@@ -1,0 +1,436 @@
+{
+  "_generated": "2026-09-12T22:51:41Z",
+  "_observations_per_day_note": "counted over 3 days with the API's 500-row cap, so any value at 166.7 is censored rather than measured; only the sparse/dense split below 100 is meaningful",
+  "_source": "research/wx_discover.py: settlement product read from each contract's own rules_primary, then checked against api.weather.gov. Regenerated daily; safe to delete, the desk falls back to config/desk.json alone.",
+  "settlement_specs": {
+    "KXHIGHCHI": {
+      "kind": "weather_cli",
+      "low": false,
+      "observations_per_day": 166.7,
+      "product": "CLIMDW",
+      "sparse": false,
+      "station": "KMDW",
+      "tz": "America/Chicago"
+    },
+    "KXHIGHDEN": {
+      "kind": "weather_cli",
+      "low": false,
+      "observations_per_day": 24.3,
+      "product": "CLIDEN",
+      "sparse": true,
+      "station": "KDEN",
+      "tz": "America/Denver"
+    },
+    "KXHIGHLAX": {
+      "kind": "weather_cli",
+      "low": false,
+      "observations_per_day": 166.7,
+      "product": "CLILAX",
+      "sparse": false,
+      "station": "KLAX",
+      "tz": "America/Los_Angeles"
+    },
+    "KXHIGHMIA": {
+      "kind": "weather_cli",
+      "low": false,
+      "observations_per_day": 166.7,
+      "product": "CLIMIA",
+      "sparse": false,
+      "station": "KMIA",
+      "tz": "America/New_York"
+    },
+    "KXHIGHNY": {
+      "kind": "weather_cli",
+      "low": false,
+      "observations_per_day": 24.7,
+      "product": "CLINYC",
+      "sparse": true,
+      "station": "KNYC",
+      "tz": "America/New_York"
+    },
+    "KXHIGHPHIL": {
+      "kind": "weather_cli",
+      "low": false,
+      "observations_per_day": 166.7,
+      "product": "CLIPHL",
+      "sparse": false,
+      "station": "KPHL",
+      "tz": "America/New_York"
+    },
+    "KXHIGHTATL": {
+      "kind": "weather_cli",
+      "low": false,
+      "observations_per_day": 166.7,
+      "product": "CLIATL",
+      "sparse": false,
+      "station": "KATL",
+      "tz": "America/New_York"
+    },
+    "KXHIGHTBOS": {
+      "kind": "weather_cli",
+      "low": false,
+      "observations_per_day": 166.7,
+      "product": "CLIBOS",
+      "sparse": false,
+      "station": "KBOS",
+      "tz": "America/New_York"
+    },
+    "KXHIGHTDAL": {
+      "kind": "weather_cli",
+      "low": false,
+      "observations_per_day": 166.7,
+      "product": "CLIDFW",
+      "sparse": false,
+      "station": "KDFW",
+      "tz": "America/Chicago"
+    },
+    "KXHIGHTDC": {
+      "kind": "weather_cli",
+      "low": false,
+      "observations_per_day": 166.7,
+      "product": "CLIDCA",
+      "sparse": false,
+      "station": "KDCA",
+      "tz": "America/New_York"
+    },
+    "KXHIGHTEWR": {
+      "kind": "weather_cli",
+      "low": false,
+      "observations_per_day": 166.7,
+      "product": "CLIEWR",
+      "sparse": false,
+      "station": "KEWR",
+      "tz": "America/New_York"
+    },
+    "KXHIGHTHOU": {
+      "kind": "weather_cli",
+      "low": false,
+      "observations_per_day": 166.7,
+      "product": "CLIHOU",
+      "sparse": false,
+      "station": "KHOU",
+      "tz": "America/Chicago"
+    },
+    "KXHIGHTLV": {
+      "kind": "weather_cli",
+      "low": false,
+      "observations_per_day": 166.7,
+      "product": "CLILAS",
+      "sparse": false,
+      "station": "KLAS",
+      "tz": "America/Los_Angeles"
+    },
+    "KXHIGHTMIN": {
+      "kind": "weather_cli",
+      "low": false,
+      "observations_per_day": 166.7,
+      "product": "CLIMSP",
+      "sparse": false,
+      "station": "KMSP",
+      "tz": "America/Chicago"
+    },
+    "KXHIGHTNOLA": {
+      "kind": "weather_cli",
+      "low": false,
+      "observations_per_day": 166.7,
+      "product": "CLIMSY",
+      "sparse": false,
+      "station": "KMSY",
+      "tz": "America/Chicago"
+    },
+    "KXHIGHTOKC": {
+      "kind": "weather_cli",
+      "low": false,
+      "observations_per_day": 166.7,
+      "product": "CLIOKC",
+      "sparse": false,
+      "station": "KOKC",
+      "tz": "America/Chicago"
+    },
+    "KXHIGHTPHX": {
+      "kind": "weather_cli",
+      "low": false,
+      "observations_per_day": 166.7,
+      "product": "CLIPHX",
+      "sparse": false,
+      "station": "KPHX",
+      "tz": "America/Phoenix"
+    },
+    "KXHIGHTSAN": {
+      "kind": "weather_cli",
+      "low": false,
+      "observations_per_day": 166.7,
+      "product": "CLISAN",
+      "sparse": false,
+      "station": "KSAN",
+      "tz": "America/Los_Angeles"
+    },
+    "KXHIGHTSATX": {
+      "kind": "weather_cli",
+      "low": false,
+      "observations_per_day": 166.7,
+      "product": "CLISAT",
+      "sparse": false,
+      "station": "KSAT",
+      "tz": "America/Chicago"
+    },
+    "KXHIGHTSDF": {
+      "kind": "weather_cli",
+      "low": false,
+      "observations_per_day": 166.7,
+      "product": "CLISDF",
+      "sparse": false,
+      "station": "KSDF",
+      "tz": "America/New_York"
+    },
+    "KXHIGHTSFO": {
+      "kind": "weather_cli",
+      "low": false,
+      "observations_per_day": 166.7,
+      "product": "CLISFO",
+      "sparse": false,
+      "station": "KSFO",
+      "tz": "America/Los_Angeles"
+    },
+    "KXLOWTLAX": {
+      "kind": "weather_cli",
+      "low": true,
+      "observations_per_day": 166.7,
+      "product": "CLILAX",
+      "sparse": false,
+      "station": "KLAX",
+      "tz": "America/Los_Angeles"
+    },
+    "KXLOWTMIN": {
+      "kind": "weather_cli",
+      "low": true,
+      "observations_per_day": 166.7,
+      "product": "CLIMSP",
+      "sparse": false,
+      "station": "KMSP",
+      "tz": "America/Chicago"
+    },
+    "KXLOWTNYC": {
+      "kind": "weather_cli",
+      "low": true,
+      "observations_per_day": 24.7,
+      "product": "CLINYC",
+      "sparse": true,
+      "station": "KNYC",
+      "tz": "America/New_York"
+    },
+    "KXLOWTTTN": {
+      "kind": "weather_cli",
+      "low": true,
+      "observations_per_day": 166.7,
+      "product": "CLITTN",
+      "sparse": false,
+      "station": "KTTN",
+      "tz": "America/New_York"
+    }
+  },
+  "stations": {
+    "KXHIGHCHI": {
+      "cli_product": "CLIMDW",
+      "lat": 41.7842,
+      "lon": -87.7553,
+      "low": false,
+      "obs_station": "KMDW"
+    },
+    "KXHIGHDEN": {
+      "cli_product": "CLIDEN",
+      "lat": 39.8466,
+      "lon": -104.6562,
+      "low": false,
+      "obs_station": "KDEN"
+    },
+    "KXHIGHLAX": {
+      "cli_product": "CLILAX",
+      "lat": 33.9381,
+      "lon": -118.3889,
+      "low": false,
+      "obs_station": "KLAX"
+    },
+    "KXHIGHMIA": {
+      "cli_product": "CLIMIA",
+      "lat": 25.7906,
+      "lon": -80.3164,
+      "low": false,
+      "obs_station": "KMIA"
+    },
+    "KXHIGHNY": {
+      "cli_product": "CLINYC",
+      "lat": 40.7833,
+      "lon": -73.9667,
+      "low": false,
+      "obs_station": "KNYC"
+    },
+    "KXHIGHPHIL": {
+      "cli_product": "CLIPHL",
+      "lat": 39.8733,
+      "lon": -75.2268,
+      "low": false,
+      "obs_station": "KPHL"
+    },
+    "KXHIGHTATL": {
+      "cli_product": "CLIATL",
+      "lat": 33.6403,
+      "lon": -84.4269,
+      "low": false,
+      "obs_station": "KATL"
+    },
+    "KXHIGHTBOS": {
+      "cli_product": "CLIBOS",
+      "lat": 42.3606,
+      "lon": -71.0106,
+      "low": false,
+      "obs_station": "KBOS"
+    },
+    "KXHIGHTDAL": {
+      "cli_product": "CLIDFW",
+      "lat": 32.8974,
+      "lon": -97.022,
+      "low": false,
+      "obs_station": "KDFW"
+    },
+    "KXHIGHTDC": {
+      "cli_product": "CLIDCA",
+      "lat": 38.8483,
+      "lon": -77.0342,
+      "low": false,
+      "obs_station": "KDCA"
+    },
+    "KXHIGHTEWR": {
+      "cli_product": "CLIEWR",
+      "lat": 40.6825,
+      "lon": -74.1694,
+      "low": false,
+      "obs_station": "KEWR"
+    },
+    "KXHIGHTHOU": {
+      "cli_product": "CLIHOU",
+      "lat": 29.6375,
+      "lon": -95.2825,
+      "low": false,
+      "obs_station": "KHOU"
+    },
+    "KXHIGHTLV": {
+      "cli_product": "CLILAS",
+      "lat": 36.0719,
+      "lon": -115.1634,
+      "low": false,
+      "obs_station": "KLAS"
+    },
+    "KXHIGHTMIN": {
+      "cli_product": "CLIMSP",
+      "lat": 44.8831,
+      "lon": -93.2289,
+      "low": false,
+      "obs_station": "KMSP"
+    },
+    "KXHIGHTNOLA": {
+      "cli_product": "CLIMSY",
+      "lat": 29.9928,
+      "lon": -90.2508,
+      "low": false,
+      "obs_station": "KMSY"
+    },
+    "KXHIGHTOKC": {
+      "cli_product": "CLIOKC",
+      "lat": 35.3886,
+      "lon": -97.6003,
+      "low": false,
+      "obs_station": "KOKC"
+    },
+    "KXHIGHTPHX": {
+      "cli_product": "CLIPHX",
+      "lat": 33.4278,
+      "lon": -112.0035,
+      "low": false,
+      "obs_station": "KPHX"
+    },
+    "KXHIGHTSAN": {
+      "cli_product": "CLISAN",
+      "lat": 32.7336,
+      "lon": -117.1831,
+      "low": false,
+      "obs_station": "KSAN"
+    },
+    "KXHIGHTSATX": {
+      "cli_product": "CLISAT",
+      "lat": 29.5328,
+      "lon": -98.4636,
+      "low": false,
+      "obs_station": "KSAT"
+    },
+    "KXHIGHTSDF": {
+      "cli_product": "CLISDF",
+      "lat": 38.1741,
+      "lon": -85.7365,
+      "low": false,
+      "obs_station": "KSDF"
+    },
+    "KXHIGHTSFO": {
+      "cli_product": "CLISFO",
+      "lat": 37.6196,
+      "lon": -122.3656,
+      "low": false,
+      "obs_station": "KSFO"
+    },
+    "KXLOWTLAX": {
+      "cli_product": "CLILAX",
+      "lat": 33.9381,
+      "lon": -118.3889,
+      "low": true,
+      "obs_station": "KLAX"
+    },
+    "KXLOWTMIN": {
+      "cli_product": "CLIMSP",
+      "lat": 44.8831,
+      "lon": -93.2289,
+      "low": true,
+      "obs_station": "KMSP"
+    },
+    "KXLOWTNYC": {
+      "cli_product": "CLINYC",
+      "lat": 40.7833,
+      "lon": -73.9667,
+      "low": true,
+      "obs_station": "KNYC"
+    },
+    "KXLOWTTTN": {
+      "cli_product": "CLITTN",
+      "lat": 40.2764,
+      "lon": -74.8164,
+      "low": true,
+      "obs_station": "KTTN"
+    }
+  },
+  "watch": [
+    "KXHIGHCHI",
+    "KXHIGHDEN",
+    "KXHIGHLAX",
+    "KXHIGHMIA",
+    "KXHIGHNY",
+    "KXHIGHPHIL",
+    "KXHIGHTATL",
+    "KXHIGHTBOS",
+    "KXHIGHTDAL",
+    "KXHIGHTDC",
+    "KXHIGHTEWR",
+    "KXHIGHTHOU",
+    "KXHIGHTLV",
+    "KXHIGHTMIN",
+    "KXHIGHTNOLA",
+    "KXHIGHTOKC",
+    "KXHIGHTPHX",
+    "KXHIGHTSAN",
+    "KXHIGHTSATX",
+    "KXHIGHTSDF",
+    "KXHIGHTSFO",
+    "KXLOWTLAX",
+    "KXLOWTMIN",
+    "KXLOWTNYC",
+    "KXLOWTTTN"
+  ]
+}

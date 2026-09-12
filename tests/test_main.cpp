@@ -531,6 +531,50 @@ static void test_universe() {
   CHECK(settlement_for("KXHIGHTNYC") == nullptr);     // Kalshi returns 404 for this series
   for (const auto& s : settlement_specs()) CHECK(std::string(s.tz).find('/') != std::string::npos);
 
+  // --- discovered settlement mappings (research/wx_discover.py -> config/weather_discovered.json)
+  // The safety property is that discovery can only ADD cities. If a discovered entry could
+  // re-point a hand-read mapping, a bad parse of one contract's rules would silently redirect the
+  // desk's idea of what an existing city settles on, and the gate would still say "verified".
+  {
+    CHECK(settlement_for("KXWXDISCOVERTEST") == nullptr);
+    const json good = {{"KXWXDISCOVERTEST", {{"kind", "weather_cli"}, {"product", "CLIZZZ"},
+                                             {"station", "KZZZ"}, {"tz", "America/Chicago"},
+                                             {"sparse", true}, {"low", true}}}};
+    CHECK(add_settlement_specs(good) == 1);
+    const SettlementSpec* d = settlement_for("KXWXDISCOVERTEST");
+    CHECK(d && std::string(d->product) == "CLIZZZ" && std::string(d->station) == "KZZZ");
+    CHECK(d->sparse && d->low);
+    // The strings must be owned here, not borrowed from the json that has since gone away.
+    CHECK(std::string(d->tz) == "America/Chicago");
+
+    // Additive only: a series already in the compiled table is never replaced.
+    const json hijack = {{"KXHIGHNY", {{"kind", "weather_cli"}, {"product", "CLIWRONG"},
+                                       {"station", "KWRONG"}, {"tz", "America/Chicago"}}}};
+    CHECK(add_settlement_specs(hijack) == 0);
+    CHECK(std::string(settlement_for("KXHIGHNY")->product) == "CLINYC");
+
+    // An incomplete entry is rejected outright rather than stored with an empty product, because
+    // an empty product is exactly what settlement_verified_for() reads as "rules unread".
+    const json partial = {{"KXWXPARTIAL", {{"kind", "weather_cli"}, {"product", "CLIAAA"}}}};
+    CHECK(add_settlement_specs(partial) == 0);
+    CHECK(settlement_for("KXWXPARTIAL") == nullptr);
+    const json empty_product = {{"KXWXEMPTY", {{"kind", "weather_cli"}, {"product", ""},
+                                               {"station", "KAAA"}, {"tz", "America/Chicago"}}}};
+    CHECK(add_settlement_specs(empty_product) == 0);
+    CHECK(settlement_for("KXWXEMPTY") == nullptr);
+    CHECK(add_settlement_specs(json::array()) == 0);
+    CHECK(add_settlement_specs(json("not an object")) == 0);
+
+    // A discovered city must be able to clear the settlement gate, or discovery is decoration.
+    Market m{};
+    m.ticker = "KXWXDISCOVERTEST-26SEP13-B70.5";
+    m.series_ticker = "KXWXDISCOVERTEST";
+    m.rules_primary = "If the minimum temperature recorded at Nowhere (CLIZZZ) for Sep 13, 2026 "
+                      "is between 70-71 degrees according to the National Weather Service, then "
+                      "the market resolves to Yes.";
+    CHECK(settlement_verified_for("weather_nws", m));
+  }
+
   // --- rollover, the same instant seen from three zones ----------------------------------------
   // 2026-09-07T04:30Z is 00:30 in New York, 23:30 the previous day in Chicago, 21:30 in Los
   // Angeles. One contract date therefore sits in a different phase in each.

@@ -5,6 +5,8 @@
 #include <string>
 #include <vector>
 
+#include <nlohmann/json.hpp>
+
 #include "desk/store.h"
 #include "desk/types.h"
 
@@ -24,6 +26,18 @@ struct SettlementSpec {
 
 const std::vector<SettlementSpec>& settlement_specs();
 const SettlementSpec* settlement_for(const std::string& series);
+
+// Settlement mappings discovered at runtime rather than typed into the table above.
+// `research/wx_discover.py` reads the NWS climate product out of each contract's OWN rules text
+// and then checks that api.weather.gov actually serves that product and that station; what it
+// writes is the result of those checks, and this loads it.
+//
+// Additive only, and deliberately so. An entry whose series already appears in settlement_specs()
+// is IGNORED rather than merged, so nothing in config can weaken or redirect a mapping that was
+// read by hand. An entry missing a product, a station or a zone is rejected outright, because a
+// spec with an empty product is exactly what settlement_verified_for() treats as unverified and
+// a half-filled one would silently claim verification it does not have. Returns the number added.
+int add_settlement_specs(const nlohmann::json& j);
 
 // Where a contract sits relative to the day it is about, judged in that contract's own zone.
 enum class ContractPhase {

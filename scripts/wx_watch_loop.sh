@@ -17,11 +17,12 @@ EVERY_S=${EVERY_S:-3600}
 echo "wx settlement watch up $(date -u +%FT%TZ)" >> "$LOG"
 while true; do
   echo "=== run $(date -u +%FT%TZ) ===" >> "$LOG"
-  if python3 -u research/wx_settlement_watch.py >> "$LOG" 2>&1; then
-    echo "$(date -u +%FT%TZ) ok" > "$HB"
-  else
-    echo "$(date -u +%FT%TZ) FAILED" > "$HB"
-    echo "collector exited non-zero $(date -u +%FT%TZ)" >> "$LOG"
-  fi
+  OK=1
+  python3 -u research/wx_settlement_watch.py >> "$LOG" 2>&1 || { OK=0; echo "settlement watch failed $(date -u +%FT%TZ)" >> "$LOG"; }
+  # Discovery writes config/weather_discovered.json through a temp file, so a failed run leaves
+  # yesterday's map in place rather than a truncated one. Cities list and delist through the day
+  # as each local date rolls over, which is why this runs hourly rather than once a morning.
+  python3 -u research/wx_discover.py >> "$LOG" 2>&1 || { OK=0; echo "discovery failed $(date -u +%FT%TZ)" >> "$LOG"; }
+  if [ "$OK" = "1" ]; then echo "$(date -u +%FT%TZ) ok" > "$HB"; else echo "$(date -u +%FT%TZ) FAILED" > "$HB"; fi
   sleep "$EVERY_S"
 done
