@@ -182,6 +182,39 @@ def reconcile(client, journal):
 
 # ---------------------------------------------------------------- flatten
 
+def refresh_markets(client, tickers, markets, verbose=True):
+    """Overlay LIVE quotes onto the snapshot before anything is priced from them.
+
+    The first live flatten this harness sent failed exactly here. It priced a sell at
+    bid - 1 tick from a snapshot captured 22 minutes earlier, by which time the bid had fallen
+    from 0.4001 to 0.3990, so the limit sat above the market, never crossed, and the IOC died
+    with a zero fill. The position stayed open and the report said the order was placed.
+
+    An emergency exit that prices from a file is not an emergency exit. Every ticker it is about
+    to touch gets a fresh quote, and any that cannot be refreshed is named rather than silently
+    used stale.
+    """
+    stale = []
+    for tk in tickers:
+        try:
+            r = client.perp_market(tk)
+            m = r.get('market') or r
+            fresh = {k: m[k] for k in ('bid', 'ask', 'mark', 'tick') if k in m}
+            if 'bid' in fresh and 'ask' in fresh:
+                markets[tk] = dict(markets.get(tk, {}), **fresh)
+            else:
+                stale.append(tk)
+        except (RuntimeError, KeyError, TypeError) as e:
+            stale.append('%s (%s)' % (tk, str(e)[:60]))
+    if verbose:
+        for tk in tickers:
+            m = markets.get(tk, {})
+            print('  quote %-13s bid %.4f  ask %.4f%s'
+                  % (tk, float(m.get('bid', 0)), float(m.get('ask', 0)),
+                     '   STALE' if tk in stale else ''))
+    return markets, stale
+
+
 def flatten_plan(positions, markets, aggressive=True):
     """Orders that take every position to zero. Marketable limits, reduce-only, never market.
 
@@ -197,12 +230,16 @@ def flatten_plan(positions, markets, aggressive=True):
             continue
         m = markets[tk]
         tick = float(m.get('tick') or 0.0001)
+        ref = float(m['bid']) if n > 0 else float(m['ask'])
+        # Cross by whichever is larger, two ticks or five basis points of the price. A tick is an
+        # absolute amount, so one tick is 25 bps on a $0.40 contract and 0.13 bps on a $7.70 one;
+        # a relative floor makes the aggression comparable across the board. The +-10% screen
+        # still catches anything absurd.
+        cross = max(2 * tick, 0.0005 * ref) if aggressive else 0.0
         if n > 0:
-            px = float(m['bid']) - (tick if aggressive else 0.0)
-            side = 'ask'
+            px, side = ref - cross, 'ask'
         else:
-            px = float(m['ask']) + (tick if aggressive else 0.0)
-            side = 'bid'
+            px, side = ref + cross, 'bid'
         px = round(round(px / tick) * tick, 6)
         plan.append({'ticker': tk, 'side': side, 'count': int(abs(round(n))),
                      'price': px, 'tick': tick, 'reduce_only': True,
@@ -270,19 +307,48 @@ def main():
             host_ok, tok_ok = k.armed()
             if args.live and not (host_ok and tok_ok):
                 raise SystemExit('not armed: host_ok=%s token_ok=%s' % (host_ok, tok_ok))
-            for o in plan:
-                fails = pre_trade_screen(o, ctx)
-                if fails:
-                    print('  %-13s REJECT %s' % (o['ticker'], '; '.join(fails)))
-                    continue
-                r = k.create_perp_order(ticker=o['ticker'], side=o['side'], count=o['count'],
-                                        price=o['price'], tick=o['tick'], reduce_only=True,
-                                        tif=o['tif'],
-                                        client_order_id='flatten-%s-%d'
-                                                        % (o['ticker'], int(dt.datetime.now(
-                                                            dt.timezone.utc).timestamp())),
-                                        journal=j, dry_run=not args.live)
-                print('  %-13s %s' % (o['ticker'], json.dumps(r)[:160]))
+            for attempt in range(3):
+                live_pos = positions
+                if args.live:
+                    try:
+                        pr = k.perp_positions()
+                        live_pos = {p['ticker']: float(p['position'])
+                                    for p in (pr.get('positions') or pr.get('market_positions')
+                                              or [])
+                                    if abs(float(p.get('position') or 0)) > 0}
+                    except (RuntimeError, KeyError, TypeError) as e:
+                        print('  could not re-read positions (%s); using the snapshot'
+                              % str(e)[:80])
+                if not live_pos:
+                    print('  flat — nothing to close')
+                    break
+                markets2, stale = refresh_markets(k, list(live_pos), dict(markets))
+                plan2 = flatten_plan(live_pos, markets2)
+                ctx2 = dict(ctx, markets=markets2, positions=live_pos,
+                            targets={t: 0.0 for t in live_pos})
+                done = True
+                for o in plan2:
+                    fails = pre_trade_screen(o, ctx2)
+                    if fails:
+                        print('  %-13s REJECT %s' % (o['ticker'], '; '.join(fails)))
+                        continue
+                    r = k.create_perp_order(
+                        ticker=o['ticker'], side=o['side'], count=o['count'], price=o['price'],
+                        tick=o['tick'], reduce_only=True, tif=o['tif'],
+                        client_order_id='flatten-%s-%d-%d' % (o['ticker'], int(
+                            dt.datetime.now(dt.timezone.utc).timestamp()), attempt),
+                        journal=j, dry_run=not args.live)
+                    fc = float(r.get('fill_count') or 0)
+                    print('  %-13s %-4s %d @ $%.4f  filled %.2f  %s'
+                          % (o['ticker'], o['side'], o['count'], o['price'], fc,
+                             'simulated' if r.get('simulated') else r.get('order_id', '')[:18]))
+                    if not r.get('simulated') and fc < o['count']:
+                        done = False
+                if done or not args.live:
+                    break
+                print('  attempt %d left size unfilled; re-reading the book' % (attempt + 1))
+            print('\n  An IOC that returns fill_count 0 with remaining_count 0 did NOT trade.')
+            print('  Confirm with: python3 scripts/kalshi_client.py /margin/positions')
         except SystemExit as e:
             print('  %s' % e)
         return 0

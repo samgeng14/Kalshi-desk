@@ -1804,3 +1804,47 @@ not negative.
 the WX_MANUAL sleeve: hold-to-settlement, never graduates to AUTO, sized from the router probability
 and never the raw model, its own lot attribution, scored separately and never pooled into model
 validation.
+
+## Session 23, part 4: volume mode meets the minimum detectable edge
+
+`research/wx_capacity.py` -> `reports/weather_capacity.md`. Sections 23, 24, 25 of the volume brief.
+
+**Minimum detectable edge is 4.6c.** 179 contracts, one directional observation each, per-contract
+settlement sd 29.4c, 34 settled city-day clusters, bootstrap SE 2.35c. That is the smallest
+per-contract edge this desk can currently tell apart from zero, and it is a property of a binary
+payoff and the number of independent weather days rather than of the model.
+
+City-days needed for each proposed floor (SE falls as sqrt of clusters):
+
+| target | city-days | days at 18 cities/day |
+|---|---|---|
+| 0.2c | 18,041 | **1,002** |
+| 0.5c | 2,887 | 160 |
+| 1.0c | 722 | 40 |
+| 2.0c | 180 | 10 |
+| 3.0c | 80 | **4** |
+| 5.0c | 29 | 2 |
+
+So 0.03 is the right order of magnitude and is not arbitrary: 3c is about the smallest floor this
+desk can verify on a useful timescale. 0.2c is not a tighter threshold, it is an unverifiable one.
+All-city discovery is what moves this - it is the mechanism that buys statistical power, which is a
+better argument for it than finding more small edges.
+
+**The population of tiny edges volume mode assumes does not exist here.** Candidates by band, maker
+entry: 0.0-0.2c 63, 0.2-0.5c 71, 0.5-1.0c 151, 1.0-2.0c 236, 2.0-5.0c 589, **5c+ 1,643**. And
+lowering the floor from 3c to 0.2c adds 659 signals for **$518 of expected value out of $16,463,
+about 3%**. The low-edge band is turnover without dollars; nearly all claimed value sits in the 5c+
+bucket, which is exactly where session 23 part 3 showed the model is most wrong.
+
+Taker realised settlement P&L is negative at every floor (-$3,855 at 0.2c to -$4,235 at 1c) and per
+dollar it gets worse as the floor rises (-0.115 -> -0.219). Anti-monotonic again, consistent with
+both the Brier result and the horizon study.
+
+Error caught before reporting: the first run kept BOTH sides of every contract at every timestamp.
+Buying YES at the bid and NO at the bid costs (1 - spread) and pays exactly 1, so that sample is a
+hedged book - its variance collapses and its return is the spread. It produced an MDE of 0.0c and a
+13% maker return, neither of which was about weather. The sample is now one directional side per
+contract per timestamp, chosen as the side the desk would take.
+
+The maker column remains conditional on fills, which are not modelled. Section 11 of the brief says
+not to credit quoted spread mechanically, and that is exactly what a fill-free maker backtest does.

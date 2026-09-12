@@ -241,6 +241,19 @@ def main():
             for r in S.reconcile(client, journal):
                 print('  %s -> %s' % (r['client_order_id'][:20], r['resolved_state']))
 
+    # Same lesson as the flatten: price from a live quote, never from a snapshot file. A stale
+    # bid is why the first live emergency exit sat above the market and never crossed.
+    if client is not None:
+        tks = [r['kalshi'] for r in decision.get('integer_book', []) if r['kalshi']]
+        tks += [p['ticker'] for p in snap.get('positions', [])
+                if abs(float(p['position'])) > 0]
+        print('\nrefreshing quotes for %d market(s)' % len(set(tks)))
+        mk = {m['ticker']: m for m in snap['markets']}
+        mk, stale = S.refresh_markets(client, sorted(set(tks)), mk)
+        snap = dict(snap, markets=list(mk.values()))
+        if stale:
+            blocks.append('could not refresh quotes for: %s' % ', '.join(map(str, stale)))
+
     plan = plan_from_decision(decision, snap, cfg)
     blocks = blocks + S.promote_unhandled_strays(warns, plan)
     for w in warns:
