@@ -253,6 +253,38 @@ def main():
             len(v), 100 * mean(xs), 100 * xs_s[len(xs_s) // 2],
             100.0 * sum(1 for x in xs if x > 0) / len(xs), 100 * lo, 100 * hi))
 
+    L.append("\n## Why every short horizon loses the same amount\n")
+    sp = sorted(r["ask"] - r["bid"] for r in states if r["ask"] > r["bid"])
+    mv = []
+    for st in states:
+        q = st["book"].near(st["ts"] + 900)
+        if q:
+            mv.append(abs(.5 * (q[1] + q[2]) - st["mid"]))
+    mv.sort()
+    if sp and mv:
+        L.append("\n| | value |")
+        L.append("|---|---|")
+        L.append("| median weather spread | **%.1fc** |" % (100 * sp[len(sp) // 2]))
+        L.append("| round-trip taker fee at 20c / 50c / 80c | %.2fc / %.2fc / %.2fc |"
+                 % (100 * 2 * fee(.2), 100 * 2 * fee(.5), 100 * 2 * fee(.8)))
+        L.append("| **cost to enter and exit** | **%.1f - %.1fc** |"
+                 % (100 * (sp[len(sp) // 2] + 2 * fee(.2)), 100 * (sp[len(sp) // 2] + 2 * fee(.5))))
+        L.append("| median move in the mid over 15 minutes | **%.2fc** |" % (100 * mv[len(mv) // 2]))
+        L.append("| 15-minute windows where the mid did not move at all | %.0f%% |"
+                 % (100.0 * sum(1 for x in mv if x == 0) / len(mv)))
+        L.append("\nThe market has to move six to ten times its typical fifteen-minute movement "
+                 "before a taker round trip breaks even. That is arithmetic, not a small sample: "
+                 "it is why every horizon above lands near the same number, and why the horizon "
+                 "barely matters. A short-horizon weather sleeve that crosses the spread cannot "
+                 "work at these spreads and these fees.\n")
+        L.append("\nThe version this does NOT measure is resting a maker order. These series are "
+                 "plain `quadratic`, so a maker fill pays **no fee at all** and earns the spread "
+                 "instead of paying it - the same %.1fc becomes a credit rather than a charge. "
+                 "Two of the three Sep-11 trades were maker fills. That is a liquidity-provision "
+                 "strategy with a fill-probability model, not a repricing strategy with a market-"
+                 "reaction model, and nothing here speaks to it either way.\n"
+                 % (100 * sp[len(sp) // 2]))
+
     L.append("\n## Does more predicted edge produce more realized profit? (section 16)\n")
     buckets = [(.03, .04), (.04, .05), (.05, .07), (.07, .10), (.10, 1.0)]
     L.append("\n| predicted edge | n | 15m | 1h | settlement |")

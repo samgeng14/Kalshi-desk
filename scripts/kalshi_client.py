@@ -59,7 +59,16 @@ def load_config(path=None):
             continue
         out.append(ch)
         i += 1
-    return json.loads(''.join(out))
+    cfg = json.loads(''.join(out))
+    # The arming interlock lives in its own file so that desk.json -- which carries hand-written
+    # comments -- never has to be machine-rewritten. config/arm.json is gitignored.
+    arm = os.path.join(os.path.dirname(p), 'arm.json')
+    if os.path.exists(arm):
+        try:
+            cfg.update(json.load(open(arm)))
+        except ValueError:
+            pass
+    return cfg
 
 
 class Kalshi:
@@ -150,9 +159,20 @@ class Kalshi:
         return out
 
     # ---------- writes ----------
+    @staticmethod
+    def _norm_host(h):
+        """macOS reports a hostname with or without a trailing .local depending on network state.
+
+        Comparing those two spellings literally is a false negative that reads as "the arm is
+        broken" at exactly the wrong moment, so both sides are normalised.
+        """
+        h = (h or '').strip().lower().rstrip('.')
+        return h[:-6] if h.endswith('.local') else h
+
     def armed(self):
         """Three independent conditions, all required."""
-        host_ok = socket.gethostname() == self.cfg.get('live_host', '\x00none')
+        want = self.cfg.get('live_host')
+        host_ok = bool(want) and self._norm_host(socket.gethostname()) == self._norm_host(want)
         tok = self.cfg.get('arm_token')
         tok_ok = bool(tok) and os.environ.get('KALSHI_ARM') == tok
         return host_ok, tok_ok

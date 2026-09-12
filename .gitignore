@@ -19,3 +19,4 @@ __pycache__/
 .quotefeed.txt
 data/snapshots/
 data/live_orders.sqlite*
+config/arm.json
