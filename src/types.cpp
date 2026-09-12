@@ -60,6 +60,10 @@ Market parse_market(const json& j) {
   m.strike_type = jstr(j, "strike_type");
   m.result = jstr(j, "result");
   m.rules_primary = jstr(j, "rules_primary");
+  // The second block of rules is where the exchange states the settlement rounding ("rounded to
+  // the nearest N decimal places") and the candle convention. That is the definition of a tick on
+  // the underlying, so the desk reads it rather than keeping its own table of constants.
+  m.rules_secondary = jstr(j, "rules_secondary");
   m.exchange_index = static_cast<int>(jnum(j, "exchange_index", 0));
   m.open_time = jstr(j, "open_time");
   m.close_time = jstr(j, "close_time");

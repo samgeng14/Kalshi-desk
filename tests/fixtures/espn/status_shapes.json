@@ -1,0 +1,235 @@
+{
+ "_provenance": "Captured live from site.api.espn.com soccer scoreboards on 2026-09-06T23:5xZ. One real event per distinct (state, type.name, period). Unmodified apart from dropping fields this desk never reads.",
+ "events": [
+  {
+   "_league": "bra.1",
+   "id": "401841219",
+   "date": "2026-09-06T14:00Z",
+   "shortName": "MIR @ CFC",
+   "status": {
+    "period": 2,
+    "displayClock": "90'+10'",
+    "type": {
+     "state": "post",
+     "name": "STATUS_FULL_TIME",
+     "completed": true,
+     "description": "Full Time"
+    }
+   },
+   "competitions": [
+    {
+     "competitors": [
+      {
+       "homeAway": "home",
+       "score": "1",
+       "team": {
+        "id": "3456",
+        "displayName": "Coritiba"
+       },
+       "statistics": [
+        {
+         "name": "possessionPct",
+         "abbreviation": "PP",
+         "displayValue": "47"
+        },
+        {
+         "name": "shotsOnTarget",
+         "abbreviation": "SOG",
+         "displayValue": "6"
+        }
+       ]
+      },
+      {
+       "homeAway": "away",
+       "score": "2",
+       "team": {
+        "id": "9169",
+        "displayName": "Mirassol"
+       },
+       "statistics": [
+        {
+         "name": "possessionPct",
+         "abbreviation": "PP",
+         "displayValue": "53"
+        },
+        {
+         "name": "shotsOnTarget",
+         "abbreviation": "SOG",
+         "displayValue": "7"
+        }
+       ]
+      }
+     ],
+     "details": []
+    }
+   ]
+  },
+  {
+   "_league": "bra.1",
+   "id": "401841220",
+   "date": "2026-09-06T22:30Z",
+   "shortName": "CHA @ COR",
+   "status": {
+    "period": 2,
+    "displayClock": "75'",
+    "type": {
+     "state": "in",
+     "name": "STATUS_SECOND_HALF",
+     "completed": false,
+     "description": "Second Half"
+    }
+   },
+   "competitions": [
+    {
+     "competitors": [
+      {
+       "homeAway": "home",
+       "score": "1",
+       "team": {
+        "id": "874",
+        "displayName": "Corinthians"
+       },
+       "statistics": [
+        {
+         "name": "possessionPct",
+         "abbreviation": "PP",
+         "displayValue": "59.4"
+        },
+        {
+         "name": "shotsOnTarget",
+         "abbreviation": "SOG",
+         "displayValue": "5"
+        }
+       ]
+      },
+      {
+       "homeAway": "away",
+       "score": "1",
+       "team": {
+        "id": "9318",
+        "displayName": "Chapecoense"
+       },
+       "statistics": [
+        {
+         "name": "possessionPct",
+         "abbreviation": "PP",
+         "displayValue": "40.6"
+        },
+        {
+         "name": "shotsOnTarget",
+         "abbreviation": "SOG",
+         "displayValue": "3"
+        }
+       ]
+      }
+     ],
+     "details": []
+    }
+   ]
+  },
+  {
+   "_league": "mex.1",
+   "id": "401876983",
+   "date": "2026-09-06T23:00Z",
+   "shortName": "SAN @ CAZ",
+   "status": {
+    "period": 1,
+    "displayClock": "45'+3'",
+    "type": {
+     "state": "in",
+     "name": "STATUS_HALFTIME",
+     "completed": false,
+     "description": "Halftime"
+    }
+   },
+   "competitions": [
+    {
+     "competitors": [
+      {
+       "homeAway": "home",
+       "score": "0",
+       "team": {
+        "id": "218",
+        "displayName": "Cruz Azul"
+       },
+       "statistics": [
+        {
+         "name": "possessionPct",
+         "abbreviation": "PP",
+         "displayValue": "64.8"
+        },
+        {
+         "name": "shotsOnTarget",
+         "abbreviation": "SOG",
+         "displayValue": "1"
+        }
+       ]
+      },
+      {
+       "homeAway": "away",
+       "score": "0",
+       "team": {
+        "id": "225",
+        "displayName": "Santos"
+       },
+       "statistics": [
+        {
+         "name": "possessionPct",
+         "abbreviation": "PP",
+         "displayValue": "35.2"
+        },
+        {
+         "name": "shotsOnTarget",
+         "abbreviation": "SOG",
+         "displayValue": "0"
+        }
+       ]
+      }
+     ],
+     "details": []
+    }
+   ]
+  },
+  {
+   "_league": "usa.1",
+   "id": "761787",
+   "date": "2026-09-09T23:30Z",
+   "shortName": "ORL @ ATL",
+   "status": {
+    "period": null,
+    "displayClock": "0'",
+    "type": {
+     "state": "pre",
+     "name": "STATUS_SCHEDULED",
+     "completed": false,
+     "description": "Scheduled"
+    }
+   },
+   "competitions": [
+    {
+     "competitors": [
+      {
+       "homeAway": "home",
+       "score": "0",
+       "team": {
+        "id": "18418",
+        "displayName": "Atlanta United FC"
+       },
+       "statistics": []
+      },
+      {
+       "homeAway": "away",
+       "score": "0",
+       "team": {
+        "id": "12011",
+        "displayName": "Orlando City SC"
+       },
+       "statistics": []
+      }
+     ],
+     "details": []
+    }
+   ]
+  }
+ ]
+}

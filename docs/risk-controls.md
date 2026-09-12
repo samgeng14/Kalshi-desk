@@ -10,12 +10,24 @@ It assumes the entered price and fee; execution and available depth are not guar
 Signals (manual/auto/bot) and manual tickets share the same pre-submission checks:
 
 - Require an authenticated, successfully refreshed account snapshot.
-- Wait for exchange user data to catch up to this desk's previous order write.
+- Wait for exchange user data to catch up to this desk's previous order write. A refusal that
+  Kalshi itself answered (a 4xx with its error body, not a 408) wrote nothing, so the previous
+  watermark is put back.
 - Require a tradable market, valid side/style, finite price, and quantity in 0.01 increments.
 - Enforce the configured price range, per-event, per-cluster, total-exposure and cash limits.
 - Estimate fees using refreshed series metadata.
 - Check collateral available on the specific market's exchange shard after resting reservations.
+- Refuse a post-only price at or through the offer just read from the exchange, before sending:
+  the book has moved, and the exchange would refuse it as a post-only cross.
 - Never retry POST requests automatically.
+
+Exchange refusals are classed (`include/desk/reject.h`). Only a malformed order
+(`hard_invalid_order`), an auth failure (`auth`) or a refusal the desk does not recognise
+(`unknown`) trips the kill switch. A post-only cross or a closed or paused market
+(`soft_market_state`) and a short balance (`soft_collateral`) mark the order not sent and give
+entries on that ticker a breather; 429 and 5xx (`retryable`) stop sending for the cycle. A
+refused exit never trips the kill switch. The phrases are matched exactly on purpose, so an
+unfamiliar refusal stays hard.
 
 The sizing bankroll is the smaller of configured bankroll and cash plus marked positions.
 The current production limits have not been increased. They remain configuration ceilings,

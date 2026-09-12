@@ -1,0 +1,84 @@
+strategy,market,regime,horizon,attempts,fills,trades_per_day,gross_alpha_bps,spread_capture_bps,markout_bps,funding_bps,incentives_bps,maker_fee_bps,taker_fee_bps,slippage_bps,net_bps_per_trade,boot_lo,boot_hi,fee_tier_assumed,break_even_maker_bps,tier_needed,volume_needed,status,evidence
+impulse_minute_bar,all,all,1m-1h,1736 hypotheses,,,16.9,0.0,,0.0,0.0,5.0,12.0,0.0,-0.1,,,0,,,,REJECTED_NONROBUST,"research/minute_bar_alpha_results.md; 33 survive Bonferroni, all lose 14-20 bps after costs"
+unconditional_maker_improve,KXLINKPERP,all,60s,2946,594,5702.4,0.0,8.88,-5.34,0.0,0.0,5.0,0.0,0.0,-1.47,,,0,3.53,2,300000,REJECTED_COST,reports/execution_summary.md
+funding_capture_unhedged,KXZECPERP,all,8h,,,0.125,0.0,0.0,,7.28,0.0,,,8.83,-1.55,,,0,,,,REJECTED_RISK,reports/funding_study.md (funding is 0.9% of one period of volatility)
+unconditional_maker_improve,KXKSHIBPERP,all,60s,2510,577,5539.2,0.0,7.67,-4.89,0.0,0.0,5.0,0.0,0.0,-2.23,,,0,2.77,3,1000000,REJECTED_COST,reports/execution_summary.md
+unconditional_maker_join,KXLINKPERP,all,60s,2981,545,5232.0,0.0,8.94,-6.37,0.0,0.0,5.0,0.0,0.0,-2.43,,,0,2.57,3,1000000,REJECTED_COST,reports/execution_summary.md
+unconditional_maker_improve,KXBCHPERP,all,60s,2858,674,6470.4,0.0,7.92,-5.35,0.0,0.0,5.0,0.0,0.0,-2.44,,,0,2.56,3,1000000,REJECTED_COST,reports/execution_summary.md
+funding_capture_unhedged,KXADAPERP,all,8h,,,0.125,0.0,0.0,,3.65,0.0,,,6.74,-3.09,,,0,,,,REJECTED_RISK,reports/funding_study.md (funding is 0.7% of one period of volatility)
+unconditional_maker_improve,KXNEARPERP,all,60s,3028,1703,16348.8,0.0,7.62,-5.88,0.0,0.0,5.0,0.0,0.0,-3.26,,,0,1.74,5,10000000,REJECTED_COST,reports/execution_summary.md
+unconditional_maker_join,KXADAPERP,all,60s,2893,1310,12576.0,0.0,4.79,-3.36,0.0,0.0,5.0,0.0,0.0,-3.57,,,0,1.43,6,30000000,REJECTED_COST,reports/execution_summary.md
+unconditional_maker_join,KXNEARPERP,all,60s,3082,1616,15513.6,0.0,7.62,-6.58,0.0,0.0,5.0,0.0,0.0,-3.96,,,0,1.04,8,300000000,REJECTED_COST,reports/execution_summary.md
+unconditional_maker_improve,KXZECPERP,all,60s,3032,1475,14160.0,0.0,7.16,-6.17,0.0,0.0,5.0,0.0,0.0,-4.0,,,0,1.0,9,1000000000,REJECTED_COST,reports/execution_summary.md
+unconditional_maker_join,KXKSHIBPERP,all,60s,2539,504,4838.4,0.0,7.71,-6.81,0.0,0.0,5.0,0.0,0.0,-4.1,,,0,0.9,9,1000000000,REJECTED_COST,reports/execution_summary.md
+unconditional_maker_improve,KXSUIPERP,all,60s,2930,729,6998.4,0.0,7.56,-7.21,0.0,0.0,5.0,0.0,0.0,-4.65,,,0,0.35,,,REJECTED_COST,reports/execution_summary.md
+unconditional_maker_join,KXZECPERP,all,60s,3061,1427,13699.2,0.0,7.19,-6.86,0.0,0.0,5.0,0.0,0.0,-4.67,,,0,0.33,,,REJECTED_COST,reports/execution_summary.md
+unconditional_maker_improve,KXHYPEPERP,all,60s,3030,1583,15196.8,0.0,3.65,-3.34,0.0,0.0,5.0,0.0,0.0,-4.69,,,0,0.31,,,REJECTED_COST,reports/execution_summary.md
+unconditional_maker_join,KXHYPEPERP,all,60s,3039,1542,14803.2,0.0,3.66,-3.48,0.0,0.0,5.0,0.0,0.0,-4.82,,,0,0.18,,,REJECTED_COST,reports/execution_summary.md
+unconditional_maker_improve,KXDOGEPERP,all,60s,2958,1089,10454.4,0.0,4.05,-3.88,0.0,0.0,5.0,0.0,0.0,-4.83,,,0,0.17,,,REJECTED_COST,reports/execution_summary.md
+unconditional_maker_improve,KXBNBPERP,all,60s,2912,866,8313.6,0.0,4.78,-4.89,0.0,0.0,5.0,0.0,0.0,-5.11,,,0,,,,REJECTED_COST,reports/execution_summary.md
+unconditional_maker_improve,KXETHPERP,all,60s,2196,2062,19795.2,0.0,0.39,-0.52,0.0,0.0,5.0,0.0,0.0,-5.13,,,0,,,,REJECTED_COST,reports/execution_summary.md
+unconditional_maker_improve,KXBTCPERP,all,60s,2926,2717,26083.2,0.0,0.25,-0.39,0.0,0.0,5.0,0.0,0.0,-5.14,,,0,,,,REJECTED_COST,reports/execution_summary.md
+unconditional_maker_join,KXBCHPERP,all,60s,2934,522,5011.2,0.0,7.92,-8.07,0.0,0.0,5.0,0.0,0.0,-5.15,,,0,,,,REJECTED_COST,reports/execution_summary.md
+unconditional_maker_join,KXSUIPERP,all,60s,2944,695,6672.0,0.0,7.57,-7.74,0.0,0.0,5.0,0.0,0.0,-5.16,,,0,,,,REJECTED_COST,reports/execution_summary.md
+unconditional_maker_join,KXDOGEPERP,all,60s,2970,1055,10128.0,0.0,4.05,-4.22,0.0,0.0,5.0,0.0,0.0,-5.17,,,0,,,,REJECTED_COST,reports/execution_summary.md
+unconditional_maker_join,KXBTCPERP,all,60s,3103,2780,26688.0,0.0,0.25,-0.54,0.0,0.0,5.0,0.0,0.0,-5.28,,,0,,,,REJECTED_COST,reports/execution_summary.md
+unconditional_maker_improve,KXVVVPERP,all,60s,3052,1956,18777.6,0.0,4.96,-5.33,0.0,0.0,5.0,0.0,0.0,-5.37,,,0,,,,REJECTED_COST,reports/execution_summary.md
+unconditional_maker_join,KXETHPERP,all,60s,3124,2800,26880.0,0.0,0.38,-0.78,0.0,0.0,5.0,0.0,0.0,-5.39,,,0,,,,REJECTED_COST,reports/execution_summary.md
+unconditional_maker_improve,KXAAVEPERP,all,60s,2940,807,7747.2,0.0,7.02,-7.42,0.0,0.0,5.0,0.0,0.0,-5.41,,,0,,,,REJECTED_COST,reports/execution_summary.md
+unconditional_maker_improve,KXXRPPERP,all,60s,3084,2118,20332.8,0.0,2.19,-2.64,0.0,0.0,5.0,0.0,0.0,-5.45,,,0,,,,REJECTED_COST,reports/execution_summary.md
+unconditional_maker_improve,KXSOLPERP,all,60s,2982,1905,18288.0,0.0,1.7,-2.16,0.0,0.0,5.0,0.0,0.0,-5.47,,,0,,,,REJECTED_COST,reports/execution_summary.md
+unconditional_maker_improve,KXADAPERP,all,60s,2848,1746,16761.6,0.0,4.79,-5.3,0.0,0.0,5.0,0.0,0.0,-5.51,,,0,,,,REJECTED_COST,reports/execution_summary.md
+unconditional_maker_improve,KXLTCPERP,all,60s,2928,1290,12384.0,0.0,2.98,-3.52,0.0,0.0,5.0,0.0,0.0,-5.55,,,0,,,,REJECTED_COST,reports/execution_summary.md
+unconditional_maker_join,KXLTCPERP,all,60s,2937,1265,12144.0,0.0,2.98,-3.55,0.0,0.0,5.0,0.0,0.0,-5.57,,,0,,,,REJECTED_COST,reports/execution_summary.md
+unconditional_maker_join,KXXRPPERP,all,60s,3104,1942,18643.2,0.0,2.19,-2.76,0.0,0.0,5.0,0.0,0.0,-5.57,,,0,,,,REJECTED_COST,reports/execution_summary.md
+unconditional_maker_join,KXSOLPERP,all,60s,2992,1846,17721.6,0.0,1.7,-2.34,0.0,0.0,5.0,0.0,0.0,-5.64,,,0,,,,REJECTED_COST,reports/execution_summary.md
+unconditional_maker_join,KXVVVPERP,all,60s,3094,1912,18355.2,0.0,4.94,-5.71,0.0,0.0,5.0,0.0,0.0,-5.77,,,0,,,,REJECTED_COST,reports/execution_summary.md
+unconditional_maker_improve,KXWLDPERP,all,60s,2866,922,8851.2,0.0,8.28,-9.56,0.0,0.0,5.0,0.0,0.0,-6.28,,,0,,,,REJECTED_COST,reports/execution_summary.md
+unconditional_maker_join,KXWLDPERP,all,60s,2877,762,7315.2,0.0,8.28,-9.61,0.0,0.0,5.0,0.0,0.0,-6.33,,,0,,,,REJECTED_COST,reports/execution_summary.md
+unconditional_maker_join,KXAAVEPERP,all,60s,2958,712,6835.2,0.0,7.03,-8.37,0.0,0.0,5.0,0.0,0.0,-6.34,,,0,,,,REJECTED_COST,reports/execution_summary.md
+unconditional_maker_join,KXBNBPERP,all,60s,2942,615,5904.0,0.0,4.78,-6.17,0.0,0.0,5.0,0.0,0.0,-6.39,,,0,,,,REJECTED_COST,reports/execution_summary.md
+funding_capture_unhedged,KXNEARPERP,all,8h,,,0.125,0.0,0.0,,1.2,0.0,,,8.47,-7.27,,,0,,,,REJECTED_RISK,reports/funding_study.md (funding is 0.1% of one period of volatility)
+funding_capture_unhedged,KXWLDPERP,all,8h,,,0.125,0.0,0.0,,3.55,0.0,,,11.45,-7.9,,,0,,,,REJECTED_RISK,reports/funding_study.md (funding is 0.5% of one period of volatility)
+taker_cross_no_signal,KXBTCPERP,all,60s,3082,3082,29587.2,0.0,0.0,-0.33,0.0,0.0,0.0,12.0,0.33,-12.66,,,0,,,,REJECTED_COST,reports/execution_summary.md
+taker_cross_no_signal,KXETHPERP,all,60s,3110,3110,29856.0,0.0,0.0,-0.51,0.0,0.0,0.0,12.0,0.51,-13.01,,,0,,,,REJECTED_COST,reports/execution_summary.md
+conditional_maker_top1%,all,selected,10s,,194,2136.6,0.0,8.77,,0.0,0.0,5.0,0.0,19.42,-15.64,-20.47,,0,,,,REJECTED_V1,"research/conditional_maker_v1_rejected.md; round trip 0/40 positive, score-selected fills have worse post-fill markout than random"
+taker_cross_no_signal,KXSOLPERP,all,60s,2982,2982,28627.2,0.0,0.0,-2.15,0.0,0.0,0.0,12.0,2.15,-16.29,,,0,,,,REJECTED_COST,reports/execution_summary.md
+conditional_maker_top1%,all,selected,5s,,194,2136.6,0.0,8.95,,0.0,0.0,5.0,0.0,20.24,-16.29,-21.91,,0,,,,REJECTED_V1,"research/conditional_maker_v1_rejected.md; round trip 0/40 positive, score-selected fills have worse post-fill markout than random"
+conditional_maker_top1%,all,selected,1s,,194,2136.6,0.0,8.52,,0.0,0.0,5.0,0.0,20.23,-16.71,-20.8,,0,,,,REJECTED_V1,"research/conditional_maker_v1_rejected.md; round trip 0/40 positive, score-selected fills have worse post-fill markout than random"
+taker_cross_no_signal,KXXRPPERP,all,60s,3084,3084,29606.4,0.0,0.0,-2.54,0.0,0.0,0.0,12.0,2.55,-17.09,,,0,,,,REJECTED_COST,reports/execution_summary.md
+conditional_maker_top1%,all,selected,60s,,194,2136.6,0.0,6.33,,0.0,0.0,5.0,0.0,19.24,-17.91,-24.04,,0,,,,REJECTED_V1,"research/conditional_maker_v1_rejected.md; round trip 0/40 positive, score-selected fills have worse post-fill markout than random"
+conditional_maker_top2%,all,selected,10s,,389,4284.1,0.0,6.07,,0.0,0.0,5.0,0.0,19.19,-18.12,-21.32,,0,,,,REJECTED_V1,"research/conditional_maker_v1_rejected.md; round trip 0/40 positive, score-selected fills have worse post-fill markout than random"
+conditional_maker_top2%,all,selected,5s,,389,4284.1,0.0,6.93,,0.0,0.0,5.0,0.0,20.23,-18.3,-21.34,,0,,,,REJECTED_V1,"research/conditional_maker_v1_rejected.md; round trip 0/40 positive, score-selected fills have worse post-fill markout than random"
+taker_cross_no_signal,KXLTCPERP,all,60s,2928,2928,28108.8,0.0,0.0,-3.5,0.0,0.0,0.0,12.0,3.5,-19.0,,,0,,,,REJECTED_COST,reports/execution_summary.md
+conditional_maker_top2%,all,selected,1s,,389,4284.1,0.0,6.16,,0.0,0.0,5.0,0.0,20.22,-19.07,-21.25,,0,,,,REJECTED_V1,"research/conditional_maker_v1_rejected.md; round trip 0/40 positive, score-selected fills have worse post-fill markout than random"
+conditional_maker_top5%,all,selected,10s,,973,10715.8,0.0,3.79,,0.0,0.0,5.0,0.0,18.69,-19.9,-21.43,,0,,,,REJECTED_V1,"research/conditional_maker_v1_rejected.md; round trip 0/40 positive, score-selected fills have worse post-fill markout than random"
+taker_cross_no_signal,KXHYPEPERP,all,60s,3030,3030,29088.0,0.0,0.0,-3.99,0.0,0.0,0.0,12.0,3.99,-19.97,,,0,,,,REJECTED_COST,reports/execution_summary.md
+conditional_maker_top5%,all,selected,5s,,973,10715.8,0.0,4.79,,0.0,0.0,5.0,0.0,19.92,-20.13,-21.6,,0,,,,REJECTED_V1,"research/conditional_maker_v1_rejected.md; round trip 0/40 positive, score-selected fills have worse post-fill markout than random"
+conditional_maker_top10%,all,selected,10s,,1946,21431.7,0.0,2.68,,0.0,0.0,5.0,0.0,18.09,-20.41,-21.35,,0,,,,REJECTED_V1,"research/conditional_maker_v1_rejected.md; round trip 0/40 positive, score-selected fills have worse post-fill markout than random"
+conditional_maker_top10%,all,selected,5s,,1946,21431.7,0.0,3.53,,0.0,0.0,5.0,0.0,19.04,-20.51,-21.32,,0,,,,REJECTED_V1,"research/conditional_maker_v1_rejected.md; round trip 0/40 positive, score-selected fills have worse post-fill markout than random"
+conditional_maker_top5%,all,selected,1s,,973,10715.8,0.0,4.36,,0.0,0.0,5.0,0.0,20.0,-20.64,-21.7,,0,,,,REJECTED_V1,"research/conditional_maker_v1_rejected.md; round trip 0/40 positive, score-selected fills have worse post-fill markout than random"
+conditional_maker_top20%,all,selected,5s,,3893,42874.3,0.0,2.34,,0.0,0.0,5.0,0.0,17.99,-20.65,-21.18,,0,,,,REJECTED_V1,"research/conditional_maker_v1_rejected.md; round trip 0/40 positive, score-selected fills have worse post-fill markout than random"
+conditional_maker_top20%,all,selected,10s,,3893,42874.3,0.0,1.86,,0.0,0.0,5.0,0.0,17.85,-20.99,-21.65,,0,,,,REJECTED_V1,"research/conditional_maker_v1_rejected.md; round trip 0/40 positive, score-selected fills have worse post-fill markout than random"
+conditional_maker_top50%,all,selected,5s,,9733,107191.4,0.0,1.03,,0.0,0.0,5.0,0.0,17.14,-21.1,-21.38,,0,,,,REJECTED_V1,"research/conditional_maker_v1_rejected.md; round trip 0/40 positive, score-selected fills have worse post-fill markout than random"
+conditional_maker_top50%,all,selected,1s,,9733,107191.4,0.0,1.09,,0.0,0.0,5.0,0.0,17.21,-21.12,-21.34,,0,,,,REJECTED_V1,"research/conditional_maker_v1_rejected.md; round trip 0/40 positive, score-selected fills have worse post-fill markout than random"
+conditional_maker_top20%,all,selected,1s,,3893,42874.3,0.0,2.3,,0.0,0.0,5.0,0.0,18.49,-21.19,-21.58,,0,,,,REJECTED_V1,"research/conditional_maker_v1_rejected.md; round trip 0/40 positive, score-selected fills have worse post-fill markout than random"
+taker_cross_no_signal,KXDOGEPERP,all,60s,2960,2960,28416.0,0.0,0.0,-4.77,0.0,0.0,0.0,12.0,4.77,-21.54,,,0,,,,REJECTED_COST,reports/execution_summary.md
+conditional_maker_top10%,all,selected,1s,,1946,21431.7,0.0,3.2,,0.0,0.0,5.0,0.0,19.75,-21.55,-22.19,,0,,,,REJECTED_V1,"research/conditional_maker_v1_rejected.md; round trip 0/40 positive, score-selected fills have worse post-fill markout than random"
+conditional_maker_top50%,all,selected,10s,,9733,107191.4,0.0,0.65,,0.0,0.0,5.0,0.0,17.22,-21.57,-21.91,,0,,,,REJECTED_V1,"research/conditional_maker_v1_rejected.md; round trip 0/40 positive, score-selected fills have worse post-fill markout than random"
+taker_cross_no_signal,KXBNBPERP,all,60s,2912,2912,27955.2,0.0,0.0,-4.94,0.0,0.0,0.0,12.0,4.94,-21.88,,,0,,,,REJECTED_COST,reports/execution_summary.md
+taker_cross_no_signal,KXVVVPERP,all,60s,3080,3080,29568.0,0.0,0.0,-5.01,0.0,0.0,0.0,12.0,5.02,-22.03,,,0,,,,REJECTED_COST,reports/execution_summary.md
+conditional_maker_top2%,all,selected,60s,,389,4284.1,0.0,0.78,,0.0,0.0,5.0,0.0,18.49,-22.71,-28.18,,0,,,,REJECTED_V1,"research/conditional_maker_v1_rejected.md; round trip 0/40 positive, score-selected fills have worse post-fill markout than random"
+conditional_maker_top20%,all,selected,60s,,3893,42874.3,0.0,-0.89,,0.0,0.0,5.0,0.0,17.43,-23.32,-24.39,,0,,,,REJECTED_V1,"research/conditional_maker_v1_rejected.md; round trip 0/40 positive, score-selected fills have worse post-fill markout than random"
+conditional_maker_top5%,all,selected,60s,,973,10715.8,0.0,-0.53,,0.0,0.0,5.0,0.0,17.79,-23.32,-26.22,,0,,,,REJECTED_V1,"research/conditional_maker_v1_rejected.md; round trip 0/40 positive, score-selected fills have worse post-fill markout than random"
+taker_cross_no_signal,KXADAPERP,all,60s,2882,2882,27667.2,0.0,0.0,-5.7,0.0,0.0,0.0,12.0,5.7,-23.39,,,0,,,,REJECTED_COST,reports/execution_summary.md
+conditional_maker_top10%,all,selected,60s,,1946,21431.7,0.0,-1.14,,0.0,0.0,5.0,0.0,17.5,-23.65,-25.41,,0,,,,REJECTED_V1,"research/conditional_maker_v1_rejected.md; round trip 0/40 positive, score-selected fills have worse post-fill markout than random"
+conditional_maker_top50%,all,selected,60s,,9733,107191.4,0.0,-1.57,,0.0,0.0,5.0,0.0,17.28,-23.85,-24.54,,0,,,,REJECTED_V1,"research/conditional_maker_v1_rejected.md; round trip 0/40 positive, score-selected fills have worse post-fill markout than random"
+taker_cross_no_signal,KXAAVEPERP,all,60s,2946,2946,28281.6,0.0,0.0,-7.28,0.0,0.0,0.0,12.0,7.28,-26.56,,,0,,,,REJECTED_COST,reports/execution_summary.md
+taker_cross_no_signal,KXZECPERP,all,60s,3032,3032,29107.2,0.0,0.0,-7.37,0.0,0.0,0.0,12.0,7.37,-26.75,,,0,,,,REJECTED_COST,reports/execution_summary.md
+taker_cross_no_signal,KXSUIPERP,all,60s,2930,2930,28128.0,0.0,0.0,-7.62,0.0,0.0,0.0,12.0,7.63,-27.25,,,0,,,,REJECTED_COST,reports/execution_summary.md
+taker_cross_no_signal,KXNEARPERP,all,60s,3030,3030,29088.0,0.0,0.0,-7.81,0.0,0.0,0.0,12.0,7.81,-27.61,,,0,,,,REJECTED_COST,reports/execution_summary.md
+taker_cross_no_signal,KXKSHIBPERP,all,60s,2512,2512,24115.2,0.0,0.0,-7.81,0.0,0.0,0.0,12.0,7.81,-27.62,,,0,,,,REJECTED_COST,reports/execution_summary.md
+taker_cross_no_signal,KXBCHPERP,all,60s,2858,2858,27436.8,0.0,0.0,-8.09,0.0,0.0,0.0,12.0,8.09,-28.18,,,0,,,,REJECTED_COST,reports/execution_summary.md
+taker_cross_no_signal,KXWLDPERP,all,60s,2866,2866,27513.6,0.0,0.0,-8.36,0.0,0.0,0.0,12.0,8.36,-28.72,,,0,,,,REJECTED_COST,reports/execution_summary.md
+taker_cross_no_signal,KXLINKPERP,all,60s,2946,2946,28281.6,0.0,0.0,-9.25,0.0,0.0,0.0,12.0,9.25,-30.51,,,0,,,,REJECTED_COST,reports/execution_summary.md

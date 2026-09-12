@@ -43,6 +43,13 @@ def listeners(port):
             raise RuntimeError(f'Port {port} belongs to another program; leaving it alone.')
     return pids
 
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+
 def show(data, url):
     if data is None:
         print('Desk is stopped. Start it with: tradeit up')
@@ -62,10 +69,16 @@ def show(data, url):
 
 def main():
     action = sys.argv[1] if len(sys.argv) == 2 else 'help'
-    if action not in ('up', 'down', 'status', 'logs'):
-        print('Usage: tradeit up | down | status | logs\nup opens Safari; down stops the desk but does not cancel exchange orders.')
+    if action not in ('up', 'down', 'status', 'logs', 'models'):
+        print('Usage: tradeit up | down | status | logs | models\nup opens Safari; down stops the desk but does not cancel exchange orders.\nmodels fits read-only research reports; it does not trade or deploy a model.')
         return
     cfg = config()
+    if action == 'models':
+        database = Path(cfg['db_path']).expanduser()
+        if not database.is_absolute(): database = ROOT / database
+        subprocess.run([sys.executable, str(ROOT/'research/model_lab.py'), '--db', str(database),
+                        '--output', str(database.parent/'model_lab/report.json')], cwd=ROOT, check=True)
+        return
     port = int(cfg.get('http_port', 8787))
     url = f'http://127.0.0.1:{port}'
     log = ROOT / 'data' / (cfg['env'] + '.log')
@@ -80,10 +93,14 @@ def main():
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         pids = listeners(port)
         if action == 'down':
+            stopping = set(pids)
             for pid in pids:
                 os.kill(pid, signal.SIGTERM)
             deadline = time.monotonic() + 45
-            while listeners(port):
+            # The HTTP listener closes before the engine finishes its current cycle and releases
+            # the SQLite flock. Waiting only on the port made `tradeit down && tradeit up` race the
+            # old process and occasionally refuse the restart.
+            while listeners(port) or any(alive(pid) for pid in stopping):
                 if time.monotonic() > deadline:
                     raise RuntimeError('Shutdown is still finishing. Check tradeit status; no forced kill sent.')
                 time.sleep(.5)

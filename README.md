@@ -19,10 +19,16 @@ whether a model proposed it, you typed it, or a bot fired it.
 ```sh
 brew install cmake openssl@3            # curl and sqlite3 come with the Xcode CLT
 git clone <this repo> ~/Code/kalshi-desk && cd ~/Code/kalshi-desk
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=arm64
 cmake --build build -j
-./build/desk-tests                      # 93 checks: fees, sizing, signing (verified with openssl), store, engine
+./build/desk-tests && ./build/systematic-tests && ./build/perps-tests && ./build/poly-tests && ./build/account-summary-tests
 ```
+
+Apple Silicon: pass `-DCMAKE_OSX_ARCHITECTURES=arm64` (or `conda deactivate` first). A conda
+`(base)` shell puts an Intel `cmake` first on PATH; under Rosetta it reports an x86_64 host, the
+objects come out x86_64, and the link fails against Homebrew's arm64 OpenSSL. A failed link also
+deletes `build/kalshi-desk`, so `tradeit up` then says the build is missing. Configure into a
+fresh `build/` after that (`rm -rf build`): the cache keeps the wrong architecture.
 
 Linux: `apt install cmake g++ libcurl4-openssl-dev libssl-dev libsqlite3-dev`, same commands.
 
@@ -123,12 +129,61 @@ proposed), `manual` (every proposal waits for you), `auto` (rule-passing proposa
 `bot` (everything goes). `scripts/tradeit up|down|status|logs` starts and stops the desk on a
 Mac with a single-instance lock and opens the dashboard.
 
+The full operating model, entry lanes, T+2 rule, position-aware additions, and NBA/weather
+research sessions are in [docs/platform-overview.md](docs/platform-overview.md).
+
+## The systematic trader
+
+The **Systematic trading** tab runs one algorithm on your say-so: it screens every watched
+contract, takes the sides whose net edge sits inside its band with a win probability above the
+floor, sizes by a capped Kelly fraction, enters through the same executor as everything else and
+manages its own exits (take-profit, stop, time stop, hold-value-vs-sale, settlement). Its own
+daily budget and loss stop sit on top of the desk's caps. Everything it will not take - edges
+above its cap, wide books, big model/market gaps - stays on the board for you. Locked baskets go
+through it too. Paper mode runs the same rules on simulated fills. `docs/systematic.md`.
+
+## Perps (the margined instance)
+
+The **Perps** tab is the only part of the desk that sees Kalshi's second exchange instance:
+its own cash (moved from the tab), equity, margin, positions with the exchange's liquidation
+price, every active perp with basis and funding, a ticket behind its own rails
+(`params.perps`: order notional, total notional, leverage, a price band around the mark, the
+kill switch), and one rule, the basis reversion, paper or live. Contracts are slices of the coin
+priced in dollars; fees are basis points of notional; nothing from the binary-contract
+arithmetic applies. `docs/perps.md` has the rails, the rule and what the sampling found (the
+BTC perp sits within 3 bps of its index in normal conditions, so the rule fires rarely by design).
+
+## Polymarket US and the pair rule
+
+The **Polymarket** tab reads the second venue (public prices without a key; orders with one):
+its cash and positions, every game market it shares with Kalshi paired by league, Eastern game
+date and team, both books side by side with the lock arithmetic for every route, a ticket
+behind its own rails (`params.polymarket`: order dollars, total dollars, a price band, the kill
+switch, the exchange's own preview), and the pair rule, paper or live: post the Kalshi leg,
+hedge on Polymarket when it fills, hold to settlement. The `xvenue` strategy makes the
+Polymarket mid the fair for any Kalshi game market both venues list, so those rows sit on the
+Trades board like any other estimate. The secret key lives in a file named by `secret_path`,
+never in the config. `docs/polymarket.md` has the wire format, the matching, the arithmetic and
+what the venue actually offers (sports game winners only; NFL within a cent of Kalshi).
+
+## The Trades board
+
+The front page is one ranked list from every source: the systematic screen's Kalshi rows
+(weather, crypto, sports, Polymarket-priced), the qualifying Kalshi/Polymarket pairs, and any
+perp with a basis worth a look, ordered by edge per dollar. A row is there only while it is
+actionable: hold or work one side of an event and its other sides leave. Double-click a row (or
+`trade`) for the confirmation: price, contracts, style, the caps, cost, what it pays if right,
+what it loses if wrong, the expected value at p(win), breakeven, and the algorithm's take-profit
+and stop levels; Enter sends. Pairs open the pair modal; a perp row jumps to the Perps ticket.
+The strategies' own proposal queue (the auto/instant lane) is on the Strategies tab.
+
 ## Auto-trading portion, in one place
 
 - Strategy mode `auto` sends proposals that pass its rule; `bot` sends all of them. Both only
-  send while the header **auto** switch is ON (`POST /api/auto {armed}`), and entries stop for
-  the day once `risk.max_auto_dollars_per_day` of purchase cost has gone out unattended (the
-  proposal then waits in Signals with an "auto budget" note). Exits, targets and stops always
+  send while the unattended-sends switch on the Strategies tab is ON (`POST /api/auto {armed}`),
+  and entries stop for the day once `risk.max_auto_dollars_per_day` of purchase cost has gone
+  out unattended (the proposal then waits in the Strategies tab's queue with an "auto budget"
+  note). Exits, targets and stops always
   run: they only reduce risk.
 - A 4xx rejection of an order we sent trips the kill switch (cancel everything, expire the
   queue, stop sending). Pre-flight refusals (caps, a stale account snapshot, an order already
@@ -173,12 +228,13 @@ closes, and `POST /api/brackets/<ticker>` / `GET /api/brackets` drive it.
 
 ## Dashboard
 
-Signals blotter (every live proposal, sorted by edge, with the mode badge and go/reject), price
-ladder for the selected market (depth, your orders, fair marker; click a level to load the
-ticket), risk panel (open exposure, per-event and per-cluster limit bars, daily stop), positions
-with unrealized P&L, order/fill blotter with slippage vs the proposal price, alerts strip, and
-tabs for strategies (modes and auto rules), P&L, the gate report, live sports states,
-hypotheses, events and config. Reads never wait on a cycle: the engine publishes a snapshot.
+The Trades board (every source ranked, double-click to trade), price ladder for the selected
+market (depth, your orders, fair marker; click a level to load the ticket), risk panel (open
+exposure, per-event and per-cluster limit bars, daily stop), positions with unrealized P&L,
+order/fill blotter with slippage vs the proposal price and the recent proposals, alerts strip,
+and tabs for strategies (modes, auto rules, the proposal queue), the systematic trader, perps,
+Polymarket, the central risk book, P&L, the gate report, live sports states, hypotheses, events
+and config. Reads never wait on a cycle: the engine publishes a snapshot.
 
 Only one desk may run per database (`data/desk.sqlite.lock`); `report` and `balance` may run
 alongside it.
@@ -223,7 +279,11 @@ include/desk/   headers          src/            implementation
   strategy.h    Strategy interface server.cpp      HTTP API + dashboard
   engine.h      Engine             strategies/     manual_fair, weather_nws, crypto_lognormal, stubs
 ui/index.html   dashboard (embedded into the binary at build time)
-tests/          desk-tests         docs/hypotheses.md   research registry
+  perps.h       PerpsDesk          perps.cpp       the margined instance: rails, ticket, basis rule
+  poly.h        PolyDesk           poly.cpp        Polymarket US: auth, matching, rails, ticket, pair rule
+                                   strategies/xvenue.cpp   the Polymarket mid as a Kalshi fair
+  account_summary.h/.cpp             read-only cash/equity/P&L totals across event contracts and perps (GET /api/account-summary)
+tests/          desk-tests, systematic-tests, perps-tests, poly-tests, account-summary-tests   docs/hypotheses.md   research registry
 ```
 
 ## HTTP API
@@ -233,6 +293,11 @@ tests/          desk-tests         docs/hypotheses.md   research registry
 `POST /api/orders/{id}/cancel` · `POST /api/positions/{t}/close` · `POST /api/fair` · `DELETE /api/fair/{t}` ·
 `POST /api/kill` · `POST /api/strategy/{name}/mode` · `POST /api/watch` · `DELETE /api/watch/{s}` ·
 `GET /api/series?q=` · `GET /api/report` · `GET /api/hypotheses` · `POST /api/hypotheses/{key}` ·
-`GET /api/fills` · `POST /api/reconcile`
+`GET /api/fills` · `POST /api/reconcile` · `GET|POST /api/systematic` · `POST /api/systematic/close/{t}` ·
+`GET /api/perps` · `GET /api/perps/book/{t}` · `POST /api/perps/sync` · `POST /api/perps/order` ·
+`POST /api/perps/orders/{id}/cancel` · `POST /api/perps/positions/{t}/close` · `POST /api/perps/transfer` ·
+`POST /api/perps/algo` · `GET /api/poly` · `GET /api/poly/pairs` · `GET /api/poly/book/{slug}` ·
+`POST /api/poly/sync` · `POST /api/poly/preview` · `POST /api/poly/order` · `POST /api/poly/orders/{id}/cancel` ·
+`POST /api/poly/positions/{slug}/close` · `POST /api/poly/algo` · `POST /api/poly/pair` · `GET /api/account-summary`
 
 The server binds 127.0.0.1 only. There is no auth on it; do not expose it.

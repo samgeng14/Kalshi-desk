@@ -14,7 +14,7 @@ struct Series {
 
 struct Market {
   std::string ticker, event_ticker, series_ticker, title, subtitle, yes_sub_title,
-      no_sub_title, status, market_type, strike_type, result, rules_primary, open_time,
+      no_sub_title, status, market_type, strike_type, result, rules_primary, rules_secondary, open_time,
       close_time, expected_expiration_time, expiration_time, updated_time;
   std::optional<double> floor_strike, cap_strike;
   double yes_bid = 0, yes_ask = 0, no_bid = 0, no_ask = 0, last = 0;

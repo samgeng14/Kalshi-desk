@@ -18,9 +18,14 @@ struct Proposal {
   std::string ticker, event_ticker, series_ticker, strategy, mode, outcome_side,
       exec_style,  // maker | taker
       status,      // pending | submitted | rejected | expired | failed | canceled
-      order_id, note, cluster;
+      order_id, note, cluster,
+      entry_kind = "new";  // new | addition | hedge | reduce
   double price = 0, count = 0, p_model = 0, sigma = 0, fee_per = 0, net_edge = 0, yes_bid = 0,
-         yes_ask = 0;
+         yes_ask = 0, required_edge = 0;
+  bool approval_required = false;
+  // The decision snapshot (trade_decisions) behind this proposal: what probability and what book
+  // caused it. Every order the executor sends gets one (decision_log.h).
+  std::string decision_id;
   json to_json() const;
 };
 
@@ -68,6 +73,12 @@ class Store {
   // proposals
   long long insert_proposal(Proposal& p);
   void update_proposal(const Proposal& p);
+  // Which moves between proposal states are legal. Statuses are plain strings written from a
+  // dozen places, and nothing stopped a terminal one from being revived: a filled or cancelled
+  // proposal going back to pending would be picked up and sent a second time, and a submitted one
+  // reset to pending would lose the order it already owns. Terminal is terminal.
+  static bool proposal_transition_ok(const std::string& from, const std::string& to);
+  static bool proposal_terminal(const std::string& s);
   std::optional<Proposal> get_proposal(long long id);
   std::vector<Proposal> proposals(const std::string& status, int limit = 200);
   std::optional<Proposal> find_open_proposal(const std::string& ticker, const std::string& side,

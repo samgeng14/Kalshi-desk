@@ -53,8 +53,19 @@ CREATE TABLE IF NOT EXISTS proposals(
   id INTEGER PRIMARY KEY, ts INTEGER, updated_ts INTEGER, ticker TEXT, event_ticker TEXT,
   series_ticker TEXT, strategy TEXT, mode TEXT, outcome_side TEXT, exec_style TEXT,
   status TEXT, order_id TEXT, note TEXT, cluster TEXT, price REAL, count REAL, p_model REAL,
-  sigma REAL, fee_per REAL, net_edge REAL, yes_bid REAL, yes_ask REAL);
+  sigma REAL, fee_per REAL, net_edge REAL, yes_bid REAL, yes_ask REAL,
+  entry_kind TEXT DEFAULT 'new', approval_required INTEGER DEFAULT 0, required_edge REAL DEFAULT 0);
 CREATE INDEX IF NOT EXISTS idx_proposals_status ON proposals(status, ts);
+CREATE TABLE IF NOT EXISTS trade_decisions(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, decision_id TEXT, event TEXT, ticker TEXT,
+  event_ticker TEXT, side TEXT, category TEXT, model_name TEXT, model_version TEXT, p_yes REAL,
+  fair_probability REAL, sigma REAL, bid REAL, ask REAL, entry_price REAL, fee REAL, slippage REAL,
+  uncertainty_buffer REAL, raw_edge REAL, executable_edge REAL, route TEXT, verdict TEXT, style TEXT,
+  count REAL, reasons_json TEXT, inputs_json TEXT, quote_json TEXT, model_ts INTEGER, book_ts INTEGER,
+  proposal_id INTEGER, note TEXT, source_decision_id TEXT DEFAULT '');
+CREATE INDEX IF NOT EXISTS idx_trade_decisions_id ON trade_decisions(decision_id, id);
+CREATE INDEX IF NOT EXISTS idx_trade_decisions_ticker ON trade_decisions(ticker, ts);
+CREATE INDEX IF NOT EXISTS idx_trade_decisions_proposal ON trade_decisions(proposal_id);
 CREATE TABLE IF NOT EXISTS orders(
   order_id TEXT PRIMARY KEY, client_order_id TEXT, ticker TEXT, outcome_side TEXT,
   book_side TEXT, type TEXT, status TEXT, yes_price REAL, no_price REAL, initial_count REAL,
@@ -87,6 +98,25 @@ CREATE TABLE IF NOT EXISTS ext_sports(id INTEGER PRIMARY KEY, ts INTEGER, event_
   red_away INTEGER, sot_home REAL, sot_away REAL, poss_home REAL, lam_home REAL, lam_away REAL,
   p_home REAL, p_draw REAL, p_away REAL, mkt_home REAL, mkt_draw REAL, mkt_away REAL);
 CREATE INDEX IF NOT EXISTS idx_ext_sports ON ext_sports(event_ticker, ts);
+CREATE TABLE IF NOT EXISTS match_state(event_ticker TEXT PRIMARY KEY, espn_id TEXT, phase TEXT,
+  phase_ts INTEGER, home_score INTEGER, away_score INTEGER, minute REAL, period INTEGER,
+  red_home INTEGER, red_away INTEGER, status_name TEXT, state TEXT, data_ts INTEGER,
+  updated_ts INTEGER);
+CREATE TABLE IF NOT EXISTS rate_fits(id INTEGER PRIMARY KEY, ts INTEGER, event_ticker TEXT,
+  model_version TEXT, calibration TEXT, phase TEXT, minute REAL, home_score INTEGER,
+  away_score INTEGER, p_home REAL, p_draw REAL, p_away REAL, lam_home REAL, lam_away REAL,
+  residual REAL, converged INTEGER);
+CREATE INDEX IF NOT EXISTS idx_rate_fits ON rate_fits(event_ticker, ts);
+CREATE TABLE IF NOT EXISTS contract_universe(ticker TEXT PRIMARY KEY, event_ticker TEXT,
+  series_ticker TEXT, local_date TEXT, tz TEXT, settle_source TEXT, settle_product TEXT,
+  phase TEXT, close_ts INTEGER, expiration_ts INTEGER, refreshed_ts INTEGER);
+CREATE INDEX IF NOT EXISTS idx_universe_phase ON contract_universe(phase, local_date);
+CREATE TABLE IF NOT EXISTS observations(id INTEGER PRIMARY KEY, source TEXT, subject TEXT,
+  kind TEXT, valid_ts INTEGER, init_ts INTEGER, published_ts INTEGER, received_ts INTEGER,
+  payload TEXT);
+CREATE INDEX IF NOT EXISTS idx_obs ON observations(source, subject, received_ts);
+CREATE INDEX IF NOT EXISTS idx_obs_valid ON observations(source, subject, valid_ts);
+CREATE TABLE IF NOT EXISTS manual_requests(id TEXT PRIMARY KEY,payload TEXT,ticker TEXT,event_ticker TEXT,status TEXT,created_ts INTEGER,expires_ts INTEGER,updated_ts INTEGER,result TEXT,error TEXT);
 )SQL";
 
 class Stmt {
@@ -177,8 +207,15 @@ void Store::migrate() {
                           "ALTER TABLE ext_weather ADD COLUMN ens_sd REAL",
                           "ALTER TABLE ext_wp ADD COLUMN home_ticker TEXT",
                           "ALTER TABLE ext_wp ADD COLUMN away_ticker TEXT",
+                          "ALTER TABLE markets ADD COLUMN rules_secondary TEXT",
                           "ALTER TABLE markets ADD COLUMN yes_bid_size REAL",
-                          "ALTER TABLE markets ADD COLUMN yes_ask_size REAL"}) {
+                          "ALTER TABLE markets ADD COLUMN yes_ask_size REAL",
+                          "ALTER TABLE proposals ADD COLUMN entry_kind TEXT DEFAULT 'new'",
+                          "ALTER TABLE proposals ADD COLUMN approval_required INTEGER DEFAULT 0",
+                          "ALTER TABLE proposals ADD COLUMN required_edge REAL DEFAULT 0",
+                          "ALTER TABLE proposals ADD COLUMN decision_id TEXT DEFAULT ''",
+                          "ALTER TABLE orders ADD COLUMN decision_id TEXT DEFAULT ''",
+                          "ALTER TABLE trade_decisions ADD COLUMN source_decision_id TEXT DEFAULT ''"}) {
     char* e2 = nullptr;
     sqlite3_exec(db_, sql, nullptr, nullptr, &e2);
     if (e2) sqlite3_free(e2);
@@ -247,20 +284,21 @@ void Store::upsert_market(const Market& m) {
   exec(
       "INSERT INTO markets(ticker,event_ticker,series_ticker,title,subtitle,yes_sub_title,"
       "no_sub_title,status,market_type,strike_type,floor_strike,cap_strike,open_time,close_time,"
-      "expected_expiration_time,expiration_time,result,rules_primary,tick,yes_bid,yes_ask,no_bid,"
+      "expected_expiration_time,expiration_time,result,rules_primary,rules_secondary,tick,yes_bid,yes_ask,no_bid,"
       "no_ask,last,volume,open_interest,custom_strike,updated_ts,yes_bid_size,yes_ask_size) "
-      "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+      "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
       "ON CONFLICT(ticker) DO UPDATE SET status=excluded.status,result=excluded.result,"
       "yes_bid=excluded.yes_bid,yes_ask=excluded.yes_ask,no_bid=excluded.no_bid,"
       "no_ask=excluded.no_ask,last=excluded.last,volume=excluded.volume,"
       "open_interest=excluded.open_interest,close_time=excluded.close_time,"
-      "expected_expiration_time=excluded.expected_expiration_time,rules_primary=excluded.rules_primary,updated_ts=excluded.updated_ts,"
+      "expected_expiration_time=excluded.expected_expiration_time,rules_primary=excluded.rules_primary,"
+      "rules_secondary=excluded.rules_secondary,updated_ts=excluded.updated_ts,"
       "yes_bid_size=excluded.yes_bid_size,yes_ask_size=excluded.yes_ask_size",
       {m.ticker, m.event_ticker, m.series_ticker, m.title, m.subtitle, m.yes_sub_title,
        m.no_sub_title, m.status, m.market_type, m.strike_type,
        m.floor_strike ? SqlValue(*m.floor_strike) : SqlValue(nullptr),
        m.cap_strike ? SqlValue(*m.cap_strike) : SqlValue(nullptr), m.open_time, m.close_time,
-       m.expected_expiration_time, m.expiration_time, m.result, m.rules_primary, m.tick, m.yes_bid,
+       m.expected_expiration_time, m.expiration_time, m.result, m.rules_primary, m.rules_secondary, m.tick, m.yes_bid,
        m.yes_ask, m.no_bid, m.no_ask, m.last, m.volume, m.open_interest,
        m.custom_strike.is_null() ? std::string("") : m.custom_strike.dump(), now_s(), m.yes_bid_size, m.yes_ask_size});
 }
@@ -285,6 +323,7 @@ static Market market_from_row(const json& r) {
   m.expiration_time = str(r, "expiration_time");
   m.result = str(r, "result");
   m.rules_primary = str(r, "rules_primary");
+  m.rules_secondary = str(r, "rules_secondary");
   m.tick = num(r, "tick") > 0 ? num(r, "tick") : 0.01;
   m.yes_bid = num(r, "yes_bid");
   m.yes_ask = num(r, "yes_ask");
@@ -411,7 +450,11 @@ json Proposal::to_json() const {
               {"fee_per", fee_per},
               {"net_edge", net_edge},
               {"yes_bid", yes_bid},
-              {"yes_ask", yes_ask}};
+              {"yes_ask", yes_ask},
+              {"entry_kind", entry_kind},
+              {"approval_required", approval_required},
+              {"required_edge", required_edge},
+              {"decision_id", decision_id}};
 }
 
 Proposal Store::proposal_from_row(const json& r) {
@@ -438,6 +481,11 @@ Proposal Store::proposal_from_row(const json& r) {
   p.net_edge = num(r, "net_edge");
   p.yes_bid = num(r, "yes_bid");
   p.yes_ask = num(r, "yes_ask");
+  p.entry_kind = str(r, "entry_kind");
+  if (p.entry_kind.empty()) p.entry_kind = "new";
+  p.approval_required = ll(r, "approval_required") != 0;
+  p.required_edge = num(r, "required_edge");
+  p.decision_id = str(r, "decision_id");
   return p;
 }
 
@@ -448,20 +496,55 @@ long long Store::insert_proposal(Proposal& p) {
   exec(
       "INSERT INTO proposals(ts,updated_ts,ticker,event_ticker,series_ticker,strategy,mode,"
       "outcome_side,exec_style,status,order_id,note,cluster,price,count,p_model,sigma,fee_per,"
-      "net_edge,yes_bid,yes_ask) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+      "net_edge,yes_bid,yes_ask,entry_kind,approval_required,required_edge,decision_id) "
+      "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
       {p.ts, p.updated_ts, p.ticker, p.event_ticker, p.series_ticker, p.strategy, p.mode,
        p.outcome_side, p.exec_style, p.status, p.order_id, p.note, p.cluster, p.price, p.count,
-       p.p_model, p.sigma, p.fee_per, p.net_edge, p.yes_bid, p.yes_ask});
+       p.p_model, p.sigma, p.fee_per, p.net_edge, p.yes_bid, p.yes_ask, p.entry_kind,
+       static_cast<long long>(p.approval_required ? 1 : 0), p.required_edge, p.decision_id});
   p.id = static_cast<long long>(sqlite3_last_insert_rowid(db_));
   return p.id;
 }
 
+bool Store::proposal_terminal(const std::string& s) {
+  return s == "filled" || s == "canceled" || s == "expired" || s == "failed" || s == "rejected";
+}
+
+bool Store::proposal_transition_ok(const std::string& from, const std::string& to) {
+  if (from.empty() || from == to) return true;          // creation, and idempotent rewrites
+  if (proposal_terminal(from)) return false;            // nothing comes back from the dead
+  if (to == "submitted") return from == "pending" || from == "unknown";   // only something live can be sent
+  // A cancel is asked for on an order that is working, and working means submitted (or an
+  // uncertain send). Executor::cancel writes submitted -> cancel_pending before it calls the
+  // exchange; refusing that move (as this once did) left the proposal claiming it still rested
+  // and turned the whole "cancel outcome unknown" state into dead code. From cancel_pending the
+  // live-to-terminal rule below lets it end canceled or filled (a fill that raced the cancel).
+  // Never from pending: a pending proposal has no order, so nothing could ever resolve it.
+  if (to == "cancel_pending") return from == "submitted" || from == "unknown";
+  if (to == "unknown") return from == "pending" || from == "submitted";
+  if (to == "pending") return false;                    // a proposal is only pending when created
+  return true;                                          // every terminal end is reachable from live
+}
+
 void Store::update_proposal(const Proposal& p) {
+  // Reject an illegal move rather than writing it. The alternative is a corrupted row that looks
+  // ordinary, and the failure it causes turns up later somewhere else entirely.
+  json before = query("SELECT status FROM proposals WHERE id=?", {p.id});
+  if (!before.empty()) {
+    std::string from = before[0].value("status", "");
+    if (!proposal_transition_ok(from, p.status)) {
+      log_event("error", "refused illegal proposal transition " + from + " -> " + p.status +
+                             " on " + p.ticker + " (proposal " + std::to_string(p.id) + ")");
+      return;
+    }
+  }
   exec(
       "UPDATE proposals SET updated_ts=?,status=?,order_id=?,note=?,price=?,count=?,p_model=?,"
-      "sigma=?,fee_per=?,net_edge=?,yes_bid=?,yes_ask=?,exec_style=?,mode=? WHERE id=?",
+      "sigma=?,fee_per=?,net_edge=?,yes_bid=?,yes_ask=?,exec_style=?,mode=?,entry_kind=?,"
+      "approval_required=?,required_edge=?,decision_id=? WHERE id=?",
       {now_s(), p.status, p.order_id, p.note, p.price, p.count, p.p_model, p.sigma, p.fee_per,
-       p.net_edge, p.yes_bid, p.yes_ask, p.exec_style, p.mode, p.id});
+       p.net_edge, p.yes_bid, p.yes_ask, p.exec_style, p.mode, p.entry_kind,
+       static_cast<long long>(p.approval_required ? 1 : 0), p.required_edge, p.decision_id, p.id});
 }
 
 std::optional<Proposal> Store::get_proposal(long long id) {
@@ -484,7 +567,7 @@ std::optional<Proposal> Store::find_open_proposal(const std::string& ticker, con
                                                   const std::string& strategy) {
   json rows = query(
       "SELECT * FROM proposals WHERE ticker=? AND outcome_side=? AND strategy=? AND status IN "
-      "('pending','submitted') ORDER BY id DESC LIMIT 1",
+      "('pending','submitted','cancel_pending') ORDER BY id DESC LIMIT 1",
       {ticker, side, strategy});
   if (rows.empty()) return std::nullopt;
   return proposal_from_row(rows[0]);
@@ -512,6 +595,10 @@ void Store::upsert_order(const Order& o, long long proposal_id) {
       {o.order_id, o.client_order_id, o.ticker, o.outcome_side, o.book_side, o.type, o.status,
        o.yes_price, o.no_price, o.initial_count, o.fill_count, o.remaining_count, o.taker_fees,
        o.maker_fees, o.created_time, o.last_update_time, proposal_id, now_s()});
+  // The decision behind the order, straight on its row: order -> decision without a join.
+  if (proposal_id > 0)
+    exec("UPDATE orders SET decision_id=(SELECT COALESCE(decision_id,'') FROM proposals WHERE id=?) "
+         "WHERE order_id=? AND (decision_id IS NULL OR decision_id='')", {proposal_id, o.order_id});
 }
 
 std::vector<Order> Store::orders(const std::string& status) {

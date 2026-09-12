@@ -212,6 +212,7 @@ void SportsLive::fetch_scoreboard(const std::string& series, const League& lg, c
         g.detail = jstr(st, "shortDetail");
         g.period = jint(status, "period", 0);
         g.clock = jstr(status, "displayClock");
+        g.last_play_id = jstr(jget(jget(c,"situation"),"lastPlay"),"id");
         const json& competitors = jget(c, "competitors");
         if (competitors.is_array())
           for (const auto& comp : competitors) {
@@ -241,10 +242,53 @@ void SportsLive::fetch_scoreboard(const std::string& series, const League& lg, c
   }
 }
 
+std::string SportsLive::state_signature(const GameState& g) {
+  return g.state+"|"+std::to_string(g.period)+"|"+std::to_string(g.home_score)+"|"+
+         std::to_string(g.away_score)+"|"+g.clock+"|"+g.last_play_id;
+}
+
+bool SportsLive::accept_win_probability(const json& j, GameState& g, long long now) {
+  const auto& header=jget(j,"header");
+  const auto& competitions=jget(header,"competitions");
+  const auto& wp=jget(j,"winprobability");
+  if (g.state!="in" || g.updated<=0 || now<g.updated || now-g.updated>120 ||
+      jstr(header,"id")!=g.espn_id || !competitions.is_array() || competitions.empty() ||
+      !wp.is_array() || wp.empty()) return false;
+  const auto& comp=competitions[0];const auto& status=jget(comp,"status");
+  if (jstr(jget(status,"type"),"state")!=g.state || jint(status,"period",-1)!=g.period ||
+      jstr(status,"displayClock")!=g.clock) return false;
+  int home=-1,away=-1;
+  const auto& teams=jget(comp,"competitors");
+  if (!teams.is_array()) return false;
+  for(const auto& team:teams) {
+    if(jstr(team,"homeAway")=="home")home=jint(team,"score",-1);
+    else if(jstr(team,"homeAway")=="away")away=jint(team,"score",-1);
+  }
+  if(home!=g.home_score || away!=g.away_score) return false;
+  const auto& point=wp.back();
+  const std::string play=jstr(point,"playId");
+  std::string latest=g.last_play_id;
+  const auto& plays=jget(j,"plays");
+  if(plays.is_array()&&!plays.empty()) {
+    const auto id=jstr(plays.back(),"id");
+    if(id.empty()||(!latest.empty()&&latest!=id)) return false;
+    latest=id;
+  }
+  // A successful HTTP fetch cannot make an older chart point current. Require an identified
+  // latest play plus the exact scoreboard state; ambiguous/missing play linkage stays unused.
+  if(play.empty() || latest.empty() || play!=latest) return false;
+  const auto& value=jget(point,"homeWinPercentage");const auto& tie=jget(point,"tiePercentage");
+  if(!value.is_number()||!std::isfinite(value.get<double>())||value.get<double>()<0||value.get<double>()>1)return false;
+  const double tie_p=tie.is_number()?tie.get<double>():0;
+  if(!std::isfinite(tie_p)||tie_p<0||value.get<double>()+tie_p>1+1e-9)return false;
+  g.wp_home=value.get<double>();g.tie=tie_p;g.wp_ts=now;g.last_sig=state_signature(g);
+  return true;
+}
+
 void SportsLive::fetch_wp(const League& lg, GameState& g, long long now) {
   // Refresh the win probability when the game state changed (score, period or clock), and at
   // least every 4 refresh intervals regardless; never more often than wp_refresh_seconds_.
-  std::string sig = std::to_string(g.period) + "|" + std::to_string(g.home_score) + "|" + std::to_string(g.away_score) + "|" + g.clock;
+  std::string sig = state_signature(g);
   if (g.wp_ts > 0 && sig == g.last_sig && now - g.wp_ts < 4 * wp_refresh_seconds_) return;
   if (now - g.wp_attempt_ts < wp_refresh_seconds_) return;
   g.wp_attempt_ts = now;  // pacing only; wp_ts below is the age of the number itself
@@ -263,21 +307,7 @@ void SportsLive::fetch_wp(const League& lg, GameState& g, long long now) {
         g.have_spread = true;
       }
     }
-    const json& wp = jget(j, "winprobability");
-    if (wp.is_array() && !wp.empty() && wp[wp.size() - 1].is_object()) {
-      const json& last = wp[wp.size() - 1];
-      const json& hw = jget(last, "homeWinPercentage");
-      if (hw.is_number()) {
-        double v = hw.get<double>();
-        if (v >= 0 && v <= 1) {
-          g.wp_home = v;
-          const json& tp = jget(last, "tiePercentage");
-          g.tie = tp.is_number() ? std::max(0.0, std::min(1.0, tp.get<double>())) : 0.0;
-          g.wp_ts = now;
-          g.last_sig = sig;
-        }
-      }
-    }
+    if(!accept_win_probability(j,g,now)) {g.wp_home=-1;g.wp_ts=0;g.tie=0;}
   } catch (const std::exception& e) {
     LOG_WARN("espn summary %s: %s", g.espn_id.c_str(), e.what());
   }
@@ -380,11 +410,13 @@ void SportsLive::prepare(const std::vector<Market>& markets, Store& store) {
       }
       double f = frac_left(lg, g.period, g.clock, g.state);
       double lt = lg.leadtime ? leadtime_prob(g.home_score - g.away_score, info.mu_home, f, lg.sigma_game) : -1;
+      double current_wp = g.last_sig == state_signature(g) && now >= g.wp_ts &&
+                          now - g.wp_ts < 4 * wp_refresh_seconds_ ? g.wp_home : -1;
       store.exec(
           "INSERT INTO ext_wp(ts,event_ticker,espn_id,league,state,period,clock,home_score,away_score,wp_home,wp_leadtime,"
           "mu_home,mkt_home,mkt_away,home_ticker,away_ticker) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
           {now, ev, g.espn_id, lg.league, g.state, static_cast<long long>(g.period), g.clock,
-           static_cast<long long>(g.home_score), static_cast<long long>(g.away_score), g.wp_home, lt, info.mu_home,
+           static_cast<long long>(g.home_score), static_cast<long long>(g.away_score), current_wp, lt, info.mu_home,
            mkt_home, mkt_away, info.home_is_a ? info.ticker_a : info.ticker_b, info.home_is_a ? info.ticker_b : info.ticker_a});
     }
   }
@@ -406,7 +438,7 @@ std::optional<Fair> SportsLive::fair(const Market& m, const Series&, Store&) {
   std::string src;
   Fair f;
   if (g.state == "post") return std::nullopt;
-  if (g.state == "in" && g.wp_home >= 0 && now - g.wp_ts < 4 * wp_refresh_seconds_) {
+  if (g.state == "in" && g.wp_home >= 0 && g.last_sig==state_signature(g) && now>=g.wp_ts && now - g.wp_ts < 4 * wp_refresh_seconds_) {
     p_home = g.wp_home;
     double fl = frac_left(lg, g.period, g.clock, g.state);
     sigma = std::max(0.02, sigma_wp_ * (0.5 + fl));  // tighter as the game runs down
@@ -425,7 +457,7 @@ std::optional<Fair> SportsLive::fair(const Market& m, const Series&, Store&) {
   } else {
     return std::nullopt;
   }
-  double tie = g.state == "in" ? g.tie : 0.0;
+  double tie = src == "espn wp" ? g.tie : 0.0;
   double p = is_home ? p_home : std::max(0.0, 1.0 - p_home - tie);
   f.p = std::max(0.005, std::min(0.995, p));
   f.sigma = sigma;
@@ -435,6 +467,9 @@ std::optional<Fair> SportsLive::fair(const Market& m, const Series&, Store&) {
                 is_home ? "(home)" : "(away)", src.c_str(), p_home, info.mu_home);
   f.note = buf;
   f.cluster = m.event_ticker;
+  f.inputs={{"valid",true},{"source",src},{"source_ts",src=="espn wp"?g.wp_ts:g.updated},
+            {"state_signature",state_signature(g)},{"auto_eligible",src=="espn wp"}};
+  if(src!="espn wp") {f.research_only=true;f.research_reason="Unvalidated sports approximation; manual research only";}
   return f;
 }
 

@@ -11,7 +11,7 @@ Forecast: Open-Meteo previous-runs archive, the run issued one day before the ta
 (temperature_2m_previous_day1), hourly max over the local day.
 Market: the last print at or before the decision moment on D-1.
 Execution: the next print on the side we would take, plus the 7% taker fee.
-"""
+\nExecution: NONE. PREDICTION ONLY, for the same reason as wx_evening.py - fills were\ntaken from prints hours after the decision. See research/execution.py.\n"""
 import bisect, collections, csv, datetime as dt, math, os, random, sqlite3
 from zoneinfo import ZoneInfo
 

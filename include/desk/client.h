@@ -28,6 +28,9 @@ class KalshiClient {
 
   bool authenticated() const { return signer_ != nullptr; }
   const std::string& base() const { return base_; }
+  // The same key the REST calls are signed with. The WebSocket feeds sign their own path with it
+  // (include/desk/ws_client.h), so they need the signer rather than another copy of the key.
+  const std::shared_ptr<Signer>& signer() const { return signer_; }
 
   // ---- public market data --------------------------------------------------
   std::vector<Series> get_series(const std::string& category = "");

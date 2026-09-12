@@ -4,6 +4,7 @@
 
 #include <csignal>
 #include <cstring>
+#include <cmath>
 #include <iostream>
 #include <thread>
 
@@ -95,6 +96,44 @@ int main(int argc, char** argv) {
       std::cout << "balance " << b.balance << " portfolio_value " << b.portfolio_value << "\n";
       for (const auto& p : client.get_positions())
         std::cout << "  " << p.ticker << " pos " << p.position << " exposure " << p.exposure << "\n";
+    } catch (const std::exception& e) {
+      std::cerr << "error: " << e.what() << "\n";
+      return 1;
+    }
+    return 0;
+  }
+
+  // Flatten everything. Uses the same close path the dashboard button uses - reduce_only paired
+  // with immediate-or-cancel, which is the combination Kalshi actually accepts - and works while
+  // the kill switch is on, because going flat only ever reduces risk. Prints the plan and does
+  // nothing unless --yes is given.
+  if (cmd == "close-all") {
+    bool confirmed = false;
+    for (const auto& a : rest) if (a == "--yes") confirmed = true;
+    try {
+      exec.reconcile(true);   // the exchange's view, not yesterday's cache
+      auto positions = store.positions();
+      int open = 0;
+      for (const auto& p : positions) if (p.position != 0) ++open;
+      if (open == 0) { std::cout << "nothing open\n"; return 0; }
+      if (store.kv_get("kill").value_or("0") == "1")
+        std::cout << "note: the kill switch is on; closing anyway, because flattening only "
+                     "reduces risk\n";
+      for (const auto& p : positions) {
+        if (p.position == 0) continue;
+        std::cout << (confirmed ? "closing " : "would close ") << p.ticker << "  "
+                  << std::fabs(p.position) << (p.position > 0 ? " YES" : " NO")
+                  << "  cost $" << p.exposure << "\n";
+        if (!confirmed) continue;
+        try {
+          std::cout << "  -> " << exec.close_position(p.ticker).dump() << "\n";
+        } catch (const std::exception& e) {
+          // One position that cannot be closed must not stop the others.
+          std::cout << "  -> FAILED: " << e.what() << "\n";
+        }
+      }
+      if (!confirmed) std::cout << "\nnothing sent. re-run with --yes to send these orders.\n";
+      else { exec.reconcile(true); std::cout << "\ndone; positions re-read from the exchange\n"; }
     } catch (const std::exception& e) {
       std::cerr << "error: " << e.what() << "\n";
       return 1;

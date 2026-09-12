@@ -1,8 +1,19 @@
 build/
 build-ci/
 data/
-config/desk.json
+config/desk.json*
 *.pem
 .DS_Store
 research/asos_*.csv
 research/wx_rise_tables.json
+__pycache__/
+*.py[cod]
+
+# Secrets live here, never in git. The desk reads them by path.
+.secrets/
+*.key
+
+# editor and runtime strays
+*.bak-*
+.gitignore.*
+.quotefeed.txt

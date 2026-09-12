@@ -35,6 +35,7 @@ Config load_config(const std::string& path) {
   take(j, "poll_seconds", c.poll_seconds);
   take(j, "reconcile_every", c.reconcile_every);
   take(j, "series_refresh_minutes", c.series_refresh_minutes);
+  take(j, "market_data_max_age_seconds", c.market_data_max_age_seconds);
   take(j, "bankroll_dollars", c.bankroll_dollars);
   if (j.contains("risk")) {
     const json& r = j["risk"];
@@ -43,11 +44,21 @@ Config load_config(const std::string& path) {
     take(r, "max_cluster_frac", c.risk.max_cluster_frac);
     take(r, "max_open_frac", c.risk.max_open_frac);
     take(r, "daily_loss_stop_frac", c.risk.daily_loss_stop_frac);
+    take(r, "daily_loss_stop_enabled", c.risk.daily_loss_stop_enabled);
     take(r, "min_edge_maker", c.risk.min_edge_maker);
     take(r, "min_edge_taker", c.risk.min_edge_taker);
     take(r, "sigma_mult", c.risk.sigma_mult);
     take(r, "min_price", c.risk.min_price);
     take(r, "proposal_ttl_seconds", c.risk.proposal_ttl_seconds);
+    take(r, "max_order_dollars", c.risk.max_order_dollars);
+    take(r, "max_turnover_dollars_per_day", c.risk.max_turnover_dollars_per_day);
+    take(r, "max_entry_horizon_hours", c.risk.max_entry_horizon_hours);
+    take(r, "add_min_edge", c.risk.add_min_edge);
+    take(r, "add_edge_improvement", c.risk.add_edge_improvement);
+    take(r, "add_cooldown_seconds", c.risk.add_cooldown_seconds);
+    take(r, "auto_additions", c.risk.auto_additions);
+    take(r, "kelly_min_samples", c.risk.kelly_min_samples);
+    take(r, "uncalibrated_max_order_frac", c.risk.uncalibrated_max_order_frac);
     take(r, "max_disagreement", c.risk.max_disagreement);
     take(r, "ladder_min_edge", c.risk.ladder_min_edge);
     take(r, "instant_edge", c.risk.instant_edge);
@@ -80,6 +91,18 @@ Config load_config(const std::string& path) {
       }
     }
   }
+  // The cross-venue fair (Polymarket US book on matched game markets) is on unless the config
+  // says otherwise; it covers nothing until Polymarket is configured and a pair is found.
+  if (!c.strategy_modes.count("xvenue")) c.strategy_modes["xvenue"] = "manual";
+  // Same for the 15-minute commodity models. A strategy with no mode is "off", and an off
+  // strategy is skipped before prepare(), so leaving these unlisted would run the settlement
+  // socket, record the feed, and price nothing - a feature that looks installed and is not. They
+  // are manual here and manual in the router's model_routes: offered, never sent.
+  for (const char* m : {"commodity_terminal_gold", "commodity_terminal_silver",
+                        "commodity_terminal_wti", "commodity_terminal_natgas",
+                        "commodity_terminal_copper"})
+    if (!c.strategy_modes.count(m)) c.strategy_modes[m] = "manual";
+  if (j.contains("systematic") && j["systematic"].is_object()) c.systematic_settings = j["systematic"];
   if (j.contains("params") && j["params"].is_object()) {
     for (auto& [k, v] : j["params"].items()) c.strategy_params[k] = v;
   }
@@ -87,6 +110,7 @@ Config load_config(const std::string& path) {
   c.db_path = expand_home(c.db_path);
   if (c.env != "demo" && c.env != "prod") throw std::runtime_error("env must be demo or prod");
   if (c.poll_seconds < 1) c.poll_seconds = 1;
+  if (c.market_data_max_age_seconds < 0) c.market_data_max_age_seconds = 0;
   return c;
 }
 
@@ -97,6 +121,7 @@ json config_to_json(const Config& c) {
          {"db_path", c.db_path},
          {"http_port", c.http_port},
          {"poll_seconds", c.poll_seconds},
+         {"market_data_max_age_seconds", c.data_max_age()},
          {"bankroll_dollars", c.bankroll_dollars},
          {"watch_series", c.watch_series},
          {"strategies", c.strategy_modes},
@@ -106,11 +131,21 @@ json config_to_json(const Config& c) {
            {"max_cluster_frac", c.risk.max_cluster_frac},
            {"max_open_frac", c.risk.max_open_frac},
            {"daily_loss_stop_frac", c.risk.daily_loss_stop_frac},
+           {"daily_loss_stop_enabled", c.risk.daily_loss_stop_enabled},
            {"min_edge_maker", c.risk.min_edge_maker},
            {"min_edge_taker", c.risk.min_edge_taker},
            {"sigma_mult", c.risk.sigma_mult},
            {"min_price", c.risk.min_price},
            {"proposal_ttl_seconds", c.risk.proposal_ttl_seconds},
+           {"max_order_dollars", c.risk.max_order_dollars},
+           {"max_turnover_dollars_per_day", c.risk.max_turnover_dollars_per_day},
+           {"max_entry_horizon_hours", c.risk.max_entry_horizon_hours},
+           {"add_min_edge", c.risk.add_min_edge},
+           {"add_edge_improvement", c.risk.add_edge_improvement},
+           {"add_cooldown_seconds", c.risk.add_cooldown_seconds},
+           {"auto_additions", c.risk.auto_additions},
+           {"kelly_min_samples", c.risk.kelly_min_samples},
+           {"uncalibrated_max_order_frac", c.risk.uncalibrated_max_order_frac},
            {"max_disagreement", c.risk.max_disagreement},
            {"ladder_min_edge", c.risk.ladder_min_edge},
            {"instant_edge", c.risk.instant_edge},

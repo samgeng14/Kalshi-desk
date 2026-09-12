@@ -1,5 +1,7 @@
 #include "desk/hedge.h"
 
+#include "desk/edge.h"
+
 #include <algorithm>
 #include <cmath>
 
@@ -99,8 +101,9 @@ HedgePlan plan_hedge(Store& store, const Config& cfg, const std::string& event_t
       bool yes = std::string(side) == "yes";
       // Taker prices: a hedge that does not fill is not a hedge. (The maker price one tick
       // inside is reported in the note so you can post it instead when there is time.)
-      double px = yes ? m->yes_ask : (m->no_ask > 0 ? m->no_ask : (m->yes_bid > 0 ? 1.0 - m->yes_bid : 0));
-      double avail = yes ? m->yes_ask_size : m->yes_bid_size;   // NO ask rests on the YES bid
+      const MarketSidePrices touch = normalize_prices(*m);   // NO ask = 1 - YES bid, resting on the YES bid
+      double px = touch.ask(yes ? Side::Yes : Side::No);
+      double avail = touch.ask_size(yes ? Side::Yes : Side::No);
       if (px <= 0 || px >= 1) continue;
       if (px < cfg.risk.min_price || px > 1 - cfg.risk.min_price) continue;
       double max_n = std::floor(budget / px);

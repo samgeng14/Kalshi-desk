@@ -10,7 +10,7 @@
 namespace desk {
 
 inline bool is_exit_strategy(const std::string& strategy) {
-  return strategy == "exit" || strategy == "target" || strategy == "stop";
+  return strategy == "exit" || strategy == "target" || strategy == "stop" || strategy == "sys_exit";
 }
 
 class Executor {
@@ -19,12 +19,14 @@ class Executor {
 
   // Places the order described by the proposal. Updates the proposal row.
   // Returns the exchange order id. Throws on rejection (proposal marked failed).
-  std::string submit(Proposal& p);
+  std::string submit(Proposal& p, const std::string& client_order_id = "", long long deadline = 0);
   json cancel(const std::string& order_id);
   // Flatten (part of) a position with an immediate-or-cancel order at the touch.
   json close_position(const std::string& ticker, double count = 0);
   // A hand-entered order from the dashboard. Logged as a proposal from strategy "ticket".
-  Proposal ticket(const OrderRequest& req, const std::string& note);
+  // `decision_id` links it to the router decision it was approved from (decision_log.h).
+  Proposal ticket(const OrderRequest& req, const std::string& note, long long deadline = 0,
+                  const std::string& decision_id = "");
 
   // Reduce-only model exit, target, or stop for an existing position: sells our side as a
   // maker (post-only GTC) or taker (IOC). Never adds risk, so the entry caps do not apply.

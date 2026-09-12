@@ -71,6 +71,54 @@ definition (daily settlement price of the named contract, not last trade).
 **COMM-2 · EIA inventory markets vs the API print.** The API Tuesday number predicts the EIA
 Wednesday surprise; weekly inventory brackets do not fully adjust after the API print.
 
+### The 15-minute terminal-price model (registered 2026-09-11, before any result)
+
+Four hypotheses about Kalshi's 15-minute gold, silver, WTI and natural-gas contracts, written
+down before the model they test had scored a single settled window. The test for each is fixed
+here so that it cannot be chosen after seeing the answer. Nothing below reports a result; each
+says what would count as one and what sample it needs first. The settlement mechanics they all
+depend on are in `docs/commodity-settlement.md`; the replay is `research/commodity_terminal.py`.
+
+**COM-1 · The terminal distribution beats the market.** A zero-drift lognormal distribution of
+the settlement reference at the window's close — built from the exchange's own published
+reference value and a short-horizon realized volatility — scores a lower Brier on settled
+contracts than the contemporaneous Kalshi mid. Everything else here rests on this one: if the
+market is better calibrated, there is no mispricing to trade and COM-2 to COM-4 fall with it.
+Data: `commodity_reference` (the settlement feed recorded tick by tick, with our receipt times),
+`quotes` for the four 15M series, settlements. Test: replay with no look-ahead — every
+probability uses only observations stamped at or before its own quote — then paired Brier
+(model − market) with a bootstrap CI on the difference, log loss, and calibration by model-p
+decile. **≥ 400 settled contracts across ≥ 2 underlyings** before anything is called supported;
+an interval containing zero is inconclusive, not encouraging.
+
+**COM-2 · Far strikes are overpriced at short horizon.** Contracts beyond about 1.5σ of the move
+still to come trade above the terminal distribution's probability — the longshot bias at a
+fifteen-minute horizon — so the cheap side of a far strike is positive expectation after the
+taker fee. Test: buckets of |distance in σ| (0–0.5, 0.5–1, 1–1.5, 1.5–2.5, 2.5+), each bucket's
+mean executable price against its realized settle rate with binomial CIs, then the net return of
+taking the cheap side at the ask, fee included. ≥ 200 settled contracts per bucket, and only
+where the book was deep enough to have filled.
+
+**COM-3 · Kalshi lags a sudden move in the reference.** After the reference moves ≥ 1 one-minute
+σ, the Kalshi mid takes seconds to reprice, and in that window the model leads the market rather
+than following it. Data: tick-resolution `commodity_reference` and top-of-book at 1 s or better,
+both stamped with **our** receipt times, so a lag we measure cannot be a lag we caused. Test:
+event study in event time (mid response at 1 s, 5 s, 15 s, 60 s; lead-lag cross-correlation of
+model p against the mid), then markout on the trades the model would have taken inside the
+window, net of fees. It fails if the lead disappears once our own feed latency is subtracted.
+
+**COM-4 · Ladder-implied vol exceeds realized vol.** The volatility implied by a whole window's
+strike ladder is above the volatility the reference realizes over that window — COM-2 read off
+the curve instead of off single strikes. Data: full ladder mid snapshots per window and
+`commodity_reference` over the same window. Test: fit one σ per window by least squares on the
+ladder mids with drift held at zero, compare with the window's realized σ, paired over ≥ 200
+windows per underlying; then simulate selling the tails at the bid, fee included, to see whether
+the gap is reachable or only visible.
+
+What this model deliberately is not: it does not predict direction, it has no machine learning in
+it, and it has no path to unattended execution in this session. `mu` is zero by construction. It
+is a baseline whose only job is to say whether Kalshi misprices the terminal distribution at all.
+
 ## Climate and Weather
 
 **WX-1 · Same-day highs: observed max + remaining forecast.** After 1pm local, the observed
@@ -255,6 +303,352 @@ Sports, Elections, Politics, Culture, Tech & Science or Mentions. SPORT-1/2/3 co
 research (the collector keeps running in `research` mode); they cannot be traded from this
 account as it stands.
 
+## SPORT-STATE-1: the rate fit ran before the desk knew the match had started (2026-09-06)
+
+Not a hypothesis about the world, a defect in the desk. `SportsInplay::prepare()` fitted scoring
+rates in its second section and only ingested ESPN state in its fourth. On the first cycle after
+any restart the state map was therefore empty, and an empty map is indistinguishable from
+"before kick-off" if you only check `state != "pre"`.
+
+What happened. The desk restarted at 19:44 UTC, mid-match, during the Marseille-Paris FC half
+time (`ext_sports` shows a 536-second logging gap from 19:39:59 to 19:48:55). The fit read the
+book as pre-match and calibrated a full-match Poisson to prices that already contained a 1-2
+scoreline. `fair()` then applied the same goals a second time through the score term:
+
+| | lam_home | lam_away | model P(home) | market |
+|---|---|---|---|---|
+| before the restart | 1.900 | 1.238 | 0.185 | 0.205 |
+| after the restart  | 0.869 | 1.475 | 0.042 | 0.205 |
+
+Nothing happened in the match between those two rows. The 50% market blend halved the error and
+still left a 13.7-cent "edge" on the board, on which 8 contracts were bought at 0.79 whose true
+edge was about +0.002. Worse, the contaminated rates were written to `kv` as
+`lam:KXLIGUE1GAME-26SEP06OLMPAR = 0.87,1.48,pre` - tagged pre-match, so they would have survived
+every later restart as though they were clean.
+
+An earlier diagnosis in the trading log blamed ESPN reporting a `"halftime"` state that the code
+did not recognise. That was wrong, and fixtures captured on 2026-09-06 (`tests/fixtures/espn/`)
+say so: ESPN's `type.state` is only ever `pre`/`in`/`post`, and half time arrives as
+`state="in"`, `type.name="STATUS_HALFTIME"`, `period=1`, `displayClock="45'+3'"`. The state field
+was never the problem; the ordering was.
+
+Fixed by making the lifecycle explicit rather than inferred:
+
+- `MatchPhase` (unknown, prematch, first_half, halftime, second_half, stoppage, finished,
+  suspended) derived from the provider's status block. Missing or unrecognised data maps to
+  `unknown`, which is never `prematch`.
+- `prepare()` ingests and settles the phase before any fitting.
+- No calibration without fresh, first-hand state. A phase restored from `match_state` across a
+  restart proves the match is under way - which keeps the pre-match branch shut - but cannot
+  itself authorise a fit.
+- Only a genuine pre-match fit is persisted as this match's rates.
+- Every fit records its provenance in `rate_fits`: calibration (prematch/inplay), phase, minute,
+  score, the three calibration prices, the rates, the residual, and whether it converged.
+- Convergence is checked against the same snapshot the fit consumed. A fit that cannot reproduce
+  its own calibration prices within `fit_tolerance` (0.02) is logged and never traded.
+- An in-play calibration reproduces the book by construction, so it carries no independent
+  information at its calibration point. `fair()` marks such a fair research-only until the score
+  moves or `inplay_min_progress` (5 minutes) of clock has run.
+
+Also fixed while capturing fixtures: `x["status"].value("period", 0)` threw on every scheduled
+fixture, because ESPN sends `"period": null` before kick-off and nlohmann's `value()` throws on a
+key that is present but of the wrong type. Ingest for not-yet-started matches was aborting.
+
+This closes no hypothesis. It means the SPORT-1/2/3 in-play sample collected before 2026-09-06
+contains fairs computed from contaminated rates wherever a restart crossed a live match, and
+that sample should be filtered by `rate_fits` provenance before anything is concluded from it.
+
+## WX-SETTLE-1: the desk is modelling the right station, and correcting it wrongly (2026-09-06)
+
+Two questions, because Kalshi moved its weather settlement to The Weather Company on 2026-08-27
+and the rules stopped naming the National Weather Service.
+
+**Is the target right?** Yes. Intersecting the settled brackets for each station-day pins the
+value Kalshi used to a one-degree interval; the NWS daily climate report for the same date falls
+inside it at all six cities on 2026-09-05 (CLIAUS 100, CLIMDW 83, CLINYC 79, CLIMIA 92, CLIPHL 84,
+CLILAX 81). TWC's number is the NWS single-station maximum, at least here. Six station-days on one
+date is evidence, not proof, and the announcement explicitly reserves the right to derive a value
+"from several observation sources", so this needs to become a standing check rather than a spot
+one. Full detail in docs/settlement.md.
+
+**Is the correction right?** No. The desk reads the hourly observation series and the settled value
+comes from the continuous sensor record, so the desk's running maximum is biased low. The model
+carried one global distribution for that gap - +0 63%, +1 31%, +2 6% - with a comment claiming 210
+settled station-days behind it. There were none. It was fitted from which brackets won, and a
+winning two-degree bracket is an interval-censored observation: it says the settled value lay in a
+range, never what it was.
+
+Measured properly, against the climate report itself (research/wx_settle_basis.py, 17 station-days):
+
+| product | days | reports/day | mean shift |
+|---|---|---|---|
+| CLINYC | 7 | 38 | +0.87 F |
+| CLIMIA / CLIMDW / CLILAX / CLIPHL | 2 each | 250 | +0.60 / +0.31 / +0.24 / +0.20 |
+| CLIAUS | 2 | 250 | -0.24 F |
+
+The gap is not a constant of the weather. It is the chance the hourly series missed the day's peak,
+which belongs to the station's reporting frequency: Central Park files about 38 observations a day
+against an airport's 250, and needs roughly four times the correction. A single global constant is
+wrong in both directions at once, and in markets whose brackets are one or two degrees wide that is
+not a rounding detail.
+
+The shift is now per station and configurable. Both values are provisional - ten airport
+station-days and seven at Central Park cannot support the tails, and api.weather.gov serves only
+about a week of climate products, so the sample cannot be extended backwards from this source.
+Session 3's recorder grows it; session 4 refits it.
+
+Separately, a series whose rules nobody has read is now research-only in code, on that ground
+alone. KXHIGHHOU, KXDENHIGH, KXHIGHTNYC and KXHIGHTCHI currently qualify.
+
+## REPLAY-1: no execution study has ever been possible on this desk (2026-09-07)
+
+Three facts, found while building the recorder.
+
+**The `books` table has never held a row.** It is created at startup and nothing writes to it;
+order books were only ever fetched on demand for the dashboard and thrown away. Across both
+databases, zero rows. So at no decision point in this desk's history was there a recorded book,
+and no study of what would have filled can be built from the past. That cannot be repaired
+retroactively.
+
+**The quote history is 32 hours long.** Two million rows, but spanning 2026-09-05 18:26 to
+2026-09-07 02:19, top-of-book only, sampled about once a minute. Enough for a conservative
+top-of-book fill model going forward; not depth, and not history.
+
+**The weather studies cannot be reproduced.** WX-1b, WX-1c and WX-1d read `hist_markets` and
+`hist_trades`. Neither table exists in either database any more. Their conclusions are written
+down here as settled and nobody can re-run them.
+
+### What this changes about WX-1b, WX-1c and WX-1d
+
+Their Brier comparisons stand. The market beat the model at every hour and a day out, and that is
+a calibration result which needs only prices and outcomes.
+
+Their **return columns do not stand**, and should not be quoted. Those numbers came from taking
+the decision at hour h and filling at the next print on our side within the following three hours.
+A print three hours later is not evidence that an order submitted at hour h would have filled: it
+is evidence somebody traded later, possibly at a price that moved because the thing being
+predicted had become clearer. The trade simulation was hindsight-contaminated in a direction that
+cannot be signed without the data that no longer exists.
+
+This does not reverse the weather conclusion. It removes one of the two legs it was standing on.
+The calibration leg alone is still enough to keep those models research-only.
+
+### What is recorded now
+
+An `observations` table that keeps four times apart instead of collapsing them into one:
+
+| | |
+|---|---|
+| `valid_ts` | the time the value is about |
+| `init_ts` | the model cycle a forecast came from - **not** when it could be read |
+| `published_ts` | when the provider made it available; 0 means unknown, which is not zero lag |
+| `received_ts` | when this desk actually had it, the only clock a live decision could use |
+
+`ReplayCursor` serves rows by one of those clocks and has no way to be asked for anything later.
+It counts what it withheld, so a replay can show it was offered the future and refused. It will
+not run backwards. Under the published-time basis a row with unknown publication is withheld
+rather than assumed instant, which is the specific mistake that turns NOAA's 12Z label into an
+hour and a half of hindsight.
+
+`Engine::record_books()` now snapshots the order book under every pending proposal and open
+position, capped at twenty per cycle. Bounded on purpose: the book that matters later is the one a
+decision was standing on, not all 2,192.
+
+Studies must declare themselves prediction-only or execution (`research/execution.py`), and an
+execution claim needs a fill inside a stated latency budget with the unfilled share reported
+next to it. `wx_evening.py` and `wx_dayahead.py` are relabelled prediction-only.
+
+## RISK-1: the desk could not explain its own cash, and a quarter of the account is invisible (2026-09-07)
+
+Found while making the risk book authoritative. Two separate faults, one of which changed the
+answer to a question Sam asked directly.
+
+**The desk cannot see $25 of a $110 account.** On 2026-09-06 at 07:35 UTC, $25 moved to a
+margined exchange instance. `/portfolio/balance` returns the sum of exchange shards 0-3, and that
+instance is not among them: shard balances total $81.23 and `account.balance` is $81.23 to the
+cent. So every equity figure, the daily stop, and every position cap has been computed on 77% of
+the account, with no indication that the rest exists. `daily_equity` now reports
+`untracked_transferred` and the engine says so out loud.
+
+Whether that $25 is intact cannot be determined from here. All-time P&L is +$0.30 if it is and
+-$24.70 if it is not, and the desk has no way to tell the difference. That is the finding.
+
+**Cash reconciliation was impossible because closes were counted as purchases.** A Kalshi binary
+pair nets: buying YES while holding NO on the same ticker closes the position and returns $1 of
+collateral per contract immediately. Treating that as a purchase leaves the balance short by the
+released collateral. Reconciling 2026-09-06 naively left **$46.00 unexplained**, which happened to
+equal that day's settlement revenue exactly and so looked like a double count. With netting
+modelled properly:
+
+```
+opens (cost)        52.78      settlement revenue   46.00
+offsetting closes   46 contracts, $46.00 released
+fees                 1.19      cashflows           -25.00
+predicted cash move            -18.70
+actual cash move               -18.70
+UNEXPLAINED                      0.00
+```
+
+`reconcile_cash()` does this at runtime over the trading day and `daily_equity` carries the
+residual. A balance the desk cannot account for no longer passes silently into the stop.
+
+**Correction to the trading log.** On the evening of 2026-09-06 this desk was told its day was
+-$17.06 and its all-time -$26.78. Both were wrong, and wrong the same way: they subtracted the
+$25 transfer from equity without recognising it had also left the balance being measured. The
+day was **+$10.02** and all-time is flat to within a dollar if the transferred $25 is intact. The
+header figure that prompted the question was right and the correction offered against it was not.
+
+## RISK-2: two contracts with different names were treated as opposite sides (2026-09-07)
+
+On 2026-09-06 the desk held 7 Paris YES and then bought 8 Marseille NO in the same match. Those
+are not opposite sides of anything. Paris YES pays if Paris wins; Marseille NO pays on a draw or
+a Paris win. One outcome set contains the other, so the two legs win together in two states and
+lose together in the third. The worst case went from $1.55 to $7.89 and the guard allowed it.
+
+The guard asked: does the new leg pay in **any** state where the book is already at its worst? It
+does - Marseille NO pays on a draw, and a draw was one of two equally bad states. So it passed.
+
+The question it should have asked is the one the plan states: what happens to the worst case?
+
+| | worst case | added cost | bought back |
+|---|---|---|---|
+| Paris YES, then Marseille NO | $1.55 -> $7.89 | $6.34 | **$0.00** |
+| Paris YES, then Paris NO | $1.55 -> $0.05 | $5.55 | $7.05 |
+
+`stack_check()` now compares the worst case before and after, and reports how much of the new
+leg's cost was bought back. A leg whose full cost lands on the worst case has no state in which it
+pays while the book is losing: it is the same bet again, whatever the two contracts are called.
+
+Two consequences worth stating, because both look like bugs and are not:
+
+**When two states tie for worst, no single leg can hedge.** A lone Paris position loses equally on
+a Marseille win and on a draw. Covering one deepens the other by the whole cost. To cover two
+states you have to buy in two of them, or buy the leg that pays in both - Paris NO. The old test
+suite asserted that a single opposing bracket was a hedge; it was not, and the state it deepened
+on 2026-09-05 is the one that settled.
+
+**A three-way match is exhaustive even though it has no strikes.** `event_structure` proved
+exhaustiveness by showing brackets tile the number line, which a 1X2 market cannot do. Without it
+the book carried a "nothing settles yes" state that cannot happen, and in that phantom state every
+leg loses - which makes every genuine hedge look like it buys nothing back. A match settled on the
+result after ninety minutes plus stoppage ends home, draw or away, so `soccer_90` events with
+three markets are now exhaustive by construction.
+
+Also closed: hand tickets used to skip the stacking check outright ("Tickets can override"). They
+still are not blocked, because a ticket is a deliberate act, but the check now runs and the result
+is written to the event log. A manual click can still concentrate an event; it can no longer do it
+without anything saying so.
+
+## RISK-3: no model on this desk has earned Kelly sizing (2026-09-07)
+
+Kelly answers "how much should I bet given this probability" and is worth exactly what the
+probability is worth. The desk sized every proposal with quarter-Kelly regardless, which means an
+unvalidated estimate was allowed to ask for a large allocation on its own say-so.
+
+The gate is now: a strategy is sized by Kelly only once it has logged at least 200 fairs on
+markets that have since settled, and scored a Brier no worse than the market mid it was quoting
+against on those same markets. That is a paired comparison against the only opponent that matters
+- a model can be well calibrated in absolute terms and still be strictly worse than the price.
+
+Run against the live database on 2026-09-07:
+
+| strategy | settled samples | Brier, model | Brier, market | sized by |
+|---|---|---|---|---|
+| `crypto_lognormal` | 4,292 | 0.1058 | **0.1009** | flat cap |
+| `sports_live` | 626 | 0.0834 | **0.0723** | flat cap |
+| `weather_nws` | 344 | 0.2946 | **0.1591** | flat cap |
+| `sports_inplay` | 125 | 0.2587 | **0.2339** | flat cap |
+
+**Every model on the desk is worse calibrated than the price it trades against.** All four fall
+back to a flat cap of 2% of bankroll per order. `ladder_arb` is exempt, because a locked basket
+does not rest on an estimate at all, and hand tickets are the operator's own decision.
+
+`crypto_lognormal` is the closest, 5% worse in relative terms over 4,292 settled markets, which is
+the one worth trying to close. `weather_nws` is 85% worse, which is the same verdict WX-1b, WX-1c
+and WX-1d reached by three other routes.
+
+Also added, so that every entry path meets the same limits: a per-order cap ($10 default, the
+outermost check, refused before anything portfolio-shaped is consulted) and a daily turnover cap
+($100 default). Turnover is a limit in its own right rather than a proxy for exposure: the taker
+fee is 7% of p(1-p) each way, so round-tripping a position is the reliable way to lose money
+slowly while every individual trade still looks fair.
+
+## EXEC-1: the desk could not close a position, and killed itself trying (2026-09-07)
+
+Found while checking why the universe had not rolled over: it had not rolled over because the
+desk stopped running at 03:29, and it stopped because it had killed itself thirteen minutes
+earlier.
+
+```
+09-06 19:35  EXIT REJECTED KXMLBGAME-26SEP061340SFNYM-SF
+09-06 19:52  EXIT REJECTED KXMLBGAME-26SEP061340SFNYM-SF
+09-07 01:47  EXIT REJECTED KXNCAAFGAME-26SEP06LOUMISS-MISS  -> KILL
+09-07 03:16  EXIT REJECTED KXNCAAFGAME-26SEP06LOUMISS-MISS  -> KILL
+   {"code":"invalid_order","details":"reduce_only can only be used with IoC orders"}
+```
+
+Two independent faults, either of which alone would have been survivable.
+
+**The order was malformed.** `submit_exit` set `reduce_only` on every exit and chose
+`good_till_canceled` for maker-style ones. Kalshi accepts `reduce_only` only on
+immediate-or-cancel orders, so every resting exit was refused on sight. The `close()` path happens
+to pair `reduce_only` with IoC and works, which is why closing by hand always worked and the
+automated exit never did. This is the plan's own warning about confirming exchange semantics
+rather than trusting a local label, arriving as a live incident.
+
+**The refusal killed the desk.** A rejected order trips the kill switch, on the reasoning that the
+desk and the exchange disagreeing about what is allowed means nothing more should go out until a
+human looks. That is right for an entry and exactly backwards for an exit: it stops the machinery
+that was trying to close a position and leaves the position open. The desk then sat dead for nine
+and a half hours holding 5 short NCAAF contracts it had been trying to sell.
+
+Fixed both ways. A resting exit no longer carries the exchange flag - the protection is enforced
+locally instead, by sizing the order to the position that exists at submit time and cancelling
+anything still resting in the kill sweep - and the proposal note records that the guarantee is
+local rather than exchange-enforced. A refused exit now marks the proposal failed, logs that the
+position is still open, and continues; only a refused entry still kills.
+
+The kill switch was still on when this was found, and `sports_live` had been switched to `auto`
+at 00:33, so the desk was unattended, killed, and holding.
+
+## EXIT-1: what a position cost is not an argument for keeping it (2026-09-07)
+
+Sam asked, of a Sassuolo position: what is a good place to exit, how much to take profit. The
+honest answer is that "take profit" is the wrong frame, and the desk had no function that said so.
+
+A $1 binary settles at $1 if the side held wins, so the expected settlement value of a position is
+the probability of that times the size. What selling returns is the executable bid times the size,
+minus the fee the sale itself costs. Holding is worth doing when the first exceeds the second.
+That is the whole comparison.
+
+The entry price is in neither number. It fixes the profit that gets reported and says nothing
+about whether holding from here is attractive. The plan puts it exactly: a bid of $0.72 means
+opposite things at a fair value of $0.66 and $0.85, and in neither case does it matter whether the
+contracts were bought at $0.20 or $0.90.
+
+`exit_decision()` makes that comparison and explains itself in a sentence per position:
+
+| fair | bid | per contract | action |
+|---|---|---|---|
+| 0.66 | 0.72 | -0.045 | **close** - the market is paying more than the position is worth |
+| 0.70 | 0.72 | -0.006 | **reduce** - close to fair, take part off |
+| 0.85 | 0.72 | +0.144 | **hold** - selling gives away the reason for holding |
+
+Three cases that are not the arithmetic, and matter more:
+
+- **A stale model must not force a liquidation.** A number too old to enter on is too old to sell
+  on. The position is frozen and additions stop; it is not dumped.
+- **No model is not a reason to sell.** An uncovered market returns `unpriced` and holds, rather
+  than acting on the absence of information.
+- **A one-cent bid is not an exit.** Below `min_bid` there is no exit at any price, whatever the
+  model thinks, and saying so is more useful than a technically-executable giveaway.
+
+Every position in the risk book now carries its action and the sentence behind it. What remains
+from session 6 is the trigger side: a goal, a card or a VAR correction should force a
+reassessment and invalidate decisions made under the previous state, and the replay comparing
+hold-to-settlement against fixed take-profit against advantage-gone needs the recorded sample
+that started accumulating today.
+
 ## How a hypothesis becomes a strategy
 
 1. Write the fair-value function (`fair(market) → p, sigma`) and its data fetch in `prepare()`.
@@ -262,3 +656,76 @@ account as it stands.
    have traded by hand; the queue is the record.
 3. Read the by-strategy row in the gate report. Move to `bot` only when the CI excludes zero,
    then lower `market_weight`.
+
+---
+
+# Results, 2026-09-11
+
+Run `python3 scripts/test_hypotheses.py`. Only one of the 23 could be answered from what the desk
+had recorded; the rest are blocked on data, and the section after this says what to do about that
+rather than leaving it as an excuse.
+
+## LONGSHOT (the executable core of SPORT-3, FIN-2 and the tail half of CRYPTO-3): rejected except in the last minutes
+
+The claim: contracts priced in single digits settle YES less often than their price implies, so
+selling them pays after fees. Tested as the trade actually available — sell YES on every leg of an
+event whose mid sits between 2c and 10c, as a taker, held to settlement.
+
+| price taken | legs | events | priced | settled YES | P&L per event | 95% CI | return on capital |
+|---|---:|---:|---:|---:|---:|---|---:|
+| at the close | 885 | 134 | 0.0334 | 0.0113 | +0.0501 | [+0.0050, +0.0952] | +0.77% |
+| 5 min before | 825 | 132 | 0.0345 | 0.0109 | +0.0575 | [+0.0144, +0.1007] | +0.94% |
+| 15 min before | 763 | 132 | 0.0380 | 0.0183 | +0.0266 | [−0.0268, +0.0799] | +0.47% |
+| **30 min before** | 687 | 126 | 0.0425 | 0.0393 | **−0.0688** | **[−0.1368, −0.0009]** | **−1.30%** |
+
+Thirty minutes before the close a 4.25c contract settles YES 3.93% of the time. **The price is
+right.** The apparent edge appears only inside the last few minutes and it is the book lagging an
+outcome that is already nearly decided, not a standing mispricing of longshots. At a 30-minute
+horizon the trade loses, with the whole interval below zero.
+
+Two things made the first cut of this look four times better, and both are worth naming because
+they are easy to repeat:
+
+- **The maker price.** Selling YES means lifting the NO offer at `1 - yes_bid`. Resting at
+  `1 - yes_ask` assumes a fill nobody promised, and turned +0.77% into +2.9%.
+- **No horizon.** Scoring at the last quote before settlement measures how fast the book updates,
+  not whether the price was wrong.
+
+What survives is small and awkward: under 1% on capital, tied up until expiration, available only
+in the final minutes of a market, where you are the one crossing a thin spread. It is not a
+strategy. It is a reason to look at where the book is slowest.
+
+## What blocks the other 22, and what to do
+
+The binding constraint is **not sources, it is time**: `quotes` reaches back to 2026-09-05. Six
+days. Every hypothesis that needs a price at a horizon before settlement is starved of history,
+and waiting is the slowest possible fix when the exchange gives the past away.
+
+`scripts/backfill_kalshi_history.py` takes it: per series, every settled market with its outcome,
+and the public trade prints across each market's whole life, into a separate `data/research.sqlite`.
+Trade prints are better than the desk's own quotes for this, because they are executions rather
+than a book the desk happened to be watching.
+
+```
+python3 scripts/backfill_kalshi_history.py --discover Crypto --max-markets 2000
+python3 scripts/backfill_kalshi_history.py --series KXNFLGAME KXNBAGAME KXMLBGAME KXNCAAFGAME
+```
+
+That unblocks, with no new source at all: SPORT-3, FIN-2, SCI-1, CO-1 (the priced half), CRYPTO-2,
+CRYPTO-3, WX-1, WX-2, COMM-1 and TRANS-1.
+
+Still needing an outside source, none of them paid:
+
+| hypothesis | needs | where |
+|---|---|---|
+| SPORT-2 | de-vigged closing line | The Odds API free tier, 500 requests a month |
+| ECON-1 | inflation nowcast | Cleveland Fed, public CSV |
+| ECON-2 | rate probabilities | CME FedWatch |
+| TRANS-1 | checkpoint counts | TSA publishes a daily table |
+| COMM-2 | weekly inventories | EIA open data API |
+
+Needing data that must be recorded going forward and cannot be backfilled at all: MICRO-1,
+SPORT-4 and WX-3 all turn on **receipt** times — when this desk learned a thing, against when it
+happened. `include/desk/record.h` already carries the four-timestamp provenance for exactly this;
+it is not yet wired into the book recorder. Until it is, any claim about reacting faster than the
+market is untestable in principle, not just unmeasured.

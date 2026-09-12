@@ -1,5 +1,9 @@
 #include "desk/executor.h"
 
+#include "desk/edge.h"
+#include "desk/reject.h"
+#include "desk/decision_log.h"
+
 #include <algorithm>
 #include <random>
 #include <set>
@@ -20,6 +24,12 @@ struct WriteWatermark {
   explicit WriteWatermark(Store& s):store(s) { store.kv_set("last_write_ts",std::to_string(now_s())); }
   ~WriteWatermark() { try { store.kv_set("last_write_ts",std::to_string(now_s())); } catch (...) {} }
 };
+// Kalshi answers a refused request with {"error":{"code":...,"message":...}}. A body without
+// that shape (an HTML page, an empty body) came from something in between, not the exchange.
+bool kalshi_error_body(const std::string& body) {
+  const json j = json::parse(body, nullptr, false);
+  return !j.is_discarded() && j.is_object() && j.contains("error") && j["error"].is_object();
+}
 }
 
 static std::string uuid4() {
@@ -36,7 +46,7 @@ static std::string uuid4() {
 Executor::Executor(const Config& cfg, Store& store, KalshiClient& client)
     : cfg_(cfg), store_(store), client_(client) {}
 
-std::string Executor::submit(Proposal& p) {
+std::string Executor::submit(Proposal& p, const std::string& client_order_id, long long deadline) {
   if (p.strategy == "close") throw std::runtime_error("A close proposal cannot be approved as new entries; use the reduce-only Close path");
   if (is_exit_strategy(p.strategy)) return submit_exit(p);
   if (!client_.authenticated()) throw std::runtime_error("no API key configured; cannot submit");
@@ -46,9 +56,19 @@ std::string Executor::submit(Proposal& p) {
   store_.upsert_series(client_.get_series_one(market.series_ticker));
   refresh_account();
   validate_entry(store_, cfg_, p, market);
-  // Fresh from the exchange: never add to or flip a position from a strategy proposal (the
-  // engine's own check reads a snapshot that can be up to a reconcile interval old).
-  if (p.strategy != "ticket") {
+  // A post-only price the book has already moved through would be refused by the exchange as
+  // "post only cross". Say so here, from the book just read, as the soft refusal it is: nothing is
+  // sent and nothing about the desk is wrong; the caller re-prices from a fresh book.
+  if (p.exec_style == "maker") {
+    const double ask = normalize_prices(market).ask(side_from(p.outcome_side));
+    if (ask > 0 && ask < 1 && p.price >= ask - 1e-9)
+      throw SoftRejection(RejectClass::SoftMarketState,
+                          "book moved: a post-only " + p.outcome_side + " bid at " + fmt2(p.price) +
+                              " would cross the " + fmt2(ask) + " offer; not sent");
+  }
+  // Fresh from the exchange: an ordinary strategy proposal never silently adds to or flips a
+  // position. Qualified additions and verified hedges were classified by entry_context above.
+  if (p.entry_kind != "addition" && p.entry_kind != "hedge") {
     for (const auto& pos : store_.positions())
       if (pos.ticker == p.ticker && pos.position != 0)
         throw std::runtime_error("position already open in " + p.ticker + "; entries never add to or flip it");
@@ -67,31 +87,51 @@ std::string Executor::submit(Proposal& p) {
     reserved += o.remaining_count * px + FeeModel::from_series(*os).fee(px, o.remaining_count, false);
   }
   double available = std::max(0.0, sb.balance - reserved);
+  if(p.strategy!="ticket")available=std::max(0.,available-shard_cash_view(store_,market,now_s()).value("queued_reserved",0.));
   if (cost > available + 1e-8) {
     // Kalshi keeps collateral per exchange shard: crypto and commodities on 2, some sports on 3.
     // A shard you have never funded refuses every order in its whole category, which is a strange
     // way to discover that MLB lives somewhere else. Move the shortfall from shard 0 and say so;
     // the transfer is asynchronous, so this order still does not go.
     std::string extra = ". Allocate collateral in Kalshi Account > Exchange indexes. No order sent.";
-    if (cfg_.risk.shard_topup_on_demand && market.exchange_index != 0 && client_.authenticated()) {
+    // Which shard has the money is a question, not an assumption. This used to move from shard 0
+    // and refuse to run at all when the target WAS shard 0, which is exactly backwards for an
+    // account whose cash has drifted elsewhere: on 2026-09-11 shard 0 held $0.25 against $65.29
+    // on shard 3, and every weather market on shard 0 was untradeable with a funded account.
+    // Ask every shard, move from the richest one that is not this one.
+    if (client_order_id.empty() && cfg_.risk.shard_topup_on_demand && client_.authenticated()) {
       long long now = now_s();
       std::string key = "ondemand_ts:" + std::to_string(market.exchange_index);
       long long last = std::stoll(store_.kv_get(key).value_or("0"));
       if (now - last >= 60) {
         store_.kv_set(key, std::to_string(now));
         try {
-          auto s0 = parse_balance(client_.call("GET", "/portfolio/balance", {{"exchange_index", "0"}}));
-          double keep = 5.0;                                  // never drain the default shard
+          const double keep = 5.0;            // never drain the shard being borrowed from
+          int from = -1;
+          double spare = 0;
+          for (int idx = 0; idx <= 3; ++idx) {
+            if (idx == market.exchange_index) continue;
+            double bal = 0;
+            try { bal = parse_balance(client_.call("GET", "/portfolio/balance",
+                                                  {{"exchange_index", std::to_string(idx)}})).balance; }
+            catch (const std::exception&) { continue; }   // a shard that will not answer is not a source
+            if (bal - keep > spare) { spare = bal - keep; from = idx; }
+          }
           double want = std::min(cfg_.risk.shard_topup_max, std::max(cost - available, 1.0) + 2.0);
-          double can = std::min(want, s0.balance - keep);
-          if (can >= 1.0) {
-            std::string id = client_.transfer_between_shards(0, market.exchange_index, can);
+          double can = std::min(want, spare);
+          if (from >= 0 && can >= 1.0) {
+            std::string id = client_.transfer_between_shards(from, market.exchange_index, can);
             store_.log_event("warn", "shard " + std::to_string(market.exchange_index) + " was short for " + p.ticker +
-                                         ": moved $" + fmt2(can) + " from shard 0 (transfer " + id + ")");
-            extra = ". Moved $" + fmt2(can) + " there from shard 0 (transfer " + id.substr(0, 8) +
-                    "); Kalshi settles that in a few seconds, so click again shortly. No order sent yet.";
+                                         ": moved $" + fmt2(can) + " from shard " + std::to_string(from) +
+                                         " (transfer " + id + ")");
+            extra = ". Moved $" + fmt2(can) + " there from shard " + std::to_string(from) + " (transfer " +
+                    id.substr(0, 8) + "); Kalshi settles that in a few seconds, so click again shortly. "
+                    "No order sent yet.";
+          } else if (from < 0) {
+            extra = ". No other shard has more than $" + fmt2(keep) + " to spare, so nothing was moved. "
+                    "No order sent.";
           } else {
-            extra = ". Shard 0 has only $" + fmt2(std::max(0.0, s0.balance - keep)) +
+            extra = ". The best other shard (shard " + std::to_string(from) + ") has only $" + fmt2(std::max(0.0, spare)) +
                     " to spare, so nothing was moved. No order sent.";
           }
         } catch (const std::exception& e) {
@@ -114,7 +154,18 @@ std::string Executor::submit(Proposal& p) {
   req.exchange_index = market.exchange_index;
   req.post_only = (p.exec_style == "maker");
   req.tif = (p.exec_style == "maker") ? "good_till_canceled" : "immediate_or_cancel";
-  req.client_order_id = uuid4();
+  req.client_order_id = client_order_id.empty() ? uuid4() : client_order_id;
+  if(deadline>0 && now_s()>=deadline)throw std::runtime_error("Manual review expired before exchange dispatch; no order sent");
+  // Every order leaves a snapshot of the probability and the book behind it (decision_log.h):
+  // the decision's own when it came from the router, one built here for a hand ticket.
+  record_order_snapshot(store_, p, market, p.strategy == "ticket" ? "ticket" : "entry", now_s());
+  store_.update_proposal(p);
+  if(!client_order_id.empty())store_.kv_set("manual_attempt:"+client_order_id,json{{"status","sending"},{"proposal_id",p.id}}.dump());
+  // The write watermark makes the next account read wait for the exchange to reflect this order.
+  // A definite refusal from Kalshi wrote nothing there, so the old watermark is put back (see the
+  // catch below) rather than making the next order, a re-priced retry say, wait out a write that
+  // never happened.
+  const auto prior_write = store_.kv_get("last_write_ts");
   try {
     WriteWatermark watermark(store_);
     OrderResponse r = client_.create_order(req);
@@ -137,6 +188,7 @@ std::string Executor::submit(Proposal& p) {
     o.remaining_count = r.remaining_count;
     o.created_time = now_iso();
     store_.upsert_order(o, p.id);
+    if(!client_order_id.empty())store_.kv_set("manual_attempt:"+client_order_id,json{{"status","submitted"},{"order_id",r.order_id},{"proposal_id",p.id}}.dump());
     LOG_INFO("submitted %s %s %s x%.2f @ %.2f -> %s (filled %.2f)", p.strategy.c_str(),
              p.outcome_side.c_str(), p.ticker.c_str(), req.count, req.price, r.order_id.c_str(),
              r.fill_count);
@@ -144,15 +196,32 @@ std::string Executor::submit(Proposal& p) {
                                  " @ " + fmt2(req.price) + (r.fill_count > 0 ? " filled " + fmt2(r.fill_count) : " resting"));
     return r.order_id;
   } catch (const ApiError& e) {
+    // Only a definite refusal from Kalshi itself (a 4xx carrying its {"error":{...}} body) puts
+    // the old watermark back. A 408, or a 4xx a proxy produced, does not prove nothing was
+    // written, so the watermark stays and the next account read waits as usual.
+    if (e.status >= 400 && e.status < 500 && e.status != 408 && kalshi_error_body(e.body)) {
+      if (prior_write) store_.kv_set("last_write_ts", *prior_write);
+      else store_.exec("DELETE FROM kv WHERE key='last_write_ts'");
+    }
     p.status = e.status >= 500 ? "unknown" : "failed";
+    if(!client_order_id.empty())store_.kv_set("manual_attempt:"+client_order_id,json{{"status",p.status},{"error",e.what()},{"proposal_id",p.id}}.dump());
     if(p.status=="unknown") store_.kv_set("uncertain_client_order_id", req.client_order_id);
-    p.note = std::string("api ") + std::to_string(e.status) + ": " + e.body.substr(0, 200);
+    if (p.status == "unknown") store_.kv_set("uncertain_since", std::to_string(now_s()));
+    const RejectClass cls = classify_rejection(e.status, e.body);
+    p.note = std::string("api ") + std::to_string(e.status) + " (" + reject_class_name(cls) + "): " + e.body.substr(0, 200);
     store_.update_proposal(p);
-    store_.log_event("error", "REJECTED " + p.ticker + " " + p.outcome_side + ": " + e.body.substr(0, 120));
+    // A market-state or collateral refusal is the market moving, not the desk being wrong; the
+    // event log says which, so a post-only cross never reads like a malformed order again.
+    if (reject_is_soft(cls) || cls == RejectClass::Retryable)
+      store_.log_event("warn", "NOT PLACED " + p.ticker + " " + p.outcome_side + " (" + reject_class_name(cls) + "): " + e.body.substr(0, 120));
+    else
+      store_.log_event("error", "REJECTED " + p.ticker + " " + p.outcome_side + " (" + reject_class_name(cls) + "): " + e.body.substr(0, 120));
     throw;
   } catch (const std::exception& e) {
     p.status="unknown"; p.note=std::string("Order outcome uncertain; reconcile before retry: ")+e.what();
+    if(!client_order_id.empty())store_.kv_set("manual_attempt:"+client_order_id,json{{"status","unknown"},{"error",e.what()},{"proposal_id",p.id}}.dump());
     store_.update_proposal(p); store_.kv_set("uncertain_client_order_id",req.client_order_id);
+    store_.kv_set("uncertain_since", std::to_string(now_s()));
     throw;
   }
 }
@@ -177,6 +246,8 @@ std::string Executor::submit_exit(Proposal& p) {
   if ((long_yes && p.outcome_side != "no") || (!long_yes && p.outcome_side != "yes"))
     throw std::runtime_error("exit side does not match the position");
   double n = floor_contracts(std::min(p.count, std::fabs(it->position)));
+  if (p.strategy == "target" || p.strategy == "stop")
+    n = std::min(n, manual_position_quantity(store_, *it));
   if (n < 0.01) throw std::runtime_error("exit quantity below 0.01");
   for (const auto& o : store_.orders("resting"))
     if (o.ticker == p.ticker)
@@ -191,10 +262,20 @@ std::string Executor::submit_exit(Proposal& p) {
   req.price = clamp_price(p.price, market.tick);
   req.count = n;
   req.exchange_index = market.exchange_index;
-  req.reduce_only = true;
+  // Kalshi accepts reduce_only only on immediate-or-cancel orders: a resting exit carrying it is
+  // refused outright with "reduce_only can only be used with IoC orders". That rejection killed
+  // this desk four times over 2026-09-06 and 07 while the position it was trying to close stayed
+  // open. A resting exit therefore goes without the flag, and the protection it would have given
+  // is enforced here instead - the order is sized to the position that exists right now, and the
+  // kill sweep cancels anything still resting.
   req.post_only = (p.exec_style == "maker");
   req.tif = (p.exec_style == "maker") ? "good_till_canceled" : "immediate_or_cancel";
+  req.reduce_only = (req.tif == "immediate_or_cancel");
+  if (!req.reduce_only && p.note.find("local reduce-only") == std::string::npos)
+    p.note += " | local reduce-only: resting exits cannot carry the exchange flag";
   req.client_order_id = uuid4();
+  record_order_snapshot(store_, p, market, "exit", now_s());
+  store_.update_proposal(p);
   try {
     WriteWatermark watermark(store_);
     OrderResponse r = client_.create_order(req);
@@ -225,6 +306,7 @@ std::string Executor::submit_exit(Proposal& p) {
   } catch (const ApiError& e) {
     p.status = e.status >= 500 ? "unknown" : "failed";
     if (p.status == "unknown") store_.kv_set("uncertain_client_order_id", req.client_order_id);
+    if (p.status == "unknown") store_.kv_set("uncertain_since", std::to_string(now_s()));
     p.note = std::string("api ") + std::to_string(e.status) + ": " + e.body.substr(0, 200);
     store_.update_proposal(p);
     store_.log_event("error", "EXIT REJECTED " + p.ticker + ": " + e.body.substr(0, 120));
@@ -234,6 +316,7 @@ std::string Executor::submit_exit(Proposal& p) {
     p.note = std::string("Exit outcome uncertain; reconcile before retry: ") + e.what();
     store_.update_proposal(p);
     store_.kv_set("uncertain_client_order_id", req.client_order_id);
+    store_.kv_set("uncertain_since", std::to_string(now_s()));
     throw;
   }
 }
@@ -243,19 +326,56 @@ json Executor::cancel(const std::string& order_id) {
   auto known = store_.query("SELECT ticker FROM orders WHERE order_id=?", {order_id});
   if (known.empty()) throw std::runtime_error("Order ticker unavailable; sync before canceling");
   WriteWatermark watermark(store_);
-  json r = client_.cancel_order(order_id, known[0]["ticker"].get<std::string>());
-  store_.log_event("info", "canceled " + order_id.substr(0, 8));
   auto rows = store_.query("SELECT * FROM orders WHERE order_id=?", {order_id});
+  double resting_before = rows.empty() ? 0.0 : rows[0].value("remaining_count", 0.0);
+  // Mark the intent before the call. A cancel that hangs or dies mid-flight then leaves a
+  // proposal that says what is actually true - a cancel was asked for and the outcome is not
+  // known - instead of one still claiming to be resting, and reconcile settles it from the
+  // exchange's own view of the order.
+  long long pid0 = store_.proposal_for_order(order_id);
+  if (pid0 > 0)
+    if (auto p0 = store_.get_proposal(pid0))
+      if (p0->status == "submitted") { p0->status = "cancel_pending"; store_.update_proposal(*p0); }
+  json r = client_.cancel_order(order_id, known[0]["ticker"].get<std::string>());
+
+  // How many contracts the cancel actually took off the book. Anything that was resting a moment
+  // ago and did not come back is a fill that landed while the cancel was in flight. Reading
+  // fill_count out of the local table instead - which is what this did - reports whatever the
+  // desk last synced and silently loses those contracts until some later reconcile finds them,
+  // with the proposal meanwhile claiming it was cancelled.
+  double reduced = -1;
+  if (r.contains("reduced_by")) {
+    const json& rb = r["reduced_by"];
+    reduced = rb.is_string() ? std::atof(rb.get<std::string>().c_str()) : rb.get<double>();
+  }
+  double raced = (std::isfinite(reduced) && reduced >= 0 && reduced <= resting_before && resting_before > 0)
+                     ? std::max(0.0, resting_before - reduced) : 0.0;
+  store_.log_event("info", "canceled " + order_id.substr(0, 8) +
+                               (raced > 1e-9 ? "; " + fmt2(raced) + " filled while cancelling" : ""));
   if (!rows.empty()) {
-    store_.exec("UPDATE orders SET status='canceled',updated_ts=? WHERE order_id=?", {now_s(), order_id});
+    // The order row records the race too: what was resting is gone, and the raced contracts are
+    // fills, so the systematic trader and the exit sweep read the right count from the table.
+    const double prior_fill = rows[0].value("fill_count", 0.0);
+    const double filled = prior_fill + raced;
+    store_.exec("UPDATE orders SET status='canceled',fill_count=?,remaining_count=0,updated_ts=? WHERE order_id=?",
+                {filled, now_s(), order_id});
     long long pid = store_.proposal_for_order(order_id);
     if (pid > 0) {
       if (auto p = store_.get_proposal(pid)) {
-        double filled = rows[0].value("fill_count", 0.0);
         p->status = filled > 0 ? "filled" : "canceled";
         if (filled > 0) p->note += " | partial " + fmt2(filled) + ", rest canceled";
         store_.update_proposal(*p);
       }
+    }
+  }
+  if (raced > 1e-9) {
+    // The position moved between the desk's last read and this cancel. Everything downstream -
+    // exposure, the exit sweep, the caps - is now working from a stale number, so go and get the
+    // real one rather than waiting for the next scheduled sync.
+    store_.log_event("warn", "fill during cancel on " + known[0]["ticker"].get<std::string>() +
+                                 ": " + fmt2(raced) + " contracts; re-reading the portfolio");
+    try { reconcile(false); } catch (const std::exception& e) {
+      LOG_WARN("reconcile after cancel race: %s", e.what());
     }
   }
   return r;
@@ -313,6 +433,8 @@ json Executor::close_position(const std::string& ticker, double count) {
   p.yes_ask = m.yes_ask;
   p.note = "close position";
   store_.insert_proposal(p);
+  record_order_snapshot(store_, p, m, "close", now_s());
+  store_.update_proposal(p);
   try {
     WriteWatermark watermark(store_);
     OrderResponse r = client_.create_order(req);
@@ -351,7 +473,8 @@ json Executor::close_position(const std::string& ticker, double count) {
   }
 }
 
-Proposal Executor::ticket(const OrderRequest& req, const std::string& note) {
+Proposal Executor::ticket(const OrderRequest& req, const std::string& note, long long deadline,
+                          const std::string& decision_id) {
   auto m = store_.get_market(req.ticker);
   Market mk = m ? *m : client_.get_market(req.ticker);
   Proposal p;
@@ -382,8 +505,23 @@ Proposal Executor::ticket(const OrderRequest& req, const std::string& note) {
       p.net_edge = pw - req.price - p.fee_per;
     }
   }
+  if (note.rfind("hedge for ", 0) == 0) p.entry_kind = "hedge";
+  EntryContext admission = entry_context(store_, cfg_, p, mk);
+  p.entry_kind = admission.kind;
+  p.required_edge = admission.required_edge;
+  p.approval_required = admission.approval_required;
+  p.decision_id = decision_id;
   store_.insert_proposal(p);
-  submit(p);
+  try {
+    submit(p,req.client_order_id,deadline);
+  } catch (const std::exception& e) {
+    // A rejected hand ticket used to remain pending and block every later order in the event.
+    // The send did not happen, so make that terminal and keep the reason in the audit trail.
+    if(p.status!="unknown")p.status = "failed";
+    p.note += " | not sent: " + std::string(e.what());
+    store_.update_proposal(p);
+    throw;
+  }
   return p;
 }
 
@@ -449,25 +587,41 @@ void Executor::topup_shards() {
   std::map<int, double> bal;
   for (const auto& sh : shards) bal[sh.value("exchange_index", 0)] = std::atof(sh.value("balance", "0").c_str());
   long long now = now_s();
+  // The richest shard funds the others. Shard 0 used to be assumed to be that shard, and to be
+  // the only legal target, so an account whose cash had drifted to shard 3 could not fund
+  // anything and could not be funded: shard 0 held $0.25 against $65.29 on shard 3 while this
+  // logged "shard 2 needs $8.82 but shard 0 has only $0.00 to spare" every ten minutes.
+  const double keep = 5.0;              // never drain the shard being borrowed from
+  auto richest_other = [&](int target_shard) {
+    int best = -1; double spare = 0;
+    for (const auto& [idx, amount] : bal) {
+      if (idx == target_shard) continue;
+      if (amount - keep > spare) { spare = amount - keep; best = idx; }
+    }
+    return std::make_pair(best, spare);
+  };
   for (const auto& [shard, target] : cfg_.risk.shard_topup) {
-    if (shard == 0 || target <= 0) continue;
+    if (target <= 0) continue;
     double have = bal.count(shard) ? bal[shard] : 0.0;
     double deficit = target - have;
     if (deficit < 1.0) continue;  // within a dollar of the target
     long long last = std::stoll(store_.kv_get("topup_ts:" + std::to_string(shard)).value_or("0"));
     if (now - last < 600) continue;  // transfers are asynchronous; do not stack them
-    double keep = 5.0;  // never drain shard 0 below this
-    double can = bal.count(0) ? bal[0] - keep : 0.0;
+    auto [from, can] = richest_other(shard);
     double amount = std::floor(std::min(deficit, can) * 100.0) / 100.0;
-    if (amount < 1.0) {
-      store_.log_event("warn", "shard " + std::to_string(shard) + " needs $" + fmt2(deficit) + " but shard 0 has only $" + fmt2(std::max(0.0, can)) + " to spare");
+    if (from < 0 || amount < 1.0) {
+      store_.log_event("warn", "shard " + std::to_string(shard) + " needs $" + fmt2(deficit) +
+                                   " but no other shard has more than $" + fmt2(keep) + " to spare" +
+                                   (from >= 0 ? " (best is shard " + std::to_string(from) + " with $" +
+                                                    fmt2(std::max(0.0, can)) + ")" : ""));
       continue;
     }
     try {
-      std::string id = client_.transfer_between_shards(0, shard, amount);
+      std::string id = client_.transfer_between_shards(from, shard, amount);
       store_.kv_set("topup_ts:" + std::to_string(shard), std::to_string(now));
-      store_.log_event("warn", "moved $" + fmt2(amount) + " from shard 0 to shard " + std::to_string(shard) + " (transfer " + id + ")");
-      LOG_WARN("topup: $%.2f shard 0 -> %d (%s)", amount, shard, id.c_str());
+      store_.log_event("warn", "moved $" + fmt2(amount) + " from shard " + std::to_string(from) +
+                                   " to shard " + std::to_string(shard) + " (transfer " + id + ")");
+      LOG_WARN("topup: $%.2f shard %d -> %d (%s)", amount, from, shard, id.c_str());
     } catch (const std::exception& e) {
       store_.log_event("error", "shard top-up failed: " + std::string(e.what()));
       LOG_WARN("topup failed: %s", e.what());
@@ -494,19 +648,35 @@ void Executor::reconcile(bool full) {
   try {
     long long min_ts = now - 7 * 86400;
     if (full) min_ts = 0;
+    bool history_complete = true;
     for (const char* st : {"executed", "canceled"}) {
       json j = client_.call("GET", "/portfolio/orders",
                             {{"limit", "1000"}, {"status", st}, {"min_ts", std::to_string(min_ts)}});
-      for (const auto& oj : j.value("orders", json::array())) store_.upsert_order(parse_order(oj), 0);
+      const json& page = j.value("orders", json::array());
+      // A full page, or a cursor, means there is more history than we read: absence from what we
+      // did read would then prove nothing.
+      if (page.size() >= 1000 || !j.value("cursor", "").empty()) history_complete = false;
+      for (const auto& oj : page) store_.upsert_order(parse_order(oj), 0);
     }
     if (auto id=store_.kv_get("uncertain_client_order_id")) {
       if (!id->empty()) {
         bool found = !store_.query("SELECT order_id FROM orders WHERE client_order_id=?",{*id}).empty();
-        // Elapsed time and an incomplete history page do not prove an ambiguous order failed.
+        long long since = std::stoll(store_.kv_get("uncertain_since").value_or("0"));
         if (found) {
           store_.kv_set("uncertain_client_order_id", "");
           store_.kv_set("uncertain_since", "0");
           store_.log_event("info", "uncertain order located; entries unblocked");
+        } else if (history_complete && since > 0 && min_ts < since && now - since >= 120) {
+          // Absence is only evidence when we have actually looked properly: a complete order
+          // history reaching back before the submission, read at least two minutes after it. An
+          // order that never reached the exchange leaves no trace, and without this the desk
+          // blocks its own entries for ever and can only be freed by hand.
+          store_.kv_set("uncertain_client_order_id", "");
+          store_.kv_set("uncertain_since", "0");
+          store_.log_event("warn", "uncertain order " + id->substr(0, 8) +
+                                       " is absent from a complete order history taken " +
+                                       std::to_string((now - since) / 60) +
+                                       " min after it was sent: treating it as never placed");
         }
       }
     }
@@ -515,7 +685,8 @@ void Executor::reconcile(bool full) {
     // Proposals whose orders finished.
     store_.exec(
         "UPDATE proposals SET status=CASE WHEN o.fill_count>0 THEN 'filled' ELSE 'canceled' END,"
-        "updated_ts=? FROM orders o WHERE proposals.order_id=o.order_id AND proposals.status='submitted' "
+        "updated_ts=? FROM orders o WHERE proposals.order_id=o.order_id "
+        "AND proposals.status IN ('submitted','cancel_pending') "
         "AND o.status IN ('executed','canceled','done')",
         {now});
   } catch (const std::exception& e) {

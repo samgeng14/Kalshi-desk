@@ -1,5 +1,6 @@
 #include <cmath>
 #include <limits>
+#include <set>
 
 #include "desk/fixed.h"
 #include "desk/log.h"
@@ -22,6 +23,7 @@ CryptoLognormal::CryptoLognormal(const json& params, const std::string& user_age
   max_horizon_seconds_ = params.value("max_horizon_seconds", 36 * 3600);  // beyond this the 3h realized vol says nothing
   refresh_seconds_ = params.value("refresh_seconds", 20);
   spot_url_ = params.value("spot_url", std::string("https://api.coinbase.com/v2/prices/{sym}-USD/spot"));
+  candles_url_ = params.value("candles_url", std::string("https://api.exchange.coinbase.com/products/{sym}-USD/candles?granularity=60"));
   dvol_url_ = params.value("dvol_url", std::string("https://www.deribit.com/api/v2/public/get_volatility_index_data?currency={sym}&resolution=3600"));
 }
 
@@ -95,6 +97,43 @@ void CryptoLognormal::prepare(const std::vector<Market>& markets, Store& store) 
       }
     }
     if (now - spot_ts_[sym] < refresh_seconds_) continue;
+    // The realized-vol window is the last three hours of one-minute samples. After a restart
+    // that follows a gap the table is empty and every crypto estimate sat "warming up" for half
+    // an hour; the exchange publishes the same minute closes, so seed the window from them once.
+    if (!candles_url_.empty() && !backfilled_[sym]) {
+      backfilled_[sym] = true;
+      try {
+        json have = store.query("SELECT COUNT(*) AS n FROM ext_prices WHERE symbol=? AND ts>?", {sym, now - 3 * 3600});
+        long long n_have = have.empty() ? 0 : have[0].value("n", 0LL);
+        if (n_have < 30) {
+          std::string url = candles_url_;
+          auto pos = url.find("{sym}");
+          if (pos != std::string::npos) url.replace(pos, 5, sym);
+          url += "&start=" + iso_of(now - 3 * 3600) + "&end=" + iso_of(now);
+          HttpResponse r = http_.get(url);
+          if (!r.ok()) throw std::runtime_error("candles HTTP " + std::to_string(r.status));
+          json j = json::parse(r.body, nullptr, false);
+          int added = 0;
+          if (j.is_array()) {
+            std::set<long long> seen;
+            for (const auto& row : store.query("SELECT ts FROM ext_prices WHERE symbol=? AND ts>?", {sym, now - 3 * 3600}))
+              seen.insert(row.value("ts", 0LL) / 60);
+            for (const auto& c : j) {  // [time, low, high, open, close, volume], newest first
+              if (!c.is_array() || c.size() < 5) continue;
+              long long t = c[0].get<long long>() + 60;   // the close belongs to the end of its minute
+              double close = c[4].get<double>();
+              if (t >= now || close <= 0 || seen.count(t / 60)) continue;
+              store.exec("INSERT INTO ext_prices(ts,symbol,price) VALUES(?,?,?)", {t, sym, close});
+              seen.insert(t / 60);
+              ++added;
+            }
+          }
+          LOG_INFO("crypto %s: realized-vol window seeded with %d minute closes from candles", sym.c_str(), added);
+        }
+      } catch (const std::exception& e) {
+        LOG_WARN("crypto candles %s: %s (warming up from live samples instead)", sym.c_str(), e.what());
+      }
+    }
     std::string url = spot_url_;
     auto pos = url.find("{sym}");
     if (pos != std::string::npos) url.replace(pos, 5, sym);
@@ -108,6 +147,7 @@ void CryptoLognormal::prepare(const std::vector<Market>& markets, Store& store) 
       if (px <= 0) throw std::runtime_error("no price in spot response");
       spot_[sym] = px;
       spot_ts_[sym] = now;
+      spot_data_ts_[sym] = now;
       spot_fails_[sym] = 0;
       store.exec("INSERT INTO ext_prices(ts,symbol,price) VALUES(?,?,?)", {now, sym, px});
       // Realized vol from ~1-minute samples over the last 3 hours (responsive to the intraday regime).
@@ -129,6 +169,9 @@ void CryptoLognormal::prepare(const std::vector<Market>& markets, Store& store) 
         lt = t;
         lp = p;
       }
+      rv_samples_[sym] = n;
+      rv_span_[sym] = static_cast<long long>(sumdt);
+      rv_data_ts_[sym] = lt;
       if (n >= 30 && sumdt > 0) {
         double var_per_sec = sum2 / sumdt;
         vol_realized_[sym] = std::sqrt(var_per_sec * 365.25 * 86400.0);
@@ -171,6 +214,23 @@ std::optional<Fair> CryptoLognormal::fair(const Market& m, const Series&, Store&
   f.p = p;
   f.sigma = 0.5 * std::fabs(p_hi - p_lo) + 0.01;
   bool have_rv = vol_realized_.count(sym) > 0;
+  if (m.series_ticker.find("15M") == std::string::npos) {
+    json reasons = json::array();
+    const long long spot_age = now - spot_data_ts_[sym];
+    const long long rv_age = now - rv_data_ts_[sym];
+    if (spot_data_ts_[sym] <= 0 || spot_age < 0 || spot_age > 120)
+      reasons.push_back("successful spot observation is missing or older than 120 seconds");
+    if (!have_rv || rv_samples_[sym] < 30 || rv_span_[sym] < 30 * 55)
+      reasons.push_back("volatility warm-up: " + std::to_string(rv_samples_[sym]) + "/30 recent one-minute returns");
+    if (rv_data_ts_[sym] <= 0 || rv_age < 0 || rv_age > 120)
+      reasons.push_back("realized volatility sample window is stale");
+    f.inputs = {{"valid", reasons.empty()}, {"reasons", reasons}, {"source", "Coinbase spot / recent realized volatility"},
+                {"symbol", sym}, {"spot", spot}, {"spot_ts", spot_data_ts_[sym]}, {"spot_age_seconds", spot_age},
+                {"volatility", vol}, {"volatility_source", have_rv ? "realized 3h" : "fallback prior"},
+                {"volatility_ts", rv_data_ts_[sym]}, {"sample_count", rv_samples_[sym]}, {"required_samples", 30},
+                {"sample_span_seconds", rv_span_[sym]}, {"basis_log_sd", basis_},
+                {"settlement_warning", "Coinbase spot is a proxy for the contract settlement index; basis risk remains"}};
+  }
   char buf[200];
   std::snprintf(buf, sizeof buf, "%s spot %.2f vol %.0f%% (%s%s) tau %.1fmin", sym.c_str(), spot, 100 * vol,
                 have_rv ? "realized 3h" : "no realized vol yet", vol_dvol_.count(sym) ? ", dvol band" : "",

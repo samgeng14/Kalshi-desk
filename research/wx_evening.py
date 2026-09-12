@@ -10,10 +10,17 @@ climate report Kalshi settles on (wx-settle: +0 63%, +1 31%, +2 6%).
 
 Fit: rise-from-running-max climatology on 2022-2025 (station, month +-1, hour, trend bucket).
 Score: every settled 2026 market in the research DB, hour by hour, out of sample.
-Execution: decision on the last print at or before h:00; fill at the NEXT print on the side we
-would take, plus the 7% taker fee. No fill assumed when that side never prints again.
+Execution: NONE. This is a PREDICTION-ONLY study. It originally filled at the next print on our
+side within three hours of the decision, which is not evidence that an order submitted at the
+decision time would have filled - a print three hours later is a different trade, at a price that
+may have moved because the thing being predicted had become clearer. The return column below is
+kept for continuity and is reported under a latency budget (research/execution.py), with the
+proportion that finds no fill stated alongside it. It is not a tradable edge and must not be
+quoted as one. The Brier comparison is unaffected and remains the study's real result.
 """
 import bisect, collections, datetime as dt, json, math, os, random, sqlite3, sys
+
+import execution
 from zoneinfo import ZoneInfo
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -92,6 +99,9 @@ def boot(xs, n=2000):
 
 def main():
     random.seed(7)
+    execution.banner(execution.PREDICTION_ONLY,
+                     "Weather same-day model vs the tape, hours 9-23.\n"
+                     "Fills are held to a latency budget; the unfilled share is reported.")
     obs = {st: load_obs(st) for st, _ in STATIONS.values()}
     tables = collections.defaultdict(collections.Counter)
     for series, (station, _tz) in STATIONS.items():
@@ -112,6 +122,7 @@ def main():
                     tables[(station, mw, h, None)][rise] += 1
 
     con = sqlite3.connect(f'file:{DB}?mode=ro', uri=True)
+    execution.require_tables(con, ['hist_markets', 'hist_trades'])
     markets = con.execute(
         "SELECT ticker,event_ticker,series_ticker,strike_type,floor_strike,cap_strike,result "
         "FROM hist_markets WHERE series_ticker IN (%s) AND result IN ('yes','no')" % ','.join('?' * len(STATIONS)),
@@ -153,16 +164,10 @@ def main():
             t_dec = int(dt.datetime(d.year, d.month, d.day, h, 0, tzinfo=ZoneInfo(tz)).timestamp())
             i = bisect.bisect_right(tl, (t_dec, 9, 'z'))
             pk = tl[i - 1][1] if i > 0 and t_dec - tl[i - 1][0] <= 3 * 3600 else None
-            nxt_yes = nxt_no = None
-            for ts, px, side in tl[i:]:
-                if ts > t_dec + 3 * 3600:
-                    break
-                if side == 'yes' and nxt_yes is None:
-                    nxt_yes = px
-                if side == 'no' and nxt_no is None:
-                    nxt_no = 1 - px
-                if nxt_yes is not None and nxt_no is not None:
-                    break
+            # A fill has to be promptly available or it is not a fill. The original three-hour
+            # window let a print from the middle of the afternoon settle a 9am decision.
+            nxt_yes, lag_y = execution.fill_at(tl[i:], t_dec, 'yes')
+            nxt_no, lag_n = execution.fill_at(tl[i:], t_dec, 'no')
             rows[h].append((pm, pk, outcome, nxt_yes, nxt_no, rmax))
 
     print()
@@ -180,19 +185,21 @@ def main():
         bm = sum((pm - o) ** 2 for pm, pk, o, *_ in with_tape) / len(with_tape)
         bk = sum((pk - o) ** 2 for pm, pk, o, *_ in with_tape) / len(with_tape)
         bb = sum(((pm + pk) / 2 - o) ** 2 for pm, pk, o, *_ in with_tape) / len(with_tape)
-        ret = []
+        ret, misses = [], 0
         for pm, pk, o, ny, nn, _rmax in with_tape:
             if pk < 0.03 or pk > 0.97 or abs(pm - pk) < EDGE:
                 continue
             buy_yes = pm > pk
             px = ny if buy_yes else nn
             if px is None or px <= 0 or px >= 1:
+                misses += 1
                 continue
             ret.append((o if buy_yes else 1 - o) - px - fee_taker(px))
         m, lo90, hi90 = boot(ret)
         better = 'MODEL' if bm < bk - 1e-9 else 'market'
         print(f'{h:>3} {len(r):>5} {len(with_tape):>6} | {bm:>11.4f} {bk:>8.4f} {bb:>7.4f} | '
-              f'{better:>6} better · trades {len(ret):>4} ret {m:+.3f} [{lo90:+.3f}, {hi90:+.3f}]')
+              f'{better:>6} better · filled {len(ret):>4} unfilled {misses:>4} '
+              f'ret {m:+.3f} [{lo90:+.3f}, {hi90:+.3f}]')
     print()
     print('A lower Brier is better. WX-1b only ever printed hours 9-16.')
 

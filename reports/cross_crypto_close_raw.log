@@ -1,0 +1,38 @@
+  60m panel: 9,599 bars, 14 assets
+  240m panel: 2,399 bars, 14 assets
+  720m panel: 799 bars, 14 assets
+
+observed across 210 specifications:
+  max            1.5423561974097835
+  mean           -0.037558876313596626
+  median         -0.05284464459805352
+  n_over_1       6
+  frac_positive  0.3238095238095238
+  best spec:     SOLUSDT own momentum 720m  (1.5424x)
+  50/300 draws  (697s)
+  100/300 draws  (1397s)
+  150/300 draws  (2102s)
+  200/300 draws  (2823s)
+  250/300 draws  (3531s)
+  300/300 draws  (4238s)
+
+null distributions over 300 circular shifts (same shift for every asset):
+  statistic            p50       p90       p95       p99       max    observed
+  max               1.0854    1.9354    2.0430    2.8229    2.9346      1.5424   p=0.167
+  mean             -0.0026    0.1343    0.1717    0.2379    0.2961     -0.0376   p=0.630
+  median           -0.0001    0.0353    0.0451    0.0742    0.0900     -0.0528   p=0.943
+  n_over_1          1.0000   12.0000   26.0000   41.0000   46.0000      6.0000   p=0.237
+  frac_positive     0.4976    0.6286    0.6762    0.7098    0.7714      0.3238   p=0.923
+
+SIGN STABILITY -- SOLUSDT own momentum 720m, held-out slice in consecutive thirds
+  round trip = 28.2 bp
+  third      bars     gross bp       net bp   hit rate
+  1            53        39.87        11.63      0.434
+  2            54         6.61       -21.63      0.481
+  3            53        84.89        56.65      0.660
+  sign pattern: + + +   ->  stable
+
+VERDICT
+  Neither the maximum nor the diffuse aggregate statistics are unusual under a
+  null that preserves autocorrelation and cross-sectional structure. The lane
+  closes on selection, not on a measured negative effect.

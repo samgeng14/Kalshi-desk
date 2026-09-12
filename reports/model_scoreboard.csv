@@ -1,0 +1,9 @@
+market,model,status,net_bps,trades,gross_bps,cost_bps,sample,note
+ALL,fair_maker_join_touch,REJECTED_COST,-4.83,5760,0.09,5.00,"2.5h L2 18 mkts","half-spread plus 60s markout leaves +0.09 bps on average; the maker fee is 5"
+ALL,fair_maker_improve,REJECTED_COST,-4.41,3800,0.59,5.00,"2.5h L2 18 mkts","posting inside the spread is the best passive mode and still loses the fee"
+ALL,taker_cross,REJECTED_COST,-19.86,13873,-2.14,17.72,"2.5h L2 18 mkts","crossing costs 12.3 bps on BTC and 21.3 on LINK; the mid does not come back"
+KXLINKPERP,fair_maker_improve,REJECTED_COST,-1.57,152,3.43,5.00,"2.5h L2","best measured execution on the board and still negative"
+KXBTCPERP,fair_maker_join,REJECTED_COST,-5.22,702,-0.22,5.00,"2.5h L2","spread 0.5 bps against a 5 bps maker fee: the fee is 10x the microstructure"
+KXETHPERP,fair_maker_join,REJECTED_COST,-5.48,705,-0.48,5.00,"2.5h L2","same shape as BTC"
+KXBTCPERP,impulse_minute_bar,REJECTED_NONROBUST,,,16.90,17.00,"1.8M bars","1736 hypotheses, 0 clear the hurdle; 33 survive Bonferroni and all lose 14-20 bps"
+KXETHPERP,impulse_minute_bar,REJECTED_NONROBUST,,,,17.00,"1.8M bars","see research/minute_bar_alpha_results.md"

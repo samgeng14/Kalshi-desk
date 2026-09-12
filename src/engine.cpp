@@ -1,4 +1,5 @@
 #include "desk/engine.h"
+#include "desk/decision_log.h"
 
 #include <algorithm>
 #include <cmath>
@@ -12,16 +13,83 @@
 #include "desk/fixed.h"
 #include "desk/log.h"
 #include "desk/timeutil.h"
+#include "desk/universe.h"
+#include "desk/record.h"
+#include "desk/reject.h"
+#include "desk/route.h"
+#include "desk/sports_models.h"
+#include "desk/strategies.h"
 
 namespace desk {
 
 Engine::Engine(Config cfg, Store& store, KalshiClient& client, Executor& exec)
-    : cfg_(std::move(cfg)), store_(store), client_(client), exec_(exec) {
-  strategies_ = build_strategies(cfg_);
+    : cfg_(std::move(cfg)), store_(store), client_(client), exec_(exec),
+      manual_orders_(store),
+      systematic_(store, &exec, cfg_,
+                  SystematicTrader::Hooks{[this] { return kill_.load(); },
+                                          [this](const std::string& why) { set_kill(true, why); },
+                                          [this] { force_reconcile_ = true; },
+                                          // A fresh read of one book when the exchange (or the
+                                          // executor's pre-flight check) says the book moved.
+                                          // Called from step(), under the engine lock.
+                                          [this](const std::string& ticker) -> json {
+                                            try { return capture_book(ticker); }
+                                            catch (const std::exception& e) {
+                                              LOG_WARN("book %s: %s", ticker.c_str(), e.what());
+                                              return json();
+                                            }
+                                          }}),
+      perps_(cfg_, store, client),
+      poly_(cfg_, store,
+            make_poly_client(poly_config(cfg_.strategy_params.is_object() && cfg_.strategy_params.contains("polymarket")
+                                             ? cfg_.strategy_params["polymarket"] : json::object()), cfg_.user_agent),
+            &exec, PolyDesk::Hooks{[this] { return kill_.load(); }, [this] { force_reconcile_ = true; }}), pair_models_(store) {
   for (const auto& s : cfg_.watch_series) watch_.insert(s);
+  // The settlement reference for the 15-minute commodity contracts. The socket is only opened
+  // when this desk actually watches one of those series: it is an authenticated channel, and a
+  // desk that trades none of them has no business holding it open. Without the feed the terminal
+  // models are not built at all, so nothing can quietly price them off a missing number.
+  {
+    const json cparams = cfg_.strategy_params.is_object() && cfg_.strategy_params.contains("commodity")
+                             ? cfg_.strategy_params["commodity"] : json::object();
+    ReferenceFeedSettings rs = reference_feed_settings(cparams, cfg_.env);
+    bool watched = false;
+    for (const auto& u : CommodityTerminal::default_underlyings())
+      for (const auto& ser : u.series)
+        if (watch_.count(ser)) watched = true;
+    if (rs.enabled && watched) {
+      reference_feed_ = std::make_unique<ReferenceFeed>(store_, rs, client_.signer());
+      reference_feed_->start();
+      MarketQuoteFeed::Settings qs = market_quote_settings(cparams, cfg_.env);
+      if (qs.enabled) {
+        quote_feed_ = std::make_unique<MarketQuoteFeed>(store_, qs, client_.signer());
+        quote_feed_->start();
+      }
+    }
+  }
+  strategies_ = build_strategies(cfg_, reference_feed_.get());
   // Persisted state overrides the config file.
   if (auto k = store_.kv_get("kill")) kill_ = (*k == "1");
   if (auto r = store_.kv_get("kill_reason")) kill_reason_ = *r;
+  // A halt raised by a rule that has since been switched off should not outlive the rule. The
+  // daily loss stop is the only halt with that property: it fires on a threshold rather than on
+  // something going wrong, so once the threshold is disabled there is nothing left to review.
+  // Every other kill reason (a rejected order, a hand kill, an unexplained balance) stands until
+  // a person clears it, because the thing that caused it has not been switched off by editing a
+  // config file. Clearing it here, at startup, rather than in the cycle, keeps this a deliberate
+  // consequence of a restart with a changed config and not something that can un-kill a running
+  // desk behind you.
+  if (kill_ && kill_reason_.rfind("Daily loss stop:", 0) == 0 &&
+      !account_stop_policy(store_, cfg_).value("enabled", true)) {
+    kill_ = false;
+    kill_pending_ = false;
+    kill_reason_.clear();
+    store_.kv_set("kill", "0");
+    store_.kv_set("kill_reason", "");
+    const std::string msg = "daily-loss halt cleared at startup: the account daily stop is switched off";
+    LOG_WARN("%s", msg.c_str());
+    store_.log_event("warn", msg);
+  }
   if (auto w = store_.kv_get("watch")) {
     json j = json::parse(*w, nullptr, false);
     if (j.is_array()) {
@@ -32,6 +100,13 @@ Engine::Engine(Config cfg, Store& store, KalshiClient& client, Executor& exec)
   for (auto& st : strategies_) {
     if (auto m = store_.kv_get("mode:" + st->name())) cfg_.strategy_modes[st->name()] = *m;
   }
+  {
+    std::lock_guard<std::mutex> lk(modes_mu_);
+    modes_copy_ = cfg_.strategy_modes;
+  }
+  // A request from the Trades board names the decision it was reviewed on: check it is still on
+  // the board before accepting it (the full revalidation runs again just before it is sent).
+  manual_orders_.set_precheck([this](const json& request) { precheck_manual_decision(request); });
   publish_snapshot();
 }
 
@@ -99,78 +174,25 @@ void Engine::refresh_markets() {
 
 // ---- proposals ---------------------------------------------------------------------
 
-std::vector<ProposalCandidate> Engine::candidates(const Market& m, const Series& s, const Fair& f) const {
-  std::vector<ProposalCandidate> out;
-  FeeModel fm = FeeModel::from_series(s);
-  const RiskConfig& r = cfg_.risk;
-  double tick = m.tick > 0 ? m.tick : 0.01;
-  double lo = r.min_price, hi = 1.0 - r.min_price;
-
-  auto consider = [&](const std::string& side, const std::string& style, double price, double p_win) {
-    if (price < lo || price > hi) return;
-    bool taker = style == "taker";
-    double fee = fm.fee_per_contract(price, taker);
-    double edge = p_win - price - fee;
-    double min_edge = taker ? r.min_edge_taker : r.min_edge_maker;
-    if (edge < min_edge) return;
-    if (edge < r.sigma_mult * f.sigma) return;
-    ProposalCandidate c;
-    c.outcome_side = side;
-    c.exec_style = style;
-    c.price = price;
-    c.fee_per = fee;
-    c.net_edge = edge;
-    c.p_win = p_win;
-    out.push_back(c);
-  };
-
-  double p = f.p, q = 1.0 - f.p;
-  // YES side. Taker: lift the ask. Maker: post a bid at p - min_edge, not crossing the ask,
-  // and only if it joins or improves the current best bid (otherwise it never fills).
-  if (m.yes_ask > 0 && m.yes_ask < 1) consider("yes", "taker", m.yes_ask, p);
+Calibration Engine::calibration_for(const std::string& strategy) const {
+  const long long now = now_s();
   {
-    double L = floor_to_tick(p - r.min_edge_maker, tick);
-    if (m.yes_ask > 0) L = std::min(L, m.yes_ask - tick);
-    if (L >= m.yes_bid && L > 0) consider("yes", "maker", L, p);
+    std::lock_guard<std::mutex> lk(calib_mu_);
+    auto it = calib_.find(strategy);
+    if (it != calib_.end() && now - it->second.second <= 900) return it->second.first;
   }
-  // NO side. NO ask = 1 - yes_bid; NO bid = 1 - yes_ask.
-  double no_ask = m.no_ask > 0 ? m.no_ask : (m.yes_bid > 0 ? 1.0 - m.yes_bid : 0);
-  double no_bid = m.no_bid > 0 ? m.no_bid : (m.yes_ask > 0 ? 1.0 - m.yes_ask : 0);
-  if (no_ask > 0 && no_ask < 1) consider("no", "taker", no_ask, q);
-  {
-    double L = floor_to_tick(q - r.min_edge_maker, tick);
-    if (no_ask > 0) L = std::min(L, no_ask - tick);
-    if (L >= no_bid && L > 0) consider("no", "maker", L, q);
-  }
-  std::sort(out.begin(), out.end(),
-            [](const ProposalCandidate& a, const ProposalCandidate& b) { return a.net_edge > b.net_edge; });
-  return out;
-}
-
-double Engine::size_for(const ProposalCandidate& c, const Market& m, double bankroll, double event_used,
-                        double cluster_used, double open_used) const {
-  const RiskConfig& r = cfg_.risk;
-  double cost = c.price + c.fee_per;
-  double n = size_contracts(bankroll, c.p_win, cost, r.kelly_frac, r.max_event_frac);
-  double room_event = r.max_event_frac * bankroll - event_used;
-  double room_cluster = r.max_cluster_frac * bankroll - cluster_used;
-  double room_open = r.max_open_frac * bankroll - open_used;
-  double room = std::min({room_event, room_cluster, room_open});
-  if (room <= 0) return 0;
-  n = std::min(n, std::floor(room / cost));
-  if (c.exec_style == "taker") {
-    double avail = c.outcome_side == "yes" ? m.yes_ask_size : m.yes_bid_size;  // NO ask == YES bid size
-    if (avail <= 0) return 0;  // displayed size unknown: never lift an invisible offer
-    n = std::min(n, std::floor(avail));
-  }
-  return n < 1 ? 0 : n;
+  // The settled-market query runs unlocked; two callers racing here both compute the same answer.
+  Calibration c = strategy_calibration(store_, strategy, cfg_.risk.kelly_min_samples);
+  std::lock_guard<std::mutex> lk(calib_mu_);
+  calib_[strategy] = {c, now};
+  return c;
 }
 
 std::map<std::string, double> Engine::exposure_by(const std::string& kind, bool include_proposals) {
   auto exposure=committed_exposure(store_);
   auto out=kind=="cluster"?exposure.clusters:exposure.events;
   if(include_proposals) for(const auto& p:store_.proposals("pending",500)) {
-    if (p.strategy == "exit" || p.strategy == "close" || p.strategy == "target" || p.strategy == "stop") continue;  // reduce risk
+    if (is_exit_strategy(p.strategy) || p.strategy == "close") continue;  // reduce risk
     auto m=store_.get_market(p.ticker);
     std::string key=kind=="cluster" && m ? risk_cluster(store_,*m):p.event_ticker;
     out[key]+=p.count*(p.price+p.fee_per);
@@ -185,7 +207,11 @@ void Engine::run_strategies() {
   // Only markets in the watch set, and only series whose quotes were refreshed recently: after a
   // failed refresh the stored book is whatever it was, and a fair against a stale book proposes
   // trades that no longer exist (or worse, ones that do, at the wrong price).
-  long long quote_ttl = 3 * std::max(1, cfg_.poll_seconds) + 10;
+  // The desk's one freshness limit for opening risk (Config::data_max_age): the board and the
+  // systematic screen judge a quote by the same number, so nothing is offered that this gate
+  // would have withdrawn. Managing what is already on (exits, stops, resting entries) keeps its
+  // own, looser limit: see board_view.
+  long long quote_ttl = cfg_.data_max_age();
   std::vector<std::string> stale_tickers;
   markets.erase(std::remove_if(markets.begin(), markets.end(),
                                [&](const Market& m) {
@@ -207,6 +233,7 @@ void Engine::run_strategies() {
     for (auto it = latest_fair_ts_.begin(); it != latest_fair_ts_.end();) {
       if (now - it->second > 6 * 3600) {
         latest_fair_.erase(it->first);
+        latest_quote_.erase(it->first);
         latest_fair_strategy_.erase(it->first);
         it = latest_fair_ts_.erase(it);
       } else ++it;
@@ -222,37 +249,6 @@ void Engine::run_strategies() {
       LOG_WARN("strategy %s prepare: %s", st->name().c_str(), e.what());
     }
   }
-  auto by_event = exposure_by("event");
-  auto by_cluster = exposure_by("cluster");
-  double open_used = open_exposure();
-  // Payoff-space book per event (positions + resting orders) plus pending proposals as if filled:
-  // used to refuse a proposal that merely stacks the bet an event already carries.
-  Exposure book = committed_exposure(store_);
-  std::map<std::string, std::vector<std::pair<long long, Holding>>> pending_by_event;  // proposal id -> holding
-  for(const auto& p:store_.proposals("pending",500)) {
-    if (p.strategy == "exit" || p.strategy == "close" || p.strategy == "target" || p.strategy == "stop") continue;
-    open_used += p.count*(p.price+p.fee_per);
-    pending_by_event[p.event_ticker].push_back({p.id, Holding{p.ticker, p.outcome_side == "yes", p.count, p.count * (p.price + p.fee_per), true}});
-  }
-  // Every mutation below refreshes the reservation book. Otherwise new same-cycle proposals
-  // escape the overlap check, and withdrawn proposals keep blocking unrelated candidates.
-  auto forget_pending = [&](long long id) {
-    for (auto& [ev, ps] : pending_by_event)
-      ps.erase(std::remove_if(ps.begin(), ps.end(), [&](const auto& item){ return item.first == id; }), ps.end());
-  };
-  auto remember_pending = [&](const Proposal& p) {
-    forget_pending(p.id);
-    pending_by_event[p.event_ticker].push_back({p.id, Holding{p.ticker, p.outcome_side == "yes", p.count,
-                                                          p.count * (p.price + p.fee_per), true}});
-  };
-  auto release_pending = [&](const Proposal& p) {
-    forget_pending(p.id);
-    double reserved = p.count * (p.price + p.fee_per);
-    auto m = store_.get_market(p.ticker);
-    by_event[p.event_ticker] -= reserved;
-    by_cluster[m ? risk_cluster(store_, *m) : p.cluster] -= reserved;
-    open_used -= reserved;
-  };
   // A proposal you could still click after its market went stale is a price from before the
   // outage. Withdraw it rather than leave it clickable.
   for (const auto& t : stale_tickers)
@@ -263,14 +259,18 @@ void Engine::run_strategies() {
             old_p->status = "expired";
             old_p->note = "quotes stale: the book behind this price is older than " + std::to_string(quote_ttl) + "s";
             store_.update_proposal(*old_p);
-            release_pending(*old_p);
           }
   fair_set_this_cycle_.clear();
-  double bankroll = cfg_.bankroll_dollars;
-  if (auto a=store_.last_account()) bankroll=std::min(bankroll,std::max(0.0,a->balance+a->portfolio_value));
-  auto positions = store_.positions();
   std::map<std::string, std::vector<Order>> resting;
   for (const auto& o : store_.orders("resting")) resting[o.ticker].push_back(o);
+  // Is this order still resting as far as the desk knows? A cancel that failed leaves its row
+  // resting (Executor::cancel updates the row only on success), which is what a retry keys off.
+  auto still_resting = [&](const std::string& order_id) {
+    for (const auto& [tk, os] : resting)
+      for (const auto& o : os)
+        if (o.order_id == order_id) return true;
+    return false;
+  };
 
   for (const auto& m : markets) {
     auto sit = series_cache_.find(m.series_ticker);
@@ -288,7 +288,16 @@ void Engine::run_strategies() {
         continue;
       }
       if (!f) continue;
+      // The model's own verdict on its estimate, before the engine's gates below write over it:
+      // this is what goes into the ProbabilityQuote.
+      const bool model_research_only = f->research_only;
+      const std::string model_research_reason = f->research_reason;
+      if (f->inputs.contains("valid") && !f->inputs.value("valid", false)) {
+        f->research_only = true;
+        f->research_reason = "model inputs need review: " + f->inputs.value("reasons", json::array()).dump();
+      }
       double raw_p = std::min(0.999, std::max(0.001, f->p));
+      f->p_raw = raw_p;
       // Log every raw estimate (traded or not) at most every 5 minutes: this is the Brier sample.
       std::string fk = m.ticker + "|" + st->name();
       if (now - last_fair_log_[fk] >= 300) {
@@ -297,6 +306,7 @@ void Engine::run_strategies() {
       }
       // Shrink toward the market until the strategy has earned trust: p = (1-w) model + w mid.
       double w = market_weight(st->name());
+      f->market_blend_weight = w;
       double mid = m.mid();
       if (w > 0 && mid > 0 && mid < 1) {
         f->p = (1.0 - w) * raw_p + w * mid;
@@ -311,6 +321,13 @@ void Engine::run_strategies() {
         latest_fair_[m.ticker] = *f;
         latest_fair_ts_[m.ticker] = now;
         latest_fair_strategy_[m.ticker] = st->name();
+        // The canonical model output: the same number, wrapped. Nothing downstream reads the Fair
+        // to decide an entry; the edge engine and the router read this.
+        const std::string category = systematic_category(json{{"category", s.category}, {"series_ticker", m.series_ticker}});
+        ProbabilityQuote q = quote_from_fair(m, category, st->name(), *f, model_research_only, model_research_reason, now, now);
+        if (!st->model_version().empty()) q.model_version = st->model_version();
+        if (auto verified = st->settlement_verified(m)) q.settlement_verified = *verified;
+        latest_quote_[m.ticker] = std::move(q);
       }
       // Resting orders from our proposals whose price no longer has edge under the current fair.
       // Runs before any gate below so an order never keeps working on a number we have stopped
@@ -322,8 +339,12 @@ void Engine::run_strategies() {
           for (const auto& o : rit0->second) {
             long long pid0 = store_.proposal_for_order(o.order_id);
             if (pid0 == 0) continue;  // placed by hand: leave it
-            if (auto pr0 = store_.get_proposal(pid0))
-              if (pr0->strategy == "target" || pr0->strategy == "stop") continue;  // your bracket, not the model's call
+            auto pr0 = store_.get_proposal(pid0);
+            // A model may cancel only its own unattended entry. A hand-approved signal is
+            // manual too; the systematic and pair engines manage their own order IDs.
+            if (!pr0 || pr0->strategy != st->name() ||
+                (pr0->mode != "auto" && pr0->mode != "bot") ||
+                store_.kv_get("manual_order:" + o.order_id).value_or("0") == "1") continue;
             double px = o.outcome_side == "yes" ? o.yes_price : o.no_price;
             double pw = o.outcome_side == "yes" ? f->p : 1.0 - f->p;
             double edge = pw - px - fm0.fee_per_contract(px, false);
@@ -372,9 +393,11 @@ void Engine::run_strategies() {
               old->status = "expired";
               old->note = "research only: " + research_reason;
               store_.update_proposal(*old);
-              release_pending(*old);
-            } else if (old->status == "submitted" && !old->order_id.empty()) {
-              // A live resting order on a number we no longer trust: pull it.
+            } else if ((old->status == "submitted" || old->status == "cancel_pending") && !old->order_id.empty() &&
+                       (old->status == "submitted" || still_resting(old->order_id))) {
+              // A live resting order on a number we no longer trust: pull it. A cancel that failed
+              // (cancel_pending with the order still resting here) is sent again: Kalshi cancels
+              // are idempotent, and leaving it would strand the order until someone noticed.
               try { exec_.cancel(old->order_id); } catch (const std::exception& e) { LOG_WARN("cancel %s: %s", old->order_id.c_str(), e.what()); }
             }
           }
@@ -383,112 +406,17 @@ void Engine::run_strategies() {
       if (!governs) continue;  // a second strategy on the same ticker: logged above, never traded
       // Killed: keep researching (fairs are logged above), propose nothing.
       if (kill_) continue;
-      // Existing position in this market: never add to it, never flip it here.
-      auto pit = std::find_if(positions.begin(), positions.end(),
-                              [&](const Position& p) { return p.ticker == m.ticker; });
-      if (pit != positions.end() && pit->position != 0) continue;
-
-      auto cands = candidates(m, s, *f);
-      if (cands.empty()) {
-        // Withdraw a stale pending proposal if the edge is gone.
-        for (const char* side : {"yes", "no"})
-          if (auto old = store_.find_open_proposal(m.ticker, side, st->name()))
-            if (old->status == "pending") {
-              old->status = "expired";
-              old->note = "edge gone";
-              store_.update_proposal(*old);
-              release_pending(*old);
-            }
-        continue;
-      }
-      const ProposalCandidate& c = cands.front();
-      std::string cluster = risk_cluster(store_, m);
-      // Already resting / pending for this ticker+side+strategy: refresh numbers instead of stacking.
-      auto existing = store_.find_open_proposal(m.ticker, c.outcome_side, st->name());
-      if (existing && existing->status == "submitted") continue;
-      // A pending proposal keeps the room it already holds: size it without counting itself.
-      double self_used = existing ? existing->count * (existing->price + existing->fee_per) : 0.0;
-      double n = size_for(c, m, bankroll, by_event[m.event_ticker] - self_used, by_cluster[cluster] - self_used,
-                          open_used - self_used);
-      if (std::getenv("DESK_DEBUG_SIZING"))
-        LOG_INFO("size %s ev_used %.2f cl_used %.2f self %.2f open %.2f -> n %.0f @ %.2f (p_win %.3f)",
-                 m.ticker.c_str(), by_event[m.event_ticker], by_cluster[cluster], self_used, open_used, n, c.price,
-                 c.p_win);
-      if (n < 1) {
-        if (existing) {  // no room left for it: withdraw rather than leave a stale number
-          existing->status = "expired";
-          existing->note = "no room";
-          store_.update_proposal(*existing);
-          forget_pending(existing->id);
-          by_event[m.event_ticker] -= self_used;
-          by_cluster[cluster] -= self_used;
-          open_used -= self_used;
-        }
-        continue;
-      }
-      // Same bet twice in one event (LAX B79.5 YES + LAX T80 NO, 2026-09-05): refuse it here.
-      {
-        std::vector<Holding> held = book.holdings[m.event_ticker];
-        for (const auto& [pid, h] : pending_by_event[m.event_ticker])
-          if (!existing || pid != existing->id) held.push_back(h);
-        Holding add{m.ticker, c.outcome_side == "yes", n, n * (c.price + c.fee_per)};
-        if (stacks_event(store_, m.event_ticker, held, add)) {
-          if (existing && existing->status == "pending") {
-            existing->status = "expired";
-            existing->note = "stacks the bet already held in " + m.event_ticker;
-            store_.update_proposal(*existing);
-            forget_pending(existing->id);
-            by_event[m.event_ticker] -= self_used;
-            by_cluster[cluster] -= self_used;
-            open_used -= self_used;
+      // Entries are the decision router's (session 15). The model's number is a ProbabilityQuote
+      // (above); the edge engine and the router decide in the cycle, for the Trades board and the
+      // algorithm alike, and nothing here proposes an entry. A pending entry proposal left from
+      // before is withdrawn so it can be neither approved nor sent.
+      for (const char* side : {"yes", "no"})
+        if (auto old = store_.find_open_proposal(m.ticker, side, st->name()))
+          if (old->status == "pending") {
+            old->status = "expired";
+            old->note = "withdrawn: model entries now come from the decision router (Trades board or the algorithm)";
+            store_.update_proposal(*old);
           }
-          f->note += " | NOT PROPOSED: stacks the bet already held in " + m.event_ticker;
-          latest_fair_[m.ticker] = *f;
-          break;
-        }
-      }
-      // Opposite side pending or resting: drop it; never work both sides of one market.
-      if (auto opp = store_.find_open_proposal(m.ticker, c.outcome_side == "yes" ? "no" : "yes", st->name())) {
-        if (opp->status == "pending") {
-          opp->status = "expired";
-          opp->note = "side flipped";
-          store_.update_proposal(*opp);
-          release_pending(*opp);
-        } else if (opp->status == "submitted" && !opp->order_id.empty()) {
-          try { exec_.cancel(opp->order_id); } catch (const std::exception& e) { LOG_WARN("cancel %s: %s", opp->order_id.c_str(), e.what()); }
-          continue;  // re-evaluate next cycle once the book is clean
-        }
-      }
-      Proposal p = existing ? *existing : Proposal{};
-      p.ticker = m.ticker;
-      p.event_ticker = m.event_ticker;
-      p.series_ticker = m.series_ticker;
-      p.strategy = st->name();
-      p.mode = mode;
-      p.outcome_side = c.outcome_side;
-      p.exec_style = c.exec_style;
-      p.status = "pending";
-      p.price = c.price;
-      p.count = n;
-      p.p_model = f->p;
-      p.sigma = f->sigma;
-      p.fee_per = c.fee_per;
-      p.net_edge = c.net_edge;
-      p.yes_bid = m.yes_bid;
-      p.yes_ask = m.yes_ask;
-      p.cluster = cluster;
-      p.note = f->note;
-      if (existing) {
-        store_.update_proposal(p);
-        by_event[m.event_ticker] += n * (c.price + c.fee_per) - self_used;
-        by_cluster[cluster] += n * (c.price + c.fee_per) - self_used;
-      } else {
-        store_.insert_proposal(p);
-        by_event[m.event_ticker] += n * (c.price + c.fee_per);
-        by_cluster[cluster] += n * (c.price + c.fee_per);
-      }
-      open_used += n*(c.price+c.fee_per)-self_used;
-      remember_pending(p);
       break;  // first strategy that covers the market wins
     }
   }
@@ -567,7 +495,22 @@ void Engine::run_ladder_arb(const std::vector<Market>& markets) {
 
 void Engine::update_daily_stop() {
   auto d=daily_equity(store_,cfg_);
-  if(d["start_pv"].get<double>()>0 && d["pv"].get<double>()<=d["stop_pv"].get<double>() && !kill_)
+  // Say so when the balance moved for reasons the desk cannot name. The stop still applies - it
+  // is the only brake there is - but a number nobody can explain should never pass silently.
+  if (!d.value("cash_explained", true)) {
+    std::string msg = "cash does not reconcile: $" + fmt2(d.value("cash_residual", 0.0)) +
+                      " of today's balance movement is unexplained; equity and the daily stop are "
+                      "computed on it anyway";
+    if (last_error_.find("cash does not reconcile") == std::string::npos) {
+      LOG_WARN("%s", msg.c_str());
+      store_.log_event("warn", msg);
+    }
+  }
+  double off = d.value("untracked_transferred", 0.0);
+  if (off > 0.01 && cycle_count_ % 200 == 1)
+    LOG_WARN("$%.2f sits on another exchange instance and is not in any equity or risk number here",
+             off);
+  if(d.value("stop_enabled",true) && d["start_pv"].get<double>()>0 && d["pv"].get<double>()<=d["stop_pv"].get<double>() && !kill_)
     set_kill(true, "Daily loss stop: equity $" + fmt2(d["pv"].get<double>()) + " <= floor $" + fmt2(d["stop_pv"].get<double>()) +
                        " (day start $" + fmt2(d["start_pv"].get<double>()) + ", money moved " + fmt2(d.value("external_flows", 0.0)) + ")");
 }
@@ -632,11 +575,52 @@ void Engine::run_exits() {
   auto positions = store_.positions();
   std::map<std::string, std::vector<Order>> resting;
   for (const auto& o : store_.orders("resting")) resting[o.ticker].push_back(o);
+
+  // Kalshi will not accept reduce_only on a resting order, so the desk has to enforce it. The
+  // loop below only visits tickers that still have a position, which means a resting exit whose
+  // position has gone - settled, closed by hand, or finished by another route - is never looked
+  // at again. If it then filled it would open the opposite position, which is the exact failure
+  // the exchange flag existed to prevent. Sweep those first, and any exit now larger than what
+  // is left to sell.
+  for (const auto& [ticker, orders] : resting) {
+    double held = 0;
+    for (const auto& pos : positions)
+      if (pos.ticker == ticker) held = std::fabs(pos.position);
+    for (const auto& o : orders) {
+      long long pid = store_.proposal_for_order(o.order_id);
+      auto pr = pid ? store_.get_proposal(pid) : std::nullopt;
+      if (!pr || !is_exit_strategy(pr->strategy)) continue;
+      const bool revoked_model_exit = pr->strategy == "exit" &&
+          store_.kv_get("model_exit:" + ticker).value_or("0") != "1";
+      if (!revoked_model_exit && o.remaining_count <= held + 1e-9) continue;
+      // Say what is being done before doing it. A cancel that fails still leaves an order resting
+      // that would open the opposite position, and that has to be visible rather than swallowed.
+      store_.log_event("warn", "pulling resting exit on " + ticker + ": " + fmt2(o.remaining_count) +
+                                   " resting against " + fmt2(held) +
+                                   " held, and a resting order carries no exchange reduce-only flag");
+      try {
+        exec_.cancel(o.order_id);
+      } catch (const std::exception& e) {
+        LOG_WARN("could not pull oversized exit %s: %s", o.order_id.c_str(), e.what());
+        store_.log_event("error", "resting exit on " + ticker +
+                                      " could NOT be pulled and would open the opposite position "
+                                      "if it fills: " + e.what());
+      }
+    }
+  }
+
   std::set<std::string> have_position;
   std::set<std::string> proposed_exits;
+  // Positions the systematic trader opened are its to manage: it has its own take-profit, stop,
+  // time stop and hold-value rules, and two exit managers on one position would fight.
+  const std::set<std::string> algo_owned = systematic_.owned_tickers();
   for (const auto& pos : positions) {
     if (pos.position == 0) continue;
     have_position.insert(pos.ticker);
+    if (algo_owned.count(pos.ticker)) continue;
+    // Knowing a fair does not confer ownership of an account position. Manual/dashboard/app
+    // positions stay manual. The separately configured user brackets still run above.
+    if (store_.kv_get("model_exit:" + pos.ticker).value_or("0") != "1") continue;
     auto fit = latest_fair_.find(pos.ticker);
     auto sit = latest_fair_strategy_.find(pos.ticker);
     auto tsit = latest_fair_ts_.find(pos.ticker);
@@ -699,7 +683,10 @@ void Engine::run_exits() {
     double buy_px = 1.0 - sell_px;
     // Existing exit for this ticker?
     auto existing = store_.find_open_proposal(pos.ticker, buy_side, "exit");
-    if (existing && existing->status == "submitted") {
+    // A cancel of the last exit that failed or is unresolved is handled like a working exit: while
+    // its order still rests it is left alone or pulled again, and only once it is gone is a new
+    // exit proposed. It is never stacked behind.
+    if (existing && (existing->status == "submitted" || existing->status == "cancel_pending")) {
       // A resting exit: leave it unless the price moved two ticks or more; the stale-order sweep
       // in run_strategies cancels it when the fair passes through it.
       auto rit = resting.find(pos.ticker);
@@ -809,7 +796,18 @@ void Engine::run_brackets() {
     FeeModel fm = srs != series_cache_.end() ? FeeModel::from_series(srs->second) : FeeModel{};
     double tick = m->tick > 0 ? m->tick : 0.01;
     bool long_yes = pit->position > 0;
-    double n = std::fabs(pit->position);
+    double n = manual_position_quantity(store_, *pit);
+    if (n < .01) {
+      // A bracket never acquires algorithm lots, even when the manual portion has closed.
+      for (const auto& o : resting[ticker]) {
+        auto pr = store_.get_proposal(store_.proposal_for_order(o.order_id));
+        if (pr && (pr->strategy == "target" || pr->strategy == "stop")) {
+          try { exec_.cancel(o.order_id); } catch (const std::exception& e) { LOG_WARN("cancel bracket %s: %s", o.order_id.c_str(), e.what()); }
+        }
+      }
+      store_.exec("UPDATE proposals SET status='expired',note='no manual quantity remains' WHERE ticker=? AND status='pending' AND strategy IN ('target','stop')", {ticker});
+      continue;
+    }
     double bid = long_yes ? m->yes_bid : (m->no_bid > 0 ? m->no_bid : (m->yes_ask > 0 ? 1.0 - m->yes_ask : 0));
     double tp = b.value("tp_price", 0.0), sl = b.value("sl_price", 0.0), trail = b.value("trail", 0.0);
     std::string mode = b.value("mode", "alert");
@@ -834,12 +832,14 @@ void Engine::run_brackets() {
       auto rit = resting.find(ticker);
       if (rit != resting.end())
         for (const auto& o : rit->second) {
+          auto pr = store_.get_proposal(store_.proposal_for_order(o.order_id));
+          if (!pr || (pr->strategy != "target" && pr->strategy != "stop")) { blocked = true; continue; }
           try { exec_.cancel(o.order_id); } catch (const std::exception& e) { LOG_WARN("cancel %s: %s", o.order_id.c_str(), e.what()); blocked = true; }
         }
       if (blocked) continue;
-      store_.exec("UPDATE proposals SET status='expired',note='stop hit' WHERE status='pending' AND ticker=? AND strategy IN ('target','exit')", {ticker});
+      store_.exec("UPDATE proposals SET status='expired',note='stop hit' WHERE status='pending' AND ticker=? AND strategy='target'", {ticker});
       if (auto sp = store_.find_open_proposal(ticker, buy_side, "stop"))
-        if (sp->status == "pending" || sp->status == "submitted") continue;  // already on its way
+        if (sp->status == "pending" || sp->status == "submitted" || sp->status == "cancel_pending") continue;  // already on its way
       Proposal p;
       p.ticker = ticker; p.event_ticker = m->event_ticker; p.series_ticker = m->series_ticker;
       p.strategy = "stop"; p.mode = "bot"; p.outcome_side = buy_side; p.exec_style = "taker"; p.status = "pending";
@@ -849,7 +849,7 @@ void Engine::run_brackets() {
       store_.insert_proposal(p);
       continue;
     }
-    // Target: keep one reduce-only maker order resting at tp for the whole position.
+    // Target: one maker order at tp for the manual portion only.
     if (tp > 0) {
       double tp_px = std::max(tick, std::min(1.0 - tick, tp));
       bool have = false;
@@ -859,7 +859,7 @@ void Engine::run_brackets() {
           long long pid = store_.proposal_for_order(o.order_id);
           auto pr = pid ? store_.get_proposal(pid) : std::nullopt;
           double our_px = long_yes ? o.yes_price : o.no_price;
-          if (pr && pr->strategy == "target" && std::fabs(our_px - tp_px) < tick / 2 && o.remaining_count >= n - 0.01) have = true;
+          if (pr && pr->strategy == "target" && std::fabs(our_px - tp_px) < tick / 2 && std::fabs(o.remaining_count - n) < .009) have = true;
           else if (pr && pr->strategy == "target") {
             try { exec_.cancel(o.order_id); } catch (const std::exception& e) { LOG_WARN("cancel %s: %s", o.order_id.c_str(), e.what()); have = true; }
           } else {
@@ -934,15 +934,31 @@ void Engine::auto_submit() {
   if (!exec_.armed()) return;
   int n = 0;
   double spent = auto_spent_today();
+  const long long started = now_s();
+  for (auto it = soft_backoff_.begin(); it != soft_backoff_.end();)
+    it = it->second <= started ? soft_backoff_.erase(it) : std::next(it);
   for (auto& p : store_.proposals("pending", 200)) {
     if (n >= cfg_.risk.max_orders_per_cycle) break;
+    // A qualified addition is visible so the user can review the extra concentration. The
+    // instant lane must not turn that review row back into an unattended order.
+    if (p.approval_required) continue;
     std::string why;
     bool reduces = is_exit_strategy(p.strategy);
+    // A model's ENTRY never goes from here (session 15): the decision router owns execution
+    // eligibility, AUTO decisions are the algorithm's and MANUAL ones are yours on the Trades
+    // board. Exits, brackets, the auto hedge and locked baskets are unchanged.
+    if (!reduces && std::any_of(strategies_.begin(), strategies_.end(),
+                                [&](const std::unique_ptr<Strategy>& st) { return st->name() == p.strategy; }))
+      continue;
+    // The market just refused (or would have refused) an entry on this ticker: give entries a
+    // breather. Exits, targets and stops on the same ticker are never held back by it.
+    if (!reduces && soft_backoff_.count(p.ticker)) continue;
     // The fast lane: an edge this big is gone by the time a human confirms it, so it goes now.
     // Mode still decides whether the strategy may trade at all - off and research never send -
     // but manual no longer means "wait" once the edge clears the bar.
     double lane = instant_edge();
-    bool instant = !reduces && lane > 0 && p.net_edge >= lane - 1e-9 && p.mode != "off" && p.mode != "research";
+    bool instant = !reduces && lane > 0 && p.net_edge >= lane - 1e-9 && (p.mode == "auto" || p.mode == "bot");
+    if (p.strategy == "auto_hedge" && store_.kv_get("auto_hedge:"+p.event_ticker).value_or("0") != "1") continue;
     if (instant && p.count * (p.price + p.fee_per) > cfg_.risk.instant_max_cost + 1e-9) {
       // Too big to send unattended: cut it to the instant cap rather than skipping the edge.
       double per = p.price + p.fee_per;
@@ -963,6 +979,7 @@ void Engine::auto_submit() {
     }
     if (!auto_armed() && !bracket) continue;  // explicit user brackets are independent of the model switch
     if (p.strategy == "exit") {
+      if (store_.kv_get("model_exit:" + p.ticker).value_or("0") != "1") continue;
       auto source = latest_fair_strategy_.find(p.ticker);
       auto fair = latest_fair_.find(p.ticker);
       if (source == latest_fair_strategy_.end() || fair == latest_fair_.end() || fair->second.research_only) continue;
@@ -1011,11 +1028,46 @@ void Engine::auto_submit() {
         add_auto_spent_bucket("shard:" + std::to_string(shard), cost);
       }
     } catch (const ApiError& e) {
-      // The exchange refused an order we sent: stop unattended trading until a human looks.
       LOG_ERR("%s submit %s: api %d %s", why.c_str(), p.ticker.c_str(), e.status, e.body.substr(0, 160).c_str());
       last_error_ = e.what();
-      if (e.status >= 400 && e.status < 500 && e.status != 429) set_kill(true, std::string("order rejected: ") + e.body.substr(0, 160));
-      break;
+      // A refused ENTRY means the desk and the exchange disagree about what is allowed, and
+      // nothing more should go out until somebody looks. A refused EXIT is the opposite case:
+      // killing the desk there leaves the position open and stops the machinery that was trying
+      // to close it. On 2026-09-06 and 07 a malformed exit did exactly that four times. Mark it
+      // failed, keep going, and let the operator see it.
+      if (reduces) {
+        p.status = "failed";
+        p.note += " | exit refused: " + e.body.substr(0, 120);
+        store_.update_proposal(p);
+        store_.log_event("error", "exit refused for " + p.ticker + " and the position is still open: " +
+                                      e.body.substr(0, 160));
+        continue;
+      }
+      // Only a refusal that says the desk itself is wrong stops the desk (reject.h). A post-only
+      // price the book moved through, a closed market or a short shard is the market moving: the
+      // proposal is spent (the executor marked it failed) and the next cycle re-prices from a
+      // fresh book.
+      const RejectClass cls = classify_rejection(e.status, e.body);
+      if (reject_trips_kill(cls)) {
+        set_kill(true, std::string("order rejected (") + reject_class_name(cls) + "): " + e.body.substr(0, 160));
+        break;
+      }
+      if (cls == RejectClass::Retryable) break;   // 429 / server trouble: stop sending this cycle
+      store_.log_event("warn", "not sent (" + std::string(reject_class_name(cls)) + ") " + p.ticker + " " +
+                                   p.outcome_side + ": " + e.body.substr(0, 120) + "; re-priced after a breather");
+      ++n;                                        // it was an order write; it counts
+      soft_backoff_[p.ticker] = now_s() + 30;
+      continue;
+    } catch (const SoftRejection& e) {
+      // Refused before sending because the book has already moved (a post-only price that would
+      // cross). Nothing went out; the pending proposal is re-priced in place next cycle.
+      LOG_INFO("%s submit %s not sent: %s", why.c_str(), p.ticker.c_str(), e.what());
+      if (p.note.find("not sent:") == std::string::npos) {
+        p.note += std::string(" | not sent: ") + e.what();
+        store_.update_proposal(p);
+      }
+      if (!reduces) soft_backoff_[p.ticker] = now_s() + 30;
+      continue;
     } catch (const std::exception& e) {
       // Pre-flight refusals (caps, stale account, another order resting, catching up) are not
       // exchange rejections: log, leave the proposal queued, move on.
@@ -1040,7 +1092,22 @@ void Engine::publish_snapshot() {
                           {"auto_rule", auto_rule_json(st->name())},
                           {"describe", st->describe()}});
   auto acct = store_.last_account();
+  // Freshness per source, as raw timestamps: the server stamps `now` when the page asks, so the
+  // dashboard subtracts and gets a real age. Publishing an age computed here would freeze at
+  // whatever it was on the last cycle, which is exactly the reading you must not trust - on
+  // 2026-09-07 this desk sat dead for nine and a half hours behind an ordinary-looking header.
+  auto newest = [&](const char* table) -> long long {
+    json r = store_.query(std::string("SELECT MAX(ts) AS t FROM ") + table);
+    return r.empty() || r[0]["t"].is_null() ? 0 : r[0].value("t", 0LL);
+  };
+  long long model_ts = 0;
+  for (const auto& [tk, ts] : latest_fair_ts_) model_ts = std::max(model_ts, ts);
   json status{{"env", cfg_.env},
+              {"discovery_ts", last_universe_refresh_},
+              {"model_ts", model_ts},
+              {"prices_ts", newest("ext_prices")},
+              {"weather_ts", newest("ext_weather")},
+              {"sports_ts", newest("ext_sports")},
               {"armed", exec_.armed()},
               {"kill", kill_.load()},
               {"kill_reason", kill_reason_},
@@ -1053,9 +1120,26 @@ void Engine::publish_snapshot() {
               {"strategies", strategies},
               {"balance", acct ? acct->balance : 0.0},
               {"portfolio_value", acct ? acct->portfolio_value : 0.0},
-              {"account_ts", acct ? acct->updated_ts : 0}};
+              {"account_ts", acct ? acct->updated_ts : 0},
+              {"perps", perps_.summary()},
+              {"polymarket", poly_.summary()}};
+  // The settlement reference, named in the header like any other data source: a commodity model
+  // priced off a socket that died twenty minutes ago is the failure this line exists to show.
+  if (reference_feed_) status["reference"] = reference_feed_->status();
+  if (quote_feed_) status["commodity_quotes"] = quote_feed_->status();
+  // Where each commodity model stands economically, from what has actually been recorded. Nothing
+  // here promotes anything: the two trading states are set by hand and by nothing else.
+  if (reference_feed_) {
+    json models = json::array();
+    for (const auto& st2 : strategies_)
+      if (st2->name().rfind("commodity_terminal", 0) == 0)
+        models.push_back(commodity_model_status(store_, st2->name()));
+    status["commodity_models"] = models;
+  }
   std::lock_guard<std::mutex> lk(snap_mu_);
   snap_fair_ = latest_fair_;
+  snap_quotes_ = latest_quote_;
+  snap_research_books_ = research_books_;
   snap_fair_strategy_ = latest_fair_strategy_;
   snap_fair_ts_ = latest_fair_ts_;
   snap_series_ = series_cache_;
@@ -1064,10 +1148,103 @@ void Engine::publish_snapshot() {
   snap_status_ = status;
 }
 
+void Engine::process_manual_orders() {
+  auto lookup=[&](const std::string& id)->json {
+    auto orders=store_.query("SELECT order_id,fill_count,remaining_count,proposal_id FROM orders WHERE client_order_id=?",{id});
+    if(!orders.empty()) {auto result=orders[0];result["status"]="submitted";return result;}
+    return json::parse(store_.kv_get("manual_attempt:"+id).value_or("{}"));
+  };
+  manual_orders_.process([&](const json& b,const std::string& id,long long deadline) {
+    OrderRequest req;req.ticker=b.value("ticker","");req.outcome_side=b.value("outcome_side","yes");
+    req.price=b.value("price",0.);req.count=b.value("count",0.);req.post_only=b.value("post_only",true);
+    req.tif=req.post_only?"good_till_canceled":"immediate_or_cancel";req.client_order_id=id;
+    // A request reviewed on a Trades board decision is revalidated against the desk as it is now,
+    // never sent from the browser's snapshot. It throws with what changed.
+    json fresh;
+    if(b.contains("decision_id")) fresh=revalidate_manual_decision(b,id);
+    try {
+      auto p=exec_.ticket(req,b.value("note","manual queued order"),deadline,fresh.is_object()?fresh.value("decision_id",""):"");
+      force_reconcile_=true;return p.to_json();
+    } catch(const RetryManualOrder&) {
+      throw;
+    } catch(const std::exception& e) {
+      const std::string error=e.what();
+      if(!store_.kv_get("manual_attempt:"+id) && error.find("account data has not caught up")!=std::string::npos)
+        throw RetryManualOrder("Waiting for the exchange account snapshot; no order sent yet");
+      // A final refusal from the shared risk checks or the exchange: say so on the decision. An
+      // order whose delivery is not known (a 5xx, a timeout) is "unknown", not refused.
+      if(fresh.is_object()) {
+        const json attempt=json::parse(store_.kv_get("manual_attempt:"+id).value_or("{}"),nullptr,false);
+        const std::string state=attempt.is_object()&&attempt.contains("status")&&attempt["status"].is_string()?attempt["status"].get<std::string>():"";
+        record_decision(store_,fresh,(state=="unknown"||state=="sending")?"unknown":"rejected",now_s(),0,
+                        "manual request "+id+": "+error,req.count,req.price,req.post_only?"maker":"taker");
+      }
+      throw;
+    }
+  },lookup,now_s());
+}
+
+json Engine::sports_models_view() {
+  json out=json::array();std::set<std::string> seen;const auto now=now_s();
+  for(const auto& w:store_.query("SELECT * FROM ext_wp WHERE ts>=? ORDER BY ts DESC LIMIT 300",{now-90})){
+    const auto event=w.value("event_ticker","");if(!seen.insert(event).second)continue;
+    const auto home=w.value("home_ticker",""),away=w.value("away_ticker","");
+    auto market=store_.get_market(home);if(!market)continue;
+    auto lg=SportsLive::default_leagues().find(market->series_ticker);
+    if(lg==SportsLive::default_leagues().end()||!lg->second.leadtime||w.value("state","")!="in"||w.value("period",0)>lg->second.periods)continue;
+    double left=SportsLive::frac_left(lg->second,w.value("period",0),w.value("clock",""),w.value("state",""));
+    double wp=w.value("wp_home",-1.);if(wp<0||wp>1)continue;
+    for(bool is_home:{true,false}){
+      const auto ticker=is_home?home:away;auto m=store_.get_market(ticker);if(!m)continue;
+      auto prior=store_.query(is_home?"SELECT MAX(mkt_home) AS earlier FROM ext_wp WHERE event_ticker=? AND ts>=? AND ts<=?":"SELECT MAX(mkt_away) AS earlier FROM ext_wp WHERE event_ticker=? AND ts>=? AND ts<=?",{event,now-600,now-60});
+      if(prior.empty()||!prior[0]["earlier"].is_number())continue;
+      auto sr=store_.get_series(m->series_ticker);if(!sr)continue;
+      auto c=sports_comeback_candidate(m->yes_ask,prior[0]["earlier"].get<double>(),is_home?wp:1-wp,FeeModel::from_series(*sr).fee(m->yes_ask,1,true),left,
+        w.value("ts",0LL)<=now&&m->quote_ts<=now&&now-m->quote_ts<=30&&m->yes_ask_size>=1&&m->yes_bid>0&&m->yes_ask>m->yes_bid);
+      c["ticker"]=ticker;c["fraction_left"]=left;c["price"]=m->yes_ask;c["per_trade_dollars"]=2.;out.push_back(c);
+    }
+  }
+  return json{{"candidates",out},{"live_enabled",false},{"notice","Comeback watch uses current ESPN win probability and a recorded dip. It does not predict the probability of doubling your exit price. Baseball/hockey need sport-specific remaining-opportunity models; they are not passed through a clock model."}};
+}
+
+void Engine::step_pair_models() {
+  const auto lab=pair_models_.view();
+  if(!lab.value("running",false)&&lab.value("positions",json::array()).empty())return;
+  auto rows=poly_.pairs(now_s());json chosen=json::array();std::set<std::string> wanted;
+  // Open paper legs always receive exit quotes. New research is bounded to four additional games.
+  for(const auto& p:lab["positions"])wanted.insert(p.value("key",""));
+  int extra=0;std::set<std::string> events;
+  std::map<std::string,json> depth;
+  for(auto r:rows){
+    const auto ticker=r.value("kalshi_ticker",""),slug=r.value("slug",""),event=r.value("kalshi_event","");
+    const bool held=wanted.count(ticker+"|"+slug)>0;
+    if(!held&&(extra>=4||events.count(event)))continue;
+    events.insert(event);if(!held)++extra;
+    try{if(!depth.count(slug)){auto b=poly_.book(slug);b["ts"]=now_s();depth[slug]=b;}
+      const auto& b=depth[slug];bool same=r.value("pm_yes_is_kalshi_yes",true);
+      r["pm_bid"]=same?b.value("best_bid",0.):1-b.value("best_ask",0.);
+      r["pm_ask"]=same?b.value("best_ask",0.):1-b.value("best_bid",0.);
+      r["pm_bid_size"]=b.value(same?"bid_size":"ask_size",0.);r["pm_ask_size"]=b.value(same?"ask_size":"bid_size",0.);r["pm_depth_ts"]=b["ts"];
+    }catch(const std::exception&){r["pm_depth_ts"]=0;}
+    if(auto km=store_.get_market(ticker)){if(auto series=store_.get_series(km->series_ticker)){r["fee_type"]=series->fee_type;r["fee_multiplier"]=series->fee_multiplier;}}
+    r["regime"]="";const auto now=now_s();
+    const auto wp=store_.query("SELECT * FROM ext_wp WHERE event_ticker=? ORDER BY ts DESC LIMIT 1",{event});
+    const auto soccer=store_.query("SELECT * FROM match_state WHERE event_ticker=?",{event});
+    if(!wp.empty()&&now-wp[0].value("ts",0LL)<=90&&wp[0].value("ts",0LL)<=now){
+      const auto& w=wp[0];r["regime"]=w.value("espn_id","")+":"+w.value("state","")+":"+w["period"].dump()+":"+w["home_score"].dump()+":"+w["away_score"].dump();
+    }else if(!soccer.empty()&&now-soccer[0].value("data_ts",0LL)<=90&&soccer[0].value("data_ts",0LL)<=now){
+      const auto& w=soccer[0];r["regime"]=w.value("espn_id","")+":"+w.value("phase","")+":"+w["home_score"].dump()+":"+w["away_score"].dump()+":"+w["red_home"].dump()+":"+w["red_away"].dump();
+    }else if(r.value("start_ts",0LL)>now)r["regime"]="pregame:"+std::to_string(r.value("start_ts",0LL));
+    chosen.push_back(r);process_manual_orders();
+  }
+  const auto sys=systematic_.state();pair_models_.step(chosen,now_s(),sys.value("settings",json::object()).value("capital_budget_dollars",40.));
+}
+
 void Engine::cycle() {
   std::lock_guard<std::mutex> lk(mu_);
   ++cycle_count_;
   apply_kill_sweep();
+  process_manual_orders();
   bool ok = true;
   auto step = [&](const char* name, auto&& fn) {
     try { fn(); } catch (const std::exception& e) {
@@ -1075,15 +1252,69 @@ void Engine::cycle() {
       last_error_ = std::string(name) + ": " + e.what();
       ok = false;
     }
+    process_manual_orders();
   };
+  // The reference socket collects on its own thread and never touches the store; this is the
+  // only writer. First in the cycle so a slow cycle does not let the pending queue grow.
+  if (reference_feed_) step("reference", [&] { reference_feed_->flush(now_s()); });
+  if (quote_feed_) step("quotes", [&] {
+    // Follow the windows that are open now. They roll every fifteen minutes, so the set is sent
+    // as a difference rather than by reconnecting, and a window that has closed is dropped as
+    // soon as it does: the study is about the live book, and an expired market has none.
+    std::set<std::string> series;
+    for (const auto& u : CommodityTerminal::default_underlyings())
+      for (const auto& ser : u.series) series.insert(ser);
+    std::vector<std::string> tickers;
+    const long long t = now_s();
+    for (const auto& m : store_.open_markets("")) {
+      if (!series.count(m.series_ticker) || !m.tradable()) continue;
+      const long long close = parse_iso(m.close_time);
+      if (close > 0 && close <= t) continue;
+      tickers.push_back(m.ticker);
+    }
+    quote_feed_->watch(tickers);
+    quote_feed_->flush(t);
+  });
   step("refresh", [&] { refresh_series(); refresh_markets(); refresh_event_meta(); });
+  step("universe", [&] { refresh_universe(); });
   if ((cycle_count_ - 1) % std::max(1, cfg_.reconcile_every) == 0 || force_reconcile_.exchange(false))
     step("reconcile", [&] { exec_.reconcile(cycle_count_ == 1); update_daily_stop(); });
+  // The margined instance: marks and the index every few seconds, the account on its own cadence
+  // (and right after anything was sent there), then the basis rule.
+  step("perps", [&] { perps_.refresh_public(now_s()); perps_.refresh_account(now_s()); perps_.step(now_s()); });
+  // Polymarket: the league universe on its own slow clock, quotes for matched markets every few
+  // seconds, the account, then the Kalshi<->Polymarket pairs the strategies read this cycle.
+  step("polymarket", [&] { poly_.refresh_universe(now_s()); poly_.match(now_s()); poly_.refresh_quotes(now_s()); poly_.refresh_account(now_s()); });
   step("strategies", [&] { run_strategies(); });
+  // Strategies first: research-only NBA/weather fairs can nominate liquid books for capture in
+  // this same cycle. Previously only held or already-proposed contracts had depth history.
+  step("books", [&] { record_books(); });
   if (cycle_count_ % 2 == 0) step("results", [&] { refresh_results(); });
   step("brackets", [&] { run_brackets(); });
   step("auto hedge", [&] { run_auto_hedge(); });
   step("exits", [&] { run_exits(); });
+  // The systematic trader reads the published snapshot (fairs, books), so publish this cycle's
+  // numbers before it runs, and let it send before the queue is worked so a locked basket it
+  // owns is not sent twice.
+  publish_snapshot();
+  // One decision set a cycle: quotes -> edges -> routes. The same rows go to the Trades board
+  // (MANUAL, and AUTO marked), to the research record (RESEARCH) and to the algorithm (AUTO).
+  step("systematic", [&] {
+    const long long t = now_s();
+    json board = research_board();
+    const RouterContext ctx = router_context(t);
+    json screen = systematic_screen(board, systematic_.settings_copy(), ctx);
+    const json st = systematic_.state();
+    screen["algorithm"] = {{"running", st.contains("running") && st["running"].is_boolean() && st["running"].get<bool>()},
+                           {"mode", st.contains("mode") && st["mode"].is_string() ? st["mode"].get<std::string>() : "paper"},
+                           {"auto_armed", ctx.auto_armed},
+                           {"auto_off_reason", ctx.auto_armed ? std::string() : ctx.auto_off_reason}};
+    screen["market_data_max_age_seconds"] = cfg_.data_max_age();
+    publish_decisions(screen, t);
+    systematic_.step(board, screen, t);
+  });
+  step("pairs", [&] { poly_.step(now_s()); });
+  step("pair model lab", [&] { step_pair_models(); });
   step("auto", [&] { auto_submit(); });
   apply_kill_sweep();
   if (ok) last_error_.clear();
@@ -1117,6 +1348,16 @@ void Engine::apply_kill_sweep() {
     }
   }
   store_.exec("UPDATE proposals SET status='expired',note='kill' WHERE status='pending'");
+  try {
+    perps_.cancel_all("kill switch");
+  } catch (const std::exception& e) {
+    LOG_WARN("perps kill sweep: %s", e.what());
+  }
+  try {
+    poly_.cancel_all("kill switch");
+  } catch (const std::exception& e) {
+    LOG_WARN("polymarket kill sweep: %s", e.what());
+  }
   publish_snapshot();
 }
 
@@ -1161,6 +1402,10 @@ void Engine::set_mode(const std::string& strategy, const std::string& mode) {
     throw std::runtime_error("bad mode " + mode);
   store_.log_event("info", strategy + " mode -> " + mode);
   cfg_.strategy_modes[strategy] = mode;
+  {
+    std::lock_guard<std::mutex> lk(modes_mu_);
+    modes_copy_ = cfg_.strategy_modes;
+  }
   if (mode == "off" || mode == "research") {
     for (const auto& o : store_.orders("resting")) {
       long long pid = store_.proposal_for_order(o.order_id);
@@ -1191,7 +1436,11 @@ void Engine::set_mode(const std::string& strategy, const std::string& mode) {
 std::string Engine::mode_for(const std::string& strategy) const { return cfg_.mode_for(strategy); }
 
 double Engine::market_weight(const std::string& strategy) const {
-  double dflt = (strategy == "manual_fair") ? 0.0 : 0.5;
+  // The strategy's own default, not a list of names kept in step by hand: a model added later
+  // that must not be blended would otherwise be blended by silence.
+  double dflt = 0.5;
+  for (const auto& st : strategies_)
+    if (st->name() == strategy) { dflt = st->default_market_weight(); break; }
   const json& P = cfg_.strategy_params;
   if (P.is_object() && P.contains(strategy) && P[strategy].is_object())
     return std::min(1.0, std::max(0.0, P[strategy].value("market_weight", dflt)));
@@ -1216,6 +1465,11 @@ json Engine::approve(long long id, double expected_price, double expected_count)
   auto p = store_.get_proposal(id);
   if (!p) throw std::runtime_error("no such proposal");
   if (p->status != "pending") throw std::runtime_error("proposal is " + p->status);
+  if (!is_exit_strategy(p->strategy) &&
+      std::any_of(strategies_.begin(), strategies_.end(),
+                  [&](const std::unique_ptr<Strategy>& st) { return st->name() == p->strategy; }))
+    throw std::runtime_error("model entries are traded from the Trades board, where the decision is revalidated "
+                             "just before it is sent; this proposal predates that and is not sent");
   // The row you clicked is a few seconds old, and an in-play model re-prices every cycle, so
   // demanding an exact match refused almost every click on a live match. Send what you confirmed
   // instead: the order goes at YOUR price and size when the proposal has only drifted a tick, and
@@ -1231,6 +1485,7 @@ json Engine::approve(long long id, double expected_price, double expected_count)
   if (p->count < 0.01) throw std::runtime_error("nothing left to buy at your size");
   if (kill_) throw std::runtime_error("kill switch is on");
   std::string oid = exec_.submit(*p);
+  store_.kv_set("manual_order:" + oid, "1");
   force_reconcile_ = true;    // positions and orders on the screen within a cycle, not in 30 s
   return json{{"order_id", oid}, {"proposal", p->to_json()}};
 }
@@ -1246,7 +1501,7 @@ json Engine::reject(long long id, const std::string& why) {
 
 json Engine::markets_view(const std::string& series_filter) {
   std::lock_guard<std::mutex> lk(snap_mu_);
-  const long long now = now_s(), stale_after = std::max(60, cfg_.poll_seconds * 3);
+  const long long now = now_s(), stale_after = cfg_.data_max_age();
   json out = json::array();
   for (const auto& m : store_.open_markets(series_filter)) {
     if (!snap_watch_.count(m.series_ticker)) continue;
@@ -1287,6 +1542,153 @@ json Engine::markets_view(const std::string& series_filter) {
 
 // Kalshi's own mutually_exclusive flag per event, cached in event_meta. Without it the risk
 // book has to assume every bracket can settle YES independently, and no hedge can be verified.
+// An execution claim needs the book that was actually there at the moment of the decision. This
+// desk has recorded two million top-of-book rows and, before this, not one order book: no study
+// of what would have filled has ever been possible on it, and no amount of later work can make
+// the past ones possible. This is what makes future ones possible.
+// Which books to read this cycle, in priority order: risk first (positions, pending proposals, the
+// algorithm's own positions), then research candidates in every category whose route is not
+// "off". Data follows the route, not execution: a manual or research candidate needs the same live
+// book as an automatic one, so only an "off" category spends nothing here. Pure selection, no I/O.
+std::vector<std::string> Engine::book_capture_plan() {
+  static constexpr int kMaxBooksPerCycle = 20;
+  std::vector<std::string> want;
+  std::set<std::string> seen;
+  auto add = [&](const std::string& ticker) {
+    if (!ticker.empty() && seen.insert(ticker).second) want.push_back(ticker);
+  };
+  // Risk first, research second. Vector order matters when the request cap is reached.
+  for (const auto& pos : store_.positions())
+    if (pos.position != 0) add(pos.ticker);
+  for (const auto& p : store_.proposals("pending", 100)) add(p.ticker);
+  // The algorithm's positions and routes. A view that cannot be built must not take book capture
+  // down with it (it did, for a NULL column): fall back to the defaults and the account's positions.
+  json lab = json::object();
+  try { lab = systematic_.view(); } catch (const std::exception& e) { LOG_WARN("book plan: systematic view: %s", e.what()); }
+  if (lab.contains("positions") && lab["positions"].is_array())
+    for (const auto& pos : lab["positions"])
+      if (pos.is_object() && pos.contains("ticker") && pos["ticker"].is_string()) add(pos["ticker"].get<std::string>());
+  json settings = lab.contains("settings") ? lab["settings"] : json();
+  if (!settings.is_object()) settings = systematic_defaults();
+  auto num = [&](const char* key, double dflt) {
+    return settings.contains(key) && settings[key].is_number() ? settings[key].get<double>() : dflt;
+  };
+  const double min_p = num("min_win_probability", .6), min_edge = num("min_edge", .04);
+
+  struct ResearchBook { std::string ticker; double liquidity = 0; };
+  std::vector<ResearchBook> research;
+  for (const auto& m : store_.open_markets()) {
+    if (!m.tradable() || !watch_.count(m.series_ticker) || !latest_fair_.count(m.ticker)) continue;
+    auto s = series_cache_.find(m.series_ticker);
+    if (s == series_cache_.end()) continue;
+    // The dedicated 15-minute crypto path remains frozen. Hourly/daily crypto may now have
+    // execution observations, just like the other research categories.
+    if (m.series_ticker.find("15M") != std::string::npos) continue;
+    // The same category the systematic screen routes by, read as a route and never as a boolean.
+    const std::string cat = systematic_category(json{{"category", s->second.category}, {"series_ticker", m.series_ticker}});
+    if (!route_captures_data(route_setting(settings, cat))) continue;
+    double score = m.liquidity + m.volume + m.open_interest;
+    if (m.yes_bid > 0 && m.yes_ask > m.yes_bid) score += 100.0 / (m.yes_ask - m.yes_bid);
+    const Fair& f = latest_fair_.at(m.ticker);
+    FeeModel fm = FeeModel::from_series(s->second);
+    double edge = -1.0;
+    const MarketSidePrices book = normalize_prices(m);
+    const double yes_ask = book.ask(Side::Yes), no_ask = book.ask(Side::No);
+    if (f.p >= min_p && yes_ask > 0)
+      edge = f.p - yes_ask - fm.fee_per_contract(yes_ask, true);
+    if (1.0 - f.p >= min_p && no_ask > 0)
+      edge = std::max(edge, 1.0 - f.p - no_ask - fm.fee_per_contract(no_ask, true));
+    if (edge >= min_edge) {
+      score += 1e9;
+      const bool inputs_valid = f.inputs.is_object() && f.inputs.contains("valid") &&
+                                f.inputs["valid"].is_boolean() && f.inputs["valid"].get<bool>();
+      if (inputs_valid) score += 1e9;
+    }
+    research.push_back({m.ticker, score});
+  }
+  std::sort(research.begin(), research.end(), [](const auto& a, const auto& b) {
+    return a.liquidity > b.liquidity;
+  });
+  for (const auto& r : research) {
+    if (want.size() >= static_cast<size_t>(kMaxBooksPerCycle)) break;
+    add(r.ticker);
+  }
+  return want;
+}
+
+// Reads one book, keeps it as the research depth for that ticker and records it as an
+// observation (on change, plus a one-minute heartbeat). Returns the depth fields the board merges.
+json Engine::capture_book(const std::string& t) {
+  const long long now = now_s();
+  Orderbook b = client_.get_orderbook(t, 10);
+  json row = {{"quote_ts", now_s()}, {"yes_bid", b.best_yes_bid()}, {"yes_ask", b.best_yes_ask()},
+              {"no_bid", b.best_no_bid()}, {"no_ask", b.best_no_ask()},
+              {"yes_bid_size", b.yes_bids.empty() ? 0.0 : b.yes_bids.back().qty},
+              {"yes_ask_size", b.no_bids.empty() ? 0.0 : b.no_bids.back().qty},
+              {"no_bid_size", b.no_bids.empty() ? 0.0 : b.no_bids.back().qty},
+              {"no_ask_size", b.yes_bids.empty() ? 0.0 : b.yes_bids.back().qty}};
+  research_books_[t] = row;
+  Observation o;
+  o.source = "kalshi.orderbook";
+  o.subject = t;
+  o.kind = "book";
+  o.valid_ts = now;          // the book is about the moment it was read
+  o.received_ts = now_s();   // and this is when we actually had it
+  o.payload = orderbook_to_json(b).dump();
+  // Record changes plus a one-minute heartbeat. The heartbeat distinguishes "the book stayed
+  // unchanged" from "the feed disappeared", which matters in fill and queue-position tests.
+  auto seen = last_book_.find(t);
+  if (seen == last_book_.end() || seen->second != o.payload || now - last_book_log_ts_[t] >= 60) {
+    last_book_[t] = o.payload;
+    last_book_log_ts_[t] = now;
+    record_observation(store_, o);
+  }
+  return row;
+}
+
+void Engine::record_books() {
+  static constexpr int kMaxBooksPerCycle = 20;
+  int n = 0;
+  for (const auto& t : book_capture_plan()) {
+    if (n >= kMaxBooksPerCycle) break;
+    // A market that has stopped trading has no book to learn from. A position in one still shows
+    // here until settlement clears, and without this the desk spends a request a cycle fetching
+    // the same empty book (KXNCAAFGAME-26SEP06WISND-WIS, determined 03:09, fifteen times over).
+    auto m = store_.get_market(t);
+    if (m && !m->tradable()) continue;
+    try {
+      capture_book(t);
+      ++n;
+    } catch (const std::exception& e) {
+      LOG_WARN("book %s: %s", t.c_str(), e.what());
+    }
+  }
+}
+
+// Discovery has to redo itself when a day turns over, and the days it cares about are local to
+// each contract: New York rolls three hours before Los Angeles, and a universe refreshed on one
+// clock keeps offering yesterday's Los Angeles market as today's for those three hours. Cheap
+// enough to run often; the point of the roll check is that it cannot be late.
+void Engine::refresh_universe() {
+  long long now = now_s();
+  static constexpr long long kRefreshSeconds = 300;
+  bool rolled = false;
+  for (const auto& spec : settlement_specs()) {
+    std::string day = trading_day(spec.tz, now);
+    auto it = universe_day_.find(spec.tz);
+    if (it == universe_day_.end()) universe_day_[spec.tz] = day;
+    else if (it->second != day) {
+      LOG_INFO("universe: %s rolled over to %s", spec.tz, day.c_str());
+      it->second = day;
+      rolled = true;
+    }
+  }
+  if (!rolled && now - last_universe_refresh_ < kRefreshSeconds) return;
+  last_universe_refresh_ = now;
+  auto rows = build_universe(store_.open_markets(), now);
+  save_universe(store_, rows, now);
+}
+
 void Engine::refresh_event_meta() {
   long long now = now_s();
   // Known events, in one query: the per-market lookup this used to do ran thousands of
@@ -1452,7 +1854,7 @@ void Engine::run_auto_hedge() {
     double worst = ex.events.count(ev) ? ex.events.at(ev) : 0.0;
     if (worst <= trigger + 0.01) continue;                       // inside the risk you accept
     if (!store_.query("SELECT id FROM proposals WHERE event_ticker=? AND strategy='auto_hedge' AND status IN "
-                      "('pending','submitted')", {ev}).empty()) continue;
+                      "('pending','submitted','cancel_pending')", {ev}).empty()) continue;
     double target = worst - cfg_.risk.hedge_auto_fraction * (worst - trigger);
     HedgePlan plan = plan_hedge(store_, cfg_, ev, holdings, std::nullopt, target);
     if (plan.options.empty()) continue;
@@ -1471,7 +1873,8 @@ void Engine::run_auto_hedge() {
     p.event_ticker = ev;
     p.series_ticker = m ? m->series_ticker : "";
     p.strategy = "auto_hedge";
-    p.mode = mode;
+    p.entry_kind = "hedge";
+    p.mode = store_.kv_get("auto_hedge:"+ev).value_or("0") == "1" ? mode : "manual";
     p.outcome_side = pick->side;
     p.exec_style = "taker";
     p.status = "pending";
@@ -1492,7 +1895,8 @@ void Engine::run_auto_hedge() {
 }
 
 json Engine::size_suggestion(const std::string& ticker, const std::string& side, double price,
-                             const std::string& style) {
+                             const std::string& style, const std::string& decision_id) {
+  if((side!="yes"&&side!="no")||(style!="maker"&&style!="taker")||!std::isfinite(price)||price<=0||price>=1)throw std::runtime_error("invalid sizing input");
   auto m = store_.get_market(ticker);
   if (!m) throw std::runtime_error("unknown market " + ticker);
   auto srs = store_.get_series(m->series_ticker);
@@ -1511,87 +1915,253 @@ json Engine::size_suggestion(const std::string& ticker, const std::string& side,
   double room = std::min({room_event, room_cluster, room_open});
   double cash = 0;
   if (auto a = store_.last_account()) cash = std::max(0.0, a->balance - committed_exposure(store_).resting);
-  room = std::min(room, cash);
+  const auto shard=shard_cash_view(store_,*m,now_s());
+  room = std::min({room,cash,shard.value("available",0.),cfg_.risk.max_order_dollars});
   double n_caps = cost > 0 ? std::floor(std::max(0.0, room) / cost) : 0;
   double n = n_caps;
-  std::string basis = "risk caps";
+  std::string basis = shard.value("fresh",false)?"risk caps + exchange shard "+std::to_string(m->exchange_index)
+                                                :shard.value("reason",std::string("shard balance unavailable; sync first"));
+  // What is actually binding, in words, so a refusal names its own cause instead of listing four
+  // numbers and leaving the reader to work out which one is zero.
+  std::string binding;
+  if (!shard.value("fresh",false)) binding = shard.value("reason",std::string("the shard balance is not known"));
+  else if (room==shard.value("available",0.)) binding = "exchange shard "+std::to_string(m->exchange_index)+
+      " has $"+fmt2(shard.value("available",0.))+" available";
+  else if (room==cash) binding = "account cash net of resting orders is $"+fmt2(cash);
+  else if (room==room_event) binding = "the per-event cap leaves $"+fmt2(std::max(0.0,room_event));
+  else if (room==room_cluster) binding = "the correlated-cluster cap leaves $"+fmt2(std::max(0.0,room_cluster));
+  else if (room==room_open) binding = "the total-open cap leaves $"+fmt2(std::max(0.0,room_open));
+  else binding = "the per-order cap is $"+fmt2(cfg_.risk.max_order_dollars);
+  // The model's number for this contract and the edge at this price and style, both from the one
+  // edge engine: the decision you are reviewing when the dialog names one (the book and the
+  // probability it was decided on), else the ticker's latest ProbabilityQuote against the stored
+  // book. The order dialog shows these numbers; it computes none of them. Kelly runs on a
+  // probability the model stands behind. An order placed on a model's decision also gets the flat
+  // cap for a model that has not yet beaten the price on settled markets: the cap the old proposal
+  // lane put on every model signal it sized, which is what a Trades-board decision replaces.
+  const json settings = decision_settings();
   double p_win = -1;
-  {
+  std::string model;
+  json edge = nullptr, decision = nullptr;
+  if (!decision_id.empty()) {
+    json shown;
+    {
+      std::lock_guard<std::mutex> lk(decisions_mu_);
+      auto it = recent_decisions_.find(decision_id);
+      if (it != recent_decisions_.end()) shown = it->second.first;
+    }
+    if (shown.is_object() && jstr(shown, "ticker") == ticker && jstr(shown, "side") == side) {
+      const EdgeCandidate at = decision_edge_at(shown, style, price, settings);
+      const double floor = jnum(settings, "manual_min_edge", 0.05);
+      edge = candidate_to_json(at);
+      edge["model"] = jstr(shown, "model_key");
+      edge["sigma"] = std::isfinite(at.fair.sigma) ? json(at.fair.sigma) : json(nullptr);
+      decision = {{"decision_id", decision_id}, {"found", true}, {"route", jstr(shown, "route")},
+                  {"reasons", shown.contains("reasons") ? shown["reasons"] : json::array()},
+                  {"manual_min_edge", floor}, {"clears_floor", at.executable && at.executable_edge + 1e-9 >= floor}};
+      if (std::isfinite(at.fair_probability) && jstr(shown, "route") == "manual") {
+        p_win = at.fair_probability;
+        model = jstr(shown, "model");
+      }
+    } else {
+      decision = {{"decision_id", decision_id}, {"found", false},
+                  {"reason", "this row is no longer on the board; the desk will refuse a ticket on it"}};
+    }
+  } else {
     std::lock_guard<std::mutex> lk(snap_mu_);
-    auto f = snap_fair_.find(ticker);
-    if (f != snap_fair_.end() && !f->second.research_only)
-      p_win = side == "no" ? 1.0 - f->second.p : f->second.p;
+    auto q = snap_quotes_.find(ticker);
+    if (q != snap_quotes_.end() && quote_valid(q->second) && q->second.inputs_valid) {
+      EdgeSettings es;
+      es.uncertainty_multiplier = jnum(settings, "uncertainty_buffer");
+      es.taker_slippage = jnum(settings, "slippage_estimate");
+      const EdgeCandidate at = candidate_at(q->second, normalize_prices(*m), side_from(side), style, price, fm, es);
+      edge = candidate_to_json(at);
+      edge["model"] = q->second.model_key();
+      edge["sigma"] = std::isfinite(q->second.sigma) ? json(q->second.sigma) : json(nullptr);
+      edge["research_only"] = q->second.research_only;
+      // A hand ticket is sized as it always was: the caps, and Kelly on a number the model stands
+      // behind. The uncalibrated-model cap below is for orders placed ON a model's decision.
+      if (!q->second.research_only) p_win = at.fair_probability;
+    }
   }
   if (p_win > 0) {
     double kelly = size_contracts(bankroll, p_win, cost, cfg_.risk.kelly_frac, cfg_.risk.max_event_frac);
     if (kelly < n) { n = kelly; basis = "quarter Kelly"; }
   }
+  if (!model.empty() && !calibration_for(model).demonstrated) {
+    const double flat = cfg_.risk.uncalibrated_max_order_frac * bankroll;
+    const double n_cal = cost > 0 ? std::floor(flat / cost) : 0;
+    if (n_cal < n) {
+      n = n_cal;
+      basis = "uncalibrated model cap";
+      binding = model + " has not beaten the price on settled markets yet, so an order on its number is capped at $" + fmt2(flat);
+    }
+  }
   return json{{"count", std::max(0.0, n)}, {"cost_per", cost}, {"fee_per", fee}, {"room", std::max(0.0, room)},
               {"basis", basis}, {"cap_event", std::max(0.0, room_event)}, {"cap_cluster", std::max(0.0, room_cluster)},
-              {"cap_open", std::max(0.0, room_open)}, {"cash", cash}, {"p_win", p_win}};
+              {"cap_open", std::max(0.0, room_open)}, {"cash", cash}, {"shard",shard}, {"p_win", p_win},
+              {"binding", binding}, {"cost_total", cost}, {"price", price}, {"style", style},
+              {"edge", edge}, {"decision", decision}};
+}
+
+json Engine::board_row_locked(const Market& m, long long now, long long stale_after, long long manage_after,
+                              double* rank_edge, const std::map<std::string, double>* held) {
+  std::string category;
+  double fee_mult = 1.0;
+  std::string fee_type = "quadratic";
+  auto sit = snap_series_.find(m.series_ticker);
+  if (sit != snap_series_.end()) {
+    category = sit->second.category;
+    fee_type = sit->second.fee_type;
+    fee_mult = sit->second.fee_multiplier;
+  }
+  double edge = -9, best_price = 0, best_fee = 0;
+  std::string best_side = "yes";
+  long long settle_ts = expected_settlement_ts(m);
+  json j = {{"ticker", m.ticker},
+            {"event_ticker", m.event_ticker},
+            {"series_ticker", m.series_ticker},
+            {"title", m.title},
+            {"yes_sub_title", m.yes_sub_title.empty() ? m.subtitle : m.yes_sub_title},
+            {"category", category},
+            {"fee_type", fee_type},
+            {"fee_multiplier", fee_mult},
+            {"event_date", event_date(m.event_ticker)},
+            {"yes_bid", m.yes_bid},
+            {"yes_ask", m.yes_ask},
+            {"no_bid", m.no_bid},
+            {"no_ask", m.no_ask},
+            {"yes_bid_size", m.yes_bid_size},
+            {"yes_ask_size", m.yes_ask_size},
+            {"tick", m.tick > 0 ? m.tick : 0.01},
+            {"quote_ts", m.quote_ts},
+            {"open_ts", parse_iso(m.open_time)},
+            {"close_ts", parse_iso(m.close_time)},
+            {"market_status", m.status},
+            {"minutes_to_close", minutes_to_close(m.close_time, m.expected_expiration_time, now)},
+            {"settlement_ts", settle_ts},
+            {"hours_to_settlement", settle_ts > 0 ? (settle_ts - now) / 3600.0 : -1.0},
+            {"quote_stale", m.quote_ts <= 0 || now - m.quote_ts > stale_after},
+            {"quote_stale_manage", m.quote_ts <= 0 || now - m.quote_ts > manage_after},
+            {"fair_stale", true},
+            {"fair_stale_manage", true},
+            {"research_only", false},
+            {"research_reason", ""}};
+  auto f = snap_fair_.find(m.ticker);
+  if (f != snap_fair_.end()) {
+    j["p_model"] = f->second.p;
+    j["p_raw"] = f->second.p_raw >= 0 ? f->second.p_raw : f->second.p;
+    j["market_blend_weight"] = f->second.market_blend_weight;
+    j["model_inputs"] = f->second.inputs;
+    j["model_research_only"] = f->second.research_only;
+    j["model_research_reason"] = f->second.research_reason;
+    j["sigma"] = f->second.sigma;
+    j["fair_note"] = f->second.note;
+    j["research_only"] = f->second.research_only;
+    j["research_reason"] = f->second.research_reason;
+    auto fs = snap_fair_strategy_.find(m.ticker);
+    j["fair_strategy"] = fs == snap_fair_strategy_.end() ? "" : fs->second;
+    auto ft = snap_fair_ts_.find(m.ticker);
+    long long fair_ts = ft == snap_fair_ts_.end() ? 0 : ft->second;
+    j["fair_ts"] = fair_ts;
+    j["fair_stale"] = fair_ts <= 0 || now - fair_ts > stale_after;
+    j["fair_stale_manage"] = fair_ts <= 0 || now - fair_ts > manage_after;
+    // The canonical model output travels with the row: the router reads the quote, not the
+    // engine's display fields.
+    auto qit = snap_quotes_.find(m.ticker);
+    ProbabilityQuote rq;
+    if (qit != snap_quotes_.end()) {
+      rq = qit->second;
+      j["quote"] = quote_to_json(rq);
+      j["model_version"] = rq.model_version;
+      j["settlement_verified"] = rq.settlement_verified;
+    } else {
+      rq.ticker = m.ticker;
+      rq.p_yes = f->second.p;
+      rq.sigma = f->second.sigma;
+    }
+    // Rank by the edge a taker would keep on the better side, from the one edge engine (no
+    // uncertainty deduction here: this orders the board, the router decides).
+    FeeModel fm{fee_type, fee_mult};
+    EdgeSettings rank_settings;
+    rank_settings.uncertainty_multiplier = 0;
+    const MarketSidePrices px = normalize_prices(m);
+    for (Side side : {Side::Yes, Side::No}) {
+      EdgeCandidate c = taker_candidate(rq, px, side, fm, rank_settings);
+      if (c.executable && c.net_edge > edge) {
+        edge = c.net_edge;
+        best_side = side_name(side);
+        best_price = c.entry_price;
+        best_fee = c.entry_fee;
+      }
+    }
+  }
+  j["edge"] = edge > -8 ? edge : 0.0;
+  j["have_edge"] = edge > -8;
+  Proposal probe;
+  probe.ticker = m.ticker;
+  probe.event_ticker = m.event_ticker;
+  probe.series_ticker = m.series_ticker;
+  probe.strategy = j.value("fair_strategy", "board");
+  probe.outcome_side = best_side;
+  probe.exec_style = "taker";
+  probe.price = best_price > 0 ? best_price : 0.5;
+  probe.count = 1;
+  probe.fee_per = best_fee;
+  probe.net_edge = edge > -8 ? edge : 0.0;
+  EntryContext admission = entry_context(store_, cfg_, probe, m, now);
+  j["entry_context"] = admission.to_json();
+  if (!admission.allowed) {
+    j["research_only"] = true;
+    j["research_reason"] = admission.reason;
+  }
+  // A position on this ticker: the entry policy for the side it holds, where a same-side addition
+  // can qualify, priced at that side's own offer (the router reads entry_context_<side> first).
+  double position = 0;
+  if (held) {
+    auto hit = held->find(m.ticker);
+    if (hit != held->end()) position = hit->second;
+  } else {
+    for (const auto& pos : store_.positions()) if (pos.ticker == m.ticker) position = pos.position;
+  }
+  if (position != 0) {
+    const std::string held_side = position > 0 ? "yes" : "no";
+    const auto qit = snap_quotes_.find(m.ticker);
+    EdgeSettings no_buffer;
+    no_buffer.uncertainty_multiplier = 0;
+    ProbabilityQuote hq;
+    if (qit != snap_quotes_.end()) hq = qit->second;
+    const EdgeCandidate c = taker_candidate(hq, normalize_prices(m), side_from(held_side),
+                                            FeeModel{j.value("fee_type", std::string("quadratic")), j.value("fee_multiplier", 1.0)},
+                                            no_buffer);
+    Proposal add = probe;
+    add.outcome_side = held_side;
+    add.price = c.executable ? c.entry_price : 0.5;
+    add.fee_per = c.entry_fee;
+    add.net_edge = c.executable ? c.net_edge : 0.0;
+    j["entry_context_" + held_side] = entry_context(store_, cfg_, add, m, now).to_json();
+  }
+  if (rank_edge) *rank_edge = edge;
+  return j;
 }
 
 json Engine::board_view(int limit) {
   std::lock_guard<std::mutex> lk(snap_mu_);
-  const long long now = now_s(), stale_after = std::max(60, cfg_.poll_seconds * 3);
+  // Two ages, two jobs. `quote_stale` / `fair_stale` use the desk's one limit for OPENING risk
+  // (Config::data_max_age), shared with the strategy engine and the systematic screen. The
+  // `*_manage` flags keep the older, looser rule for MANAGING what is already on (exits, stops,
+  // resting entries): refusing to manage a position is a risk of its own.
+  const long long now = now_s(), stale_after = cfg_.data_max_age(),
+                  manage_after = std::max(60, cfg_.poll_seconds * 3);
   struct Row { json j; double edge; };
   std::vector<Row> rows;
   rows.reserve(512);
+  std::map<std::string, double> held;
+  for (const auto& pos : store_.positions()) if (pos.position != 0) held[pos.ticker] = pos.position;
   for (const auto& m : store_.open_markets()) {
     if (!snap_watch_.count(m.series_ticker)) continue;
-    std::string category;
-    double fee_mult = 1.0;
-    std::string fee_type = "quadratic";
-    auto sit = snap_series_.find(m.series_ticker);
-    if (sit != snap_series_.end()) {
-      category = sit->second.category;
-      fee_type = sit->second.fee_type;
-      fee_mult = sit->second.fee_multiplier;
-    }
     double edge = -9;
-    json j = {{"ticker", m.ticker},
-              {"event_ticker", m.event_ticker},
-              {"series_ticker", m.series_ticker},
-              {"title", m.title},
-              {"yes_sub_title", m.yes_sub_title.empty() ? m.subtitle : m.yes_sub_title},
-              {"category", category},
-              {"fee_type", fee_type},
-              {"fee_multiplier", fee_mult},
-              {"event_date", event_date(m.event_ticker)},
-              {"yes_bid", m.yes_bid},
-              {"yes_ask", m.yes_ask},
-              {"no_bid", m.no_bid},
-              {"no_ask", m.no_ask},
-              {"yes_bid_size", m.yes_bid_size},
-              {"yes_ask_size", m.yes_ask_size},
-              {"minutes_to_close", minutes_to_close(m.close_time, m.expected_expiration_time, now)},
-              {"quote_stale", m.quote_ts <= 0 || now - m.quote_ts > stale_after},
-              {"fair_stale", true},
-              {"research_only", false},
-              {"research_reason", ""}};
-    auto f = snap_fair_.find(m.ticker);
-    if (f != snap_fair_.end()) {
-      j["p_model"] = f->second.p;
-      j["sigma"] = f->second.sigma;
-      j["fair_note"] = f->second.note;
-      j["research_only"] = f->second.research_only;
-      j["research_reason"] = f->second.research_reason;
-      auto fs = snap_fair_strategy_.find(m.ticker);
-      j["fair_strategy"] = fs == snap_fair_strategy_.end() ? "" : fs->second;
-      auto ft = snap_fair_ts_.find(m.ticker);
-      long long fair_ts = ft == snap_fair_ts_.end() ? 0 : ft->second;
-      j["fair_ts"] = fair_ts;
-      j["fair_stale"] = fair_ts <= 0 || now - fair_ts > stale_after;
-      // Edge a taker would keep on the better side, so the server can rank without the browser
-      // parsing every contract on the exchange.
-      FeeModel fm{fee_type, fee_mult};
-      double p = f->second.p;
-      double no_ask = m.no_ask > 0 ? m.no_ask : (m.yes_bid > 0 ? 1.0 - m.yes_bid : 0);
-      if (m.yes_ask > 0 && m.yes_ask < 1) edge = std::max(edge, p - m.yes_ask - fm.fee_per_contract(m.yes_ask, true));
-      if (no_ask > 0 && no_ask < 1) edge = std::max(edge, (1 - p) - no_ask - fm.fee_per_contract(no_ask, true));
-    }
-    j["edge"] = edge > -8 ? edge : 0.0;
-    j["have_edge"] = edge > -8;
+    json j = board_row_locked(m, now, stale_after, manage_after, &edge, &held);
     rows.push_back({std::move(j), edge});
   }
   std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) { return a.edge > b.edge; });
@@ -1601,7 +2171,72 @@ json Engine::board_view(int limit) {
     if (limit > 0 && n++ >= limit) break;
     out.push_back(std::move(r.j));
   }
-  return json{{"total", rows.size()}, {"shown", out.size()}, {"markets", out}};
+  return json{{"total", rows.size()}, {"shown", out.size()}, {"markets", out},
+              {"market_data_max_age_seconds", stale_after}};
+}
+
+// Research uses actual captured depth, without rewriting the quotes or strategy inputs used by
+// the existing desk. Filtering happens before any presentation cap, including for BTC/ETH.
+json Engine::research_board() {
+  json board = board_view(0);
+  const long long now = now_s(), stale_after = cfg_.data_max_age(),
+                  manage_after = std::max(60, cfg_.poll_seconds * 3);
+  std::lock_guard<std::mutex> lk(snap_mu_);
+  for (auto& row : board["markets"]) {
+    const std::string ticker = row.value("ticker", "");
+    auto book = snap_research_books_.find(ticker);
+    const long long book_ts = book == snap_research_books_.end() ? 0 : book->second.value("quote_ts", 0LL);
+    const long long row_ts = row.value("quote_ts", 0LL);
+    // A captured book is merged (prices and depth) while it is young enough to manage on, as it
+    // always was: a stop needs the captured depth to hit the bid, and one failed read in a slow
+    // cycle must not turn it into a resting sell. It is also merged when it is at least as new as
+    // the market's own top of book. Only a capture past the management limit AND older than the
+    // market row is dropped (it used to overwrite that fresher quote and leave the row stale for
+    // good); the row is then treated like one with no capture: its own quote, no captured depth.
+    // The flags come from the capture's age: entries stop at the entry limit, management at its own.
+    // Positions and resting entries are captured first every cycle, so for them the capture is
+    // effectively always what is used.
+    const bool capture_manageable = book_ts > 0 && book_ts <= now && now - book_ts <= manage_after;
+    if (book != snap_research_books_.end() && (capture_manageable || book_ts >= row_ts)) {
+      for (const auto& [key, value] : book->second.items()) row[key] = value;
+      row["quote_stale"] = book_ts <= 0 || now < book_ts || now - book_ts > stale_after;
+      row["quote_stale_manage"] = book_ts <= 0 || now < book_ts || now - book_ts > manage_after;
+    } else {
+      row["yes_bid_size"] = 0.0;
+      row["yes_ask_size"] = 0.0;
+      row["no_bid_size"] = 0.0;
+      row["no_ask_size"] = 0.0;
+    }
+  }
+  // Paper holdings may survive the open universe. Keep observing their last available book;
+  // the simulator will mark it stale and leave exits pending rather than inventing a fill.
+  return board;
+}
+
+json Engine::research_screen(const json& settings) {
+  return systematic_screen(research_board(), settings, now_s(), {}, {}, cfg_.risk.max_disagreement);
+}
+
+json Engine::systematic_view(int screen_limit) {
+  json out = systematic_.view();
+  // The router with the desk's real state: ownership, cooldowns, the kill switch and the master
+  // switch (a row the algorithm would take while it is stopped is shown as yours, with the reason).
+  const long long t = now_s();
+  json screen = systematic_screen(research_board(), systematic_.settings_copy(), router_context(t));
+  // The rows are sorted: algo, manual, weak, blocked. The blocked tail is most of the exchange
+  // and the page does not need all of it every five seconds.
+  size_t total = screen["rows"].size();
+  if (screen_limit > 0 && total > static_cast<size_t>(screen_limit))
+    screen["rows"].erase(screen["rows"].begin() + screen_limit, screen["rows"].end());
+  screen["shown"] = screen["rows"].size();
+  out["screen"] = std::move(screen);
+  out["live_auto_armed"] = auto_armed();
+  return out;
+}
+
+json Engine::configure_systematic(const json& body) {
+  systematic_.configure(body);
+  return systematic_view();
 }
 
 json Engine::strategies_view() const {
@@ -1647,6 +2282,107 @@ json Engine::risk_view() {
               {"kill_reason", kill_reason_}};
 }
 
+// ---- the book -------------------------------------------------------------------------------
+// One switch over lanes that already exist, rather than a fifth algorithm. Each lane keeps its
+// own rules, budgets and exits; this only starts and stops them together and reports the line.
+
+namespace {
+// A lane the switch can drive. `available` is the question "could this run at all right now",
+// which is not the same as "is it on": a lane with no key, or switched off in config, must say
+// so in words rather than silently stay dark when the switch is thrown.
+json lane_row(const std::string& name, const std::string& covers, bool available,
+              const std::string& why, bool running, bool paper) {
+  return json{{"name", name}, {"covers", covers}, {"available", available},
+              {"unavailable_reason", available ? "" : why},
+              {"running", running}, {"mode", paper ? "paper" : "live"}};
+}
+}  // namespace
+
+json Engine::book() {
+  json lanes = json::array();
+  int on = 0;
+
+  const json sys = systematic_.view();
+  const bool sys_live = jstr(sys, "mode") == "live";
+  const bool sys_ok = !sys_live || exec_.armed();
+  lanes.push_back(lane_row("systematic", "weather, crypto, sports and the locked baskets",
+                           sys_ok, "live mode needs an API key", sys.value("running", false), !sys_live));
+  if (sys.value("running", false)) ++on;
+
+  const json pm = poly_.summary();
+  lanes.push_back(lane_row("pairs", "the same game on Kalshi and Polymarket",
+                           pm.value("enabled", false) && pm.value("armed", false),
+                           pm.value("enabled", false) ? "no Polymarket key: prices only"
+                                              : "Polymarket is off in config",
+                           pm.value("algo_running", false), pm.value("algo_paper", false)));
+  if (pm.value("algo_running", false)) ++on;
+
+  const json pp = perps_.summary();
+  lanes.push_back(lane_row("perps", "the margined instance: basis against the index",
+                           pp.value("enabled", false) && pp.value("armed", false),
+                           pp.value("enabled", false) ? "the margined instance is not reachable"
+                                              : "perps are off in config",
+                           pp.value("algo_running", false), pp.value("algo_paper", false)));
+  if (pp.value("algo_running", false)) ++on;
+
+  // Lane 2 is not a queue of its own: it is the rows the screen already produced and held back.
+  // Counting them rather than inventing a second list keeps one definition of the line. The
+  // screen is the one systematic_view() last computed (the dashboard asks for it every few
+  // seconds); this used to read systematic_.view(), which has no screen, so it always said zero.
+  // Older than a minute, or never computed, and the counts are unknown rather than zero.
+  json summary;
+  {
+    std::lock_guard<std::mutex> lk(screen_summary_mu_);
+    summary = screen_summary_;
+  }
+  const long long screen_ts = summary.value("generated_ts", 0LL), now = now_s();
+  const bool known = screen_ts > 0 && screen_ts <= now + 1 && now - screen_ts <= 60;
+  return json{{"running", on > 0}, {"lanes_on", on}, {"lanes", lanes},
+              {"for_you", known ? json(summary.value("for_you", 0)) : json(nullptr)},
+              {"blocked", known ? json(summary.value("blocked", 0)) : json(nullptr)},
+              {"research", known ? json(summary.value("research", 0)) : json(nullptr)},
+              {"best_edge", known ? summary.value("best_edge", 0.0) : 0.0},
+              {"best_ticker", known ? summary.value("best_ticker", std::string()) : std::string()},
+              {"screen_ts", screen_ts},
+              {"kill", kill_.load()}, {"kill_reason", kill_reason_}};
+}
+
+json Engine::book_configure(const json& body) {
+  if (!body.is_object()) throw std::runtime_error("request must be an object");
+  if (!body.contains("running") || !body["running"].is_boolean())
+    throw std::runtime_error("book takes {running: true|false} and an optional lane");
+  const bool want = body["running"].get<bool>();
+  // An optional lane turns the master switch into a per-lane one. Running the pairs lane without
+  // the weather book, or stopping perps alone, is an ordinary thing to want and used to mean
+  // going to a different tab for each.
+  const std::string only = body.value("lane", "");
+  if (!only.empty() && only != "systematic" && only != "pairs" && only != "perps")
+    throw std::runtime_error("unknown lane: " + only);
+  if (want && kill_)
+    throw std::runtime_error("the kill switch is on; re-arm the desk first");
+
+  // Each lane is asked separately and a refusal from one does not stop the others: a missing
+  // Polymarket key should not keep weather and crypto switched off.
+  json started = json::array(), refused = json::array();
+  auto drive = [&](const char* name, auto&& fn) {
+    if (!only.empty() && only != name) return;
+    try { fn(); started.push_back(name); }
+    catch (const std::exception& e) { refused.push_back(json{{"lane", name}, {"why", e.what()}}); }
+  };
+  drive("systematic", [&] { systematic_.configure(json{{"running", want}}); });
+  drive("pairs",      [&] { poly_.configure_algo(json{{"running", want}}); });
+  drive("perps",      [&] { perps_.configure_algo(json{{"running", want}}); });
+
+  store_.log_event("info", (only.empty() ? std::string("book ") : "lane " + only + " ") +
+                               (want ? "started: " : "stopped: ") + std::to_string(started.size()) +
+                               " lanes" +
+                               (refused.empty() ? "" : ", " + std::to_string(refused.size()) + " refused"));
+  json out = book();
+  out["changed"] = started;
+  out["refused"] = refused;
+  return out;
+}
+
 json Engine::status() {
   std::lock_guard<std::mutex> lk(snap_mu_);
   return snap_status_.is_null() ? json{{"env", cfg_.env}, {"cycle", 0}, {"watch", json::array()},
@@ -1656,5 +2392,295 @@ json Engine::status() {
                                        {"last_error", ""}, {"kill_reason", ""}, {"account_ts", 0}}
                                 : snap_status_;
 }
+
+// ---- the decision pipeline (session 15) -------------------------------------------------------
+
+RouterContext Engine::router_context(long long now, bool include_manual_queue) {
+  RouterContext ctx;
+  ctx.now = now;
+  ctx.killed = kill_.load();
+  systematic_.router_context(ctx);   // the algorithm's trades, account positions, cooldowns, switch
+  ctx.strategy_modes = strategy_modes();   // the locked copy: this also runs on HTTP threads
+  // A working order owns its event the way a position does: one event, one entry decision.
+  for (const auto& o : store_.orders("resting"))
+    if (auto m = store_.get_market(o.ticker)) { ctx.held_events.insert(m->event_ticker); ctx.working_events.insert(m->event_ticker); }
+  // So does a proposal still waiting to be sent (an arbitrage leg waiting for approval, an exit).
+  for (const auto& p : store_.proposals("pending", 500)) {
+    std::string event = p.event_ticker;
+    if (event.empty())
+      if (auto m = store_.get_market(p.ticker)) event = m->event_ticker;
+    ctx.held_events.insert(event);
+    ctx.working_events.insert(event);
+  }
+  // So does a manual request you have already queued there.
+  if (include_manual_queue)
+    for (const auto& r : store_.query("SELECT event_ticker FROM manual_requests WHERE status IN ('queued','processing','unknown')"))
+      if (r.contains("event_ticker") && r["event_ticker"].is_string()) {
+        ctx.held_events.insert(r["event_ticker"].get<std::string>());
+        ctx.working_events.insert(r["event_ticker"].get<std::string>());
+      }
+  ctx.held_events.erase("");
+  ctx.working_events.erase("");
+  return ctx;
+}
+
+void Engine::publish_decisions(const json& screen, long long now) {
+  std::vector<json> offered, research;
+  // Lane 2 of the Book panel, counted from this cycle's decisions: the rows offered to you, the
+  // blocked and the research ones, and the best executable edge waiting for you.
+  {
+    int for_you = 0, blocked = 0, n_research = 0;
+    double best = 0;
+    std::string best_ticker;
+    if (screen.contains("rows") && screen["rows"].is_array())
+      for (const auto& r : screen["rows"]) {
+        const std::string route = jstr(r, "route");
+        if (route == "blocked") { ++blocked; continue; }
+        if (route == "research") { ++n_research; continue; }
+        if (route != "manual") continue;
+        ++for_you;
+        if (jnum(r, "executable_edge") > best) { best = jnum(r, "executable_edge"); best_ticker = jstr(r, "ticker"); }
+      }
+    std::lock_guard<std::mutex> lk(screen_summary_mu_);
+    screen_summary_ = json{{"generated_ts", screen.value("generated_ts", 0LL)}, {"for_you", for_you},
+                           {"blocked", blocked}, {"research", n_research}, {"best_edge", best},
+                           {"best_ticker", best_ticker}};
+  }
+  {
+    std::lock_guard<std::mutex> lk(decisions_mu_);
+    cycle_screen_ = screen;
+    if (screen.contains("rows") && screen["rows"].is_array())
+      for (const auto& r : screen["rows"]) {
+        const std::string route = r.value("route", std::string());
+        if (route != "manual" && route != "auto" && route != "research") continue;
+        const std::string id = r.value("decision_id", std::string());
+        if (!id.empty() && route != "research") recent_decisions_[id] = {r, now};
+        // Snapshot what was offered when it first appears, when its route changes or its edge moves
+        // by 2c, and on a 5-minute heartbeat; not every cycle (the book's timestamp alone changes
+        // every five seconds). What happened to a decision (approved, revalidated, auto, rejected,
+        // submitted) is always recorded; this is the sampled record of what the board showed.
+        const double price = jnum(r, "price"), edge = jnum(r, "executable_edge", -1);
+        // The research record is for the candidates a research model would have taken (an edge
+        // after the buffer), sampled: when one first appears or changes route, then every 15 min.
+        // Its every estimate is already in model_fairs; this table is for decisions.
+        if (route == "research" && !(edge > 0)) continue;
+        const std::string key = jstr(r, "ticker") + "|" + jstr(r, "side") + "|" + jstr(r, "model_key");
+        Offered& o = offered_[key];
+        const bool changed = o.ts == 0 || o.route != route || (route != "research" && std::fabs(o.edge - edge) >= 0.02 - 1e-9);
+        if (changed || now - o.ts >= (route == "research" ? 900 : 300)) {
+          (route == "research" ? research : offered).push_back(r);
+          o = Offered{route, id, price, edge, now};
+        }
+      }
+    // An unsent review expires after 90 s, so a displayed decision is only needed that long.
+    for (auto it = recent_decisions_.begin(); it != recent_decisions_.end();)
+      it = now - it->second.second > 150 ? recent_decisions_.erase(it) : std::next(it);
+    for (auto it = offered_.begin(); it != offered_.end();)
+      it = now - it->second.ts > 3600 ? offered_.erase(it) : std::next(it);
+  }
+  for (const auto& r : offered) record_decision(store_, r, "offered", now);
+  for (const auto& r : research) record_decision(store_, r, "research", now);
+  // The sampled records age out (offered after 30 days, research after 90); what happened to a
+  // decision, and so every order's trail, is kept.
+  if (now - last_decision_prune_ >= 86400) {
+    last_decision_prune_ = now;
+    store_.exec("DELETE FROM trade_decisions WHERE (event='offered' AND ts<?) OR (event='research' AND ts<?)",
+                {now - 30LL * 86400, now - 90LL * 86400});
+  }
+}
+
+json Engine::decisions_view(bool include_research, int limit) {
+  json screen;
+  {
+    std::lock_guard<std::mutex> lk(decisions_mu_);
+    screen = cycle_screen_;
+  }
+  std::vector<json> lanes, research;
+  if (screen.contains("rows") && screen["rows"].is_array())
+    for (const auto& r : screen["rows"]) {
+      const std::string route = jstr(r, "route");
+      if (route == "manual" || route == "auto") lanes.push_back(r);
+      // A research row is on the board's research filter only when its model would have an edge
+      // there: the rest are recorded (trade_decisions) and shown on the Systematic tab.
+      else if (route == "research" && jnum(r, "executable_edge", -1) > 0) research.push_back(r);
+    }
+  // Ranked by edge per dollar of risk (Kelly), the order the algorithm itself takes AUTO rows in.
+  auto by_kelly = [](const json& a, const json& b) { return jnum(a, "kelly", -1) > jnum(b, "kelly", -1); };
+  std::stable_sort(lanes.begin(), lanes.end(), by_kelly);
+  std::stable_sort(research.begin(), research.end(), by_kelly);
+  // One row per event and route: the best one. An event is one entry decision (the others are
+  // blocked the moment one is taken), and a single event's brackets would otherwise fill the
+  // board. `event_rows` says how many rows the event had on that route.
+  auto one_per_event = [](std::vector<json>& rows) {
+    std::map<std::string, size_t> first;
+    std::vector<json> out;
+    for (auto& r : rows) {
+      const std::string key = jstr(r, "event_ticker") + "|" + jstr(r, "route");
+      auto it = first.find(key);
+      if (it != first.end()) {
+        out[it->second]["event_rows"] = out[it->second].value("event_rows", 1) + 1;
+        continue;
+      }
+      first[key] = out.size();
+      r["event_rows"] = 1;
+      out.push_back(std::move(r));
+    }
+    rows = std::move(out);
+  };
+  one_per_event(lanes);
+  one_per_event(research);
+  json rows = json::array();
+  int rank = 0;
+  for (auto& r : lanes) {
+    if (limit > 0 && rank >= limit) break;
+    r["rank"] = ++rank;
+    rows.push_back(std::move(r));
+  }
+  if (include_research)
+    for (auto& r : research) {
+      if (limit > 0 && static_cast<int>(rows.size()) >= 2 * limit) break;
+      r["rank"] = nullptr;
+      rows.push_back(std::move(r));
+    }
+  const json settings = screen.value("settings", json::object());
+  return json{{"generated_ts", screen.value("generated_ts", 0LL)},
+              {"counts", screen.value("counts", json::object())},
+              {"algorithm", screen.value("algorithm", json::object())},
+              {"market_data_max_age_seconds", screen.value("market_data_max_age_seconds", 0)},
+              {"rows", rows},
+              {"floors", {{"min_edge", jnum(settings, "min_edge")},
+                          {"manual_min_edge", jnum(settings, "manual_min_edge")},
+                          {"uncertainty_buffer", jnum(settings, "uncertainty_buffer")},
+                          {"slippage_estimate", jnum(settings, "slippage_estimate")},
+                          {"auto_max_sigma", jnum(settings, "auto_max_sigma")}}}};
+}
+
+json Engine::decision_settings() {
+  {
+    std::lock_guard<std::mutex> lk(decisions_mu_);
+    if (cycle_screen_.contains("settings") && cycle_screen_["settings"].is_object()) return cycle_screen_["settings"];
+  }
+  return validate_systematic_settings(json::object(), systematic_.settings_copy());   // before the first cycle
+}
+
+void Engine::precheck_manual_decision(const json& b) {
+  const std::string did = b.value("decision_id", std::string());
+  json shown;
+  {
+    std::lock_guard<std::mutex> lk(decisions_mu_);
+    auto it = recent_decisions_.find(did);
+    if (it != recent_decisions_.end()) shown = it->second.first;
+  }
+  if (!shown.is_object())
+    throw std::runtime_error("the row you reviewed (decision " + did + ") is no longer on the board; review the current row");
+  if (shown.value("ticker", std::string()) != b.value("ticker", std::string()) ||
+      shown.value("side", std::string()) != b.value("outcome_side", std::string()))
+    throw std::runtime_error("the ticket does not match decision " + did);
+  const std::string route = shown.value("route", std::string());
+  if (route == "auto") throw std::runtime_error("that row is the algorithm's to send (AUTO); it is not offered to you");
+  if (route != "manual") throw std::runtime_error("that row is not offered to you (" + route + ")");
+  // The price and style you chose, on the book and probability you were shown: a ticket under the
+  // manual floor is refused at the click rather than a cycle later. The full revalidation, on a
+  // fresh book, still runs just before the order goes. (The cycle's settings: this runs on the
+  // HTTP thread inside the queue's lock, and the algorithm's own lock is held across live sends.)
+  const json settings = decision_settings();
+  const std::string style = b.value("post_only", true) ? "maker" : "taker";
+  const double price = b.value("price", 0.0);
+  const EdgeCandidate at = decision_edge_at(shown, style, price, settings);
+  const double floor = settings.value("manual_min_edge", 0.05);
+  if (!at.executable || at.executable_edge + 1e-9 < floor)
+    throw std::runtime_error("at " + fmt2(price) + " (" + style + ") the edge after the fee, slippage and the uncertainty buffer is " +
+                             fmt2(at.executable_edge) + ", under the " + fmt2(floor) + " manual floor");
+}
+
+json Engine::revalidate_manual_decision(const json& b, const std::string& request_id) {
+  const long long now = now_s();
+  const std::string did = b.value("decision_id", std::string()), ticker = b.value("ticker", std::string()),
+                    side = b.value("outcome_side", std::string("yes"));
+  const double price = b.value("price", 0.0), count = b.value("count", 0.0);
+  const std::string style = b.value("post_only", true) ? "maker" : "taker";
+  json shown;
+  {
+    std::lock_guard<std::mutex> lk(decisions_mu_);
+    auto it = recent_decisions_.find(did);
+    if (it != recent_decisions_.end()) shown = it->second.first;
+  }
+  const std::string note = "manual request " + request_id;
+  auto refuse = [&](const std::string& why) {
+    json r = shown.is_object() ? shown : json{{"decision_id", did}, {"ticker", ticker}, {"side", side}, {"route", "manual"}};
+    record_decision(store_, r, "rejected", now, 0, note + ": " + why, count, price, style);
+    throw std::runtime_error(why + "; nothing sent");
+  };
+  if (!shown.is_object()) refuse("the row you reviewed is no longer on the board (decision " + did + ")");
+  if (shown.value("ticker", std::string()) != ticker || shown.value("side", std::string()) != side)
+    refuse("the ticket does not match the decision it names");
+  // An estimate that is merely a little old is a wait, not a verdict: the queue's first pass of a
+  // cycle runs before the strategies step, so after a slow cycle the model's number can sit just
+  // past the entry limit. The request stays queued, inside its 90 s review window, and is checked
+  // again after the next estimate. One that is missing, or long gone, is refused below with why.
+  {
+    std::lock_guard<std::mutex> lk(snap_mu_);
+    auto ft = snap_fair_ts_.find(ticker);
+    if (ft != snap_fair_ts_.end() && now - ft->second > cfg_.data_max_age() && now - ft->second <= 120)
+      throw RetryManualOrder("waiting for the model's next estimate before the last check; nothing sent yet");
+  }
+  // The book as it is now, straight from the exchange, and the model's latest number: never the
+  // screen the browser was looking at.
+  Market mk = client_.get_market(ticker);
+  store_.upsert_market(mk);
+  mk.quote_ts = now;
+  json row;
+  {
+    std::lock_guard<std::mutex> lk(snap_mu_);
+    row = board_row_locked(mk, now, cfg_.data_max_age(), std::max(60, cfg_.poll_seconds * 3));
+  }
+  RouterContext ctx = router_context(now, false);   // this request's own queue reservation is not a conflict
+  ctx.max_age = cfg_.data_max_age();
+  const json settings = validate_systematic_settings(json::object(), systematic_.settings_copy());
+  const TradeDecision d = decide(row, side_from(side), settings, ctx);
+  json fresh = decision_to_row(d);
+  if (fresh.value("model_key", std::string()) != shown.value("model_key", std::string()))
+    refuse("the model behind this row changed (" + shown.value("model_key", std::string()) + " -> " +
+           fresh.value("model_key", std::string()) + ")");
+  if (d.route == DecisionRoute::Auto) refuse("this row is now the algorithm's to send (AUTO)");
+  if (d.route != DecisionRoute::Manual)
+    refuse("this row is no longer offered to you (" + d.verdict + "): " + (d.reasons.empty() ? std::string() : d.reasons.front()));
+  // The edge at the price and style you chose, from the same engine and the same floor.
+  EdgeSettings es;
+  es.uncertainty_multiplier = settings.value("uncertainty_buffer", 0.5);
+  es.taker_slippage = settings.value("slippage_estimate", 0.0);
+  const FeeModel fm{row.value("fee_type", std::string("quadratic")), row.value("fee_multiplier", 1.0)};
+  const EdgeCandidate at = candidate_at(d.candidate.fair, normalize_prices_from_row(row), side_from(side), style, price, fm, es);
+  const double floor = settings.value("manual_min_edge", 0.05);
+  if (!at.executable || at.executable_edge + 1e-9 < floor)
+    refuse("at your price " + fmt2(price) + " (" + style + ") the edge after the fee, slippage and the uncertainty buffer is " +
+           fmt2(at.executable_edge) + ", under the " + fmt2(floor) + " manual floor");
+  // The cap an order on an unproven model's number has always had: the flat fraction of the
+  // bankroll the old proposal lane sized every model signal against. A hand ticket (no decision)
+  // is the operator's own and is not capped here, as it never was.
+  const std::string model_name = fresh.value("model", std::string());
+  if (!model_name.empty() && !calibration_for(model_name).demonstrated) {
+    double bankroll = cfg_.bankroll_dollars;
+    if (auto a = store_.last_account()) bankroll = std::min(bankroll, std::max(0.0, a->balance + a->portfolio_value));
+    const double flat = cfg_.risk.uncalibrated_max_order_frac * bankroll;
+    const double cost = count * (at.entry_price + at.entry_fee);
+    if (cost > flat + 1e-9)
+      refuse(model_name + " has not beaten the price on settled markets yet, so an order on its number is capped at $" +
+             fmt2(flat) + "; this one costs $" + fmt2(cost));
+  }
+  record_decision(store_, shown, "approved", now, 0, note, count, price, style);
+  // What is actually sent: the fresh decision at your price and style.
+  fresh["price"] = at.entry_price;
+  fresh["style"] = at.style;
+  fresh["fee"] = at.entry_fee;
+  fresh["slippage"] = at.estimated_slippage;
+  fresh["raw_edge"] = at.raw_edge;
+  fresh["executable_edge"] = at.executable_edge;
+  fresh["approved_from"] = did;
+  record_decision(store_, fresh, "revalidated", now, 0, note + " (approved from " + did + ")", count, price, style);
+  return fresh;
+}
+
+json Engine::decision_trace(const std::string& order_id) { return desk::decision_trace(store_, order_id); }
 
 }  // namespace desk

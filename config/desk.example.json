@@ -14,12 +14,21 @@
     "max_event_frac": 0.10,            // all brackets of one event
     "max_cluster_frac": 0.25,          // correlated cluster (same coin+day, all weather same day)
     "max_open_frac": 0.60,
-    "daily_loss_stop_frac": 0.10,      // trips the kill switch
+    "daily_loss_stop_enabled": true,   // false disables the account-wide equity halt entirely;
+                                       // a halt already raised by it is then cleared on restart
+    "daily_loss_stop_frac": 0.10,      // only read when daily_loss_stop_enabled is true
     "min_edge_maker": 0.03,            // dollars per contract, net of fee
     "min_edge_taker": 0.05,
     "sigma_mult": 1.0,                 // edge must also exceed sigma_mult * model sigma
     "min_price": 0.05,                 // never trade outside [0.05, 0.95]
     "proposal_ttl_seconds": 300,
+    "max_order_dollars": 10.0,
+    "max_turnover_dollars_per_day": 100.0,
+    "max_entry_horizon_hours": 48.0,   // no new risk expected to settle later than T+2
+    "add_min_edge": 0.08,              // an already-held side needs at least 8c net edge
+    "add_edge_improvement": 0.03,      // and 3c more than the last recorded entry edge
+    "add_cooldown_seconds": 900,
+    "auto_additions": false,           // qualified additions still require a click
     "max_orders_per_cycle": 5,
     "max_disagreement": 0.30,          // a model this far from a two-sided market is research-only (2026-09-05: 5 for 5 the market was right)
     "max_auto_dollars_per_day": 20.0,  // unattended entries (auto/bot) stop for the day past this purchase cost; exits/targets/stops still run
@@ -28,6 +37,12 @@
   },
 
   // Series the desk pulls every cycle. Add/remove from the dashboard too.
+  // Optional. Algorithm settings applied over whatever the Systematic tab last saved, at every
+  // start, validated by the same rules that screen uses. Use it for preferences that should not
+  // depend on remembering to click. Any key of the systematic settings is accepted; unnamed keys
+  // keep their saved value, and a rejected block leaves the saved settings untouched.
+  // "systematic": { "stop_loss_mode": "fraction", "stop_loss_fraction": 0.70 },
+
   "watch_series": [
     "KXHIGHNY", "KXHIGHCHI", "KXHIGHMIA", "KXHIGHLAX", "KXHIGHHOU", "KXHIGHAUS", "KXHIGHPHIL", "KXDENHIGH",
     "KXBTC", "KXETH",
@@ -43,6 +58,7 @@
   // risk caps, kill switch, daily stop still apply)
   "strategies": {
     "manual_fair":      "manual",
+    "xvenue":           "manual",      // Polymarket US price as the fair for the game markets it also lists (docs/polymarket.md)
     "weather_nws":      "manual",      // day-ahead brackets propose; same-day is research-only until WX-1c (see params)
     "crypto_lognormal": "research",    // CRYPTO-2 first look: DVOL is the wrong vol for 1-hour brackets; needs shard collateral too
     "sports_inplay":    "research",    // keeps the ext_sports collector running; the account cannot open Sports positions
@@ -103,6 +119,39 @@
       "stations": {
         "KXHIGHNY": {"lat": 40.7789, "lon": -73.9692, "obs_station": "KNYC"}
       }
+    },
+    "perps": {
+      // The margined instance (perpetual futures), docs/perps.md. Separate cash: move it from
+      // the Perps tab. Rails apply to every ticket and to the basis rule; the exchange's margin
+      // checks come after them.
+      "enabled": true,
+      "max_order_notional": 30.0,      // dollars of notional per order (KXBTCPERP ~ $8 a contract)
+      "max_total_notional": 60.0,      // positions at the mark plus resting orders, all perps
+      "max_leverage": 2.0,             // total notional / perps equity
+      "price_band_pct": 2.0,           // a limit further than this from the mark is refused
+      "refresh_seconds": 10,           // marks, index, bid/ask for every active perp
+      "account_refresh_seconds": 30,   // balance, positions, resting orders, fills
+      "watch": [],                     // [] = every active perp; else e.g. ["KXBTCPERP", "KXETHPERP"]
+      "algo": {                        // the basis-reversion rule's starting settings (the tab can change them)
+        "entry_bps": 25, "exit_bps": 5, "stop_bps": 60, "max_hold_minutes": 120,
+        "contracts": 1, "daily_loss_stop": 3.0, "markets": ["KXBTCPERP", "KXETHPERP"]
+      }
+    },
+    "polymarket": {
+      // Polymarket US (docs/polymarket.md): a second venue for the same game contracts, the fair
+      // behind the xvenue strategy, and the other leg of the Kalshi/Polymarket pair rule. The
+      // secret never goes in this file: it lives in secret_path (chmod 600). Without a key the
+      // desk still reads public prices and shows pairs; it just cannot send.
+      "enabled": true,
+      "key_id": "",                    // the KEY ID from polymarket.us/developer
+      "secret_path": "~/.polymarket/secret",   // a file holding the base64 SECRET KEY, nothing else
+      "leagues": ["nfl", "cfb", "mlb", "nba", "nhl", "wnba", "epl", "lal", "sea", "bun", "lg1", "mls", "ucl"],
+      "max_order_dollars": 25.0,       // cost (or short margin) per Polymarket order
+      "max_total_dollars": 100.0,      // Polymarket positions plus resting orders
+      "price_band": 0.10,              // a limit further than this from the mid is refused
+      "refresh_seconds": 10,           // quotes for every matched game market
+      "universe_refresh_seconds": 600, // league event lists
+      "account_refresh_seconds": 30    // balance, positions, open orders, activity
     }
   }
 }

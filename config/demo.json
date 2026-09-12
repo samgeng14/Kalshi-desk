@@ -20,6 +20,11 @@
     "sigma_mult": 1.0,                 // edge must also exceed sigma_mult * model sigma
     "min_price": 0.05,                 // never trade outside [0.05, 0.95]
     "proposal_ttl_seconds": 300,
+    "max_entry_horizon_hours": 48.0,
+    "add_min_edge": 0.08,
+    "add_edge_improvement": 0.03,
+    "add_cooldown_seconds": 900,
+    "auto_additions": false,
     "max_orders_per_cycle": 5
   },
 

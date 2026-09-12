@@ -4,8 +4,11 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 
 #include "desk/eval.h"
+#include "desk/account_summary.h"
 #include "desk/risk.h"
 #include "desk/fixed.h"
 #include "desk/log.h"
@@ -77,13 +80,31 @@ void HttpServer::routes() {
     res.set_content(UI_HTML, "text/html; charset=utf-8");
   });
 
+  // The book: two lanes, one switch. The GET is lock-free enough to sit on the fast poll; the
+  // POST takes the engine lock because it changes what the desk will send.
+  s.Get("/api/book", [this](const httplib::Request&, httplib::Response& res) {
+    guarded(res, [&] { return engine_.book(); });
+  });
+  s.Post("/api/book", [this](const httplib::Request& req, httplib::Response& res) {
+    guarded(res, [&] {
+      std::lock_guard<std::mutex> lk(engine_.mutex());
+      return engine_.book_configure(body_json(req));
+    });
+  });
+
   s.Get("/api/state", [this](const httplib::Request&, httplib::Response& res) {
     guarded(res, [&] {
       json j = engine_.status();
       json pos = json::array();
-      for (const auto& p : store_.positions())
+      for (const auto& p : store_.positions()) {
+        const double manual=manual_position_quantity(store_,p);
+        const double owned=std::fabs(p.position)-manual;
+        const bool bracket=!store_.query("SELECT ticker FROM brackets WHERE ticker=?",{p.ticker}).empty();
         pos.push_back({{"ticker", p.ticker}, {"position", p.position}, {"exposure", p.exposure},
-                       {"realized_pnl", p.realized_pnl}, {"fees_paid", p.fees_paid}, {"total_traded", p.total_traded}});
+                       {"realized_pnl", p.realized_pnl}, {"fees_paid", p.fees_paid}, {"total_traded", p.total_traded},
+                       {"exit_manager",owned>0?(manual>0?"mixed: algorithm + manual":"algorithm"):(bracket?"manual brackets":"manual")},
+                       {"algorithm_quantity",owned},{"manual_quantity",manual}});
+      }
       j["positions"] = pos;
       json ords = json::array();
       for (const auto& o : store_.orders("resting"))
@@ -175,6 +196,186 @@ void HttpServer::routes() {
     });
   });
 
+  s.Get("/api/research/screen", [this](const httplib::Request& req, httplib::Response& res) {
+    guarded(res, [&] {
+      json patch = json::object();
+      const json defaults = systematic_defaults();
+      for (const auto& [key, value] : req.params) {
+        if (!defaults.contains(key)) throw std::runtime_error("unknown research setting: " + key);
+        if (defaults.at(key).is_string()) patch[key] = value;
+        else if (defaults.at(key).is_boolean()) patch[key] = (value == "true" || value == "1");
+        else {
+          size_t used = 0;
+          double number = std::stod(value, &used);
+          if (used != value.size()) throw std::runtime_error("invalid research setting: " + key);
+          patch[key] = number;
+        }
+      }
+      return engine_.research_screen(validate_systematic_settings(patch, defaults));
+    });
+  });
+
+  s.Get("/api/systematic", [this](const httplib::Request& req, httplib::Response& res) {
+    guarded(res, [&] {
+      int limit = req.has_param("limit") ? std::atoi(req.get_param_value("limit").c_str()) : 400;
+      return engine_.systematic_view(limit);
+    });
+  });
+  // The cycle's decisions (decision_router.h): MANUAL and AUTO rows for the Trades board, with
+  // RESEARCH behind ?research=1. The route on every row is the backend's; the page never
+  // recomputes it.
+  s.Get("/api/decisions", [this](const httplib::Request& req, httplib::Response& res) {
+    guarded(res, [&] {
+      const bool research = req.has_param("research") && req.get_param_value("research") != "0";
+      int limit = req.has_param("limit") ? std::atoi(req.get_param_value("limit").c_str()) : 200;
+      return engine_.decisions_view(research, limit);
+    });
+  });
+  // What probability and what book caused an order: order -> proposal -> decision snapshots.
+  s.Get(R"(/api/decisions/trace/([^/]+))", [this](const httplib::Request& req, httplib::Response& res) {
+    guarded(res, [&] { return engine_.decision_trace(req.matches[1]); });
+  });
+  s.Post("/api/systematic", [this](const httplib::Request& req, httplib::Response& res) {
+    guarded(res, [&] { return engine_.configure_systematic(body_json(req)); });
+  });
+  // Sell one of the algorithm's positions into the bid now. Touches the exchange: engine lock.
+  s.Post(R"(/api/systematic/close/([^/]+))", [this](const httplib::Request& req, httplib::Response& res) {
+    guarded(res, [&] {
+      std::lock_guard<std::mutex> lk(engine_.mutex());
+      json out = engine_.close_systematic(req.matches[1]);
+      engine_.request_reconcile();
+      return out;
+    });
+  });
+
+  // ---- the margined instance: perpetual futures ---------------------------------------------
+  // PerpsDesk has its own lock; nothing here waits for the cycle, except the sync, which shares
+  // the refresh timers with it.
+  s.Get("/api/perps", [this](const httplib::Request&, httplib::Response& res) {
+    guarded(res, [&] { return engine_.perps().view(); });
+  });
+  s.Get(R"(/api/perps/book/([^/]+))", [this](const httplib::Request& req, httplib::Response& res) {
+    guarded(res, [&] { return engine_.perps().book(req.matches[1]); });
+  });
+  s.Post("/api/perps/sync", [this](const httplib::Request&, httplib::Response& res) {
+    guarded(res, [&] {
+      std::lock_guard<std::mutex> lk(engine_.mutex());
+      engine_.perps().refresh_public(now_s());
+      engine_.perps().refresh_account(now_s(), true);
+      return engine_.perps().summary();
+    });
+  });
+  s.Post("/api/perps/order", [this](const httplib::Request& req, httplib::Response& res) {
+    guarded(res, [&] {
+      json b = body_json(req);
+      if (engine_.killed()) throw std::runtime_error("kill switch is on");
+      PerpOrderRequest r;
+      r.ticker = b.value("ticker", "");
+      r.side = b.value("side", "bid");
+      r.price = b.value("price", 0.0);
+      r.count = b.value("count", 0.0);
+      r.post_only = b.value("post_only", true);
+      r.reduce_only = b.value("reduce_only", false);
+      r.tif = r.post_only ? "good_till_canceled" : b.value("tif", "good_till_canceled");
+      if (r.tif != "good_till_canceled" && r.tif != "immediate_or_cancel" && r.tif != "fill_or_kill")
+        throw std::runtime_error("tif must be good_till_canceled, immediate_or_cancel or fill_or_kill");
+      if (r.ticker.empty() || r.price <= 0 || r.count <= 0) throw std::runtime_error("bad ticket");
+      return engine_.perps().ticket(r, b.value("note", "ticket"));
+    });
+  });
+  s.Post(R"(/api/perps/orders/([^/]+)/cancel)", [this](const httplib::Request& req, httplib::Response& res) {
+    guarded(res, [&] { return engine_.perps().cancel(req.matches[1]); });
+  });
+  s.Post(R"(/api/perps/positions/([^/]+)/close)", [this](const httplib::Request& req, httplib::Response& res) {
+    guarded(res, [&] {
+      if (engine_.killed()) throw std::runtime_error("kill switch is on");
+      return engine_.perps().close_position(req.matches[1]);
+    });
+  });
+  s.Post("/api/perps/transfer", [this](const httplib::Request& req, httplib::Response& res) {
+    guarded(res, [&] {
+      json b = body_json(req);
+      json out = engine_.perps().transfer(b.value("source", ""), b.value("destination", ""), b.value("dollars", 0.0));
+      engine_.request_reconcile();   // the event-contract balance moved too
+      return out;
+    });
+  });
+  s.Post("/api/perps/algo", [this](const httplib::Request& req, httplib::Response& res) {
+    guarded(res, [&] { return engine_.perps().configure_algo(body_json(req)); });
+  });
+
+  // Read-only account totals across the event contracts and the margined instance (the parallel
+  // session's module): cash, equity and P&L today, nulls where a number is unknown.
+  s.Get("/api/account-summary", [this](const httplib::Request&, httplib::Response& res) {
+    guarded(res, [&] { return account_summary(store_, engine_.config(), engine_.perps().summary()); });
+  });
+
+  // ---- Polymarket US: the second venue, the pairs and the pair rule ------------------------------
+  s.Get("/api/poly", [this](const httplib::Request&, httplib::Response& res) {
+    guarded(res, [&] { return engine_.poly().view(); });
+  });
+  s.Get("/api/poly/pairs", [this](const httplib::Request&, httplib::Response& res) {
+    guarded(res, [&] { return engine_.poly().pairs(now_s()); });
+  });
+  s.Get(R"(/api/poly/book/([^/]+))", [this](const httplib::Request& req, httplib::Response& res) {
+    guarded(res, [&] { return engine_.poly().book(req.matches[1]); });
+  });
+  s.Post("/api/poly/sync", [this](const httplib::Request&, httplib::Response& res) {
+    guarded(res, [&] {
+      std::lock_guard<std::mutex> lk(engine_.mutex());
+      engine_.poly().refresh_quotes(now_s());
+      engine_.poly().refresh_account(now_s(), true);
+      return engine_.poly().summary();
+    });
+  });
+  auto poly_request = [](const json& b) {
+    PolyOrderRequest r;
+    r.slug = b.value("slug", "");
+    r.action = b.value("action", "BUY");
+    r.price = b.value("price", 0.0);
+    r.quantity = b.value("quantity", 0.0);
+    r.post_only = b.value("post_only", false);
+    r.tif = b.value("tif", r.post_only ? "GTC" : "GTC");
+    if (r.tif != "GTC" && r.tif != "IOC" && r.tif != "FOK") throw std::runtime_error("tif must be GTC, IOC or FOK");
+    if (r.slug.empty() || r.price <= 0 || r.price >= 1 || r.quantity <= 0) throw std::runtime_error("bad ticket");
+    return r;
+  };
+  s.Post("/api/poly/preview", [this, poly_request](const httplib::Request& req, httplib::Response& res) {
+    guarded(res, [&] { return engine_.poly().preview(poly_request(body_json(req))); });
+  });
+  s.Post("/api/poly/order", [this, poly_request](const httplib::Request& req, httplib::Response& res) {
+    guarded(res, [&] {
+      json b = body_json(req);
+      if (engine_.killed()) throw std::runtime_error("kill switch is on");
+      return engine_.poly().ticket(poly_request(b), b.value("note", "ticket"));
+    });
+  });
+  s.Post(R"(/api/poly/orders/([^/]+)/cancel)", [this](const httplib::Request& req, httplib::Response& res) {
+    guarded(res, [&] { return engine_.poly().cancel(req.matches[1], body_json(req).value("slug", "")); });
+  });
+  s.Post(R"(/api/poly/positions/([^/]+)/close)", [this](const httplib::Request& req, httplib::Response& res) {
+    guarded(res, [&] {
+      if (engine_.killed()) throw std::runtime_error("kill switch is on");
+      return engine_.poly().close_position(req.matches[1]);
+    });
+  });
+  s.Post("/api/poly/algo", [this](const httplib::Request& req, httplib::Response& res) {
+    guarded(res, [&] { return engine_.poly().configure_algo(body_json(req)); });
+  });
+  // One pair by hand: the Kalshi leg now (through the executor, under the engine lock), the
+  // Polymarket leg when it fills, by the same machinery the rule uses.
+  s.Post("/api/poly/pair", [this](const httplib::Request& req, httplib::Response& res) {
+    guarded(res, [&] {
+      std::lock_guard<std::mutex> lk(engine_.mutex());
+      json b = body_json(req);
+      if (engine_.killed()) throw std::runtime_error("kill switch is on");
+      json out = engine_.poly().send_pair(b.value("kalshi_ticker", ""), b.value("route", "buy_kalshi_sell_pm"), b.value("contracts", 0.0),
+                                          b.value("kalshi_style", "maker"), b.value("pm_style", "taker"), now_s());
+      engine_.request_reconcile();
+      return out;
+    });
+  });
+
   // Sizing and hedging read the store and the published snapshot; they must not queue behind a
   // cycle that is out fetching quotes, or the trade strip sits there saying "checking...".
   s.Get("/api/size", [this](const httplib::Request& req, httplib::Response& res) {
@@ -182,7 +383,8 @@ void HttpServer::routes() {
       return engine_.size_suggestion(req.get_param_value("ticker"),
                                      req.has_param("side") ? req.get_param_value("side") : "yes",
                                      std::atof(req.get_param_value("price").c_str()),
-                                     req.has_param("style") ? req.get_param_value("style") : "taker");
+                                     req.has_param("style") ? req.get_param_value("style") : "taker",
+                                     req.has_param("decision_id") ? req.get_param_value("decision_id") : "");
     });
   });
 
@@ -197,6 +399,16 @@ void HttpServer::routes() {
       return engine_.hedge_view(req.get_param_value("event"), req.get_param_value("ticker"),
                                 req.has_param("side") ? req.get_param_value("side") : "yes", num("count"), num("price"));
     });
+  });
+
+  s.Get("/api/manual-orders", [this](const httplib::Request&,httplib::Response& res) {
+    guarded(res,[&]{return engine_.manual_orders().view();});
+  });
+  s.Post("/api/manual-orders", [this](const httplib::Request& req,httplib::Response& res) {
+    guarded(res,[&]{return engine_.manual_orders().enqueue(body_json(req),now_s());});
+  });
+  s.Post(R"(/api/manual-orders/([a-fA-F0-9-]+)/cancel)", [this](const httplib::Request& req,httplib::Response& res) {
+    guarded(res,[&]{return engine_.manual_orders().cancel(req.matches[1],now_s());});
   });
 
   s.Post("/api/order", [this](const httplib::Request& req, httplib::Response& res) {
@@ -272,6 +484,49 @@ void HttpServer::routes() {
     });
   });
 
+  s.Get("/api/risk-controls", [this](const httplib::Request&, httplib::Response& res) {
+    guarded(res,[&] {
+      const auto state=engine_.status();
+      return json{{"account_stop",account_stop_policy(store_,engine_.config())},
+        {"daily",daily_equity(store_,engine_.config())},{"kill",engine_.killed()},
+        {"kill_reason",state.value("kill_reason","")}};
+    });
+  });
+  s.Get("/api/sports-models",[this](const httplib::Request&,httplib::Response& res){guarded(res,[&]{return engine_.sports_models_view();});});
+  s.Get("/api/pair-models",[this](const httplib::Request&,httplib::Response& res){guarded(res,[&]{return engine_.pair_models().view();});});
+  s.Post("/api/pair-models",[this](const httplib::Request& req,httplib::Response& res){guarded(res,[&]{return engine_.pair_models().configure(body_json(req));});});
+  s.Get("/api/model-lab", [this](const httplib::Request&, httplib::Response& res) {
+    guarded(res,[&] {
+      const auto path=std::filesystem::path(engine_.config().db_path).parent_path()/"model_lab"/"report.json";
+      if(!std::filesystem::exists(path))return json{{"models",json::array()},{"live_enabled",false},
+        {"notice","No fitted research artifact yet. Run tradeit models to evaluate the recorded data."}};
+      if(std::filesystem::file_size(path)>2*1024*1024)throw std::runtime_error("model report exceeds size limit");
+      std::ifstream in(path);json report;in>>report;
+      if(!report.is_object()||report.value("schema","")!="model-lab-v1"||!report.contains("models")||!report["models"].is_array())
+        throw std::runtime_error("invalid model report");
+      report["live_enabled"]=false; // This endpoint cannot deploy a model or enable an algorithm.
+      return report;
+    });
+  });
+  s.Post("/api/risk-controls", [this](const httplib::Request& req, httplib::Response& res) {
+    guarded(res,[&] {
+      const auto body=body_json(req);
+      std::lock_guard<std::mutex> lk(engine_.mutex());
+      auto policy=body.contains("account_stop")?set_account_stop_policy(store_,engine_.config(),body["account_stop"]):account_stop_policy(store_,engine_.config());
+      bool acknowledged=false;
+      std::string error;
+      if(body.value("acknowledge_daily_halt",false)) {
+        const auto reason=store_.kv_get("kill_reason").value_or("");
+        const auto daily=daily_equity(store_,engine_.config());
+        if(reason.rfind("Daily loss stop:",0)!=0) error="This control only acknowledges a daily-loss halt; another kill reason must be reviewed separately.";
+        else if(now_s()-daily.value("account_ts",0LL)>60) error="Account data is stale; sync before acknowledging the halt.";
+        else if(daily.value("stop_enabled",true) && daily.value("pv",0.0)<=daily.value("stop_pv",0.0)) error="The enabled account stop is still breached.";
+        else {engine_.set_kill(false,"daily loss halt acknowledged from risk controls");acknowledged=true;}
+      }
+      store_.log_event("info","Account daily stop settings reviewed: "+policy.dump());
+      return json{{"account_stop",policy},{"acknowledged",acknowledged},{"acknowledge_error",error},{"kill",engine_.killed()}};
+    });
+  });
   s.Post("/api/kill", [this](const httplib::Request& req, httplib::Response& res) {
     guarded(res, [&] {
       json b = body_json(req);
@@ -330,7 +585,10 @@ void HttpServer::routes() {
         json row = b;
         if (pit != positions.end() && pit->position != 0) {
           bool long_yes = pit->position > 0;
-          double n = std::fabs(pit->position), cost = std::fabs(pit->exposure);
+          double n = manual_position_quantity(store_, *pit);
+          double cost = std::fabs(pit->exposure) * n / std::fabs(pit->position);
+          row["cost_basis_estimated"] = n < std::fabs(pit->position);
+          row["algorithm_quantity"] = std::fabs(pit->position) - n;
           double bid = m ? (long_yes ? m->yes_bid : (m->no_bid > 0 ? m->no_bid : (m->yes_ask > 0 ? 1.0 - m->yes_ask : 0))) : 0;
           row["side"] = long_yes ? "yes" : "no";
           row["count"] = n;
@@ -369,7 +627,9 @@ void HttpServer::routes() {
       auto positions = store_.positions();
       auto pit = std::find_if(positions.begin(), positions.end(), [&](const Position& p) { return p.ticker == t; });
       if (pit == positions.end() || pit->position == 0) throw std::runtime_error("no open position in " + t);
-      double n = std::fabs(pit->position), cost = std::fabs(pit->exposure), avg = n > 0 ? cost / n : 0;
+      double n = manual_position_quantity(store_, *pit);
+      if (n < .01) throw std::runtime_error("No manual quantity: this position belongs to an algorithm; release it before adding a manual bracket");
+      double avg = std::fabs(pit->exposure) / std::fabs(pit->position);
       double tp = b.value("tp_price", 0.0), sl = b.value("sl_price", 0.0), trail = b.value("trail", 0.0);
       double tpd = b.value("tp_dollars", 0.0), sld = b.value("sl_dollars", 0.0);
       if (tpd > 0) tp = avg + tpd / n;
@@ -490,7 +750,14 @@ void HttpServer::routes() {
   });
 
   s.Get("/api/pnl", [this](const httplib::Request&, httplib::Response& res) {
-    guarded(res, [&] { return build_pnl(store_, engine_.config().risk.day_tz); });
+    guarded(res, [&] {
+      json j = build_pnl(store_, engine_.config().risk.day_tz);
+      // The margined instance is separate money: shown next to the event-contract numbers and
+      // added into the combined line the header carries.
+      j["perps"] = engine_.perps().pnl();
+      j["polymarket"] = engine_.poly().pnl();
+      return j;
+    });
   });
 
   s.Get("/api/events", [this](const httplib::Request& req, httplib::Response& res) {

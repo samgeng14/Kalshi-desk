@@ -1,0 +1,22 @@
+  60m panel: 9,599 bars, 8 assets
+  240m panel: 2,399 bars, 8 assets
+  720m panel: 799 bars, 8 assets
+
+observed best of 120 specifications: 1.5424x  (SOLUSDT own momentum 720m)
+  50/200 null draws
+  100/200 null draws
+  150/200 null draws
+  200/200 null draws
+
+null best-of-120 distribution over 200 shifts:
+  p50: 0.9331x
+  p75: 1.2603x
+  p90: 1.6936x
+  p95: 2.0522x
+  p99: 2.8078x
+  max: 2.9022x
+
+observed 1.5424x   ->   p = 0.135
+
+VERDICT: the observed maximum is inside the null. This is selection across 144
+         correlated specifications, not a signal.

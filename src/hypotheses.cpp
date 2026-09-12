@@ -29,6 +29,20 @@ void seed_hypotheses(Store& store) {
        "Settled game markets and their last traded prices (Kalshi public /markets/trades, backfillable now).",
        "Bucket last prices (1-5c, 6-10c, 11-20c); compare win rate to mean price with binomial CIs; "
        "compute net return of buying NO at the ask in each bucket."},
+      {"SPORT-4", "Sports", "NBA live probability with an explicit overtime state",
+       "A possession-level NBA model using pregame strength, score, clock, possession, bonus, timeouts and "
+       "team strength can beat Kalshi's executable price after fees in selected liquid states. Overtime is "
+       "modelled as a branch before regulation ends; a jump caused only by forgetting that branch is a model bug.",
+       "Timestamped NBA play-by-play and final outcomes; pregame line; Kalshi top-of-book and depth snapshots; "
+       "actual receipt times for every feed.",
+       "Walk-forward seasons only. Compare model Brier/log loss with the contemporaneous Kalshi mid, then replay "
+       "maker and taker entries with latency, queue and unfilled orders. Report overtime states separately."},
+      {"MICRO-1", "Market microstructure", "Maker fills after public score updates",
+       "Liquid sports books briefly offer maker spread capture after public score events, but only if fill gains "
+       "exceed adverse selection from faster traders.",
+       "Orderbook snapshots/deltas, trades, score-event receipt times, our order acknowledgements and fills.",
+       "Event-time study around scores and period changes; estimate fill probability and markout at 1s, 5s, 30s "
+       "and 120s. Graduate only if net markout is positive out of sample after fees and missed fills."},
       // ---- Crypto ----
       {"CRYPTO-1", "Crypto", "Hourly BTC/ETH brackets lag spot",
        "Bracket quotes on KXBTC/KXETH hourly markets update slower than spot; a lognormal fair from live spot "
@@ -89,6 +103,50 @@ void seed_hypotheses(Store& store) {
        "inventory brackets do not fully adjust after the API print.",
        "API and EIA weekly releases (manual or scraped); quotes around Tuesday 4:30pm ET.",
        "Regress EIA surprise on API surprise; test post-API price moves vs eventual settlement."},
+      // ---- Commodities: the 15-minute terminal-price model (session 16) --------------------
+      // Registered before the model has a single settled window. Nothing below reports a result;
+      // each row says what would count as one, and what sample it needs first. The point of
+      // writing them now is that the test cannot be chosen after seeing the answer.
+      {"COM-1", "Commodities", "15-minute terminal distribution beats the market",
+       "On KXGOLD15M, KXSILVER15M, KXWTI15M and KXNATGAS15M, a zero-drift lognormal distribution of the "
+       "settlement reference at close - built from the exchange's own published reference value and a "
+       "short-horizon realized volatility - scores a lower Brier on settled contracts than the contemporaneous "
+       "Kalshi mid does. If it does not, there is no mispricing here to trade and the rest of these fall with it.",
+       "commodity_reference (the settlement feed recorded tick by tick, with our own receipt times); "
+       "top-of-book snapshots for the four 15M series (quotes table); settlements.",
+       "research/commodity_terminal.py, replayed with no look-ahead: every probability uses only observations "
+       "stamped at or before its own quote. Paired Brier (model vs mid) with a bootstrap CI on the difference, "
+       "log loss, and a calibration curve by model-p decile. At least 400 settled contracts across at least two "
+       "underlyings before anything is called supported; a difference that does not clear its CI is rejected."},
+      {"COM-2", "Commodities", "Far strikes are overpriced at short horizon",
+       "Contracts far from the reference - beyond about 1.5 sigma of the remaining move - trade above the "
+       "terminal distribution's probability, the familiar longshot bias at a fifteen-minute horizon, so the "
+       "cheap side of a far strike is positive expectation after the taker fee.",
+       "The same replay, bucketed by |distance_in_sigma| at quote time (the model already records it in the "
+       "estimate's diagnostics); asks and bids at those times; settlements.",
+       "Buckets 0-0.5, 0.5-1, 1-1.5, 1.5-2.5 and above 2.5 sigma. Compare each bucket's mean executable price "
+       "with its realized settle rate, binomial CIs; then the net return of taking the cheap side at the ask, "
+       "fee included. Needs >= 200 settled contracts per bucket, and it is only interesting where the book is "
+       "deep enough to have filled."},
+      {"COM-3", "Commodities", "Kalshi lags a sudden move in the reference",
+       "After the reference moves at least one 1-minute sigma, the Kalshi mid takes seconds to reprice, and in "
+       "that window the model's probability leads the market rather than following it.",
+       "commodity_reference at tick resolution and top-of-book at one second or better, both stamped with OUR "
+       "receipt times, so that a lag we measure cannot be a lag we caused.",
+       "Event study in event time around moves >= 1 sigma: the mid's response at 1s, 5s, 15s and 60s, and the "
+       "lead-lag cross-correlation of model p against the mid. Then markout at those horizons on trades the "
+       "model would have taken inside the window, net of fees. The hypothesis fails if the measured lead "
+       "disappears once our own feed latency is subtracted."},
+      {"COM-4", "Commodities", "Ladder-implied vol exceeds realized vol",
+       "The volatility implied by a whole window's strike ladder is systematically above the volatility the "
+       "reference actually realizes over that window, which is the same statement as COM-2 read off the curve "
+       "instead of off single strikes.",
+       "Full ladder mid snapshots per window (every strike of the event, not just the ones we would trade) and "
+       "commodity_reference over the same window.",
+       "Fit one sigma per window by least squares on the ladder mids with drift held at zero; compare it with "
+       "the window's realized sigma from the reference; paired test over >= 200 windows per underlying. Then "
+       "simulate selling the tails at the bid, fee included, to see whether the gap is reachable or only "
+       "visible."},
       // ---- Climate ----
       {"WX-1", "Climate and Weather", "Same-day highs: observed max + remaining forecast",
        "After 1pm local, observed running max plus the remaining hourly forecast beats bracket prices; edge "
@@ -103,6 +161,14 @@ void seed_hypotheses(Store& store) {
        "center bracket better than the market, which underprices it when models agree.",
        "ext_weather history (forecast vs settled value) per station; NBM if a fetcher is added.",
        "Estimate sigma per station from >= 40 days of history; Brier of N(fc, sigma_station) vs market."},
+      {"WX-3", "Climate and Weather", "NBM plus HRRR settlement-station distribution",
+       "A point-in-time distribution built from NBM probabilistic temperature guidance, HRRR short-range paths "
+       "and station-specific observation-to-settlement corrections may add information beyond the current NWS "
+       "point forecast. Public-model availability alone is not evidence of an edge.",
+       "Archived NBM/HRRR cycles with received times, high-frequency observations at the named station, exact "
+       "contract settlement source and settled bracket outcomes.",
+       "Rolling-origin backtest by city and lead time. Compare Brier and log loss against the Kalshi mid; require "
+       "positive executable return with a blocked final test period before leaving research mode."},
       // ---- Economics ----
       {"ECON-1", "Economics", "CPI brackets vs nowcast in the final 48h",
        "In the 48 hours before the CPI print, a distribution centered on the Cleveland Fed nowcast blended "
