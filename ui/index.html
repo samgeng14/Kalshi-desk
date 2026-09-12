@@ -131,6 +131,59 @@
      the inline max-height mean anything. */
   .scroll { max-height:none; overflow:auto; }
   #trades tr[data-trade] { cursor:pointer; }
+  /* The decision has a side. That side is the primary action; the other side is legitimate but
+     it is NOT what the desk priced, so it is offered as a plainly secondary hand ticket. */
+  .sides { display:flex; gap:8px; align-items:center; margin:6px 0 2px; flex-wrap:wrap; }
+  .sides .cur { padding:2px 10px; border:1px solid #3f6ea8; background:#1d2735; color:#e6ecf5;
+                font-weight:600; letter-spacing:.04em; }
+  .sides button.alt { background:transparent; border:1px solid #2a2f3a; color:#8b94a5;
+                      padding:2px 9px; font-weight:400; }
+  .sides button.alt:hover { color:#cfd6e2; border-color:#3d4658; }
+  /* The funnel makes the router's work visible when the board is empty, which is most of the
+     time on a working desk. Without it, "no trades" and "broken" look identical. */
+  .funnel { display:flex; gap:0; align-items:center; flex-wrap:wrap; margin:4px 0 2px; }
+  .funnel .st { padding:1px 7px; cursor:pointer; border:1px solid #2a2f3a; background:#12151c; }
+  .funnel .st:hover { border-color:#3d4658; }
+  .funnel .st b { font-variant-numeric:tabular-nums; }
+  .funnel .ar { opacity:.4; padding:0 4px; }
+  .funnel .st.act b { color:#7fd18b; }
+  #tr_routes .chip.on { background:#1d2735; border-color:#3f6ea8; }
+  /* This block lives inside a table cell, so it has to undo the table's alignment and row
+     borders or the explanation arrives right-aligned in full-width stripes. */
+  .whynot { padding:10px 6px 8px; text-align:left; }
+  .whynot h4 { margin:0 0 5px; font-size:12px; letter-spacing:.06em; color:#cfd6e2; }
+  .whynot table { width:auto; margin:5px 0 9px; border-collapse:collapse; }
+  .whynot tr, .whynot td { border:0 !important; background:none !important; }
+  .whynot td { padding:1px 0; text-align:left; }
+  .whynot .n { text-align:right; padding-right:9px; font-variant-numeric:tabular-nums;
+               color:#cfd6e2; width:3.2em; }
+  .whynot .acts { display:flex; gap:6px; margin-top:6px; }
+  .whynot .acts button { padding:2px 10px; }
+  /* The waterfall is the panel's reason for existing: it turns "net edge +6.2c" from an assertion
+     into an arithmetic anyone can check by eye. Tabular numerals so the column actually lines up. */
+  #detailpanel h2 { margin-bottom:4px; }
+  .wf { width:100%; border-collapse:collapse; margin:3px 0 7px; }
+  .wf td { padding:1px 0; border:0; text-align:left; }
+  .wf td.v { text-align:right; font-variant-numeric:tabular-nums; width:6.5em; }
+  .wf tr.sum td { border-top:1px solid #2a2f3a; padding-top:3px; font-weight:600; }
+  .wf tr.sub td { color:#8b94a5; }
+  .wf tr.resid td { color:#d4a05a; }
+  .dstack { margin:2px 0 8px; padding:0 0 0 14px; }
+  .dstack li { margin:1px 0; color:#a8b2c1; }
+  .dbtns { display:flex; gap:7px; align-items:center; flex-wrap:wrap; margin-top:7px; }
+  .dbtns button.prim { background:#1e4620; border:1px solid #3f7d43; color:#dff3e0;
+                       font-weight:600; padding:4px 14px; letter-spacing:.03em; }
+  .dbtns button.prim:hover { background:#255429; }
+  .dbtns button.prim:disabled { background:#181b22; border-color:#2a2f3a; color:#5c6675;
+                                font-weight:400; cursor:not-allowed; }
+  .dbtns button.sec { background:transparent; border:1px solid #2a2f3a; color:#8b94a5; padding:4px 10px; }
+  .dbtns button.sec:hover { color:#cfd6e2; border-color:#3d4658; }
+  .drow { display:grid; grid-template-columns:auto 1fr; gap:1px 9px; }
+  .drow .k { color:#6b7686; }
+  #trades_note details, #manual_ownership { margin:3px 0 0; }
+  #trades_note summary, #manual_ownership summary { cursor:pointer; color:#6b7686; list-style:none; }
+  #trades_note summary::-webkit-details-marker, #manual_ownership summary::-webkit-details-marker { display:none; }
+  #trades_note summary::before, #manual_ownership summary::before { content:'? '; color:#4d5665; }
   /* The route is the desk's (decision router): AUTO rows are the algorithm's and RESEARCH rows are
      nobody's, so neither reads as something to click. */
   #trades tr[data-route="auto"] td, #trades tr[data-route="research"] td { color:var(--dim); }
@@ -372,17 +425,18 @@
     <div id="manual_queue" class="mini" role="status"></div>
     <div id="actionlog" class="mini"></div>
     <div id="baskets"></div>
+    <div id="tr_funnel" class="mini funnel" role="status"></div>
+    <div class="chips" id="tr_routes" role="tablist"></div>
     <div class="chips" id="tr_cats"></div>
     <table id="trades"><thead><tr>
       <th title="the desk's rank: edge per dollar of risk (Kelly), MANUAL and AUTO together">#</th><th class="l">market</th><th class="l">side</th><th>price</th>
       <th title="the model's probability that this side settles at $1 (pairs: locked whatever settles)">fair</th>
-      <th title="the model's uncertainty; the uncertainty deduction is the buffer times sigma">σ</th>
-      <th title="fair minus price, per contract">raw edge</th>
-      <th title="after the fee, the slippage estimate and the uncertainty deduction: the number the floors are measured on">net edge</th>
+      <th title="after the fee, the slippage estimate and the uncertainty deduction: the number the floors are measured on. Open a row for the full breakdown from the raw discrepancy down to this.">net edge</th>
       <th class="l">model</th><th class="l" title="the decision router's route; this page never recomputes it">route</th><th>time left</th><th></th>
     </tr></thead><tbody></tbody></table>
     <div id="trades_note" class="mini"></div>
-    <p class="mini" id="manual_ownership">Orders you submit here are manually managed. The algorithm does not adopt them or apply its exits. Only manual brackets you explicitly enable can close them automatically. AUTO rows are the algorithm's own and are not offered here.</p>
+    <details class="mini" id="manual_ownership"><summary>how routes and ownership work</summary>
+      <p class="mini">Orders you submit here are manually managed. The algorithm does not adopt them or apply its exits. Only manual brackets you explicitly enable can close them automatically. AUTO rows are the algorithm's own and are not offered here.</p></details>
     <div id="trade" class="hidden"></div>
     <div class="mini" style="margin-top:5px">
       series <select id="series"></select>
@@ -394,6 +448,11 @@
     </div>
   </section>
 
+  <section class="panel" id="detailpanel">
+    <h2>Selected <span class="mini" id="detail_title">click or j/k a row</span></h2>
+    <div id="detail_body"><p class="mini dim">No row selected. The board's rows are selectable with
+      the mouse or with j / k; whatever is selected is explained here.</p></div>
+  </section>
   <section class="panel" id="ladderpanel">
     <h2>Ladder <span class="mini" id="ladder_title">click a market</span></h2>
     <div class="kv mini" id="ladder_meta"></div>
@@ -407,7 +466,7 @@
     <h2>Risk</h2>
     <div id="risk"></div>
     <h3>Positions</h3>
-    <table id="pos"><thead><tr><th class="l">market</th><th>pos</th><th>avg</th><th>bid</th><th>unreal</th><th>real</th><th class="l">target / stop</th><th></th></tr></thead><tbody></tbody></table>
+    <table id="pos"><thead><tr><th class="l" title="who owns the automatic exit on this position. AUTO: the algorithm manages it. ME: nothing closes it unless you set a bracket. MIXED: both hold part of it.">owner</th><th class="l">market</th><th>pos</th><th>avg</th><th>bid</th><th>unreal</th><th>real</th><th class="l">target / stop</th><th></th></tr></thead><tbody></tbody></table>
     <p class="mini">Target = a resting reduce-only order at that price (or the profit in $ you want); stop = dump into the bid when it trades through (max loss in $); trail = stop follows the bid up by that many cents. <b>auto</b> executes, <b>alert</b> only flags the row. Prices are for the side you hold.</p>
     <h3>Open orders</h3>
     <table id="ords"><thead><tr><th class="l">market</th><th>side</th><th>px</th><th>left</th><th>filled</th><th></th></tr></thead><tbody></tbody></table>
@@ -774,8 +833,28 @@
 
   let state = null, curSeries = store.get('series') || '', selTicker = store.get('ticker') || '', lastMarkets = [], pnl = null, risk = null;
 
+  // Every request gets a deadline. `fetch` without a signal waits forever, and only the manual
+  // order call ever passed one: a pair submit to a Polymarket that was NOT CONNECTED hung
+  // indefinitely, so its `finally` never ran, the in-flight flag stayed set, and every later
+  // manual order was refused with "an order request is still pending" - for hours, with no way
+  // out. A hung request must fail, not wedge the desk.
+  const API_TIMEOUT_MS = 15000;
   async function api(path, opts) {
-    const r = await fetch(path, Object.assign({headers:{'Content-Type':'application/json', 'X-Desk': '1'}}, opts||{}));
+    const o = Object.assign({headers:{'Content-Type':'application/json', 'X-Desk': '1'}}, opts||{});
+    if (!o.signal) o.signal = AbortSignal.timeout(API_TIMEOUT_MS);
+    let r;
+    try {
+      r = await fetch(path, o);
+    } catch (err) {
+      // Name the deadline rather than surfacing a bare "signal is aborted": the operator needs to
+      // know the desk did not answer, not that an AbortController fired.
+      if (err && (err.name === 'TimeoutError' || err.name === 'AbortError')) {
+        const e = new Error(`no answer from the desk in ${Math.round(API_TIMEOUT_MS/1000)}s (${path})`);
+        e.name = 'TimeoutError';
+        throw e;
+      }
+      throw err;
+    }
     const j = await r.json().catch(()=>({}));
     if (!r.ok || (j.error && !(path.startsWith('/api/manual-orders')&&j.id&&j.status))) {const e=new Error(j.error ? j.error : ('HTTP '+r.status));e.httpStatus=r.status;throw e;}
     return j;
@@ -993,6 +1072,8 @@
     for (const tr of rows) setClass(tr, 'sel', false);
     setClass(rows[i], 'sel', true);
     rows[i].scrollIntoView({block:'nearest'});
+    detailKey = rows[i].dataset.trade;
+    renderDetail();
   }
   function cycleDensity() {
     const order = ['normal','compact','roomy'];
@@ -1063,7 +1144,7 @@
     const t = $('#toast'); t.textContent = msg; t.className = 'toast' + (err ? ' err' : '');
     clearTimeout(toast._t); toast._t = setTimeout(()=>t.classList.add('hidden'), err ? 8000 : 3500);
   }
-  const post = (p, body) => api(p, {method:'POST', body: JSON.stringify(body||{})});
+  const post = (p, body, opts) => api(p, Object.assign({method:'POST', body: JSON.stringify(body||{})}, opts||{}));
   const del = (p) => api(p, {method:'DELETE'});
   const modePill = m => `<span class="pill ${m==='auto'?'auto':m==='bot'?'bot':'man'}">${m}</span>`;
 
@@ -1173,15 +1254,19 @@
       const age = ts => ts ? Math.max(0, s.now - ts) : null;
       const show = a => a==null ? '-' : (a<90 ? a+'s' : (a<5400 ? Math.round(a/60)+'m' : Math.round(a/3600)+'h'));
       const cls = (a, warn, bad) => a==null ? 'dim' : (a>=bad ? 'dn' : (a>=warn ? 'warn' : 'up'));
-      const parts = [['cyc', age(s.last_cycle_ts), 30, 120],
-                     ['px',  age(s.prices_ts),    120, 900],
-                     ['wx',  age(s.weather_ts),   1800, 7200],
-                     ['spt', age(s.sports_ts),    3600, 86400],
-                     ['mdl', age(s.model_ts),     120, 900],
-                     ['disc',age(s.discovery_ts), 900, 3600]];
-      if (s.polymarket && s.polymarket.enabled) parts.push(['pm', age(s.polymarket.quotes_ts), 60, 300]);
+      // Named, not abbreviated. "spt 49m" is a number the operator has to decode before they can
+      // act on it; "SPORTS STALE 49m" is the finding itself. The word STALE appears only past the
+      // bad threshold, so a healthy row stays short and a broken one is unmissable.
+      const parts = [['CYCLE',   age(s.last_cycle_ts), 30, 120],
+                     ['PRICES',  age(s.prices_ts),    120, 900],
+                     ['WEATHER', age(s.weather_ts),   1800, 7200],
+                     ['SPORTS',  age(s.sports_ts),    3600, 86400],
+                     ['MODELS',  age(s.model_ts),     120, 900],
+                     ['MARKETS', age(s.discovery_ts), 900, 3600]];
+      if (s.polymarket && s.polymarket.enabled) parts.push(['POLYMARKET', age(s.polymarket.quotes_ts), 60, 300]);
       setHTML($('#fresh'), parts.map(([k,a,w,b]) =>
-        '<span class="'+cls(a,w,b)+'">'+k+' '+show(a)+'</span>').join(''));
+        '<span class="'+cls(a,w,b)+'" title="'+k.toLowerCase()+', '+(a==null?'never':a+'s old')+'">'
+        + k + (a!=null && a>=b ? ' STALE' : '') + ' ' + show(a) + '</span>').join(''));
     })();
     $('#err').textContent = s.last_error || '';
     paintStatus();   // the four invariants, every cycle
@@ -1343,7 +1428,7 @@
     let sawSettling = false;
     $('#pos tbody').innerHTML = posRows.map(p => {
       let sep = '';
-      if (p.trading_closed && !sawSettling) { sawSettling = true; sep = '<tr><td class="l dim mini" colspan="8">settling (trading closed; payout at settlement, outside today\'s caps)</td></tr>'; }
+      if (p.trading_closed && !sawSettling) { sawSettling = true; sep = '<tr><td class="l dim mini" colspan="9">settling (trading closed; payout at settlement, outside today\'s caps)</td></tr>'; }
       return sep + (p => {
       const b = bmap[p.ticker]; const n = Math.abs(p.position); const avg = n > 0 ? Math.abs(p.cost) / n : 0;
       const bid = b && b.bid !== undefined ? b.bid : p.mid;
@@ -1355,7 +1440,13 @@
         : `<button data-hedge="${p.ticker}" title="what in this event protects this position">hedge</button> <button class="bad" data-close="${p.ticker}">close</button>`;
       const owner = (state?.positions||[]).find(x=>x.ticker===p.ticker) || p;
       const ownership = owner.exit_manager || 'manual';
-      return `<tr><td class="l">${p.ticker}<div class="mini" title="Only the named manager owns automatic exits">${esc(ownership)}${(owner.algorithm_quantity??owner.systematic_quantity)>0?' · algo '+fmt(owner.algorithm_quantity??owner.systematic_quantity,2):''}${owner.manual_quantity>0?' · manual '+fmt(owner.manual_quantity,2):''}</div></td>
+      // One badge for the question the row is most often scanned for. Derived from the manager the
+      // server reports, never from the quantities: a position can carry algo size and still be
+      // managed by hand, and guessing from the split would mislabel exactly those.
+      const own = /algorithm/.test(ownership) && /manual/.test(ownership) ? ['MIXED','man']
+                : /algorithm/.test(ownership) ? ['AUTO','bot'] : ['ME','man'];
+      const ownCell = `<td class="l"><span class="pill ${own[1]}" title="${esc(ownership)}">${own[0]}</span></td>`;
+      return `<tr>${ownCell}<td class="l">${p.ticker}<div class="mini" title="Only the named manager owns automatic exits">${esc(ownership)}${(owner.algorithm_quantity??owner.systematic_quantity)>0?' · algo '+fmt(owner.algorithm_quantity??owner.systematic_quantity,2):''}${owner.manual_quantity>0?' · manual '+fmt(owner.manual_quantity,2):''}</div></td>
       <td class="${c(p.position)}">${fmt(p.position,2)} ${p.position>0?'Y':'N'}</td><td>${fmt(avg)}</td><td>${fmt(bid)}</td>
       <td class="${c(p.unrealized)}">${fmt(p.unrealized)}</td><td class="${c(p.realized)}">${fmt(p.realized)}</td>
       <td class="l">${closed ? '<span class="mini dim">awaiting settlement</span>' : line + form}</td>
@@ -1590,7 +1681,7 @@
     toggle.className = s.running ? 'bad' : 'ok';
     const modeSel = $('#sys_mode'); if (document.activeElement !== modeSel) modeSel.value = mode; modeSel.disabled = s.running;
     const pill = $('#sys_state_pill');
-    pill.textContent = s.running ? (s.halted ? 'RUNNING · HALTED' : (mode === 'live' ? 'RUNNING · LIVE' : 'RUNNING · PAPER')) : 'STOPPED';
+    pill.textContent = s.running ? (s.halted ? 'HALTED' : (mode === 'live' ? 'RUNNING · LIVE' : 'RUNNING · PAPER')) : 'STOPPED';
     pill.className = 'pill ' + (s.running ? (s.halted ? 'man' : (mode === 'live' ? 'bot' : 'auto')) : '');
     $('#sys_halt').textContent = s.halted ? 'halted: ' + s.halt_reason : (s.killed ? 'KILL switch is on: nothing is sent' : '');
     $('#sys_clear_halt').classList.toggle('hidden', !s.halted);
@@ -1754,7 +1845,7 @@
     toggle.className = a.running ? 'bad' : 'ok';
     const modeSel = $('#pp_algo_mode'); if (document.activeElement !== modeSel) modeSel.value = a.paper ? 'paper' : 'live'; modeSel.disabled = !!a.running;
     const apill = $('#pp_algo_pill');
-    apill.textContent = a.running ? (a.halted ? 'RUNNING · HALTED' : (a.paper ? 'RUNNING · PAPER' : 'RUNNING · LIVE')) : 'STOPPED';
+    apill.textContent = a.running ? (a.halted ? 'HALTED' : (a.paper ? 'RUNNING · PAPER' : 'RUNNING · LIVE')) : 'STOPPED';
     apill.className = 'pill ' + (a.running ? (a.halted ? 'man' : (a.paper ? 'auto' : 'bot')) : '');
     $('#pp_algo_status').textContent = `${a.paper ? 'paper' : 'live'} · step ${ppAge(a.last_step_ts)}`;
     $('#pp_algo_halt').textContent = a.halted ? 'halted: ' + a.halt_reason : '';
@@ -1944,7 +2035,7 @@
     toggle.className = a.running ? 'bad' : 'ok';
     const modeSel = $('#pl_algo_mode'); if (document.activeElement !== modeSel) modeSel.value = a.paper ? 'paper' : 'live'; modeSel.disabled = !!a.running;
     const apill = $('#pl_algo_pill');
-    apill.textContent = a.running ? (a.halted ? 'RUNNING · HALTED' : (a.paper ? 'RUNNING · PAPER' : 'RUNNING · LIVE')) : 'STOPPED';
+    apill.textContent = a.running ? (a.halted ? 'HALTED' : (a.paper ? 'RUNNING · PAPER' : 'RUNNING · LIVE')) : 'STOPPED';
     apill.className = 'pill ' + (a.running ? (a.halted ? 'man' : (a.paper ? 'auto' : 'bot')) : '');
     $('#pl_algo_status').textContent = `${a.paper ? 'paper' : 'live'} · step ${ppAge(a.last_step_ts)}`;
     $('#pl_algo_halt').textContent = a.halted ? 'halted: ' + a.halt_reason : '';
@@ -2126,6 +2217,12 @@
   // Until you pick a tab yourself in this session, a remembered tab that would hide all of
   // them gives way to 'all'. Clicking any chip pins your choice and stops this for good.
   let tradesCatPinned = false;
+  // The route tabs are the primary filter. FOR ME is the default because the first question an
+  // operator has on opening the desk is "what can I act on", and answering it with a mixed list
+  // of auto rows, weak rows and research rows is what made an empty board look like a fault.
+  let tradesRoute = store.get('tradesRoute') || 'me';
+  // Which row the detail panel is showing, so a repaint does not lose it.
+  let detailKey = null;
   const submittedEvents = new Map();
   const eventKey = r => r.event_ticker || r.kalshi_event || (r.ticker||r.kalshi_ticker||'').split('-').slice(0,-1).join('-') || r.ticker || r.kalshi_ticker;
   function lockSubmittedEvent(row) { submittedEvents.set(eventKey(row), Date.now()+120000); renderTrades(); }
@@ -2185,9 +2282,13 @@
 
   function tradesModel() {
     const q = ($('#tr_q').value || '').toLowerCase();
-    const showAuto = $('#tr_algo').checked, showResearch = $('#tr_research').checked;
+    // EVERY lane's rows are built, always. Deriving these from the current tab meant the tab
+    // counts were computed after the rows had already been excluded, so AUTO read 0 while two
+    // auto rows existed. The tab filters at the end instead; these stay open so the counts on the
+    // chips describe what is available rather than what the current tab happens to admit.
+    const showAuto = true, showResearch = true;
     const minWin = Number($('#tr_minwin').value || 0) / 100;
-    const rows = [];
+    let rows = [];
     const now = Date.now()/1000;
     const inflight = new Set();
     for (const [,request] of unacknowledged) inflight.add(eventKey(request));
@@ -2219,7 +2320,13 @@
     // One pair a game: the two team markets of an event are the same trade seen from either side
     // (selling the favourite on Kalshi is buying the underdog), so the better lock represents it.
     const bestPair = {};
+    // A pair needs BOTH venues. Offering one while Polymarket is not connected produces a row
+    // whose trade button can only fail - and the failure was a request with no deadline, which is
+    // what wedged the manual lane. If the second leg is unreachable the row is not tradable, so it
+    // is not listed.
+    const pmLive = !!(pnl?.polymarket?.synced);
     for (const p of pairsRows) {
+      if (!pmLive) continue;
       if (!accountFresh || held.has(eventKey(p))) continue;
       // Only what the pair rule itself would take: tight books (a resting leg on a wide book never
       // fills, its "lock" is just the spread) and a lock over the rule's floors. The Polymarket tab lists the rest.
@@ -2250,6 +2357,23 @@
     // the desk's own rank (never re-sorted here), research after them, then pairs and perps.
     const band = r => r.kind === 'pair' && r.instant ? 0 : r.kind === 'kalshi' ? (r.route === 'research' ? 2 : 1) : 3;
     rows.sort((a,b) => band(a) - band(b) || (a.kind === 'kalshi' && b.kind === 'kalshi' ? 0 : (b.score||0) - (a.score||0)));
+    // Route gating. A pair or perp row is traded by hand, so it belongs under FOR ME.
+    const routeOf = r => r.kind === 'kalshi' ? r.route : 'manual';
+    // ALL still honours the RESEARCH checkbox, which is the one place it still means something.
+    const routeOk = r => tradesRoute === 'all' ? (routeOf(r) !== 'research' || $('#tr_research').checked)
+                       : tradesRoute === 'me' ? routeOf(r) === 'manual'
+                       : tradesRoute === 'auto' ? routeOf(r) === 'auto'
+                       : routeOf(r) === 'research';
+    const researchShown = $('#tr_research').checked;
+    const routeCounts = {me: 0, auto: 0, research: 0,
+                         all: rows.filter(r => routeOf(r) !== 'research' || researchShown).length};
+    for (const r of rows) {
+      const ro = routeOf(r);
+      if (ro === 'manual') routeCounts.me++;
+      else if (ro === 'auto') routeCounts.auto++;
+      else if (ro === 'research') routeCounts.research++;
+    }
+    rows = rows.filter(routeOk);
     const counts = {all: rows.length};
     for (const r of rows) counts[r.cat] = (counts[r.cat]||0) + 1;
     const cats = ['all',...new Set(['weather','sports','crypto','commodities','economics','finance','tech_science','pair','perps','other',...Object.keys(counts)].filter(k=>k!=='all'))];
@@ -2259,14 +2383,172 @@
     if (!tradesCatPinned && tradesCat !== 'all' && rows.some(isTradable)
         && !rows.some(r => r.cat === tradesCat && isTradable(r))) tradesCat = 'all';
     const out = rows.filter(r => (tradesCat === 'all' || r.cat === tradesCat) && (!q || (r.ticker + ' ' + (r.title||'') + ' ' + (r.sub||'') + ' ' + (r.model||'')).toLowerCase().includes(q)));
-    return {rows: out, counts, cats, total: rows.length, decisionsFresh};
+    return {rows: out, counts, cats, total: rows.length, decisionsFresh, routeCounts};
   }
+  // An empty board is the normal resting state of a working router, so it has to account for
+  // itself. Every number here comes from the server's own decision counts and reason histogram;
+  // nothing is recomputed in the browser, because a second opinion computed in JS is exactly how
+  // a screen starts disagreeing with the engine it is supposed to be reporting.
+  function emptyBoardExplanation(fresh) {
+    const gen = decisions?.generated_ts || 0;
+    if (!fresh) {
+      return `<div class="whynot"><h4 class="warn">DECISIONS ARE STALE</h4>
+        <div class="mini">The board is not being refreshed by the desk. Last good update
+        ${gen ? sysAge(gen) : 'never'}. Nothing below is current.</div></div>`;
+    }
+    const c = decisions?.counts || {}, reasons = decisions?.reasons || [];
+    const label = {me: 'NO MANUAL TRADES RIGHT NOW', auto: 'NOTHING ON AUTO RIGHT NOW',
+                   research: 'NO RESEARCH ROWS RIGHT NOW', all: 'NO DECISIONS RIGHT NOW'}[tradesRoute];
+    const sides = Number(c.sides || 0);
+    const rows = [['auto (the algorithm sends these)', c.algo], ['for you', c.manual],
+                  ['edge below the floor', c.weak], ['research only', c.research],
+                  ['blocked by a data or risk gate', c.blocked]]
+      .filter(([, n]) => Number(n) > 0)
+      .map(([k, n]) => `<tr><td class="n">${n}</td><td class="l dim">${k}</td></tr>`).join('');
+    const why = reasons.slice(0, 6)
+      .map(r => `<tr><td class="n">${r.count}</td><td class="l dim">${esc(r.reason)}</td></tr>`).join('');
+    return `<div class="whynot">
+      <h4>${label}</h4>
+      <div class="mini">${sides} decision${sides === 1 ? '' : 's'} evaluated this cycle
+        &middot; ${sysAge(gen)}</div>
+      ${rows ? `<table>${rows}</table>` : ''}
+      ${why ? `<div class="mini">Top reasons nothing cleared:</div><table>${why}</table>` : ''}
+      <div class="acts">
+        <button data-trfunnel="all">SHOW ALL DECISIONS</button>
+        <button data-trfunnel="research">SHOW RESEARCH</button>
+      </div></div>`;
+  }
+
+  // ---- the selected row, explained ------------------------------------------------------
+  // One panel answers: what is this, what does the book say, how did the raw discrepancy become
+  // the net edge, why is it on this route, and what can I do about it. Every number is the row's
+  // own field; the panel does no arithmetic except the waterfall, and the waterfall checks itself.
+  function selectedBoardRow() {
+    const tr = document.querySelector('#trades tbody tr.sel[data-trade]');
+    return tr ? findTradeRow(tr.dataset.trade) : null;
+  }
+  function edgeWaterfall(row, r) {
+    // Only an event-contract decision HAS this decomposition. A perps or pair row is priced by its
+    // own rule from a dollar price and a basis, with no model fair and no per-contract fee terms,
+    // and running it through the waterfall produced an entry of -231.8c and an "unexplained"
+    // residual out of fields that were simply absent. Those rows get their own line instead.
+    const isDecision = r.kind === 'kalshi' && Number.isFinite(Number(row.p_win ?? r.fair));
+    if (!isDecision) {
+      const what = esc(r.what || r.model || 'its own rule');
+      const px = Number(row.price ?? r.price);
+      return `<table class="wf">
+        <tr><td>priced by</td><td class="v">${what}</td></tr>
+        <tr class="sub"><td>at</td><td class="v">${Number.isFinite(px)?fmt(px,4):'-'}</td></tr>
+        <tr class="sub"><td colspan="2">No model probability on this row, so there is no
+          fair-minus-price decomposition to show. ${r.kind==='pair'?'A pair is locked by its two legs settling against each other.':'The basis rule on the Perps tab is the systematic version of this.'}</td></tr>
+      </table>`;
+    }
+    const cents = x => !Number.isFinite(Number(x)) ? '-' : (x > 0 ? '+' : x < 0 ? '−' : ' ')
+      + Math.abs(x * 100).toFixed(1) + '¢';
+    const fair = Number(row.p_win ?? r.fair), px = Number(row.price ?? r.price);
+    const fee = Number(row.fee), slip = Number(row.slippage), unc = Number(row.uncertainty_buffer);
+    const raw = Number(row.raw_edge ?? r.raw), net = Number(row.executable_edge ?? r.net);
+    const parts = [fee, slip, unc].map(x => Number.isFinite(x) ? x : 0);
+    // If the row's own terms do not reconstruct its own net edge the panel says so rather than
+    // presenting a tidy column that happens to be wrong. A silent rounding of a disagreement is
+    // how a screen teaches you to trust a number it has not actually checked.
+    const resid = Number.isFinite(raw) && Number.isFinite(net)
+      ? net - (raw - parts[0] - parts[1] - parts[2]) : NaN;
+    const line = (k, v, cls) => `<tr class="${cls||''}"><td>${k}</td><td class="v ${cls==='sum'?c(v):''}">${cents(v)}</td></tr>`;
+    return `<table class="wf">
+      <tr><td>model fair</td><td class="v">${Number.isFinite(fair)?(fair*100).toFixed(1)+'¢':'-'}</td></tr>
+      <tr class="sub"><td>entry ${esc(row.style||'')} at</td><td class="v">${Number.isFinite(px)?'−'+(px*100).toFixed(1)+'¢':'-'}</td></tr>
+      ${line('raw discrepancy', raw)}
+      <tr class="sub"><td>fee</td><td class="v">${cents(-parts[0])}</td></tr>
+      <tr class="sub"><td>slippage estimate</td><td class="v">${cents(-parts[1])}</td></tr>
+      <tr class="sub"><td>uncertainty (buffer × σ ${Number.isFinite(Number(row.sigma))?fmt(row.sigma,3):'-'})</td><td class="v">${cents(-parts[2])}</td></tr>
+      ${line('NET EDGE', net, 'sum')}
+      ${Number.isFinite(resid) && Math.abs(resid) > 0.0005
+        ? `<tr class="resid"><td>unexplained</td><td class="v">${cents(resid)}</td></tr>` : ''}
+    </table>`;
+  }
+  function renderDetail() {
+    const r = selectedBoardRow();
+    const title = $('#detail_title'), body = $('#detail_body');
+    if (!r) {
+      setText(title, 'click or j/k a row');
+      setHTML(body, `<p class="mini dim">No row selected. The board's rows are selectable with the
+        mouse or with j / k; whatever is selected is explained here.</p>`);
+      return;
+    }
+    const row = r.row || {};
+    const route = r.kind === 'kalshi' ? String(r.route || '') : 'manual';
+    const tradable = r.kind !== 'kalshi' || route === 'manual';
+    const side = String(row.side || r.side || '').toUpperCase();
+    const other = side === 'YES' ? 'NO' : 'YES';
+    // A perps/pair row has no yes/no side; it has an action. "BUY —" told the operator nothing.
+    const actionLabel = side === 'YES' || side === 'NO' ? `BUY ${side}` : (r.what || 'TRADE');
+    const hasSide = side === 'YES' || side === 'NO';
+    const reasons = [...(row.reasons || r.reasons || []), ...(row.warnings || [])];
+    setText(title, r.ticker || '');
+    const spread = Number.isFinite(Number(row.spread)) ? Number(row.spread)
+      : (Number(row.ask) - Number(row.bid));
+    // What the desk will and will not do with this row, said in the row's own terms.
+    // The badge beside this already names the route, so the note adds what the route MEANS.
+    const routeNote = route === 'auto'
+      ? 'the algorithm sends this itself; it is not offered to you.'
+      : route === 'manual' ? 'yours to review. The desk re-checks the decision on a fresh book before anything is sent.'
+      : route === 'research' ? 'priced and recorded, offered to nobody.'
+      : 'a data or risk gate stands in front of this.';
+    setHTML(body, `
+      <div class="mini">${esc(row.title || r.title || '')}${row.yes_sub_title?' · '+esc(row.yes_sub_title):''}</div>
+      <div class="mini dim">${esc(r.cat||'')} · settles ${r.settles>=0?(r.settles<1?Math.round(r.settles*60)+'m':fmt(r.settles,1)+'h'):'-'} · quote ${sysAge(row.quote_ts)} · model ${sysAge(row.fair_ts||row.model_ts)}</div>
+      <div class="drow mini" style="margin:6px 0 2px">
+        <span class="k">book</span><span>${fmt(row.bid)} / ${fmt(row.ask)}
+          <span class="dim">(${fmt(row.bid_size,0)} × ${fmt(row.ask_size,0)})</span>
+          ${Number.isFinite(spread)?`<span class="dim">spread ${(spread*100).toFixed(1)}¢</span>`:''}</span>
+        <span class="k">model</span><span>${esc(row.model_key||row.model||r.model||'-')}${row.model_version?' <span class="dim">'+esc(row.model_version)+'</span>':''}</span>
+        <span class="k">settlement</span><span class="${row.settlement_verified===false?'warn':'dim'}">${row.settlement_verified===false?'not verified against a published strike':'verified'}</span>
+      </div>
+      ${edgeWaterfall(row, r)}
+      <div class="mini"><span class="pill ${route==='auto'?'bot':route==='manual'?'man':''}">${route.toUpperCase()||'BLOCKED'}</span>
+        <span class="dim">${esc(routeNote)}</span></div>
+      ${reasons.length?`<div class="mini" style="margin-top:5px">Why it is on this route:</div>
+        <ul class="dstack mini">${reasons.slice(0,6).map(x=>`<li>${esc(x)}</li>`).join('')}</ul>`:''}
+      <div class="dbtns">
+        <button class="prim" id="d_buy" ${tradable?'':'disabled'}
+          title="${tradable?'Open the order ticket on this decision. The desk re-checks it before anything is sent.':route==='auto'?'The algorithm sends this row itself; it is not offered to you.':route==='research'?'Recorded, offered to nobody.':'A data or risk gate blocks this row.'}">BUY ${side||'—'}</button>
+        ${r.kind==='kalshi'&&hasSide?`<button class="sec" id="d_other" title="Opens a fresh hand ticket on the ${other} side. The desk has not priced that side and will not re-check it against a decision.">take ${other} instead</button>`:''}
+        <span class="mini dim">${tradable?'Enter opens the ticket':'not offered to you'}</span>
+      </div>`);
+    const buy = $('#d_buy');
+    if (buy && tradable) buy.addEventListener('click', () => openTradeModal(r));
+    const oth = $('#d_other');
+    if (oth) oth.addEventListener('click', () => openTrade(r.ticker, other.toLowerCase(), null, {}));
+  }
+
   function renderTrades() {
     if (!decisions) return;
-    const {rows, counts, cats, total, decisionsFresh} = tradesModel();
+    const {rows, counts, cats, total, decisionsFresh, routeCounts} = tradesModel();
     const n = parseInt($('#tr_n').value, 10) || 20;
     const alg = decisions.algorithm || {};
-    const algo = alg.running ? 'algorithm ' + (alg.mode === 'live' ? 'LIVE' : 'paper') + (alg.auto_armed === false ? ' (AUTO off)' : '') : 'algorithm stopped';
+    // `running` is the switch the operator set; `halted` is what the engine is actually doing.
+    // Reading only the switch is how this line said "algorithm LIVE" while nothing was being sent.
+    // HALTED goes in the count line; the reason gets its own line below, because a long reason
+    // concatenated here reflowed the board's own controls onto a second row.
+    const algo = alg.halted ? 'ALGORITHM HALTED'
+      : alg.running ? 'algorithm ' + (alg.mode === 'live' ? 'LIVE' : 'paper') + (alg.auto_armed === false ? ' (AUTO off)' : '')
+      : 'algorithm stopped';
+    // Route tabs first: they are the question "what can I act on" in four words.
+    const RT = [['me','FOR ME'],['auto','AUTO'],['all','ALL'],['research','RESEARCH']];
+    $('#tr_routes').innerHTML = RT.map(([k,label]) =>
+      `<span class="chip ${k===tradesRoute?'on':''}" data-trroute="${k}" role="tab"
+         aria-selected="${k===tradesRoute}">${label}<span class="n">${(routeCounts||{})[k]||0}</span></span>`).join('');
+    // The funnel. Each step is clickable and lands on the tab that explains that number.
+    const fn = decisions?.funnel;
+    $('#tr_funnel').innerHTML = !fn ? '' : [
+      ['watched','MARKETS', null], ['priced','PRICED', null], ['edge','EDGE', 'all'],
+      ['actionable','ACTIONABLE', 'me']
+    ].map(([k,label,tab],i) =>
+      `${i?'<span class="ar">\u2192</span>':''}<span class="st${tab===tradesRoute?' act':''}"`
+      + `${tab?` data-trfunnel="${tab}"`:''} title="${esc(label.toLowerCase())}">${label} <b>${fn[k]??'-'}</b></span>`
+    ).join('') + `<span class="ar">→</span><span class="st" data-trfunnel="auto">AUTO <b>${fn['auto']??0}</b></span>`
+      + `<span class="st" data-trfunnel="me">MANUAL <b>${fn['manual']??0}</b></span>`;
     $('#tr_cats').innerHTML = cats.map(k => `<span class="chip ${k===tradesCat?'on':''}" data-trcat="${k}">${k}<span class="n">${counts[k]||0}</span></span>`).join('');
     $('#trades_count').textContent = `${Math.min(n, rows.length)} of ${total} actionable · ${algo} · decisions ${sysAge(decisions.generated_ts)}`;
     const num = (x, d = 3, sign = false) => x === null || x === undefined || !Number.isFinite(Number(x)) ? '-' : (sign && x > 0 ? '+' : '') + fmt(x, d);
@@ -2285,15 +2567,34 @@
         <td class="l">${esc(r.what)}</td>
         <td>${r.kind==='perps'?fmt(r.price,4):fmt(r.price)}</td>
         <td>${fair}</td>
-        <td>${num(r.sigma)}</td>
-        <td class="${c(r.raw)}">${num(r.raw, r.kind==='perps'?4:3, true)}</td>
         <td class="edge ${c(r.net)}">${num(r.net, 3, true)}</td>
         <td class="l mini">${esc(r.model||'')}</td>
         <td class="l">${ROUTE_PILL[r.route] || esc(r.route||'')}</td>
         <td class="dim">${settles}</td>
         <td>${tradable?`<button data-tradebtn="${esc(r.key)}" class="ok">trade</button>`:''}</td></tr>`;
-    }).join('') || `<tr><td class="l dim" colspan="12">${decisionsFresh ? 'nothing actionable right now: no fresh two-sided book with an edge that clears the fees and the floors. The Systematic tab shows every row and why.' : 'waiting for the desk\'s decisions…'}</td></tr>`;
-    $('#trades_note').innerHTML = `${decisionsFresh?'':'<span class="warn">The desk\'s decisions are stale; event rows are hidden until a new cycle publishes them.</span> '}Routes are the desk\'s decision router; this page does not recompute them. MANUAL: yours to review, and the desk rechecks it before anything is sent. AUTO: the algorithm sends it itself and it is not offered to you. RESEARCH: recorded, offered to nobody. One row per event and route; events you hold, work or have queued are not listed. Pairs need both legs to fill and settlement rules to match; their quoted profit is conditional. Every hand order still passes entry risk limits.`;
+    }).join('') || `<tr><td class="l" colspan="11">${emptyBoardExplanation(decisionsFresh)}</td></tr>`;
+    // The selection is re-applied after the rows are replaced, because innerHTML destroyed the
+    // previous element. Falling back to the top row means the panel is useful the moment the
+    // board has anything in it, without the operator having to click first.
+    (function keepSelection() {
+      const els = boardRowsEls();
+      if (!els.length) { renderDetail(); return; }
+      const want = detailKey && els.find(el => el.dataset.trade === detailKey);
+      const pick = want || els[0];
+      for (const el of els) setClass(el, 'sel', el === pick);
+      detailKey = pick.dataset.trade;
+      renderDetail();
+    })();
+    // The staleness warning stays inline and always visible - it changes what the screen means.
+    // The standing explanation of what the routes are does not change minute to minute, so it
+    // folds away: it was costing a third of the board's height on a 900px display.
+    $('#trades_note').innerHTML =
+      `${alg.halted?`<div class="warn">The algorithm is HALTED and is sending nothing${alg.halt_reason?': '+esc(alg.halt_reason):''}. Clear the halt on the Systematic tab. Manual orders are unaffected.</div>`:''}`
+      + `${decisionsFresh?'':'<span class="warn">The desk\'s decisions are stale; event rows are hidden until a new cycle publishes them.</span> '}`
+      + `<details><summary>what the routes mean</summary><span class="dim">Routes are the desk\'s decision router; this page does not recompute them. `
+      + `MANUAL: yours to review, and the desk rechecks it before anything is sent. AUTO: the algorithm sends it itself and it is not offered to you. `
+      + `RESEARCH: recorded, offered to nobody. One row per event and route; events you hold, work or have queued are not listed. `
+      + `Pairs need both legs to fill and settlement rules to match; their quoted profit is conditional. Every hand order still passes entry risk limits.</span></details>`;
   }
   function findTradeRow(key) { return tradesModel().rows.find(r => r.key === key) || null; }
 
@@ -2335,16 +2636,116 @@
   });
   for(const id of ['tr_minwin','tr_research'])$('#'+id).addEventListener('change',renderTrades);
   let modalState = null, modalSubmitting = false;
+  // WHICH ticket is in flight, not just whether one is. Without this, opening a second ticket
+  // while the first is awaiting confirmation would disable the new dialog's own controls.
+  let submittingState = null;
+  const submittingThis = () => modalState !== null && modalState === submittingState;
+  // Manual sends are serialised, one request at a time, because the desk answers them one at a
+  // time and an event may only carry one entry decision. A second send does not get refused any
+  // more: it waits here and goes when the one in front of it has been answered.
+  //
+  // What a queued send keeps, and why it is still safe to send it later:
+  //   - reviewed_ts is stamped when YOU pressed send, not when it leaves. The desk expires an
+  //     unsent review after 90s, and stamping at departure would have hidden the wait from the
+  //     rule that exists to catch exactly this.
+  //   - every item goes out through sendKalshiModal's own path, so the /api/size cap re-check and
+  //     the desk's re-check of the decision against a fresh book both still run on it.
+  // The drain STOPS on the first failure rather than pushing the rest into whatever broke. A kill
+  // switch or a rejected review would otherwise reject every remaining item in turn.
+  const MAX_QUEUED = 5;
+  let sendQueue = [], queueHalted = '';
   function closeModal() { const m = $('#modal'); if (m) m.remove(); modalState = null;return true; }
-  function submissionPending(pending, what='') {
+  let pendingWatchdog = null, pendingTick = null, pendingSince = 0;
+  function submissionPending(pending, what='', st=null) {
     modalSubmitting=pending;
-    const status=$('#order_pending');status.classList.toggle('hidden',!pending);
-    status.textContent=pending?`${what} — awaiting confirmation. You can close the dialog; that does not cancel the order. Further manual submissions wait for this result.`:'';
+    submittingState=pending?st:null;
+    if(pending)pendingLabel=what;
+    clearTimeout(pendingWatchdog);
+    pendingWatchdog=null;
+    pendingSince=pending?Date.now():0;
+    clearInterval(pendingTick);
+    pendingTick=null;
+    if(pending){
+      // The banner shows how long this has been waiting and offers a way out after ten seconds,
+      // so it needs its own clock. Without this it only repainted when something ELSE triggered a
+      // render, and a request that blocks the desk blocks those too - so the escape hatch never
+      // appeared precisely when it was needed.
+      pendingTick=setInterval(renderSendQueue,1000);
+      // Belt and braces behind the request deadline. If a submission is still marked in flight
+      // well past any deadline, the flag itself is the fault: something threw between setting it
+      // and its `finally`, or a promise never settled. The desk must not stay unusable for that.
+      pendingWatchdog=setTimeout(()=>{
+        if(!modalSubmitting)return;
+        modalSubmitting=false;submittingState=null;
+        clearInterval(pendingTick);pendingTick=null;
+        queueHalted='the previous submission never reported back and was cleared after 30s. '
+          + 'Check the manual queue and the blotter before re-sending: it may still have reached the desk.';
+        renderSendQueue();
+        toast('A submission never reported back; the desk has been unblocked. '
+              + 'Check the manual queue before re-sending.',true);
+      },30000);
+    }
+    renderSendQueue();
   }
-  function lockModalControls() { if(modalSubmitting)$('#modal')?.querySelectorAll('input,select,button:not(#md_cancel)').forEach(e=>e.disabled=true); }
+  let pendingLabel='';
+  // One banner carries both facts: what is in flight, and what is stacked behind it. A queue the
+  // operator cannot see is a queue they cannot cancel.
+  function renderSendQueue() {
+    const status=$('#order_pending');
+    if(!status)return;
+    const parts=[];
+    if(modalSubmitting){
+      const secs=pendingSince?Math.round((Date.now()-pendingSince)/1000):0;
+      parts.push(`<div><b>${esc(pendingLabel)}</b> — awaiting confirmation${secs?` (${secs}s)`:''}. `
+        + `Closing the dialog does not cancel it.`
+        + (secs>=10?` <button data-unwedge="1" class="sec" title="Stops waiting for this reply and unblocks manual sends. It does NOT cancel the order: if it reached the desk it is still live, so check the manual queue and the blotter first.">stop waiting</button>`:'')
+        + `</div>`);
+    }
+    if(sendQueue.length)parts.push(`<div>${sendQueue.length} queued behind it:</div>`
+      + sendQueue.map((q,i)=>`<div>&nbsp;${i+1}. ${esc(q.what)} `
+      + `<button data-unqueue="${q.id}" class="sec" title="remove this one from the queue; it is not sent">cancel</button></div>`).join(''));
+    if(sendQueue.length>1)parts.push(`<div><button data-unqueue="all" class="sec">cancel all queued</button></div>`);
+    if(queueHalted)parts.push(`<div class="dn">Queue stopped: ${esc(queueHalted)} `
+      + `${sendQueue.length?'The remaining items were NOT sent.':''}</div>`
+      + (sendQueue.length?`<div><button data-requeue="go" class="sec" title="send the next queued order; it is re-checked on a fresh book like any other">resume queue</button> `
+        + `<button data-unqueue="all" class="sec">discard queue</button></div>`:''));
+    status.classList.toggle('hidden',!parts.length);
+    setHTML(status,parts.join(''));
+  }
+  function enqueueSend(st){
+    if(sendQueue.length>=MAX_QUEUED)
+      return toast(`${MAX_QUEUED} orders are already queued. Wait for them, or cancel one.`,true);
+    // The desk allows one entry decision per event, so a second send on an event already in
+    // flight or already queued is a double-press rather than an intention.
+    const key=eventKey(st.row);
+    if(sendQueue.some(q=>q.key===key))
+      return toast('That event is already queued.',true);
+    const what=`${String(st.row.side).toUpperCase()} ${st.count} ${st.ticker} @ ${fmt(st.price)} ${st.style}`;
+    sendQueue.push({id:crypto.randomUUID(),key,what,reviewed_ts:Math.floor(Date.now()/1000),
+                    ticker:st.ticker,side:st.row.side,price:st.price,count:st.count,
+                    style:st.style,decision_id:st.decision_id||'',note:st.note||'',row:st.row});
+    queueHalted='';
+    renderSendQueue();
+    toast(`Queued: ${what} (position ${sendQueue.length})`);
+    if(modalState===st)closeModal();
+  }
+  async function drainSendQueue(){
+    if(modalSubmitting||!sendQueue.length||queueHalted)return;
+    const q=sendQueue.shift();
+    renderSendQueue();
+    // Rebuilt as a ticket state and sent down the ordinary path, so nothing about a queued order
+    // bypasses a check that an interactive one passes.
+    const st={kind:'kalshi',ticker:q.ticker,side:q.side,price:q.price,count:q.count,style:q.style,
+              row:q.row,decision_id:q.decision_id,note:q.note,reviewed_ts:q.reviewed_ts,
+              fromQueue:true};
+    await sendKalshiModal(st);
+  }
+  function lockModalControls() { if(submittingThis())$('#modal')?.querySelectorAll('input,select,button:not(#md_cancel)').forEach(e=>e.disabled=true); }
   function modalHtml(inner) { return `<div class="modal-bg" id="modal"><div class="modal">${inner}</div></div>`; }
   function openTradeModal(r, explicit = null) {
-    if(modalSubmitting)return toast('An order request is still pending. Its result will appear in the action log.',true);
+    // Deliberately NOT refused while a send is in flight: building the next ticket is how you get
+    // something into the queue. The in-flight send holds its own state and checks `modalState ===
+    // st` before it touches the dialog, so replacing the dialog cannot be clobbered by it.
     closeModal();
     if (r.kind === 'perps') {
       document.querySelector('button[data-tab="perps"]').click();
@@ -2378,7 +2779,7 @@
     modalSizeTimer = setTimeout(() => {
       const seq = st.sizeSeq = (st.sizeSeq || 0) + 1;   // only the latest request's answer is used
       api(modalSizeUrl(st)).then(sz => {
-        if (modalState !== st || modalSubmitting || seq !== st.sizeSeq) return;
+        if (modalState !== st || submittingThis() || seq !== st.sizeSeq) return;
         st.size = sz;
         if (initial && !st.explicit && !st.sizeEdited && sz.count >= 1) st.count = Math.floor(sz.count);
         renderKalshiModal();
@@ -2435,7 +2836,16 @@
         <tr><td class="k">settlement feed</td><td class="${rf.settlement?.replicated_strike?'':'warn'}">${rf.settlement?.replicated_strike?'confirmed: this feed reproduced the exchange\'s own published strike':'NOT confirmed against a published strike — the estimate is research only'}</td></tr>
         ${Number.isFinite(Number(rf.external?.basis))?`<tr><td class="k">${esc(rf.external.symbol||'futures')} cross-check</td><td class="mini dim">${fmt(rf.external.price,dp)}, ${(rf.external.basis>0?'+':'')+fmt(rf.external.basis,dp)} vs the reference · diagnostic only, never priced from</td></tr>`:''}
       </table>`;
+    // Which side is the desk's, and how to take the other one without pretending it is backed.
+    const other = String(row.side) === 'yes' ? 'no' : 'yes';
+    const sideRow = `<div class="sides">
+        <span class="cur">BUY ${String(row.side).toUpperCase()}</span>
+        <span class="mini dim">${st.decision_id ? "the side the desk priced and will re-check" : 'your chosen side'}</span>
+        <button class="alt" id="md_other" data-otherside="${other}"
+          title="Opens a fresh hand ticket on the ${other.toUpperCase()} side. The desk has not priced that side and will not re-check it against a decision, so it carries no manual floor and no route.">take ${other.toUpperCase()} instead</button>
+      </div>`;
     $('#modal_body').innerHTML = `<h3>${String(row.side).toUpperCase()} ${esc(row.ticker)} ${pill}</h3>
+      ${sideRow}
       <div class="mini">${esc(row.title||'')} · ${esc(row.yes_sub_title||'')} · ${esc(row.category||'')} via ${esc(row.model_key||row.fair_strategy||'')} · book ${fmt(bid)} / ${fmt(ask)} (${fmt(row.bid_size,0)} × ${fmt(row.ask_size,0)}) · quote ${sysAge(row.quote_ts)} · model ${sysAge(row.fair_ts)}</div>
       <div class="grid">
         <span class="k">price</span><input id="md_price" type="number" step="0.01" min="0.01" max="0.99" value="${st.price.toFixed(2)}">
@@ -2461,25 +2871,47 @@
       ${dec && !dec.found ? `<div class="warn">${esc(dec.reason||'This row is no longer on the board.')} Close and review the current row.</div>` : ''}
       <p class="mini">This is a <b>manual order</b>. Algorithm stop-loss, take-profit and time limits do not apply. Configure your own manual bracket after a fill if you want an automatic exit. Exit scenarios need a buyer and are not guaranteed.${st.decision_id?' Before it is sent the desk checks this decision again on a fresh book: the model\'s latest number, the route, the manual floor at your price and who owns the event. If anything changed nothing is sent, and the manual queue says why.':''}</p>
       <div class="mini dn">${esc(st.error||'')}</div>
-      <div class="row"><button id="md_send" class="ok">${modalSubmitting?'Submitting…':'send '+String(row.side).toUpperCase()+' '+n+' @ '+fmt(st.price)}</button><button id="md_cancel">${modalSubmitting?'hide dialog':'close'}</button><span class="mini dim">Enter sends · Esc closes${modalSubmitting?' · closing does not cancel the order':''}</span></div>`;
-    $('#md_price').addEventListener('change', () => { if(modalSubmitting)return;const v = parseFloat($('#md_price').value); if (v > 0 && v < 1) { st.price = v; renderKalshiModal(); refreshModalSize(st); } });
-    $('#md_count').addEventListener('change', () => { if(modalSubmitting)return;const v = Number($('#md_count').value); if (v >= .01) { st.count = v;st.sizeEdited=true;renderKalshiModal(); } });
-    $('#md_target').addEventListener('change',()=>{if(modalSubmitting)return;const v=Number($('#md_target').value);if(v>0&&v<1){st.target=v;renderKalshiModal();}});
-    $('#md_style').addEventListener('change', () => { if(modalSubmitting)return;st.style = $('#md_style').value; if (st.style === 'maker' && st.price >= ask) st.price = Math.max(0.01, Math.min(ask - 0.01, bid + 0.01)); if (st.style === 'taker') st.price = ask; renderKalshiModal(); refreshModalSize(st); });
+      <div class="row"><button id="md_send" class="ok">${submittingThis()?'Submitting…':modalSubmitting?'queue '+String(row.side).toUpperCase()+' '+n+' @ '+fmt(st.price):'send '+String(row.side).toUpperCase()+' '+n+' @ '+fmt(st.price)}</button><button id="md_cancel">${submittingThis()?'hide dialog':'close'}</button><span class="mini dim">${modalSubmitting&&!submittingThis()?'a send is awaiting confirmation — this one will queue behind it':'Enter sends · Esc closes'}${submittingThis()?' · closing does not cancel the order':''}</span></div>`;
+    const mdOther = $('#md_other');
+    if (mdOther) mdOther.addEventListener('click', () => {
+      if (submittingThis()) return;
+      // Deliberately NOT a mutation of this ticket: flipping the side in place would keep the
+      // decision_id and send a decision-backed order for a side the desk never priced. This
+      // opens a clean hand ticket through the same path the trade strip uses.
+      const tk = st.ticker, sd = mdOther.dataset.otherside;
+      closeModal();
+      openTrade(tk, sd, null, {});
+    });
+    $('#md_price').addEventListener('change', () => { if(submittingThis())return;const v = parseFloat($('#md_price').value); if (v > 0 && v < 1) { st.price = v; renderKalshiModal(); refreshModalSize(st); } });
+    $('#md_count').addEventListener('change', () => { if(submittingThis())return;const v = Number($('#md_count').value); if (v >= .01) { st.count = v;st.sizeEdited=true;renderKalshiModal(); } });
+    $('#md_target').addEventListener('change',()=>{if(submittingThis())return;const v=Number($('#md_target').value);if(v>0&&v<1){st.target=v;renderKalshiModal();}});
+    $('#md_style').addEventListener('change', () => { if(submittingThis())return;st.style = $('#md_style').value; if (st.style === 'maker' && st.price >= ask) st.price = Math.max(0.01, Math.min(ask - 0.01, bid + 0.01)); if (st.style === 'taker') st.price = ask; renderKalshiModal(); refreshModalSize(st); });
     $('#md_cancel').addEventListener('click', closeModal);
     $('#md_fit')?.addEventListener('click',()=>{if(!caps)return;st.count=Math.floor(caps.count);st.sizeEdited=true;renderKalshiModal();});
-    $('#md_send').addEventListener('click', sendKalshiModal);
+    // Wrapped, not passed by reference: sendKalshiModal now takes an optional queued ticket as
+    // its first argument, and a bare listener would hand it the MouseEvent instead.
+    $('#md_send').addEventListener('click', () => sendKalshiModal());
     lockModalControls();
     setTimeout(() => { const e = $('#md_count'); if (e && document.activeElement !== $('#md_price')) e.focus(); }, 0);
   }
-  async function sendKalshiModal() {
-    const st = modalState; if (!st || st.kind !== 'kalshi' || modalSubmitting) return;
+  async function sendKalshiModal(queued = null) {
+    const st = queued || modalState;
+    if (!st || st.kind !== 'kalshi') return;
+    // A send while one is already awaiting confirmation joins the queue instead of being refused.
+    // Only an interactive send can enqueue; a drained item is already past this point.
+    if (modalSubmitting) return st.fromQueue ? undefined : enqueueSend(st);
     if(!(st.price>0&&st.price<1&&Number.isFinite(st.count)&&st.count>=.01))return toast('Enter a valid limit price and quantity.',true);
     const payload = {ticker: st.ticker, outcome_side: st.row.side, price: st.price, count: st.count, post_only: st.style === 'maker', note: st.note || 'manual dashboard review'};
     if (st.decision_id) payload.decision_id = st.decision_id;
     const what = `${String(st.row.side).toUpperCase()} ${st.count} ${st.ticker} @ ${fmt(st.price)} ${st.style}`;
     let queuedRequest=null;
-    submissionPending(true,what);renderKalshiModal();
+    submissionPending(true,what,st);
+    // The dialog closes the moment the request is in flight. It used to stay open showing
+    // "Submitting…", which put a modal overlay between the operator and the board - so the next
+    // row could not be reached and nothing could be queued behind this. Everything the open
+    // dialog was still showing now lives in the banner: what is in flight, what is queued, and
+    // why the queue stopped. Closing it never cancelled the order and still does not.
+    if(!st.fromQueue&&modalState===st)closeModal();
     try {
       if(state?.kill)throw new Error('Desk halted: '+(state.kill_reason||'kill switch is on')+'. Review the risk controls before submitting.');
       st.sizeSeq=(st.sizeSeq||0)+1;   // a debounced answer still in flight must not replace this one
@@ -2492,7 +2924,8 @@
         + `Binding: ${size.binding || 'unknown'}.`
         + (size.count>=1 ? ' Use affordable quantity, or fix that and review again.' : ''));
       lockSubmittedEvent(st.row);
-      const request={...payload,client_request_id:crypto.randomUUID(),reviewed_ts:Math.floor(Date.now()/1000)};queuedRequest=request;
+      const request={...payload,client_request_id:crypto.randomUUID(),
+        reviewed_ts:st.reviewed_ts||Math.floor(Date.now()/1000)};queuedRequest=request;
       unacknowledged.set(request.client_request_id,request);saveUnacknowledged();
       const r=await api('/api/manual-orders',{method:'POST',body:JSON.stringify(request),signal:AbortSignal.timeout(10000)});
       unacknowledged.delete(request.client_request_id);saveUnacknowledged();
@@ -2503,7 +2936,15 @@
       if(queuedRequest&&e.httpStatus>=400&&e.httpStatus<500){unacknowledged.delete(queuedRequest.client_request_id);saveUnacknowledged();}
       if(!queuedRequest||(e.httpStatus>=400&&e.httpStatus<500)){logAction(what,false,e.message);submittedEvents.delete(eventKey(st.row));renderTrades();}
       st.error=e.name==='TimeoutError'?'Queue acknowledgement unknown. Check the manual queue; retry uses the same request ID.':e.message;toast(st.error,true);await refreshManualQueue();}
-    finally {submissionPending(false);if(modalState===st)renderKalshiModal();}
+    finally {
+      submissionPending(false);
+      if(modalState===st)renderKalshiModal();
+      // Anything still queued behind a failure stays queued and unsent: the next item would
+      // almost certainly hit the same wall, and a series of rejections is worse than a stop.
+      if(st.error&&sendQueue.length)queueHalted=st.error;
+      renderSendQueue();
+      if(!st.error)drainSendQueue();
+    }
   }
   function openPairModal(p) {
     if(modalSubmitting)return;
@@ -2542,7 +2983,7 @@
     $('#md_route').addEventListener('change', () => { if(modalSubmitting)return;st.route = $('#md_route').value; renderPairModal(); });
     $('#md_ks').addEventListener('change', () => { if(modalSubmitting)return;st.ks = $('#md_ks').value; renderPairModal(); });
     $('#md_ps').addEventListener('change', () => { if(modalSubmitting)return;st.ps = $('#md_ps').value; renderPairModal(); });
-    $('#md_n').addEventListener('change', () => { if(modalSubmitting)return;const v = parseInt($('#md_n').value, 10); if (v >= 1) { st.contracts = v; renderPairModal(); } });
+    $('#md_n').addEventListener('change', () => { if(submittingThis())return;const v = parseInt($('#md_n').value, 10); if (v >= 1) { st.contracts = v; renderPairModal(); } });
     $('#md_cancel').addEventListener('click', closeModal);
     $('#md_send').addEventListener('click', async () => {
       if(modalSubmitting||modalState!==st||!selected||!(pick.profit>0))return;
@@ -2551,7 +2992,8 @@
       submissionPending(true,what);renderPairModal();
       try {
         lockSubmittedEvent(p);
-        const r = await post('/api/poly/pair', payload);
+        // The call that wedged the desk. It had no deadline while the Kalshi path had one.
+        const r = await post('/api/poly/pair', payload, {signal: AbortSignal.timeout(10000)});
         logAction(what, true, `Kalshi leg ${r.state||''}`);
         toast('pair sent: Kalshi leg working; Polymarket leg goes on the fill');
         submissionPending(false);if(modalState===st)closeModal(); refreshState(); refreshTrades();
@@ -2563,7 +3005,7 @@
   document.addEventListener('keydown', (ev) => {
     if (!modalState) return;
     if (ev.key === 'Escape' || ev.key === 'Esc') { ev.preventDefault();ev.stopPropagation();closeModal(); }
-    else if (!modalSubmitting && ev.key === 'Enter' && !(ev.target && ev.target.tagName === 'SELECT')) { const b = $('#md_send'); if (b && !b.disabled) b.click(); }
+    else if (ev.key === 'Enter' && !(ev.target && ev.target.tagName === 'SELECT')) { const b = $('#md_send'); if (b && !b.disabled) b.click(); }
   },true);
   // Double-click opens the order dialog on a MANUAL row (and on pairs and perps, which have their
   // own dialogs). AUTO and RESEARCH rows say why they are not yours instead of opening anything.
@@ -2571,9 +3013,64 @@
   $('#trades').addEventListener('click', (ev) => {
     const b = ev.target.closest('button[data-tradebtn]');
     if (b) { const r = findTradeRow(b.dataset.tradebtn); if (r) openTradeModal(r); return; }
-    const tr = ev.target.closest('tr[data-trade]'); if (tr && tr.dataset.trade.indexOf('|') > 0 && !tr.dataset.trade.startsWith('pair|') && !tr.dataset.trade.startsWith('perp|')) selectTicker(tr.dataset.trade.split('|')[0]);
+    const tr = ev.target.closest('tr[data-trade]');
+    if (tr) {
+      // Selection is what the detail panel reads, so a click has to set it the same way j/k does.
+      for (const el of boardRowsEls()) setClass(el, 'sel', false);
+      setClass(tr, 'sel', true);
+      detailKey = tr.dataset.trade;
+      renderDetail();
+    }
+    if (tr && tr.dataset.trade.indexOf('|') > 0 && !tr.dataset.trade.startsWith('pair|') && !tr.dataset.trade.startsWith('perp|')) selectTicker(tr.dataset.trade.split('|')[0]);
   });
   $('#tr_cats').addEventListener('click', (ev) => { const ch = ev.target.closest('[data-trcat]'); if (!ch) return; tradesCat = ch.dataset.trcat; tradesCatPinned = true; store.set('tradesCat', tradesCat); renderTrades(); });
+  function setTradesRoute(r) {
+    if (!r || r === tradesRoute) { renderTrades(); return; }
+    tradesRoute = r;
+    store.set('tradesRoute', r);
+    // Changing lane resets the category narrowing: a category picked while looking at AUTO is
+    // not a statement about what you want to see under FOR ME, and carrying it over is how the
+    // board ends up empty for a reason the operator did not choose.
+    tradesCat = 'all';
+    tradesCatPinned = false;
+    store.set('tradesCat', 'all');
+    renderTrades();
+  }
+  // The queue's own controls. Cancelling only removes an item that has NOT been sent; anything
+  // already awaiting confirmation is the desk's now and closing a dialog never recalls it.
+  $('#order_pending').addEventListener('click', (ev) => {
+    const un = ev.target.closest('[data-unqueue]');
+    if (un) {
+      const id = un.dataset.unqueue;
+      const n = sendQueue.length;
+      sendQueue = id === 'all' ? [] : sendQueue.filter(q => q.id !== id);
+      if (!sendQueue.length) queueHalted = '';
+      toast(id === 'all' ? `${n} queued order${n===1?'':'s'} cancelled` : 'queued order cancelled');
+      renderSendQueue();
+      return;
+    }
+    if (ev.target.closest('[data-requeue]')) { queueHalted = ''; renderSendQueue(); drainSendQueue(); return; }
+    if (ev.target.closest('[data-unwedge]')) {
+      // The operator's own way out. Never silent about what it does not do: the order may be live.
+      modalSubmitting = false; submittingState = null;
+      clearTimeout(pendingWatchdog); pendingWatchdog = null;
+      clearInterval(pendingTick); pendingTick = null;
+      queueHalted = 'you stopped waiting for the previous reply. That did NOT cancel it - check the '
+        + 'manual queue and the blotter before re-sending.';
+      renderSendQueue();
+      toast('Stopped waiting. Manual sends are unblocked; check the queue before re-sending.', true);
+    }
+  });
+  $('#tr_routes').addEventListener('click', (ev) => {
+    const ch = ev.target.closest('[data-trroute]');
+    if (ch) setTradesRoute(ch.dataset.trroute);
+  });
+  // The funnel numbers and the empty-board buttons both navigate, so one listener on the panel
+  // covers them wherever they are rendered.
+  $('#tradespanel').addEventListener('click', (ev) => {
+    const f = ev.target.closest('[data-trfunnel]');
+    if (f) { ev.preventDefault(); setTradesRoute(f.dataset.trfunnel); }
+  });
   $('#tr_q').addEventListener('input', renderTrades);
   $('#tr_n').addEventListener('change', renderTrades);
   $('#tr_algo').addEventListener('change', renderTrades);
@@ -2581,11 +3078,11 @@
   // ---- trade strip (with the hedge that goes in the same click) -----------------------------
   let manualOpenVersion=0, hedgeSubmitting=false;
   async function openTrade(ticker, side, researchCandidate = null, explicit = null) {
-    if(modalSubmitting||hedgeSubmitting)return;
+    if(hedgeSubmitting)return;
     const version=++manualOpenVersion;
     let m = researchCandidate || decisionRows.find(x=>x.ticker===ticker&&x.side===side) || researchRows.find(x=>x.ticker===ticker&&x.side===side) || boardRows.find(x=>x.ticker===ticker);
     if(!m)try{m=(await api('/api/markets?series='+encodeURIComponent(ticker.split('-')[0]||''))).find(x=>x.ticker===ticker);}catch(e){if(!explicit)throw e;}
-    if(version!==manualOpenVersion||modalSubmitting||hedgeSubmitting)return;
+    if(version!==manualOpenVersion||hedgeSubmitting)return;
     if(!m&&!explicit)return toast('Market not on the board.',true);
     m=m||{ticker};
     const model=typeof m.p_model==='number'?m.p_model:null;
@@ -2726,8 +3223,11 @@
       <span class="k">fees</span><span>${m.fee_type||''} ×${m.fee_multiplier!==undefined?m.fee_multiplier:''} ${m.fee_type==='quadratic'?'(maker free)':''}</span>
       <span class="k">fair</span><span>${fair ? fmt(fair.p,3)+' ±'+fmt(fair.sigma,2)+' <span class="dim">'+esc(fair.strategy)+' · '+esc(fair.note)+'</span>' : '<span class="dim">none</span>'}</span>
       <span class="k">position</span><span>${pos ? (pos.position>0?'+':'')+fmt(pos.position,2)+' (cost '+money(Math.abs(pos.exposure))+', realized '+money(pos.realized)+')' : '<span class="dim">flat</span>'}</span>`);
-    const bids = new Map((L.book.yes_bids||[]).map(l=>[Math.round(l[0]*100), l[1]]));
-    const asks = new Map((L.book.no_bids||[]).map(l=>[Math.round((1-l[0])*100), l[1]]));   // NO bid at q == YES ask at 1-q
+    // Every other field on this response is read defensively; `book` was not, so a ladder reply
+    // without one threw and blanked the whole panel instead of showing an empty book.
+    const B = L.book || {};
+    const bids = new Map((B.yes_bids||[]).map(l=>[Math.round(l[0]*100), l[1]]));
+    const asks = new Map((B.no_bids||[]).map(l=>[Math.round((1-l[0])*100), l[1]]));   // NO bid at q == YES ask at 1-q
     const myBid = new Map(), myAsk = new Map();
     for (const o of L.orders||[]) { if (o.outcome_side==='yes') myBid.set(Math.round(o.yes_price*100), (myBid.get(Math.round(o.yes_price*100))||0)+o.remaining); else myAsk.set(Math.round(o.yes_price*100), (myAsk.get(Math.round(o.yes_price*100))||0)+o.remaining); }
     for (const p of L.pending||[]) { const px = Math.round((p.outcome_side==='yes'?p.price:1-p.price)*100); const mp = p.outcome_side==='yes'?myBid:myAsk; mp.set(px, (mp.get(px)||0) + 0); }

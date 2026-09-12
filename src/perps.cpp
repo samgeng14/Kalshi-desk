@@ -54,6 +54,7 @@ PerpMarket parse_perp_market(const json& j) {
   auto side_price = [](double v) { return (std::isfinite(v) && v > 0 && v < 1e9) ? v : 0.0; };
   m.bid = side_price(d(j, "bid"));
   m.ask = side_price(d(j, "ask"));
+  m.quote_received_ts_ms = now_ms();   // ours: the venue sends no clock with the book
   m.last = d(j, "price");
   m.mark = ticker_price(j, "settlement_mark_price", &m.mark_ts_ms);
   m.liquidation_mark = ticker_price(j, "liquidation_mark_price");
@@ -235,7 +236,13 @@ PerpsDesk::PerpsDesk(const Config& cfg, Store& store, KalshiClient& client)
                                // "12 contracts" is $4.82 in one and $132 in the other. 0 falls back to
                                // the contract count, which is what a settings row written earlier holds.
                                {"notional_dollars", pc_.algo_notional_dollars},
-                               {"cooldown_minutes", 30.0}, {"markets", pc_.algo_markets}}}};
+                               {"cooldown_minutes", 30.0},
+                               // How old the book may be when an entry is priced from it. The
+                               // validator refuses a settings key it does not already hold, and
+                               // the range check reads 0.0 for an absent one, so this default has
+                               // to exist here or every perps settings save would be rejected.
+                               {"book_max_age_seconds", 2.0},
+                               {"markets", pc_.algo_markets}}}};
   if (auto saved = store_.kv_get(kAlgoKey)) {
     json parsed = json::parse(*saved, nullptr, false);
     if (parsed.is_object()) {
@@ -646,6 +653,9 @@ json PerpsDesk::configure_algo(const json& body) {
     range("contracts", 0.01, 1000); range("daily_loss_stop", 0.01, 10000); range("entry_ttl_seconds", 10, 3600);
   range("notional_dollars", 0, 10000);
     range("cooldown_minutes", 0, 1440);
+    // Below ~0.2s no snapshot would ever qualify and the strategy would silently stop
+    // trading; above a minute the gate stops meaning anything.
+    range("book_max_age_seconds", 0.2, 60);
     if (settings.value("exit_bps", 0.0) >= settings.value("entry_bps", 0.0)) throw std::invalid_argument("exit_bps must be below entry_bps");
     st["settings"] = settings;
     algo_log("info", "perps rule settings changed");
@@ -693,6 +703,10 @@ void PerpsDesk::step(long long now) {
   const json settings = st["settings"];
   const bool paper = st.value("paper", true);
   const std::string mode = paper ? "paper" : "live";
+  // How old the book may be when an entry is priced from it. Two seconds by default: the loop runs
+  // every few seconds, and anything older is a price the exchange has already moved past.
+  const long long book_max_age_ms =
+      static_cast<long long>(1000.0 * settings.value("book_max_age_seconds", 2.0));
   const double entry_bps = settings.value("entry_bps", 25.0), exit_bps = settings.value("exit_bps", 5.0),
                stop_bps = settings.value("stop_bps", 60.0), hold = settings.value("max_hold_minutes", 120.0),
                contracts = settings.value("contracts", 1.0), ttl = settings.value("entry_ttl_seconds", 90.0),
@@ -839,6 +853,20 @@ void PerpsDesk::step(long long now) {
       auto m = market(ticker);
       if (!m || !m->is_open || m->bid <= 0 || m->ask <= 0 || m->reference <= 0) continue;
       if (now * 1000 - m->reference_ts_ms > 120000) continue;   // a stale index is not a basis
+      // A stale BOOK is not a basis either, and it is the half that decides whether a post-only
+      // price crosses. Only the index was gated here, so an old bid/ask could both fabricate a
+      // basis that had already closed and price an order the exchange then refused. Said once per
+      // market per run, like the unsized warning, so a quiet feed cannot flood the log.
+      const long long book_age_ms = m->quote_received_ts_ms > 0 ? now * 1000 - m->quote_received_ts_ms : -1;
+      if (book_age_ms < 0 || book_age_ms > book_max_age_ms) {
+        if (stale_book_.insert(ticker).second)
+          algo_log("warn", ticker + ": book snapshot is " +
+                               (book_age_ms < 0 ? std::string("unstamped") : fmt2(book_age_ms / 1000.0) + "s old") +
+                               ", over the " + fmt2(book_max_age_ms / 1000.0) +
+                               "s entry limit; no order is priced from it");
+        continue;
+      }
+      stale_book_.erase(ticker);
       double basis = m->basis_bps();
       double needed = fee_bps(ticker, false) + fee_bps(ticker, true) + 5.0;   // maker in, taker out, and something for the desk
       if (std::fabs(basis) < std::max(entry_bps, needed)) continue;
@@ -968,7 +996,8 @@ json PerpsDesk::view() {
                        {"volume_24h", m.volume_24h}, {"open_interest", m.open_interest}, {"fractional", m.fractional},
                        {"funding_rate", f == funding_cache_.end() ? json(nullptr) : json(f->second.rate)},
                        {"next_funding", f == funding_cache_.end() ? "" : f->second.next_funding_time},
-                       {"reference_age_s", m.reference_ts_ms > 0 ? (now * 1000 - m.reference_ts_ms) / 1000 : -1}});
+                       {"reference_age_s", m.reference_ts_ms > 0 ? (now * 1000 - m.reference_ts_ms) / 1000 : -1},
+                       {"book_age_ms", m.quote_received_ts_ms > 0 ? now * 1000 - m.quote_received_ts_ms : -1}});
   }
   json positions = json::array();
   double total_notional = 0, total_unreal = 0;

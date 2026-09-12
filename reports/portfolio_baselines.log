@@ -1,0 +1,11 @@
+panel: 13 assets, 51376 hourly bars, 2020-10-16 .. 2026-08-31
+rebalance every 168h; Kalshi one-way 12.32-21.30 bps
+
+computing rolling PCA (720h trailing window, refit daily)...
+Traceback (most recent call last):
+  File "/tmp/qh/scripts/portfolio_baselines.py", line 137, in <module>
+    main()
+  File "/tmp/qh/scripts/portfolio_baselines.py", line 90, in main
+    res = P.simulate(rets, ts, names, fn, rebalance_h=REBAL, k=3,
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: simulate() got an unexpected keyword argument 'vol_target_bps'

@@ -1,0 +1,78 @@
+==============================================================================
+1. THE TURNOVER BUDGET
+==============================================================================
+Kalshi one-way cost, bps: min 12.32 (BTCUSDT)  median 16.93  max 21.30 (LINKUSDT)
+Of every one of those, 12.00 bps is the tier-0 taker fee.
+
+rebalance  lookback   rebal/yr     turnover      cost %/yr   gross needed
+4h         4h             2190        1.518         562.2%         562.2%
+8h         8h             1095        1.511         279.8%         279.8%
+12h        12h             730        1.512         186.7%         186.7%
+24h        24h             365        1.508          93.2%          93.2%
+48h        48h             182        1.500          46.3%          46.3%
+168h       168h             52        1.493          13.1%          13.1%
+336h       336h             26        1.490           6.5%           6.5%
+
+"gross needed" is the gross return the book must earn just to pay its own costs.
+
+Same table under the verified fee ladder, 12h rebalance:
+30d volume          taker bps cost %/yr at 12h
+$0 (tier 0)       taker  12.0         186.7%
+                  maker   5.0         109.4%
+$100k             taker  10.0         164.6%
+                  maker   4.0          98.4%
+$1m               taker   6.0         120.5%
+                  maker   2.4          80.7%
+$3m               taker   5.0         109.4%
+                  maker   2.0          76.3%
+$10m              taker   4.0          98.4%
+                  maker   1.6          71.9%
+$100m             taker   3.2          89.6%
+                  maker   1.2          67.5%
+
+==============================================================================
+2. THE PCA RESIDUAL, AGAINST THE COST OF TRADING IT
+==============================================================================
+
+  60m bars   PC1 66.7%  PC2 4.5%  PC3 4.2%   (top 3 = 75.5%)
+                   raw sd bps resid sd bps   round trip   resid/rt
+      BTCUSDT            62.8         31.5         24.6       1.28
+      ETHUSDT            82.1         35.1         25.0       1.41
+      LINKUSDT          108.6         49.2         42.6       1.15
+      SOLUSDT           125.5         68.9         28.2       2.44
+      XRPUSDT           109.9         61.6         29.1       2.12
+      MEDIAN            108.6         51.7         33.9       1.48
+
+ 240m bars   PC1 67.9%  PC2 4.5%  PC3 4.1%   (top 3 = 76.5%)
+                   raw sd bps resid sd bps   round trip   resid/rt
+      BTCUSDT           126.5         62.2         24.6       2.52
+      ETHUSDT           167.1         69.1         25.0       2.76
+      LINKUSDT          218.3         97.2         42.6       2.28
+      SOLUSDT           253.8        137.3         28.2       4.86
+      XRPUSDT           218.7        126.8         29.1       4.36
+      MEDIAN            218.3         97.6         33.9       2.77
+
+ 720m bars   PC1 67.0%  PC2 5.2%  PC3 4.2%   (top 3 = 76.4%)
+                   raw sd bps resid sd bps   round trip   resid/rt
+      BTCUSDT           218.2        104.3         24.6       4.23
+      ETHUSDT           288.1        118.2         25.0       4.73
+      LINKUSDT          375.6        168.5         42.6       3.96
+      SOLUSDT           434.9        236.8         28.2       8.39
+      XRPUSDT           368.1        231.0         29.1       7.94
+      MEDIAN            372.0        168.5         33.9       4.73
+
+==============================================================================
+3. WHAT PC1-NEUTRALITY COSTS, 2021-2026
+==============================================================================
+year     EW long bp/bar     annualised % cross-sec sd bp
+2020              22.66           165.4%          276.6
+2021              26.22           191.4%          307.3
+2022             -20.66          -150.8%          164.1
+2023              11.77            85.9%          141.0
+2024               8.16            59.6%          171.2
+2025              -6.16           -44.9%          142.0
+2026              -6.46           -47.1%          111.5
+ALL                3.42            25.0%          180.1
+
+The last column is the cross-sectional dispersion a long/short book harvests from.
+The middle column is what a PC1-neutral book gives up by construction.

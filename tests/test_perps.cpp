@@ -72,6 +72,17 @@ static void test_parsers() {
   CHECK_NEAR(m.basis_bps(), (7.8524 - 7.8507) / 7.8507 * 1e4, 1e-6);   // ~2.2 bps rich
   CHECK_NEAR(m.tick, 0.0001, 1e-12);
   CHECK(m.mark_ts_ms > 0 && m.reference_ts_ms > 0);
+  // The book carries no venue clock, so the parser stamps OUR receive time. This is the field the
+  // maker entry gates on: a post-only price built from a stale snapshot is what the exchange
+  // refuses as "post only cross", and the same stale bid/ask also feed mid() and therefore the
+  // basis the entry was decided on. Named for what it is - when it reached us - not when it was true.
+  CHECK(m.quote_received_ts_ms > 0);
+  CHECK(m.quote_received_ts_ms >= now_ms() - 5000 && m.quote_received_ts_ms <= now_ms() + 1000);
+  // The venue sends no book timestamp, so the stamp must NOT come from the payload: a market JSON
+  // with no timestamps at all still has to produce a usable receive time.
+  json bare = mj;
+  bare.erase("settlement_mark_price"); bare.erase("reference_price");
+  CHECK(parse_perp_market(bare).quote_received_ts_ms > 0);
   // No reference: no basis, never a trade.
   json nj = mj; nj.erase("reference_price");
   CHECK(parse_perp_market(nj).basis_bps() == 0);

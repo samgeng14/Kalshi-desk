@@ -186,16 +186,15 @@ def main():
     print('  effective draw count is below {} and the p99/max columns rest on a handful of'
           .format(n_draws))
     print('  order statistics. Read those two columns as indicative.')
-    pw = float(np.mean(np.array(null['n_all_gates']) > 0))
-    print('\n  POWER CHECK. Under the null, the all-gates count exceeds zero in {:.1%} of draws.'
-          .format(pw))
-    if pw < 0.05:
-        print('  A gate that pure noise also fails almost always cannot distinguish anything, so')
-        print('  an observed zero is not evidence against the mechanism -- only that this sample')
-        print('  cannot resolve it.')
-    else:
-        print('  The gate does separate signal from noise at this sample length, so an observed')
-        print('  zero is informative rather than vacuous.')
+    fp = float(np.mean(np.array(null['n_all_gates']) > 0))
+    print('\n  SPECIFICITY. Under the null, the all-gates count exceeds zero in {:.1%} of draws'
+          .format(fp))
+    print('  ({:,} specification-draws). That is a false-positive rate, NOT power: it says the'
+          .format(n_draws * n_spec))
+    print('  gate does not fire on noise, and says nothing about whether it would fire on a real')
+    print('  effect. Power is a different measurement and lives in cross_crypto_power.py, which')
+    print('  injects an edge of known size and reports the smallest one this sample can see. Do')
+    print('  not read an observed zero as evidence of absence without that number.')
 
     best_label = labels[int(np.argmax(ratios))]
     focal, model, bar = best_label.split()[0], ' '.join(best_label.split()[1:-1]), \

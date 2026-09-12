@@ -14,6 +14,164 @@ Working agreement for every session in this programme:
   geolocation check rejects it, so autonomous execution has to run on the Mac. This constrains
   session 8 and is not negotiable by design choices made earlier.
 
+## Session 21 - "post only cross" on /margin/orders (2026-09-12)
+
+Sam reported `POST /margin/orders -> 400 invalid_order / "post only cross"`.
+
+**What it is.** A post-only order priced from a book snapshot the market has since moved past. The
+exchange refusing it is the exchange doing its job: post-only means "never take", and it declined
+to turn the order into a taker fill nobody asked for.
+
+**It is not breaking anything.** The perps entry loop catches it, logs `entry not sent`, and moves
+to the next market; nothing is recorded and nothing halts. On the event-contract side the same
+refusal is already classified `SoftMarketState` in `include/desk/reject.h`, which documents the
+2026-09-11 02:32 incident where it halted the algorithm and requested the kill switch. Four
+occurrences in the whole log, all on event contracts before that reclassification.
+
+**The defect it reveals, which is the part worth fixing.** The maker entry gated the INDEX at 120
+seconds and never gated the BOOK:
+
+    if (now * 1000 - m->reference_ts_ms > 120000) continue;   // a stale index is not a basis
+
+`PerpMarket` stamped `mark_ts_ms` and `reference_ts_ms` - the venue nests those with their own
+clocks - but carried no timestamp for the bid/ask at all, because the venue sends none. So an
+arbitrarily old book could both price an order the exchange then refused AND feed `mid()`, and
+`mid()` is what `basis_bps()` is computed from. The refusal is benign; what it says is that the
+basis the entry was decided on may no longer have existed.
+
+**The fix.** `PerpMarket` gains `quote_received_ts_ms`, stamped in `parse_perp_market` with
+`now_ms()` and named for what it can honestly be - when the snapshot reached us, not when the book
+was true - which is the same distinction Sam insisted on for the commodity feed in Session 18. The
+maker entry now refuses to price from a book older than `book_max_age_seconds` (default 2.0,
+settable 0.2-60), warns once per market per run like the unsized warning rather than every cycle,
+and the perps view exposes `book_age_ms` beside `reference_age_s`.
+
+**A trap in adding the setting.** `configure_algo` throws on a settings key the stored object does
+not already contain, and the range check reads 0.0 for an absent key - so a `range("book_max_age_
+seconds", 0.2, 60)` without a matching default in the published settings object would have made
+EVERY perps settings save fail validation. The default is in the settings literal with a comment
+saying why it has to be.
+
+No strategy logic changed: the side and price selection is untouched, and it was already correct
+(join the touch, never cross). This is a freshness gate in front of it.
+
+### What was run
+
+- `perps.cpp`, `engine.cpp`, `test_perps.cpp` clean under `-Wall -Wextra`.
+- `test_perps.cpp` extended: the stamp exists, is within seconds of now, and survives a market
+  payload with no venue timestamps at all - it must not be read from the body.
+- `ui-routes` 63, `ui-desk-ux` 94, both 0 failures.
+
+### Open
+
+- A rebuild is needed for any of this: `cmake --build build`, then restart.
+- Whether 2 seconds is the right limit is a question for the live log: if `book snapshot is Ns old`
+  starts appearing for a market every run, the snapshot cadence is the problem, not the gate.
+
+## Session 20 - the desk UI answers its own questions (2026-09-12)
+
+`docs/ui-redesign.md` has the full account. Built straight into `ui/index.html` at Sam's
+instruction rather than as a prototype, and verified in headless Chromium against a stub API at
+1440x900 and 1920x1080.
+
+The board used to say `nothing actionable right now`. That sentence is true of a working router
+almost all the time and is also what a broken one says, which is precisely the confusion that
+prompted this: a category chip clicked once had persisted in localStorage and was filtering the
+board to an empty category. The screen held the information to say so and did not.
+
+**Four lanes** (FOR ME default) with counts describing what is available rather than what the
+current tab admits. **A decision funnel** - markets, priced, edge, actionable, auto, manual - every
+step clickable. **An empty board that itemises itself** from the server's own decision counts and a
+new reason histogram: how many rows were weak, research-only or blocked, and the top reasons none
+cleared. **Stale is distinguished from empty.** `σ` and `raw edge` left the default columns, since
+the decomposition belongs in the ticket where that question is actually asked.
+
+**Halted could read as running, and that was real.** `screen["algorithm"]` published only the
+operator's switch, so a halted engine reported `algorithm LIVE`. It now carries
+`requested_running`, `halted`, `halt_reason`, `halt_class` and `actually_running`; the board header
+tests halted first; three pills that said `RUNNING · HALTED` say `HALTED`; and the reason gets its
+own line that also states what the halt does NOT stop.
+
+**The ticket's side logic.** The decision's side is primary and labelled as the one the desk priced
+and will re-check. The other side opens a fresh hand ticket through the existing trade-strip path
+rather than flipping the current ticket, because a flip in place would keep the `decision_id` and
+send a decision-backed order for a side the desk never priced.
+
+Backend additions are read-only: `funnel` and `reasons` on `decisions_view`, computed from the
+UNFILTERED screen because the point is to account for the rows the board does not show. No model,
+threshold, route, order or graduation logic was touched.
+
+### What was run
+
+- `ui-routes` 63 checks, `ui-desk-ux` 43 checks (new, registered in CMakeLists), both 0 failures.
+- `engine.cpp` clean under `-Wall -Wextra`.
+- Three scenarios in a real browser at both resolutions: 0 console errors, 0 page errors.
+
+### Two bugs the browser found that the static tests could not
+
+`routeCounts` was returned by `tradesModel` but not destructured by `renderTrades`, which threw and
+blanked the entire panel. And the lane counts were computed after the lane switches had already
+excluded the rows, so AUTO read 0 while two auto rows existed. Both were invisible to a test that
+reads the page as text, and both would have shipped.
+
+### Second tranche: the selected-row panel
+
+The right column now leads with SELECTED, above the ladder: the market, the book, the model, the
+settlement state, the edge waterfall, the route and its reason stack, and the buttons. It follows
+the selection from both the mouse and `j`/`k`, survives a repaint (the selection is re-applied
+after `innerHTML` destroys the row), and defaults to the top row so it is useful without a click.
+
+**The waterfall checks itself.** It rebuilds the row's net edge from the row's own terms and prints
+an `unexplained` line if they do not reconcile. Verified in both directions: an inconsistent
+fixture produced `unexplained +0.1¢`; making the fixture add up removed the line.
+
+**Buttons.** `tradable` is the route, not a guess. Disabled buttons state their reason per route.
+The other-side control opens a fresh hand ticket rather than flipping the ticket, which would keep
+the `decision_id` and send a decision-backed order for a side the desk never priced.
+
+**Ownership.** The always-visible positions table leads with a ME / AUTO / MIXED badge, derived
+from the manager the server reports and not from the algo/manual size split - a position can carry
+algo size and still be hand-managed, and the split would mislabel exactly those.
+
+`ui-desk-ux` is now 71 checks. Three scenarios at both resolutions, 0 console and 0 page errors.
+
+### Manual sends queue instead of being refused
+
+A send while one is awaiting confirmation used to be dropped with a toast. It now queues, capped at
+five, visible and cancellable per item, and drains when the one in front is answered.
+
+What keeps it safe: each item leaves through the ordinary send path, so the `/api/size` cap
+re-check and the desk's re-check of the decision on a fresh book both still run on it;
+`reviewed_ts` is stamped when the operator pressed send, not at departure, so the desk's
+90-second unsent-review expiry still means what it says; a second send on an already-queued event
+is refused as a double-press; and the drain HALTS on the first failure rather than pushing the
+remainder into whatever broke, with explicit resume and discard controls.
+
+The dialog now closes when the request goes in flight - it used to sit open over the board, which
+made queuing impossible - and the submit lock is per dialog, so building the next ticket does not
+arrive with disabled controls. The send button relabels to `queue …` in that state.
+
+Verified in a browser against a slow stub endpoint: pressing one row then the same row three times
+sent one order and queued one, cancel emptied the queue, and only the in-flight order reached the
+server. 0 page errors.
+
+Two bugs found there that no static test could see: `addEventListener('click', sendKalshiModal)`
+passed the MouseEvent into the new optional first parameter, so every send returned early at
+`st.kind !== 'kalshi'`; and the ladder read `L.book.yes_bids` unguarded while every neighbouring
+field had a guard, so a partial response threw and blanked the panel.
+
+`ui-desk-ux` is now 94 checks.
+
+### Open
+
+- The bottom strip as POSITIONS / ORDERS / FILLS / ACTIVITY tabs: the tables and the ownership
+  column are in, but they are stacked rather than tabbed.
+- The bottom strip as POSITIONS / ORDERS / FILLS / ACTIVITY with an ownership column.
+- The consolidated `/api/desk-view` snapshot and timer consolidation.
+- The per-row "why not?" inspector. The reason histogram is its aggregate form, which is the half
+  that answers the question that started this.
+- A rebuild is needed for any of it to appear: the UI is embedded into the binary at build time.
+
 ## Session 19 - the board was reporting a loss on an account that was up (2026-09-12)
 
 Sam asked whether the P&L was right. It was not, by $44, and the three reasons were independent.
@@ -1459,3 +1617,49 @@ reading the actual Kalshi settlement rules for those weather series and establis
 Weather Company source resolves to the NWS station the model currently uses. If it does not, the
 existing weather model has been fitting the wrong target all along, and that finding outranks
 everything else in the plan.
+
+## Session 22 - the settlement gate decides the research program
+
+`research/settlement_gate_census.py` -> `reports/settlement_gate_census.md`. Transcribes
+`settlement_verified_for()` and every strategy's `covers()` out of the source and runs both against
+the live universe, so "which model can pass" is measured rather than argued.
+
+Verified transcription: **1,314 of 1,314** `trade_decisions` rows agree with the recorded
+`quote_json.settlement_verified`, zero mismatches. Coverage attribution agrees on 99.6% of a
+2-hour `model_fairs` window; the residual is pairs added to `poly_pairs` after the running
+process's last `prepare()`.
+
+The census, 4,583 active markets:
+
+| model | covers | verified | live books |
+|---|---|---|---|
+| `crypto_lognormal` | 2,948 | 2,948 (100%) | 114 |
+| `xvenue` | 778 | 0 (by design) | - |
+| `sports_inplay` | 258 | 0 | - |
+| `weather_nws` | 111 | 0 | - |
+| `sports_live` | 103 | 103 (100%) | 91 |
+
+Three mechanisms, each measured:
+
+- **Weather is gone, not failing.** 111 of 111 active weather markets settle "according to The
+  Weather Company"; zero name the NWS. `weather_source_supported()` rejects any TWC mention, so
+  Kalshi's 2026-08-27 authority change took the whole lane out. `docs/settlement.md` has TWC
+  matching the NWS CLI maximum 6/6 on one date - evidence, not the standing check the gate needs.
+- **`sports_inplay` has no mapped series.** The gate wants `soccer_90`; the only mapped series
+  (`KXBRASILEIROGAME`) lists no active market, and the 6 soccer series that ARE listed have no
+  spec. 258 covered, 0 reachable. Unlock is reading rules, not changing a model.
+- **Registry precedence costs 604 markets.** `xvenue` sits 2nd, ahead of every model that can
+  pass, and takes 604 game markets that `sports_live` verifies unconditionally - 288 of them while
+  producing no usable fair of its own (stale or one-sided Polymarket book).
+
+Checked before recommending: all **707** structured markets in the `sports_live` leagues are
+"<Team> wins" contracts settling on the official game result, so that model's unconditional
+`settlement_verified = true` is sound on the live universe. Zero exceptions.
+
+Error caught before it was filed: the first pass measured Polymarket freshness against wall clock
+and reported **0 of 778** pairs fresh. The desk had stopped writing 13 minutes earlier; at its own
+last cycle **396** pairs were fine. Every freshness test in the script now anchors to
+`MAX(markets.updated_ts)`. Third time a missing observation nearly became a finding.
+
+Program: `sports_live` first, `crypto_lognormal` second, nothing else. `sports_totals` passes the
+gate unconditionally but `params.sports_totals.markets` is empty, so it covers nothing.

@@ -1,0 +1,64 @@
+  60m panel: 51,376 bars, 13 assets
+  240m panel: 12,843 bars, 13 assets
+  720m panel: 4,280 bars, 13 assets
+
+observed across 195 specifications (156 independent -- `seesaw sign (minus basket)`
+is exactly -1 x `equal-weight basket`, so its 39 rows carry no new information):
+  max              1.0441431498216374
+  mean             -0.015084328150421057
+  median           -0.033387070718335646
+  n_over_1         1
+  frac_positive    0.3230769230769231
+  n_net_lo_pos     0
+  n_all_gates      0
+  best spec:       XRPUSDT own momentum 720m  (1.0441x)
+
+circular-shift offsets drawn from [214, 2,140) bars (5%-50% of the shortest panel)
+  50/300 draws  (1190s)
+  100/300 draws  (2384s)
+  150/300 draws  (3569s)
+  200/300 draws  (4746s)
+  250/300 draws  (5933s)
+  300/300 draws  (7136s)
+
+null distributions over 300 circular shifts of the target only:
+  statistic              p50       p90       p95       p99       max     observed  p_right   p_left
+  max                 0.7903    1.1965    1.2974    1.5060    1.7376       1.0441    0.217    0.783
+  mean                0.0046    0.0719    0.0868    0.1173    0.1565      -0.0151    0.627    0.373
+  median              0.0006    0.0193    0.0261    0.0350    0.0592      -0.0334    0.960    0.040
+  n_over_1            0.0000    2.0000    3.0000    6.0100   12.0000       1.0000    0.243    0.883
+  frac_positive       0.5026    0.6364    0.6718    0.7129    0.7231       0.3231    0.943    0.057
+  n_net_lo_pos        0.0000    0.0000    0.0000    0.0000    0.0000       0.0000    1.000    1.000
+  n_all_gates         0.0000    0.0000    0.0000    0.0000    0.0000       0.0000    1.000    1.000
+
+  binomial SE on a p near 0.17 with 300 draws: 0.022. Offsets are drawn WITH
+  replacement from 1,926 candidates, and nearby offsets give similar sweeps, so the
+  effective draw count is below 300 and the p99/max columns rest on a handful of
+  order statistics. Read those two columns as indicative.
+
+  POWER CHECK. Under the null, the all-gates count exceeds zero in 0.0% of draws.
+  A gate that pure noise also fails almost always cannot distinguish anything, so
+  an observed zero is not evidence against the mechanism -- only that this sample
+  cannot resolve it.
+
+SIGN STABILITY -- XRPUSDT own momentum 720m, held-out slice in consecutive thirds
+  (3,423 pooled out-of-sample bars, 1,712 day-clusters)
+  trade cost = 14.37 bp/bar (turnover 0.494 x 29.08 bp round trip + amortised open/close)
+  third     bars    gross bp     net bp  turnover  hit rate  z vs .5
+  1          570       -0.02     -14.39     0.515     0.479    -1.01
+  2          571       17.15       2.78     0.472     0.520     0.96
+  3          571       22.65       8.28     0.486     0.508     0.38
+  4          570       24.51      10.14     0.496     0.498    -0.08
+  5          570        9.80      -4.57     0.508     0.493    -0.34
+  6          571       15.93       1.56     0.488     0.504     0.21
+  share of total gross by third: 1: -0%  2: 19%  3: 25%  4: 27%  5: 11%  6: 18%
+  a |z| below 1.96 is not distinguishable from a coin flip in either direction
+
+GATES ON THE OBSERVED SWEEP
+  economic_ratio > 1                       1 of 195
+  and net_lo > 0                           0
+  and excess_lo > 0 (beats a constant)     0
+
+VERDICT
+  No specification passes all three gates, so there is nothing for the selection
+  null to adjudicate. The lane closes on the gates, not on multiple testing.

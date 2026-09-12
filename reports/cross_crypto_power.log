@@ -1,0 +1,26 @@
+XRPUSDT own momentum 720m, 3423 pooled bars, 1712 day-clusters
+observed  gross +15.00  cost 14.37  ratio 1.044  net_lo -7.46  excess_lo +3.30
+
+injected edge, on top of the real returns
+k           gross      ratio       net     net_lo   excess_lo    gate2    gate3
+0.00        15.00      1.044      0.63      -7.46        3.30        -        -
+0.25        18.58      1.293      4.21      -3.89        6.97        -        -
+0.50        22.15      1.541      7.78      -0.33       10.64        -        -
+0.75        25.72      1.790     11.35       3.24       14.27     PASS     PASS
+1.00        29.29      2.038     14.92       6.81       17.94     PASS     PASS
+1.25        32.86      2.287     18.49      10.37       21.61     PASS     PASS
+1.50        36.43      2.535     22.06      13.94       25.24     PASS     PASS
+1.75        40.01      2.784     25.63      17.51       28.89     PASS     PASS
+2.00        43.58      3.032     29.21      21.07       32.52     PASS     PASS
+2.50        50.72      3.530     36.35      28.20       39.82     PASS     PASS
+3.00        57.86      4.027     43.49      35.34       47.09     PASS     PASS
+
+minimum detectable effect
+  net_lo > 0 first fires at an injected edge of k = 0.75 x cost
+  all three gates fire at k = 0.75 x cost
+  closed form: net_lo > 0 needs gross > cost + half-width = 14.37 + 8.06 = 22.43 bp/bar,
+               i.e. an economic ratio of 1.56. Observed is 1.04.
+
+Interpretation: the test detects an edge worth 56% of its trading cost. The
+observed signal is worth 4% of its trading cost. The zero is a measurement, not a
+shrug -- but it also means an edge smaller than 8.06 bp/bar would not have been seen.

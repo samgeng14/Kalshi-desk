@@ -25,6 +25,15 @@ struct PerpMarket {
   double tick = 0.0001, contract_size = 0, bid = 0, ask = 0, last = 0, mark = 0, liquidation_mark = 0, reference = 0;
   double leverage = 0, volume_24h = 0, open_interest = 0;
   long long mark_ts_ms = 0, reference_ts_ms = 0;
+  // OUR receive time for the bid/ask, because the venue sends no timestamp with them: `mark` and
+  // `reference` arrive nested with their own clocks, the book does not. So this is named for what
+  // it can actually be: when this snapshot reached us, not when the book was true.
+  //
+  // It matters twice. A post-only order priced from a stale snapshot is refused as "post only
+  // cross" when the book has moved since - which is the exchange protecting us - and the SAME
+  // stale bid/ask feed `mid()`, so the basis the entry was decided on may no longer exist either.
+  // The refusal is benign; what it reveals is that the signal was computed on an old book.
+  long long quote_received_ts_ms = 0;
   bool is_open = true;
   bool fractional = false;
   double mid() const { return bid > 0 && ask > 0 ? 0.5 * (bid + ask) : (last > 0 ? last : mark); }
@@ -144,6 +153,8 @@ class PerpsDesk {
   // Markets whose one-contract price is above the per-entry notional. Logged once per run rather
   // than once per cycle; cleared for a market as soon as it can be sized again.
   std::set<std::string> unsized_;
+  // Markets currently skipped for a stale book, so the warning is said once rather than per cycle.
+  std::set<std::string> stale_book_;
   void algo_persist();
   void algo_log(const std::string& level, const std::string& msg);
   double algo_pnl_today(long long now);

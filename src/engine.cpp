@@ -1305,7 +1305,20 @@ void Engine::cycle() {
     const RouterContext ctx = router_context(t);
     json screen = systematic_screen(board, systematic_.settings_copy(), ctx);
     const json st = systematic_.state();
-    screen["algorithm"] = {{"running", st.contains("running") && st["running"].is_boolean() && st["running"].get<bool>()},
+    // `running` is what the operator ASKED FOR. A halted engine still reports running=true here,
+    // which is how a screen could read RUNNING while nothing was being sent. Both facts are now
+    // published so the UI can show the difference instead of guessing: requested_running is the
+    // switch, halted is the engine's own state, and `running` stays as it was for compatibility.
+    const bool requested = st.contains("running") && st["running"].is_boolean() && st["running"].get<bool>();
+    const bool halted = st.contains("halted") && st["halted"].is_boolean() && st["halted"].get<bool>();
+    screen["algorithm"] = {{"running", requested},
+                           {"requested_running", requested},
+                           {"halted", halted},
+                           {"halt_reason", st.contains("halt_reason") && st["halt_reason"].is_string()
+                                               ? st["halt_reason"].get<std::string>() : std::string()},
+                           {"halt_class", st.contains("halt_class") && st["halt_class"].is_string()
+                                              ? st["halt_class"].get<std::string>() : std::string()},
+                           {"actually_running", requested && !halted},
                            {"mode", st.contains("mode") && st["mode"].is_string() ? st["mode"].get<std::string>() : "paper"},
                            {"auto_armed", ctx.auto_armed},
                            {"auto_off_reason", ctx.auto_armed ? std::string() : ctx.auto_off_reason}};
@@ -2542,9 +2555,49 @@ json Engine::decisions_view(bool include_research, int limit) {
       r["rank"] = nullptr;
       rows.push_back(std::move(r));
     }
+  // ---- funnel and reason histogram -------------------------------------------------------
+  // Built from the UNFILTERED screen, because the whole point is to account for the rows the
+  // board does not show. An empty board is the normal state of a working router, and without
+  // this the operator cannot tell it apart from a broken one.
+  // Counted as DISTINCT MARKETS, not rows. A row is one side of one market, so counting rows made
+  // the funnel read "2124 markets -> 4248 priced", which is not a funnel: the second number was
+  // sides and the first was markets. Every step now counts the same thing.
+  std::set<std::string> priced_mkts, edge_mkts, auto_mkts, manual_mkts;
+  int f_auto = 0, f_manual = 0;
+  std::map<std::string, int> reason_counts;
+  if (screen.contains("rows") && screen["rows"].is_array())
+    for (const auto& r : screen["rows"]) {
+      const std::string v = jstr(r, "verdict");
+      const std::string tk = jstr(r, "ticker");
+      if (jnum(r, "fair", 0) > 0 || jnum(r, "p_yes", 0) > 0) priced_mkts.insert(tk);
+      if (jnum(r, "executable_edge", -1) > 0) edge_mkts.insert(tk);
+      if (v == "algo") { auto_mkts.insert(tk); ++f_auto; }
+      else if (v == "manual") { manual_mkts.insert(tk); ++f_manual; }
+      else if (r.contains("reasons") && r["reasons"].is_array()) {
+        // Only non-actionable rows contribute: these are the answers to "why not?".
+        for (const auto& x : r["reasons"])
+          if (x.is_string()) ++reason_counts[x.get<std::string>()];
+      }
+    }
+  json reasons = json::array();
+  {
+    std::vector<std::pair<std::string, int>> v(reason_counts.begin(), reason_counts.end());
+    std::stable_sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+    for (const auto& [k, n] : v) reasons.push_back({{"reason", k}, {"count", n}});
+  }
+  const json counts = screen.value("counts", json::object());
+  const json funnel = {{"watched", jnum(counts, "markets", 0)},
+                       {"priced", static_cast<int>(priced_mkts.size())},
+                       {"edge", static_cast<int>(edge_mkts.size())},
+                       {"actionable", static_cast<int>(auto_mkts.size() + manual_mkts.size())},
+                       {"auto", static_cast<int>(auto_mkts.size())},
+                       {"manual", static_cast<int>(manual_mkts.size())},
+                       {"sides", jnum(counts, "sides", 0)}};
   const json settings = screen.value("settings", json::object());
   return json{{"generated_ts", screen.value("generated_ts", 0LL)},
-              {"counts", screen.value("counts", json::object())},
+              {"counts", counts},
+              {"funnel", funnel},
+              {"reasons", reasons},
               {"algorithm", screen.value("algorithm", json::object())},
               {"market_data_max_age_seconds", screen.value("market_data_max_age_seconds", 0)},
               {"rows", rows},

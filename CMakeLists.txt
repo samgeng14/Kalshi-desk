@@ -147,6 +147,9 @@ add_test(NAME pair-models COMMAND pair-model-tests)
 find_program(NODE_EXE NAMES node)
 if(NODE_EXE)
   add_test(NAME ui-routes COMMAND ${NODE_EXE} ${CMAKE_SOURCE_DIR}/tests/test_ui_routes.cjs)
+  # The operator-facing structures: lanes, the self-explaining empty board, the funnel, halted
+  # never reading as running, and the ticket's side logic. Also reads the page, no browser.
+  add_test(NAME ui-desk-ux COMMAND ${NODE_EXE} ${CMAKE_SOURCE_DIR}/tests/test_ui_desk_ux.cjs)
 endif()
 
 # Recorder data integrity: unit conversion and sequence-gap handling, no network required.
