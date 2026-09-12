@@ -1,6 +1,6 @@
 # Weather settlement watch
 
-Generated 2026-09-12 23:16:23Z. One row per station-day. `metar` is what `weather_nws` observes, `CLI` is the NWS climate maximum Kalshi's rules name, `Kalshi` is the interval the settled ladder pins the paid value to.
+Generated 2026-09-12 23:20:51Z. One row per station-day. `metar` is what `weather_nws` observes, `CLI` is the NWS climate maximum Kalshi's rules name, `Kalshi` is the interval the settled ladder pins the paid value to.
 
 
 ## Gate A: does The Weather Company settle on the NWS climate value?

@@ -1,0 +1,3 @@
+2026-09-12T23:35:29Z  daemon up  live=False  rebalance every 168h  poll 300s
+2026-09-12T23:35:29Z  not due until 2026-09-19 23:07 UTC; nothing to do
+2026-09-12T23:35:29Z  to close the book: KALSHI_ARM=$KALSHI_ARM python3 scripts/portfolio_safety.py --flatten --live

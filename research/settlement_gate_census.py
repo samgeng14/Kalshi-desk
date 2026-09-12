@@ -34,7 +34,14 @@ def default_db(root):
     is not a database", "disk I/O error") on a file that passes quick_check. Read the snapshot.
     """
     snap = os.path.join(root, "data", "snapshots", "prod-latest.sqlite")
-    return snap if os.path.exists(snap) else os.path.join(root, "data", "prod.sqlite")
+    if os.path.exists(snap):
+        return snap
+    raise SystemExit(
+        "No research snapshot at %s, and this will NOT fall back to the live database.\n"
+        "Opening data/prod.sqlite while the desk runs is what killed it on 2026-09-12: the desk's\n"
+        "last write was 23:17:26 and a snapshot read of the live file started at 23:17:27. It died\n"
+        "in that second - no exception, no log line. Take a snapshot with the desk stopped, or\n"
+        "natively on the Mac outside the bridge mount, then re-run." % snap)
 
 # ---- settlement_specs(), transcribed from src/universe.cpp -------------------------------------
 # product "" means nobody has read that series' rules; the gate treats that as unverified.

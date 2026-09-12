@@ -2009,3 +2009,32 @@ Verified stable across two consecutive runs.
 The underlying choice is the operator's, and there are only three options: fewer watched markets,
 a faster cycle, or a higher staleness bar. The third means pricing from quotes the desk has
 already decided are too old to trust, so it is the one to reach for last.
+
+## Session 23, part 9: I killed the desk
+
+23:17:26Z - the desk's last write, mid-cycle, logging sports_live fixtures normally.
+23:17:27Z - a research snapshot started reading all 1.37 GB of prod.sqlite through SQLite.
+23:18:18Z - the snapshot finished. The desk was gone.
+
+No exception. No `terminating due to`. No log line at all - the process was killed, not thrown
+out of. That is a different failure from the three earlier crashes, and it happened in the same
+second a full-file read of the live database began across the bridge mount.
+
+This was the mitigation for the earlier problem. It was worse than the problem: the snapshot is
+the single heaviest read possible of the file the desk is writing, and it runs from a different
+operating system through a mount whose locking semantics are not the desk's.
+
+Everything that touches the live database from the research side is now removed:
+
+- `scripts/wx_watch_loop.sh` no longer calls `wx_snapshot.sh`. The call is commented out with the
+  timestamps above, so nobody restores it without reading them.
+- `default_db()` in all six weather research scripts no longer falls back to `data/prod.sqlite`.
+  It raises and refuses to run. A silent fallback is how this would come back.
+- `wx_snapshot.sh` still exists but is hand-run only, and only with the desk stopped.
+
+Three older scripts (`constraint_scan.py`, `loo_feasible.py`, `loo_surface.py`) still default to
+the live file. Nothing schedules them, but they should not be run while the desk is up.
+
+The standing rule: **nothing on the research side opens `data/prod.sqlite` while the desk is
+running.** If fresh data is needed, stop the desk, snapshot, restart - or produce the snapshot
+natively on the Mac, outside the mount.
