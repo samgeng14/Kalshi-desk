@@ -342,6 +342,7 @@ def main():
             host_ok, tok_ok = k.armed()
             if args.live and not (host_ok and tok_ok):
                 raise SystemExit('not armed: host_ok=%s token_ok=%s' % (host_ok, tok_ok))
+            done = True
             for attempt in range(3):
                 live_pos = positions
                 if args.live:

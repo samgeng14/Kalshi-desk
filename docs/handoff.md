@@ -1897,3 +1897,37 @@ counts at 166.7 are censored by the API's 500-row cap, not measured, and the JSO
 
 All six touched translation units and the test file compile clean under g++ -std=c++17.
 **Needs a rebuild and restart on the Mac before any of it takes effect.**
+
+## Session 23, part 6: the gate that was keeping the board empty
+
+Rebuilding for all-city discovery would not have put a single row on the board, because
+`weather_source_supported()` in `src/risk.cpp` rejected any contract naming The Weather Company -
+and since Kalshi's 2026-08-27 change that is every listed temperature contract. 111 of 111 active
+weather markets failed the gate. No amount of model work could have changed it.
+
+**TWC is now accepted when the contract still names the climate product the desk has mapped for
+that series.** Both halves are load-bearing. The product code is the same one
+`research/wx_discover.py` reads out of these rules and checks against api.weather.gov, and
+requiring it to MATCH THE MAPPING means a contract that quietly changes station stops verifying
+rather than silently verifying against the wrong station.
+
+Evidence: `reports/wx_settlement_watch.md`, a standing check rather than the one-off six-on-one-date
+in `docs/settlement.md`. TWC's settled value fell inside the Kalshi bracket that settled YES on
+**30 of 30** completed station-days, six cities, five dates. Thirty agreements is a sample, not a
+proof, so this unlocks MANUAL only; AUTO still has its own gate, and one disagreement in that
+report should send this predicate straight back to false.
+
+Verified against live data: **all 72 active weather markets now pass**, against 0 before.
+
+Tests: TWC with the mapped product verifies; TWC naming a DIFFERENT product for the same series
+does not; TWC naming no product does not; an unmapped series cannot be rescued by naming any
+product; a series mapped with an empty product stays unverified however the rules read; and the
+pre-August NWS wording still verifies, so nothing that worked before stops working.
+
+Still to do before the board is actually full, and neither can be done from the sandbox:
+1. **Rebuild and restart on the Mac.** No cmake in the Linux VM, and `build/` is a macOS cache.
+2. **Lower the display floor.** `manual_min_edge` defaults to 0.05 and `min_edge` to 0.03 in
+   `src/systematic.cpp`; the router hides a MANUAL candidate under `manual_min_edge`
+   (`decision_router.cpp:333`). The validator requires `manual_min_edge >= min_edge`, so both move
+   together. The desk's HTTP port is not reachable from the VM, so this is a POST the operator
+   makes: `POST /api/systematic {"min_edge":0.0025,"manual_min_edge":0.0025}`.

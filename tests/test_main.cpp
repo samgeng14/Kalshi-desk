@@ -575,6 +575,58 @@ static void test_universe() {
     CHECK(settlement_verified_for("weather_nws", m));
   }
 
+  // --- The Weather Company as a settlement authority --------------------------------------
+  // Kalshi moved these to TWC on 2026-08-27. Rejecting every TWC mention kept 111 of 111 active
+  // weather markets research-only; accepting TWC blindly would verify a contract whose station
+  // had quietly changed. The rule is that TWC is fine so long as the contract still names the
+  // climate product the desk has mapped for that series.
+  {
+    Market twc{};
+    twc.series_ticker = "KXHIGHCHI";
+    twc.rules_primary = "If the maximum temperature recorded at Chicago (CLIMDW) for Sep 13, 2026, "
+                        "is between 82-83 degrees fahrenheit according to The Weather Company, "
+                        "then the market resolves to Yes.";
+    CHECK(weather_source_supported(twc));
+    CHECK(settlement_verified_for("weather_nws", twc));
+
+    // Same authority, a product this series is not mapped to: the desk would be modelling one
+    // station and settling on another, so this must NOT verify.
+    Market moved = twc;
+    moved.rules_primary = "If the maximum temperature recorded at Chicago (CLIORD) for Sep 13, "
+                          "2026, is between 82-83 degrees according to The Weather Company, then "
+                          "the market resolves to Yes.";
+    CHECK(!weather_source_supported(moved));
+    CHECK(!settlement_verified_for("weather_nws", moved));
+
+    // TWC with no product named at all: nothing ties the contract to a station we can read.
+    Market bare = twc;
+    bare.rules_primary = "If the maximum temperature in Chicago for Sep 13, 2026 is between 82-83 "
+                         "degrees according to The Weather Company, then the market resolves to Yes.";
+    CHECK(!weather_source_supported(bare));
+
+    // A series with no mapping cannot be rescued by naming any product.
+    Market unmapped = twc;
+    unmapped.series_ticker = "KXHIGHNOWHERE";
+    CHECK(!weather_source_supported(unmapped));
+
+    // A series mapped with an EMPTY product stays unverified however the rules read: an empty
+    // product is the desk's own record that nobody read that series' rules.
+    Market unread{};
+    unread.series_ticker = "KXHIGHHOU";   // compiled table carries product ""
+    unread.rules_primary = "If the maximum temperature recorded at Houston (CLIHOU) for Sep 13, "
+                           "2026 is above 95 according to The Weather Company, resolves Yes.";
+    CHECK(settlement_for("KXHIGHHOU") && std::string(settlement_for("KXHIGHHOU")->product).empty());
+    CHECK(!weather_source_supported(unread));
+
+    // The pre-August wording still verifies, so nothing that worked before stops working.
+    Market old_form{};
+    old_form.series_ticker = "KXHIGHCHI";
+    old_form.rules_primary = "If the highest temperature recorded at Chicago Midway, IL for July "
+                             "09, 2026 is between 86-87 according to the National Weather "
+                             "Service's Climatological Report (Daily), resolves Yes.";
+    CHECK(weather_source_supported(old_form));
+  }
+
   // --- rollover, the same instant seen from three zones ----------------------------------------
   // 2026-09-07T04:30Z is 00:30 in New York, 23:30 the previous day in Chicago, 21:30 in Los
   // Angeles. One contract date therefore sits in a different phase in each.

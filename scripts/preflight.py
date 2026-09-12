@@ -120,7 +120,10 @@ def main():
     for u in dec.get('unlisted_legs', []):
         print('   UNREPRESENTABLE  %s — %s' % (u['symbol'], u['reason']))
 
-    print('\n5. PLAN AND PRE-TRADE SCREEN')
+    print('\n5. PLAN, EXECUTION LOOP AND PRE-TRADE SCREEN')
+    # --quick shortens the window but still runs every cycle, cancel step and screen. The first
+    # version of this check was the reason a duplicate-order bug reached a live account: it
+    # validated the planner and never walked the loop.
     ok, out, _ = run(['scripts/portfolio_execute.py', '--quick'], 'execute')
     if 'Traceback' in out:
         fatal.append('the executor raised while planning')
@@ -128,8 +131,28 @@ def main():
     else:
         for ln in out.strip().splitlines():
             if any(k in ln for k in ('MAKER', 'CROSS', 'SKIP', 'REJECT', 'BLOCK', 'NOTE',
-                                     'leg(s)')):
+                                     'leg(s)', 'OVERFILLED', 'budget', 'cancelled')):
                 print('   ' + ln.strip())
+        # One order per ticker per cycle, and one cross at most. More than that in the log means
+        # the loop is duplicating again.
+        from collections import Counter
+        posts = Counter()
+        for ln in out.splitlines():
+            parts = ln.split()
+            if len(parts) > 2 and parts[1] in ('MAKER', 'CROSS'):
+                posts[(parts[0], parts[1], parts[-3] if parts[1] == 'MAKER' else 'x')] += 1
+        dupes = {k: v for k, v in posts.items() if v > 1}
+        if dupes:
+            fatal.append('the execution loop posted the same leg twice in one cycle: %s'
+                         % sorted(dupes)[:3])
+            print('   DUPLICATE POSTS  %s' % sorted(dupes)[:3])
+        crosses = Counter(parts[0] for ln in out.splitlines()
+                          for parts in [ln.split()]
+                          if len(parts) > 2 and parts[1] == 'CROSS')
+        if any(v > 1 for v in crosses.values()):
+            fatal.append('a leg crossed more than once: %s'
+                         % [k for k, v in crosses.items() if v > 1])
+            print('   MULTIPLE CROSSES  %s' % [k for k, v in crosses.items() if v > 1])
 
     print('\n' + '=' * 72)
     if fatal:

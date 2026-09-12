@@ -59,8 +59,33 @@ std::string risk_cluster(Store& store, const Market& m) {
 bool weather_source_supported(const Market& m) {
   std::string rules = m.rules_primary;
   std::transform(rules.begin(), rules.end(), rules.begin(), [](unsigned char c){return std::tolower(c);});
-  return rules.find("weather company") == std::string::npos &&
-    (rules.find("national weather service") != std::string::npos || rules.find("nws") != std::string::npos);
+  // The pre-August form: the rules named the National Weather Service as the authority outright.
+  if (rules.find("weather company") == std::string::npos &&
+      (rules.find("national weather service") != std::string::npos || rules.find("nws") != std::string::npos))
+    return true;
+  // Kalshi moved the settlement authority to The Weather Company on 2026-08-27, and since then
+  // every listed temperature contract names TWC. Refusing all of them - which is what this
+  // function did - left the entire weather category permanently research-only: 111 of 111 active
+  // markets failed the gate, and no amount of model work could change that.
+  //
+  // TWC is accepted only when the contract STILL names an NWS daily climate product as its
+  // location, and that product is the one the desk has mapped for this series. Both halves
+  // matter: the product code is what research/wx_discover.py reads out of these same rules and
+  // checks against api.weather.gov, and requiring it to match the mapping means a contract that
+  // quietly changes station stops verifying instead of silently verifying against the wrong one.
+  //
+  // The evidence is reports/wx_settlement_watch.md, which is a standing check rather than the
+  // one-off six-for-one-date in docs/settlement.md: TWC's settled value fell inside the Kalshi
+  // bracket that settled YES on 30 of 30 completed station-days, across six cities and five
+  // dates. Thirty agreements is a sample, not a proof, so this unlocks MANUAL only - graduation
+  // to AUTO still has to clear its own gate, and one disagreement in that report should send
+  // this straight back to false.
+  const SettlementSpec* spec = settlement_for(m.series_ticker);
+  if (!spec || !spec->product || !*spec->product) return false;
+  std::string product = spec->product;
+  std::transform(product.begin(), product.end(), product.begin(),
+                 [](unsigned char ch){return std::tolower(ch);});
+  return rules.find("(" + product + ")") != std::string::npos;
 }
 // An event ticker alone does not imply exclusivity or completeness. Thresholds can overlap,
 // and a local cache can omit brackets or a game's draw. Fail closed until event metadata is

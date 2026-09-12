@@ -1,0 +1,78 @@
+{
+ "decision_id": "2026-09-12T23:05:42Z",
+ "live": false,
+ "log": [
+  {
+   "ticker": "KXBCHPERP",
+   "symbol": "BCHUSDT",
+   "skip": false,
+   "want": -3,
+   "tick": 0.0001,
+   "is_exit": false,
+   "sent": 0,
+   "outcome": "crossed"
+  },
+  {
+   "ticker": "KXBTCPERP",
+   "symbol": "BTCUSDT",
+   "skip": false,
+   "want": -1,
+   "tick": 0.0001,
+   "is_exit": false,
+   "sent": 0,
+   "outcome": "skipped_at_cross",
+   "reason": "benefit 3.484 bps vs taker cost + buffer 6.907 bps"
+  },
+  {
+   "ticker": "KXDOGEPERP",
+   "symbol": "DOGEUSDT",
+   "skip": true,
+   "want": -1,
+   "reason": "no-trade test: benefit did not clear cost x required ratio",
+   "sent": 0,
+   "outcome": "skipped"
+  },
+  {
+   "ticker": "KXETHPERP",
+   "symbol": "ETHUSDT",
+   "skip": false,
+   "want": 3,
+   "tick": 0.0001,
+   "is_exit": false,
+   "sent": 0,
+   "outcome": "skipped_at_cross",
+   "reason": "benefit 4.374 bps vs taker cost + buffer 6.896 bps"
+  },
+  {
+   "ticker": "KXLTCPERP",
+   "symbol": "LTCUSDT",
+   "skip": false,
+   "want": 2,
+   "tick": 0.0001,
+   "is_exit": false,
+   "sent": 0,
+   "outcome": "skipped_at_cross",
+   "reason": "benefit 8.223 bps vs taker cost + buffer 8.345 bps"
+  },
+  {
+   "ticker": "KXNEARPERP",
+   "symbol": "NEARUSDT",
+   "skip": false,
+   "want": 3,
+   "tick": 0.0001,
+   "is_exit": false,
+   "sent": 0,
+   "outcome": "crossed"
+  },
+  {
+   "ticker": "KXWLDPERP",
+   "symbol": "(not in book)",
+   "skip": false,
+   "want": 0,
+   "tick": 0.0001,
+   "is_exit": true,
+   "sent": 0,
+   "outcome": "crossed"
+  }
+ ]
+}
