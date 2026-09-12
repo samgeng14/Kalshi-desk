@@ -1,0 +1,104 @@
+{
+  "spec_name": "PORTFOLIO_V1",
+  "frozen_at_utc": "2026-09-12T19:00:00Z",
+  "frozen_by": "research session; see reports/portfolio_v1.md",
+  "status": "FROZEN — no parameter may change in response to live results",
+
+  "signal_universe": {
+    "comment": "Binance USD-M perpetual symbols used to BUILD the signal. This is the PCA and ranking universe and it does not change if a name turns out to be untradable on the execution venue.",
+    "symbols": ["AAVEUSDT", "ADAUSDT", "AVAXUSDT", "BCHUSDT", "BNBUSDT", "BTCUSDT",
+                "DOGEUSDT", "ETHUSDT", "LINKUSDT", "LTCUSDT", "NEARUSDT", "SOLUSDT",
+                "XRPUSDT"],
+    "bar_minutes": 60,
+    "price_field": "close",
+    "return_type": "log return in basis points"
+  },
+
+  "pca": {
+    "window_hours": 720,
+    "n_components": 3,
+    "refit_every_hours": 24,
+    "standardization": "per-asset z-score using the trailing window's own mean and sd",
+    "sign_convention": "each component flipped so its loadings sum positive",
+    "warmup_policy": "bars before the first full window are dropped, never zero-filled"
+  },
+
+  "components": {
+    "comment": "Ten signals. Each is a cross-sectional vector, z-scored across assets, then averaged with equal weight. No subsetting.",
+    "cross_sectional_momentum_hours": [168, 336, 504, 720, 1440],
+    "residual_momentum_hours": [168, 336, 504, 720, 1440],
+    "residual_definition": "asset return minus its reconstruction from the first 3 PCs, in bps",
+    "component_zscore": "cross-sectional, across assets, per component, per rebalance",
+    "aggregation": "arithmetic mean of the 10 z-scored components, equal weight"
+  },
+
+  "portfolio": {
+    "rebalance_hours": 168,
+    "k_long": 3,
+    "k_short": 3,
+    "weighting": "equal weight within each side",
+    "gross_exposure": 1.0,
+    "neutralization": "project the PC1 loading vector out of the weight vector, then rescale to restore gross",
+    "hysteresis": "none — rank hysteresis was tested and measurably reduced return",
+    "vol_targeting": "none — tested at 15/25/35% and measurably reduced Sharpe and Calmar"
+  },
+
+  "cost_assumptions": {
+    "comment": "Measured Kalshi one-way cost to cross, in bps of notional, per coin. 12.00 of each is the tier-0 taker fee. Charged on weight CHANGES only.",
+    "oneway_bps": {
+      "BTCUSDT": 12.32, "ETHUSDT": 12.50, "SOLUSDT": 14.12, "XRPUSDT": 14.54,
+      "LTCUSDT": 15.58, "DOGEUSDT": 16.79, "BNBUSDT": 16.93, "ADAUSDT": 17.69,
+      "AAVEUSDT": 19.28, "NEARUSDT": 19.74, "BCHUSDT": 20.15, "LINKUSDT": 21.30
+    },
+    "default_oneway_bps": 17.0,
+    "charge_rule": "sum_i |w_i(t) - w_i(t-1)| * oneway_i"
+  },
+
+  "research_result_frozen_against": {
+    "span": "2021-05 .. 2026-08 out of sample",
+    "ann_pct": 18.7, "vol_pct": 25.7, "sharpe": 0.73,
+    "max_drawdown_pct": 28.7, "calmar": 0.65, "cost_pct_yr": 8.8,
+    "positive_years": "5 of 6",
+    "net_lo_bps_per_hour": 0.0096,
+    "excess_lo_bps_per_hour": -0.0007,
+    "gate_status": "net_lo PASSES; excess_lo against a volatility-matched always-long FAILS at -0.0007",
+    "honest_label": "not a proven profitable strategy — this deployment is live execution validation"
+  },
+
+  "feasibility_thresholds": {
+    "comment": "Set BEFORE measuring anything about contract sizes or account equity. If the live integer book cannot meet ALL of these, the deployment falls back to SHADOW + EXECUTION_CANARY and real PnL is not labelled PORTFOLIO_V1.",
+    "relative_weight_tracking_error_max": 0.30,
+    "net_exposure_over_gross_max": 0.20,
+    "pc1_exposure_over_gross_max": 0.25,
+    "min_representable_legs": 4,
+    "min_representable_legs_of": 6
+  },
+
+  "canary_risk_limits": {
+    "gross_over_equity_max": 1.0,
+    "margin_utilization_max": 0.35,
+    "single_name_notional_over_equity_max": 0.25,
+    "manual_leverage": "none during live validation",
+    "drawdown_warning_pct": 5.0,
+    "drawdown_halt_new_risk_pct": 10.0,
+    "size_increase_on_gains": "forbidden",
+    "frozen_rebalances_before_any_capital_change": 4
+  },
+
+  "execution": {
+    "style": "maker first",
+    "maker_window_seconds": 900,
+    "reprice_interval_seconds": 60,
+    "max_reprices": 5,
+    "taker_fallback": "allowed only if the remaining expected benefit still exceeds the all-in taker cost plus the safety buffer",
+    "safety_buffer_bps": 5.0,
+    "skip_policy": "if neither maker nor taker clears the buffer, skip the leg and log it"
+  },
+
+  "no_trade_test": {
+    "comment": "A change in target weight is not a reason to trade. Estimated marginal benefit must exceed the round-trip cost plus buffer.",
+    "benefit_estimate": "delta_weight * composite_score_spread * horizon_return_scale",
+    "horizon_return_scale_bps": "trailing 168h cross-sectional dispersion of returns",
+    "require_benefit_over_cost_ratio": 1.5
+  }
+}

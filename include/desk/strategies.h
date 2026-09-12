@@ -9,6 +9,7 @@
 #include "desk/models/terminal_price.h"
 #include "desk/reference_feed.h"
 #include "desk/strategy.h"
+#include "desk/wxdist.h"
 
 namespace desk {
 
@@ -123,6 +124,14 @@ class WeatherNws : public Strategy {
     double fc_at_now = -999;   // hourly forecast for the hour of the latest observation
     double resid = 0;          // t_now - fc_at_now: how far the day is running from forecast
     bool have_resid = false;
+    // The hourly forecast path for this date, (period start, temperature F), in time order.
+    // The model used to keep only max(hourly) and price a normal around it. The maximum of the
+    // expected hourly values is not the expected maximum - whenever several hours sit near the
+    // top, whichever one runs warm becomes the day's high - and that gap cannot be recovered
+    // from a single number afterwards. wxdist::simulate_extreme needs the path itself.
+    std::vector<std::pair<long long, double>> hourly;
+    // The hours that have not finished yet: the only ones that can still set the day's peak.
+    std::vector<double> remaining(long long now) const;
     int offset_seconds = 0;
     long long fetched = 0;     // refresh scheduling; can be a retry timestamp after failure
     long long forecast_fetched_ts = 0;  // successful forecast response, separate from retry scheduling
@@ -137,6 +146,17 @@ class WeatherNws : public Strategy {
   };
   // Exposed for tests: probability that the settled integer temperature falls in the market's bracket.
   static double bracket_prob(const Market& m, double mu, double sd, double observed_max, bool have_obs, bool low);
+  // WX1: the station-day priced from a simulated temperature trajectory rather than a normal
+  // placed around the highest hourly point forecast. Every bracket of a ladder reads off ONE
+  // distribution, so the ladder sums to one because of how it was built rather than by accident.
+  // Recorded beside WX0 under the strategy name "weather_wx1"; it does not produce the Fair the
+  // desk trades on until the horse race in reports/wx_versions.md says it should.
+  struct Wx1Dist {
+    long long fc_ts = 0, obs_ts = 0, hour = 0;   // what it was built from; rebuilt when these move
+    MaxDistribution mid, lo, hi;                 // centre, and the same day at 0.7x / 1.3x day sigma
+    bool ok = false;
+  };
+  static double read_bracket(const MaxDistribution& dist, const Market& m);
   void set_day_forecast(const std::string& series, const DayForecast& d) { fc_[series + "|" + d.date] = d; }
   void set_clock(long long now) { now_override_ = now; }
 
@@ -146,6 +166,11 @@ class WeatherNws : public Strategy {
   Http http_;
   std::map<std::string, Station> stations_;                    // series -> station
   std::map<std::string, DayForecast> fc_;                       // series|date -> forecast
+  std::map<std::string, Wx1Dist> wx1_;                          // series|date -> simulated ladder
+  const Wx1Dist* wx1_for(const Station& st, const DayForecast& d, const std::string& key, long long now);
+  double sigma_hour_ = 1.0;    // hour-to-hour wiggle around the day's shared bias
+  double rho_ = 0.7;           // its persistence between adjacent hours
+  int wx1_draws_ = 20000;
   std::map<std::string, long long> ens_ts_;                     // series -> last ensemble fetch
   int refresh_seconds_ = 600;
   int ens_refresh_seconds_ = 1800;

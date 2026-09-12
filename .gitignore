@@ -17,3 +17,5 @@ __pycache__/
 *.bak-*
 .gitignore.*
 .quotefeed.txt
+data/snapshots/
+data/live_orders.sqlite*

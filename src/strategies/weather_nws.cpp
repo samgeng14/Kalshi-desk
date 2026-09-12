@@ -39,6 +39,9 @@ WeatherNws::WeatherNws(const json& params, const std::string& user_agent) : http
   double sigma_f = params.value("sigma_f", 2.5);
   double bias_f = params.value("bias_f", 0.4);  // hourly-sampled forecasts understate the continuous max (see wx-settle)
   refresh_seconds_ = params.value("refresh_seconds", 600);
+  sigma_hour_ = params.value("sigma_hour", 1.0);
+  rho_ = params.value("rho", 0.7);
+  wx1_draws_ = params.value("wx1_draws", 20000);
   ens_refresh_seconds_ = params.value("ens_refresh_seconds", 1800);
   forecast_max_age_seconds_ = std::max(60, params.value("forecast_max_age_seconds", 1800));
   forecast_issue_max_age_seconds_ = std::max(60, params.value("forecast_issue_max_age_seconds", 21600));
@@ -95,6 +98,16 @@ bool WeatherNws::covers(const Market& m, const Series& s) const {
 }
 
 static double c_to_f(double c) { return c * 9.0 / 5.0 + 32.0; }
+
+// An hourly period covers the hour that starts at its timestamp, so it is still able to set the
+// day's peak until that hour has fully elapsed. Using `start > now` instead would silently drop
+// the hour in progress, which on a hot afternoon is frequently the hour that matters most.
+std::vector<double> WeatherNws::DayForecast::remaining(long long now) const {
+  std::vector<double> out;
+  for (const auto& [t, temp] : hourly)
+    if (t + 3600 > now) out.push_back(temp);
+  return out;
+}
 
 void WeatherNws::refresh_station(Station& st, const std::string& date, long long now) {
   std::string key = st.series + "|" + date;
@@ -155,6 +168,9 @@ void WeatherNws::refresh_station(Station& st, const std::string& date, long long
         any = true;
       }
       if (!any) throw std::runtime_error("date not in hourly forecast");
+      // Keep the path, not just its extremes. Assigned only on a successful parse, so a failed
+      // refresh leaves the last good trajectory in place rather than blanking it.
+      d.hourly.assign(hourly.begin(), hourly.end());
       d.forecast_fetched_ts = now;
       const auto& props = j["properties"];
       std::string issued = props.contains("updateTime") && props["updateTime"].is_string()
@@ -379,7 +395,62 @@ double WeatherNws::bracket_prob(const Market& m, double mu, double sd, double ob
   return std::max(0.0, std::min(1.0, p));
 }
 
-std::optional<Fair> WeatherNws::fair(const Market& m, const Series&, Store&) {
+// Read one bracket off a simulated distribution. The wording Kalshi uses is inclusive on a
+// between and strict on an open end, which is the same convention bracket_prob encodes with its
+// half-degree offsets; here the distribution is already over whole degrees, so the comparison is
+// exact rather than a continuity correction.
+double WeatherNws::read_bracket(const MaxDistribution& dist, const Market& m) {
+  if (dist.empty()) return -1;
+  if (m.strike_type == "between" && m.floor_strike && m.cap_strike)
+    return dist.p_between(static_cast<int>(std::lround(*m.floor_strike)),
+                          static_cast<int>(std::lround(*m.cap_strike)));
+  if (m.strike_type == "greater" && m.floor_strike)
+    return dist.p_greater(static_cast<int>(std::lround(*m.floor_strike)));
+  if (m.strike_type == "less" && m.cap_strike)
+    return dist.p_less(static_cast<int>(std::lround(*m.cap_strike)));
+  return -1;
+}
+
+// One simulation per station-day, not per contract: the distribution belongs to the day, and
+// every bracket of the ladder is a different question asked of the same answer. Rebuilt when the
+// forecast refreshes, when a new observation lands, or when the hour turns and one more hour of
+// the day can no longer set its peak.
+const WeatherNws::Wx1Dist* WeatherNws::wx1_for(const Station& st, const DayForecast& d,
+                                               const std::string& key, long long now) {
+  const long long hour = (now + d.offset_seconds) / 3600;
+  Wx1Dist& c = wx1_[key];
+  if (c.ok && c.fc_ts == d.forecast_fetched_ts && c.obs_ts == d.observation_fetched_ts && c.hour == hour)
+    return &c;
+  c = Wx1Dist{};
+  c.fc_ts = d.forecast_fetched_ts;
+  c.obs_ts = d.observation_fetched_ts;
+  c.hour = hour;
+  TrajectoryInputs in;
+  in.hourly = d.remaining(now);
+  const bool have_obs = d.have_obs && (st.low ? d.obs_min < 999 : d.obs_max > -999);
+  in.running_max = have_obs ? (st.low ? d.obs_min : d.obs_max) : -999;
+  if (in.hourly.empty() && !have_obs) return nullptr;
+  in.sigma_day = st.sigma_f;
+  in.sigma_hour = sigma_hour_;
+  in.rho = rho_;
+  in.settle_shift = st.settle_shift;
+  in.low = st.low;
+  // st.bias_f is deliberately NOT added here. That constant stands in for the gap between the
+  // maximum of a sampled forecast and the continuous maximum it understates; simulating the
+  // trajectory produces that gap directly, because whichever of several near-peak hours happens
+  // to run warm becomes the day's high. Adding the constant on top would apply the same
+  // correction twice. Whether the simulated gap is the right SIZE is what the race measures.
+  c.mid = simulate_extreme(in, wx1_draws_, 7);
+  TrajectoryInputs wide = in, tight = in;
+  wide.sigma_day = in.sigma_day * 1.3;
+  tight.sigma_day = in.sigma_day * 0.7;
+  c.hi = simulate_extreme(wide, wx1_draws_, 7);
+  c.lo = simulate_extreme(tight, wx1_draws_, 7);
+  c.ok = !c.mid.empty();
+  return c.ok ? &c : nullptr;
+}
+
+std::optional<Fair> WeatherNws::fair(const Market& m, const Series&, Store& store) {
   auto sit = stations_.find(m.series_ticker);
   if (sit == stations_.end()) return std::nullopt;
   const Station& st = sit->second;
@@ -466,6 +537,22 @@ std::optional<Fair> WeatherNws::fair(const Market& m, const Series&, Store&) {
   Fair f;
   f.p = p;
   f.sigma = 0.5 * std::fabs(p1 - p2) + 0.02;
+  // WX1 alongside WX0, never instead of it. The number below is recorded under its own strategy
+  // name and carried in the diagnostics; the Fair this function returns is still WX0's, so
+  // nothing about what the desk offers or sends changes until the race says it should.
+  if (const Wx1Dist* w = wx1_for(st, d, m.series_ticker + "|" + date, now)) {
+    const double q = read_bracket(w->mid, m);
+    if (q >= 0) {
+      const double qh = read_bracket(w->hi, m), ql = read_bracket(w->lo, m);
+      const double qsig = (qh >= 0 && ql >= 0) ? 0.5 * std::fabs(qh - ql) + 0.02 : f.sigma;
+      store.insert_model_fair(now, m.ticker, "weather_wx1", q, qsig, m.yes_bid, m.yes_ask);
+      f.inputs["wx1_p"] = q;
+      f.inputs["wx1_sigma"] = qsig;
+      f.inputs["wx1_mean_f"] = w->mid.mean();
+      f.inputs["wx1_sd_f"] = w->mid.sd();
+      f.inputs["wx1_hours_simulated"] = static_cast<int>(d.remaining(now).size());
+    }
+  }
   char buf[200];
   if (past_day)
     std::snprintf(buf, sizeof buf, "%s %s day over: obs %s %.0f (+0/+1/+2 sensor shift), awaiting climate report",

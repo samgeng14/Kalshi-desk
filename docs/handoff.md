@@ -1663,3 +1663,109 @@ last cycle **396** pairs were fine. Every freshness test in the script now ancho
 
 Program: `sports_live` first, `crypto_lognormal` second, nothing else. `sports_totals` passes the
 gate unconditionally but `params.sports_totals.markets` is empty, so it covers nothing.
+
+## Session 23 - weather lane, part 1: the settlement target
+
+Weather only, per the WEATHER_V2 brief. Sections 3 and part of 10 are done; 4 and 7 are next.
+
+`research/wx_settlement_watch.py` -> `data/wx_settlement.sqlite`, `reports/wx_settlement_watch.md`.
+Standing collector, idempotent, reads prod.sqlite read-only and never writes to it.
+`scripts/wx_watch_loop.sh` runs it hourly under the same nohup pattern as the perps recorder, and
+is deliberately a separate process so the running recorder is never restarted for it.
+
+**Gate A: 30 of 30 station-days agree.** The Weather Company's settled value falls inside the
+Kalshi bracket that settled YES, on every completed station-day with both sides available, across
+6 cities and 5 dates. The prior evidence was 6 agreements on one date. Still not enough to
+graduate, but it is now a sample rather than an anecdote, and it accrues daily on its own.
+
+**Finding that changes the architecture: the CLI is issued several times a day, not once.**
+The NWS files a climate product in the morning, in the late afternoon, often again an hour later,
+and a final one after local midnight. Each carries the daily maximum SO FAR from the station's
+5-minute ASOS record. None is flagged CORRECTED - they are a running tally, not revisions, and the
+first version of this collector reported "52 of 63 station-days had corrections" because it read
+them as such.
+
+Measured across 42 completed station-days:
+
+| issuance (local) | already equals the final value | n |
+|---|---|---|
+| 07:00 | 0% | 6 |
+| 16:00 | **86%** | 28 |
+| 17:00 | 79% | 14 |
+| 18:00 | 86% | 7 |
+| 19:00 | 100% | 7 |
+| after local midnight | 100% | 51 |
+
+These markets trade until 01:00 local. So on roughly six days in seven the settling value is
+publicly readable from about 16:00 local, eight or nine hours before the market closes, from the
+same record Kalshi settles on. A running maximum cannot fall, so an afternoon issuance that is not
+yet final is a hard floor and the only remaining question is how much further the day climbs.
+
+This is strictly better than what `weather_nws` reads today. The model takes the maximum of the
+HOURLY METAR series and then adds a guessed `settle_shift` to cover the peak that series missed
+between reports. The CLI has no such gap. Reading it intraday replaces an estimated correction
+(current support: n=6 at KNYC, n=1 everywhere else) with the settling series itself.
+
+Two self-checks that caught errors before they were reported:
+- `limit=1000` on the observations endpoint returns HTTP 400, so the first run recorded no METAR
+  value at all for any station while still printing a full report. Capped at 500.
+- The lock-time table joined issuances to `wx_settlement` on `(cli_loc, local_date)`, but
+  KXHIGHCHI and KXLOWTCHI share MDW, so maxima were being compared against the daily MINIMUM row.
+  It read 84% final for issuances after local midnight, which is impossible by construction. The
+  final now comes from the issuance table itself, and that row reads 100% as it must.
+
+Days still running are stored as provisional (`cli_complete=0`) and excluded from every agreement
+and shift number, so a running maximum is never recorded as a settled value.
+
+## Session 23, part 2: WX1 wired, and the baseline that says why it is needed
+
+**Section 7 done.** `DayForecast` now keeps `hourly` (period start, temperature) and a
+`remaining(now)` helper. `refresh_station` was building that path locally and discarding it after
+taking a max. The path is assigned only on a successful parse, so a failed refresh leaves the last
+good trajectory rather than blanking it. `remaining()` keeps the hour in progress (`t + 3600 >
+now`), because on a hot afternoon that is usually the hour that matters.
+
+**Sections 4 and 12 done, conservatively.** `WeatherNws::wx1_for()` simulates ONE distribution per
+station-day - not per contract - and every bracket reads off it via `read_bracket()`. Rebuilt when
+the forecast refreshes, an observation lands, or the hour turns. Recorded to `model_fairs` under
+the strategy name `weather_wx1` and carried in `Fair::inputs` as `wx1_p` / `wx1_sigma` /
+`wx1_mean_f` / `wx1_sd_f`. **The Fair the desk trades on is still WX0's.** Nothing about what is
+offered or sent changes.
+
+`st.bias_f` is deliberately not added in WX1. That constant stands in for the gap between a
+sampled forecast's maximum and the continuous maximum it understates; the trajectory simulation
+produces that gap directly, so adding the constant would apply one correction twice.
+
+**Section 13 baseline, from 354 recorded observations over 31 settled event-days, 6 dates:**
+
+| | Brier | vs market |
+|---|---|---|
+| raw `weather_nws` | 0.1707 | **+0.0202** |
+| Kalshi mid | 0.1504 | - |
+| desk fair (w=0.50) | 0.1492 | -0.0012 |
+
+`raw - market` 95% CI clustered by event-day: [-0.0218, +0.0621]. **The raw model does not beat
+the price.** The interval straddles zero, so it is not established as worse either; what is
+established is that there is no evidence of an edge in the number itself.
+
+By horizon the sign flips: T-24h +0.0361, T-12h +0.0247, T-6h +0.0321, then T-3h -0.0381,
+T-1h -0.0054, T-30m -0.0478. The model is worse than the market day-ahead and better near close,
+which is where its observations pin the answer. n at the short horizons is 15-27.
+
+Section 17 sweep: w=0.00 +0.0202, w=0.25 +0.0067, w=0.50 -0.0012, w=0.75 -0.0034, w=1.00 by
+definition 0. The shipped 0.50 is not the best weight on this sample, and every weight's advantage
+over the market alone is inside the noise. In-sample over every day the desk has; not a split, and
+not a tuned weight.
+
+**Calibration says what is wrong, and it is the thing WX1 is for.** The raw model predicts 0.023
+where 0.051 occurs, 0.074 where 0.129 occurs, 0.147 where 0.224 occurs. It is systematically too
+low in the low-probability buckets, which is a distribution that is too narrow - precisely the
+signature of putting a normal around max(E[hour]) instead of simulating E[max]. Pre-registered
+prediction for the race: WX1 should improve the 0-20% buckets first.
+
+Caveat that matters: 748 horizon-observations were skipped for a one-sided book against 354 kept.
+If one-sided books are more common when the market is confident, the retained sample is not a
+random subset. Worth measuring before any of the above is treated as settled.
+
+Not yet done: sections 5, 6, 8 (beyond the running-max floor already in the simulator), 9, 10
+(replace the guessed shift with the intraday CLI), 11, 14, 15, 16, 18-25.
