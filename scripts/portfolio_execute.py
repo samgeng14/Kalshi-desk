@@ -196,9 +196,13 @@ def execute(plan, decision, snap, cfg, client, journal=None, live=False, quick=F
             pos = positions_now()
             # INVARIANT: no leg may ever hold more than it was asked to hold. If one does, a
             # duplicate filled somewhere and nothing more should be sent until a human looks.
+            # The ceiling is whichever is larger, the target or where this run started. An exit
+            # leg holds more than its target of zero by definition -- that is what makes it an
+            # exit -- so comparing to the target alone flags every close as an overfill.
             over = [(tk, pos.get(tk, 0), l['want']) for l in work
                     for tk in [l['ticker']]
-                    if abs(pos.get(tk, 0)) > abs(l['want']) + 0.5]
+                    if abs(pos.get(tk, 0)) > max(abs(l['want']),
+                                                 abs(start_pos.get(tk, 0))) + 0.5]
             if over:
                 for tk, have, want in over:
                     print('  %-13s OVERFILLED  holding %+g against a target of %+d'
