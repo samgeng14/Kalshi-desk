@@ -151,8 +151,9 @@ def dashboard(decision, snap, cfg, equity_start=None):
     A('mode                %s' % decision.get('mode'))
     A('pnl label           %s' % decision.get('pnl_label'))
     A('last signal bar     %s UTC (%.1f h old at decision time)'
-      % (dt.datetime.utcfromtimestamp((decision.get('data', {}).get('last_bar_ms') or 0) / 1000)
-         .strftime('%Y-%m-%d %H:%M'), decision.get('data', {}).get('stale_hours') or -1))
+      % (dt.datetime.fromtimestamp((decision.get('data', {}).get('last_bar_ms') or 0) / 1000,
+                                   dt.timezone.utc).strftime('%Y-%m-%d %H:%M'),
+         decision.get('data', {}).get('stale_hours') or -1))
     tw = decision.get('target_weights', {})
     longs = sorted([s for s, v in tw.items() if v > 0.01], key=lambda s: -tw[s])
     shorts = sorted([s for s, v in tw.items() if v < -0.01], key=lambda s: tw[s])
@@ -198,11 +199,49 @@ def main():
     decision = json.load(open(args.decision))
     snap = json.load(open(args.snapshot))
 
+    # The snapshot on disk is whatever the DECISION was priced against, which is by definition
+    # before the trade. Rendering the dashboard from it reports "(flat)" while the book is on.
+    # Positions and equity come from the exchange whenever the key is reachable.
+    try:
+        from kalshi_client import Kalshi
+        import kalshi_snapshot as KS
+        acct, positions, markets = KS.from_api()
+        snap = dict(snap, account=acct, positions=positions, markets=markets,
+                    source='exchange', captured_ts=acct['ts'])
+        print('(positions and equity read live from the exchange)\n')
+    except (SystemExit, RuntimeError, ImportError, KeyError, TypeError, ValueError) as e:
+        print('(could not reach the exchange: %s — showing the snapshot, which predates '
+              'any fills)\n' % str(e)[:80])
+
     dash = dashboard(decision, snap, cfg, args.equity_start)
     print(dash)
 
     if args.append_ledger:
-        rows = rows_from_decision(decision)
+        fills = {}
+        try:
+            from kalshi_client import Kalshi as _K
+            fr = _K().perp_fills(limit=200)
+            for f in (fr.get('fills') or []):
+                tk = f.get('ticker') or f.get('market_ticker')
+                if not tk or f.get('created_time', '') < decision['decided_at_utc'][:13]:
+                    continue
+                cur = fills.setdefault(tk, {'fill_quantity': 0.0, 'fees': 0.0, 'notional': 0.0,
+                                            'maker_or_taker': 'maker'})
+                q, px = float(f.get('count') or 0), float(f.get('price') or 0)
+                cur['fill_quantity'] += q
+                cur['fees'] += float(f.get('fees') or 0)
+                cur['notional'] += q * px
+                if f.get('is_taker'):
+                    cur['maker_or_taker'] = 'taker'
+            for tk, c in fills.items():
+                c['fill_price'] = (c['notional'] / c['fill_quantity']
+                                   if c['fill_quantity'] else None)
+                c['realized_cost_bps'] = (1e4 * c['fees'] / c['notional']
+                                          if c['notional'] else None)
+                c['count'] = c['fill_quantity']
+        except (SystemExit, RuntimeError, ImportError, KeyError, TypeError, ValueError):
+            pass
+        rows = rows_from_decision(decision, fills)
         append_rows(rows)
         print('\nappended %d ledger row(s) to %s' % (len(rows), CSV_PATH))
 

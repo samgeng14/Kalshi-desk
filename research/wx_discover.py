@@ -133,9 +133,20 @@ def main():
     ap.add_argument("--config-out", default=os.path.join(ROOT, "config", "weather_discovered.json"))
     ap.add_argument("--desk-db", default=default_db(ROOT))
     ap.add_argument("--limit", type=int, default=8)
+    ap.add_argument("--max-watch", type=int, default=12,
+                    help="cap on watched weather series. The engine cycle has to refresh every "
+                         "watched market inside market_data_max_age_seconds, and on 2026-09-12 a "
+                         "cycle already took 17-25s against a 25s bar. Discovery can find 25 "
+                         "cities; watching all of them at once is how a desk starts skipping the "
+                         "markets it is meant to be pricing.")
     a = ap.parse_args()
 
     rows = discover(a)
+    old_cfg = {}
+    try:
+        old_cfg = json.load(open(a.config_out))
+    except Exception:
+        pass
     db = sqlite3.connect(a.out_db)
     db.executescript(SCHEMA)
     for r in rows:
@@ -249,7 +260,36 @@ def main():
             "kind": "weather_cli", "product": r["cli_product"], "station": st, "tz": tz,
             "sparse": bool(sparse), "low": r["kind"] == "low",
             "observations_per_day": round(per_day, 1)}
-    cfg["watch"] = sorted(cfg["settlement_specs"])
+    # Already-watched cities first - they have quote history and the cycle already carries them -
+    # then the rest in a stable order, capped. Growing the universe is not free: every watched
+    # market has to be re-quoted inside the staleness bar or it is skipped, and a skipped market
+    # is worse than an unwatched one because the desk believes it is covering it.
+    # Sticky across runs, in one direction only: mappings accumulate, they never disappear
+    # because a city happened not to be listed at the minute this ran. Cities list and delist as
+    # each local date rolls over, so a watch list rebuilt from only what is listed RIGHT NOW
+    # churns hourly - the desk would keep changing which cities it covers for reasons that have
+    # nothing to do with the cities. A watch entry with no listing today costs one wasted API
+    # call, which is why KXHIGHAUS sitting unlisted in the config was harmless.
+    for series, spec in old_cfg.get("settlement_specs", {}).items():
+        if series not in cfg["settlement_specs"]:
+            cfg["settlement_specs"][series] = spec
+            st = old_cfg.get("stations", {}).get(series)
+            if st:
+                cfg["stations"][series] = st
+
+    # Only series with BOTH a mapping and a grid point can be watched: one without a station entry
+    # would be polled every cycle and refused at the gate every cycle.
+    eligible = [x for x in cfg["settlement_specs"] if x in cfg["stations"]]
+    # Cities the desk already watches come first - they have quote history and the cycle already
+    # carries them - then the rest by name, so the list settles rather than reshuffling.
+    order = sorted(x for x in eligible if x in watched) + sorted(x for x in eligible if x not in watched)
+    cfg["watch"] = order[:a.max_watch]
+    cfg["_discovered_not_watched"] = order[a.max_watch:]
+    cfg["_watch_cap_note"] = (
+        "capped at --max-watch=%d. Every watched market must be re-quoted inside "
+        "market_data_max_age_seconds or the cycle skips it, and on 2026-09-12 a cycle already "
+        "took 17-25s against a 25s bar. Raise this only after the skipped-markets count in "
+        "prod.log falls." % a.max_watch)
     cfg["_generated"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     cfg["_source"] = ("research/wx_discover.py: settlement product read from each contract's own "
                       "rules_primary, then checked against api.weather.gov. Regenerated daily; "

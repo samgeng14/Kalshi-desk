@@ -1931,3 +1931,81 @@ Still to do before the board is actually full, and neither can be done from the 
    (`decision_router.cpp:333`). The validator requires `manual_min_edge >= min_edge`, so both move
    together. The desk's HTTP port is not reachable from the VM, so this is a POST the operator
    makes: `POST /api/systematic {"min_edge":0.0025,"manual_min_edge":0.0025}`.
+
+## Session 23, part 7: the desk keeps dying, and research was probably contributing
+
+`data/prod.log`, 2026-09-12, three fatal crashes on three different SQLite errors:
+
+```
+05:23:28Z  cycle refresh: sqlite step: database disk image is malformed
+21:48:09Z  cycle perps:   sqlite step: file is not a database
+22:29:10Z  cycle books:   sqlite step: disk I/O error
+```
+
+Each terminated the process through an uncaught `std::runtime_error`, and each time the desk
+stayed down until somebody noticed. The 22:29 crash is why the operator's
+`POST /api/systematic` printed nothing: `curl -s` hides connection-refused.
+
+`PRAGMA quick_check` on the file returns **ok**, and 48 GB is free. So the file is not damaged and
+the disk is not full - which points at the access layer rather than the data.
+
+**Measured, with the desk stopped: a read-only research query moves `prod.sqlite-shm`.** Before a
+single `mode=ro` query the -shm mtime read 23:04:32; after it, 23:06:02. A read-only SQLite
+connection in WAL mode still maps and updates the shared-memory index. This research has been
+querying the live database repeatedly across the bridge mount - a second process, on a different
+operating system, touching the writer's locking state - and the two later crashes fall inside that
+window. The 05:23 crash predates it, so this is not the whole story, but it can no longer be
+treated as unrelated.
+
+Fixed on the research side:
+- `scripts/wx_snapshot.sh` takes a consistent copy through SQLite's backup API (not `cp`, which
+  would tear a page mid-write) into `data/snapshots/prod-latest.sqlite`.
+- Every research script now defaults to that snapshot via `default_db()`, falling back to the live
+  file only when no snapshot exists.
+- `scripts/wx_watch_loop.sh` refreshes the snapshot at the top of each hourly pass.
+
+Two things for the operator, neither done here because both change how the live desk behaves:
+
+1. **The desk has no supervisor.** `perps_recorder.py` has `recorder_supervise.sh` watching a
+   heartbeat FILE rather than the process, for exactly the reason in that script's header. The
+   desk itself has nothing, so three crashes today each cost roughly half an hour of silence.
+2. **A transient storage error should not terminate a process holding positions.** `cycle books`,
+   `cycle refresh` and `cycle perps` all let a `std::runtime_error` escape. A retry with backoff
+   around the cycle, with a halt after N consecutive failures, would have turned all three of
+   today's crashes into log lines.
+
+## Session 23, part 8: the cycle is saturated
+
+Symptom: the dashboard stopped responding. The desk itself was fine - cycling every 17-25s,
+fetching NWS forecasts and ensembles, no crash since 22:29.
+
+The real number is in prod.log: **235 markets skipped this cycle: quotes older than 25s**, every
+cycle. Cycle interval measured from consecutive log lines is 17-25s against a
+`market_data_max_age_seconds` bar of 25. The cycle takes about as long as the freshness window it
+has to beat, so a growing share of the universe is stale by the time it comes round again.
+
+Checked before blaming the discovery change, because the obvious story was that adding 20 cities
+did it:
+
+| time | markets skipped |
+|---|---|
+| 05:00Z | 111 |
+| 15:00Z | 102 |
+| 20:00Z | **199** |
+| 22:00Z | 213 |
+| 23:00Z | 235 |
+
+The rebuild landed at 22:20. The count had already doubled between 15:00 and 20:00, hours before
+any of this session's changes were live. Discovery added roughly 22 to a problem that was already
+there and already growing.
+
+Mitigation applied: `research/wx_discover.py --max-watch` caps the watch list, default 12 - the 5
+cities already watched plus 7 - while every verified mapping is still recorded. 15 discovered
+cities are held back in `_discovered_not_watched` and can be promoted once the skipped count
+falls. The list is now sticky: mappings accumulate across runs and never disappear because a city
+was not listed at the minute discovery ran, so the hourly rerun cannot churn what the desk covers.
+Verified stable across two consecutive runs.
+
+The underlying choice is the operator's, and there are only three options: fewer watched markets,
+a faster cycle, or a higher staleness bar. The third means pricing from quotes the desk has
+already decided are too old to trust, so it is the one to reach for last.

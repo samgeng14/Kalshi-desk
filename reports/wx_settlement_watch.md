@@ -1,6 +1,6 @@
 # Weather settlement watch
 
-Generated 2026-09-12 22:15:57Z. One row per station-day. `metar` is what `weather_nws` observes, `CLI` is the NWS climate maximum Kalshi's rules name, `Kalshi` is the interval the settled ladder pins the paid value to.
+Generated 2026-09-12 23:16:23Z. One row per station-day. `metar` is what `weather_nws` observes, `CLI` is the NWS climate maximum Kalshi's rules name, `Kalshi` is the interval the settled ladder pins the paid value to.
 
 
 ## Gate A: does The Weather Company settle on the NWS climate value?
@@ -110,11 +110,11 @@ An issuance that is not yet final can only be low, because a running maximum can
 | `KXHIGHPHIL` | 2026-09-11 | 81.0 | 268 | 81 | +0.0 | [81, 82] | yes |
 | `KXLOWTCHI` | 2026-09-11 | 60.8 | 281 | 61 | +0.2 | - | - |
 | `KXLOWTMIN` | 2026-09-11 | 62.1 | 283 | 62 | -0.1 | - | - |
-| `KXHIGHAUS` | 2026-09-12 | 100.4 | 225 | 101 | - | - | - |
-| `KXHIGHCHI` | 2026-09-12 | 87.8 | 222 | 88 | - | - | - |
-| `KXHIGHLAX` | 2026-09-12 | 82.4 | 198 | - | - | - | - |
-| `KXHIGHMIA` | 2026-09-12 | 93.0 | 236 | 93 | - | - | - |
-| `KXHIGHNY` | 2026-09-12 | 78.1 | 19 | 78 | - | - | - |
-| `KXHIGHPHIL` | 2026-09-12 | 82.9 | 235 | 83 | - | - | - |
-| `KXLOWTCHI` | 2026-09-12 | 68.0 | 222 | 68 | - | - | - |
-| `KXLOWTMIN` | 2026-09-12 | 62.6 | 219 | 63 | - | - | - |
+| `KXHIGHAUS` | 2026-09-12 | 100.4 | 238 | 101 | - | - | - |
+| `KXHIGHCHI` | 2026-09-12 | 87.8 | 235 | 88 | - | - | - |
+| `KXHIGHLAX` | 2026-09-12 | 82.4 | 211 | - | - | - | - |
+| `KXHIGHMIA` | 2026-09-12 | 93.0 | 249 | 93 | - | - | - |
+| `KXHIGHNY` | 2026-09-12 | 78.1 | 20 | 78 | - | - | - |
+| `KXHIGHPHIL` | 2026-09-12 | 82.9 | 248 | 83 | - | - | - |
+| `KXLOWTCHI` | 2026-09-12 | 68.0 | 235 | 68 | - | - | - |
+| `KXLOWTMIN` | 2026-09-12 | 62.6 | 232 | 63 | - | - | - |
