@@ -25,37 +25,48 @@ class Halt(Exception):
 # ---------------------------------------------------------------- kill switches
 
 def kill_switches(decision, acct, positions, cfg, max_stale_hours=30.0, expected_hash=None):
-    """Every condition that must be false before new risk is opened. Returns a list of reasons."""
-    bad = []
+    """Conditions that stop new risk. Returns (blocks, warnings).
+
+    A STRAY POSITION IS A WARNING, NOT A BLOCK, and the distinction matters because the first
+    version of this deadlocked: a position outside the book blocked all trading, and trading was
+    the only way to close it. The executor promotes a stray to a block only if its own plan does
+    NOT close it, which is the condition that actually deserves to stop everything.
+    """
+    blocks, warns = [], []
     if not decision:
-        # No decision yet is a distinct state from a bad one. Reporting "hash changed" here would
-        # be a false alarm, and a safety harness that cries wolf on a clean start teaches you to
-        # ignore it.
-        bad.append('no decision file yet — run portfolio_live.py first')
+        blocks.append('no decision file yet — run portfolio_live.py first')
     else:
         if expected_hash and decision.get('config_hash') != expected_hash:
-            bad.append('config hash changed since the freeze')
+            blocks.append('config hash changed since the freeze')
         st = decision.get('data', {}).get('stale_hours')
         if st is None:
-            bad.append('decision file records no data age')
+            blocks.append('decision file records no data age')
         elif st > max_stale_hours:
-            bad.append('signal data stale: %.1f hours' % st)
+            blocks.append('signal data stale: %.1f hours' % st)
     if not acct or acct.get('equity') is None:
-        bad.append('account state unavailable')
-    snap_age = None
+        blocks.append('account state unavailable')
     if acct.get('ts'):
-        snap_age = (dt.datetime.now(dt.timezone.utc).timestamp() - float(acct['ts'])) / 3600.0
-        if snap_age > max_stale_hours:
-            bad.append('account snapshot %.1f hours old' % snap_age)
-    declared = {p['ticker']: float(p['position']) for p in positions}
-    booked = {r['kalshi']: r['contracts'] for r in decision.get('integer_book', []) if r['kalshi']}
-    for tk, n in declared.items():
-        if tk not in booked and abs(n) > 0:
-            bad.append('position in %s (%g) is not part of the current book' % (tk, n))
-    eq = float(acct.get('equity') or 0)
-    if eq <= 0:
-        bad.append('non-positive equity')
-    return bad
+        age = (dt.datetime.now(dt.timezone.utc).timestamp() - float(acct['ts'])) / 3600.0
+        if age > max_stale_hours:
+            blocks.append('account snapshot %.1f hours old' % age)
+    if float(acct.get('equity') or 0) <= 0:
+        blocks.append('non-positive equity')
+
+    booked = {r['kalshi'] for r in decision.get('integer_book', []) if r['kalshi']}
+    for p in positions:
+        tk, n = p['ticker'], float(p['position'])
+        if abs(n) > 0 and tk not in booked:
+            warns.append({'kind': 'stray_position', 'ticker': tk, 'contracts': n,
+                          'text': 'position in %s (%g) is not part of the current book' % (tk, n)})
+    return blocks, warns
+
+
+def promote_unhandled_strays(warns, plan):
+    """Any stray the plan does not close becomes a block."""
+    closing = {leg['ticker'] for leg in plan
+               if leg.get('is_exit') and not leg.get('skip')}
+    return ['%s and the plan does not close it' % w['text']
+            for w in warns if w['kind'] == 'stray_position' and w['ticker'] not in closing]
 
 
 def loss_guards(equity_now, equity_start, cfg):
@@ -206,6 +217,10 @@ def main():
     ap.add_argument('--decision', default=os.path.join(ROOT, 'reports', 'decisions', 'latest.json'))
     ap.add_argument('--test-flatten', action='store_true',
                     help='exercise the whole flatten path with the arm disabled')
+    ap.add_argument('--flatten', action='store_true',
+                    help='ACTUALLY close every open position. Needs --live as well as the '
+                         'right machine and KALSHI_ARM.')
+    ap.add_argument('--live', action='store_true')
     ap.add_argument('--equity-start', type=float, default=None)
     args = ap.parse_args()
 
@@ -221,13 +236,14 @@ def main():
     print('equity $%.4f   positions %d   markets %d'
           % (float(acct['equity']), len(positions), len(markets)))
 
-    bad = kill_switches(decision, acct, snap.get('positions', []), cfg,
-                        expected_hash=want_hash)
+    blocks, warns = kill_switches(decision, acct, snap.get('positions', []), cfg,
+                                  expected_hash=want_hash)
     print('\nKILL SWITCHES')
-    if bad:
-        for b in bad:
-            print('  BLOCK  %s' % b)
-    else:
+    for b in blocks:
+        print('  BLOCK  %s' % b)
+    for w in warns:
+        print('  WARN   %s' % w['text'])
+    if not blocks and not warns:
         print('  clear — no condition blocks opening new risk')
 
     state, dd = loss_guards(float(acct['equity']), args.equity_start, cfg)
@@ -245,6 +261,31 @@ def main():
         print('  %-13s %-4s %4d @ $%.4f  reduce_only  screen: %s'
               % (o['ticker'], o['side'], o['count'], o['price'],
                  'PASS' if not fails else 'REJECT ' + '; '.join(fails)))
+
+    if args.flatten:
+        print('\nEMERGENCY FLATTEN%s' % (' — LIVE' if args.live else ' — dry run (add --live)'))
+        try:
+            from kalshi_client import Kalshi, Journal
+            k, j = Kalshi(), Journal()
+            host_ok, tok_ok = k.armed()
+            if args.live and not (host_ok and tok_ok):
+                raise SystemExit('not armed: host_ok=%s token_ok=%s' % (host_ok, tok_ok))
+            for o in plan:
+                fails = pre_trade_screen(o, ctx)
+                if fails:
+                    print('  %-13s REJECT %s' % (o['ticker'], '; '.join(fails)))
+                    continue
+                r = k.create_perp_order(ticker=o['ticker'], side=o['side'], count=o['count'],
+                                        price=o['price'], tick=o['tick'], reduce_only=True,
+                                        tif=o['tif'],
+                                        client_order_id='flatten-%s-%d'
+                                                        % (o['ticker'], int(dt.datetime.now(
+                                                            dt.timezone.utc).timestamp())),
+                                        journal=j, dry_run=not args.live)
+                print('  %-13s %s' % (o['ticker'], json.dumps(r)[:160]))
+        except SystemExit as e:
+            print('  %s' % e)
+        return 0
 
     if args.test_flatten:
         print('\nTESTING THE FLATTEN PATH WITH THE ARM DISABLED')

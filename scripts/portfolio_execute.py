@@ -215,17 +215,11 @@ def main():
     if decision.get('config_hash') != want_hash:
         raise SystemExit('decision was made under a different config hash. Refusing to execute.')
 
-    blocks = S.kill_switches(decision, snap['account'], snap.get('positions', []), cfg,
-                             expected_hash=want_hash)
+    blocks, warns = S.kill_switches(decision, snap['account'], snap.get('positions', []), cfg,
+                                    expected_hash=want_hash)
     print('EXECUTE  %s   mode=%s   label=%s'
           % (dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
              decision['mode'], decision['pnl_label']))
-    if blocks:
-        print('\nBLOCKED — new risk will not be opened:')
-        for b in blocks:
-            print('  %s' % b)
-        if args.live:
-            raise SystemExit('refusing to trade with kill switches active')
 
     client = journal = None
     try:
@@ -238,7 +232,29 @@ def main():
     except SystemExit as e:
         print('no signing key reachable here (%s) — dry run only' % e)
 
+    # Section 10: reconcile BEFORE planning, never after. An intent with no terminal state is
+    # resolved against the exchange, because a lost response is unknown, not failed.
+    if client is not None and journal is not None:
+        pending = journal.unresolved()
+        if pending:
+            print('\nRECONCILING %d unresolved intent(s) before planning' % len(pending))
+            for r in S.reconcile(client, journal):
+                print('  %s -> %s' % (r['client_order_id'][:20], r['resolved_state']))
+
     plan = plan_from_decision(decision, snap, cfg)
+    blocks = blocks + S.promote_unhandled_strays(warns, plan)
+    for w in warns:
+        closed = any(l.get('is_exit') and l['ticker'] == w['ticker'] and not l.get('skip')
+                     for l in plan)
+        print('  %s  %s' % ('NOTE ' if closed else 'BLOCK',
+                            w['text'] + (' — this plan closes it' if closed else '')))
+    if blocks:
+        print('\nBLOCKED — new risk will not be opened:')
+        for b in blocks:
+            print('  %s' % b)
+        if args.live:
+            raise SystemExit('refusing to trade with kill switches active')
+
     print('\n%d leg(s) in the plan' % len(plan))
     log = execute(plan, decision, snap, cfg, client=client, journal=journal,
                   live=args.live, quick=args.quick)
