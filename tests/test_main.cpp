@@ -2614,20 +2614,86 @@ static void test_trading_day_and_pnl_ledger() {
           {m.ticker, m.event_ticker, "yes", 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, "2026-09-06T19:05:00Z"});
   pnl = build_pnl(st, "America/Chicago");
   CHECK_NEAR(pnl["total"].get<double>(), 9.88 - 0.0091, 1e-9);
-  // A settled market with a ledger row: Kalshi's realized number (post-settlement, gross) is the
-  // single source; the settlement arithmetic is not added on top.
+  // A settled market with a ledger row: the SETTLEMENT RECORD is the single source, and the
+  // ledger is not consulted. This assertion used to read the other way round, and that is what
+  // made the board report a loss on an account that was up: Kalshi's realized_pnl covers only the
+  // portion closed before expiry, so preferring it threw away whatever settled at expiry.
   Market m2 = m; m2.ticker = "KXHIGHLAX-26SEP05-B79.5"; m2.event_ticker = "KXHIGHLAX-26SEP05"; m2.series_ticker = "KXHIGHLAX"; st.upsert_market(m2);
   st.exec("INSERT INTO realized(ticker,realized_pnl,fees_paid,updated_ts) VALUES(?,?,?,?)", {m2.ticker, -3.29, 0.02, now_s()});
   st.exec("INSERT INTO settlements(ticker,event_ticker,market_result,yes_count,no_count,yes_cost,no_cost,revenue,fee,settled_time) VALUES(?,?,?,?,?,?,?,?,?,?)",
           {m2.ticker, m2.event_ticker, "no", 13.0, 0.0, 4.29, 0.0, 0.0, 0.0, "2026-09-06T19:05:00Z"});
   pnl = build_pnl(st, "America/Chicago");
-  CHECK_NEAR(pnl["settled_pnl"].get<double>(), -3.29 - 0.02, 1e-9);
+  CHECK_NEAR(pnl["settled_pnl"].get<double>(), 0.0 - 4.29, 1e-9);  // 13 YES bought, NO won: total loss
   CHECK(pnl["n_settled"].get<int>() == 1);
-  // A pre-ledger settlement (July history) still uses the settlement arithmetic.
+  // A July settlement, no ledger row, unchanged by the fix: one side, revenue already gross.
   st.exec("INSERT INTO settlements(ticker,event_ticker,market_result,yes_count,no_count,yes_cost,no_cost,revenue,fee,settled_time) VALUES(?,?,?,?,?,?,?,?,?,?)",
           {"KXOLD-26JUL08-X", "KXOLD-26JUL08", "yes", 10.0, 0.0, 6.0, 0.0, 10.0, 0.1, "2026-07-08T19:05:00Z"});
   pnl = build_pnl(st, "America/Chicago");
-  CHECK_NEAR(pnl["settled_pnl"].get<double>(), -3.31 + (10.0 - 6.0 - 0.1), 1e-9);
+  CHECK_NEAR(pnl["settled_pnl"].get<double>(), -4.29 + (10.0 - 6.0 - 0.1), 1e-9);
+
+  // settled_pnl() against two real markets from prod.sqlite, both worked out by hand.
+  //
+  // A market traded in BOTH directions. 12 NO at .17, then 9 YES at .57, which closes 9 of the NO
+  // at .43. Kalshi realized +2.34 on that close; the 3 NO left settled for 3.00 against a .51
+  // basis; fees .2731. True P&L +4.5569. `revenue` on this record is 3.00 - the NET position's
+  // payout - so reading revenue directly reports +0.33 less than half the truth, and the old code
+  // preferred the ledger's +2.34 and lost the settlement leg entirely.
+  json both = {{"market_result", "no"}, {"yes_count", 9.0}, {"no_count", 12.0},
+               {"yes_cost", 5.13}, {"no_cost", 2.04}, {"revenue", 3.0}, {"fee", 0.2731}};
+  CHECK_NEAR(settled_pnl(both), 4.5569, 1e-9);
+  CHECK(settled_pnl(both) > both["revenue"].get<double>() - 5.13 - 2.04 - 0.2731);  // strictly better than the naive read
+  // A market closed partway and then expired worthless. 5.73 YES at a .2594 average, 1 closed at
+  // .19 (-0.0694), 4.73 expired (-1.2268), fees .0812: -1.3774 by hand. The record's stored costs
+  // are rounded to the tenth of a cent, so the record gives -1.3772; the 2e-4 between them is that
+  // rounding and not a disagreement. Pinned to what the record actually yields.
+  json part = {{"market_result", "no"}, {"yes_count", 5.73}, {"no_count", 1.0},
+               {"yes_cost", 1.486}, {"no_cost", 0.81}, {"revenue", 0.0}, {"fee", 0.0812}};
+  CHECK_NEAR(settled_pnl(part), -1.3772, 1e-9);
+  CHECK(std::fabs(settled_pnl(part) - (-1.3774)) < 3e-4);  // and it agrees with the hand figure
+  // A position opened and fully closed before expiry: equal counts, revenue 0. The matched pairs
+  // are worth their count, so the loss is the two costs net of it - not the whole of both costs.
+  json flat = {{"market_result", "yes"}, {"yes_count", 3.0}, {"no_count", 3.0},
+               {"yes_cost", 2.67}, {"no_cost", 0.54}, {"revenue", 0.0}, {"fee", 0.0}};
+  CHECK_NEAR(settled_pnl(flat), 3.0 - 2.67 - 0.54, 1e-9);
+  // Fees are charged once. The settlement fee and the summed fill fees are the same money on all
+  // 77 settled markets on this account; subtracting both was the second of the three defects.
+  json fee_once = {{"market_result", "yes"}, {"yes_count", 4.0}, {"no_count", 0.0},
+                   {"yes_cost", 2.0}, {"no_cost", 0.0}, {"revenue", 4.0}, {"fee", 0.25}};
+  CHECK_NEAR(settled_pnl(fee_once), 4.0 - 2.0 - 0.25, 1e-9);
+  // ---- all-time account P&L, top-down ------------------------------------------------
+  // The real numbers off prod.sqlite on 2026-09-12, because this is the figure that says whether
+  // the account made money and it was wrong for weeks.
+  Store ac(":memory:");
+  ac.exec("INSERT INTO account(ts,balance,portfolio_value) VALUES(?,?,?)", {now_s(), 114.8953, 0.0});
+  ac.exec("INSERT INTO cashflows(id,ts,kind,amount) VALUES(?,?,?,?)", {"d1", 1783444741, "deposit", 10.0});
+  ac.exec("INSERT INTO cashflows(id,ts,kind,amount) VALUES(?,?,?,?)", {"d2", 1788700000, "deposit", 100.0});
+  ac.exec("INSERT INTO cashflows(id,ts,kind,amount) VALUES(?,?,?,?)", {"t1", 1788800000, "to_margined", -25.0});
+  // No perps tables yet: absent must read as zero rather than throwing, and the transfer out must
+  // not be mistaken for money that left the building.
+  json ap = build_pnl(ac, "America/Chicago")["account"];
+  CHECK_NEAR(ap["deposits"].get<double>(), 110.0, 1e-9);
+  CHECK_NEAR(ap["perps_equity"].get<double>(), 0.0, 1e-9);
+  CHECK_NEAR(ap["credits"].get<double>(), 0.0, 1e-9);
+  CHECK_NEAR(ap["equity"].get<double>(), 114.8953, 1e-9);
+  // Now the perps side: $25 transferred in, $25 credited by the exchange for volume, 8 fills that
+  // between them lost 13.51 cents. Equity 49.8649.
+  ac.exec("CREATE TABLE IF NOT EXISTS perp_account(ts INTEGER PRIMARY KEY, settled_funds REAL, position_value REAL, equity REAL, maintenance_margin REAL, initial_margin REAL, available REAL)");
+  ac.exec("CREATE TABLE IF NOT EXISTS perp_fills(fill_id TEXT PRIMARY KEY, order_id TEXT, ticker TEXT, side TEXT, count REAL, price REAL, entry_price REAL, fees REAL, realized_pnl REAL, is_taker INTEGER, created_time TEXT, ts INTEGER, order_source TEXT)");
+  ac.exec("INSERT INTO perp_account(ts,settled_funds,position_value,equity,maintenance_margin,initial_margin,available) VALUES(?,?,?,?,?,?,?)",
+          {now_s(), 49.8649, 0.0, 49.8649, 0.0, 0.0, 49.8649});
+  ac.exec("INSERT INTO perp_fills(fill_id,realized_pnl,fees,ts) VALUES(?,?,?,?)", {"f1", -0.0015, 0.1336, now_s()});
+  ap = build_pnl(ac, "America/Chicago")["account"];
+  CHECK_NEAR(ap["equity"].get<double>(), 164.7602, 1e-9);            // 114.8953 + 49.8649
+  CHECK_NEAR(ap["credits"].get<double>(), 25.0, 1e-9);               // 49.8649 - 25.00 - (-0.1351)
+  CHECK_NEAR(ap["gain_over_deposits"].get<double>(), 54.7602, 1e-9);
+  CHECK_NEAR(ap["all_time"].get<double>(), 29.7602, 1e-9);           // the number on the board
+  // A withdrawal is money leaving and must reduce the gain; a transfer never does. Same equity,
+  // so taking $10 out means the trading earned $10 more than the balance alone suggests.
+  ac.exec("INSERT INTO cashflows(id,ts,kind,amount) VALUES(?,?,?,?)", {"w1", 1788900000, "withdrawal", -10.0});
+  ap = build_pnl(ac, "America/Chicago")["account"];
+  CHECK_NEAR(ap["deposits"].get<double>(), 100.0, 1e-9);
+  CHECK_NEAR(ap["all_time"].get<double>(), 39.7602, 1e-9);
+
   // Position rows say when trading has closed so the screen shows "settling" instead of a close button.
   Position pos; pos.ticker = m2.ticker; pos.position = 13; pos.exposure = 4.29; st.replace_positions({pos});
   pnl = build_pnl(st, "America/Chicago");

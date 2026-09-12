@@ -30,13 +30,17 @@ def sweep_max(panels, shift=0):
     best_label = None
     n_spec = 0
     for bar, (rets, ts, names) in panels.items():
-        r = np.roll(rets, shift, axis=0) if shift else rets
         for fi, focal in enumerate(names):
             oneway = C.KALSHI_ONEWAY_BPS.get(focal, C.DEFAULT_ONEWAY)
-            X, y = C.design(r, fi, n_lags=1)
+            X, y = C.design(rets, fi, n_lags=1)
             if shift:
-                # Shift the TARGET only, so predictors keep their own history and the alignment
-                # between X and y is what breaks.
+                # Roll the TARGET only. An earlier version rolled the whole panel and THEN the
+                # target, which left the fixed test index range [va:T] pointing at a different
+                # calendar window on every draw. That mixed destroyed alignment with
+                # window-to-window variation and widened the null, making the observed maximum
+                # easier to place inside it -- a bias toward the negative conclusion. Here the
+                # predictors, the test window and the clusters are identical in every draw, and
+                # the only thing that changes is which future each predictor is matched to.
                 y = np.roll(y, shift)
             T = len(y)
             va = int(T * (C.TRAIN_FRAC + C.VALID_FRAC))

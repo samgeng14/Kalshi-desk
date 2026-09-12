@@ -49,6 +49,36 @@ static std::string gstr(const json& r, const char* k) {
   return it->get<std::string>();
 }
 
+// Settled P&L for one market, from the settlement record alone. Three properties of Kalshi's
+// settlement record make the obvious reading wrong, and all three were live in this file until
+// the totals were reconciled against the account balance.
+//
+//   `revenue` is the payout on the NET position, not the gross one. Offsetting contracts are
+//   netted when the closing trade happens rather than at expiry, so a market traded in both
+//   directions reports a revenue well below what its counts imply, and exactly 0 when it ended
+//   flat. The gross payout is the winning side's own count: every contract held on that side is
+//   worth $1 whether it was closed early or carried to settlement.
+//
+//   `fee` and the summed fill fees are the SAME money. Across all 77 settled markets on this
+//   account they are equal to the cent. Subtracting both charged every market its fees twice.
+//
+//   The `realized` ledger is not a substitute for either. Kalshi's realized_pnl is the P&L of the
+//   CLOSED portion only, on a weighted-average cost basis. It omits whatever settled at expiry,
+//   and it is 0 for any market that was never closed early - which was 53 of the 57 rows in it.
+//   Preferring it silently dropped the settlement leg of every market it covered.
+//
+// Checked by hand against two markets, both reproduced exactly:
+//   ATLPHI-PHI - bought 12 NO at .17, then 9 YES at .57, which closes 9 NO at .43. Kalshi
+//     realized +2.34 on that close; the 3 NO left settled for +2.49 over a .51 basis; fees
+//     .2731. Total +4.5569, and this function returns +4.5569.
+//   BFCSAS-SAS - 5.73 YES at a .2594 average, 1 closed at .19 for -0.0694, the other 4.73
+//     expired worthless for -1.2268, fees .0812. Total -1.3774, and this function returns it.
+double settled_pnl(const json& r) {
+  const double payout =
+      gstr(r, "market_result") == "yes" ? gnum(r, "yes_count") : gnum(r, "no_count");
+  return payout - gnum(r, "yes_cost") - gnum(r, "no_cost") - gnum(r, "fee");
+}
+
 json build_report(Store& store, const Config& cfg) {
   json rep;
   long long now = now_s();
@@ -71,17 +101,10 @@ json build_report(Store& store, const Config& cfg) {
   double total_pnl = 0, total_staked = 0;
   std::map<std::string, std::vector<double>> by_strategy;
   json trades = json::array();
-  std::map<std::string, std::pair<double, double>> ledger;
-  for (const auto& r : store.query("SELECT ticker, realized_pnl, fees_paid FROM realized", {}))
-    ledger[gstr(r, "ticker")] = {gnum(r, "realized_pnl"), gnum(r, "fees_paid")};
   for (const auto& r : settled) {
     double staked = gnum(r, "yes_cost") + gnum(r, "no_cost");
     if (staked <= 0) continue;
-    std::string tk = gstr(r, "ticker");
-    // Kalshi's realized number when we have it (settlement records show revenue 0 for markets
-    // held on both sides); the settlement arithmetic otherwise.
-    double pnl = ledger.count(tk) ? ledger[tk].first - ledger[tk].second
-                                  : gnum(r, "revenue") - staked - gnum(r, "fee") - gnum(r, "trade_fees");
+    double pnl = settled_pnl(r);
     double rr = pnl / staked;
     ret.push_back(rr);
     total_pnl += pnl;
@@ -220,9 +243,11 @@ json build_pnl(Store& store, const std::string& day_tz) {
   std::map<std::string, std::pair<double, double>> ledger;  // ticker -> (realized, fees_paid)
   for (const auto& r : store.query("SELECT ticker, realized_pnl, fees_paid FROM realized", {}))
     ledger[gstr(r, "ticker")] = {gnum(r, "realized_pnl"), gnum(r, "fees_paid")};
-  // Settled: revenue - cost - trade fees, attributed to the first proposal's strategy.
+  // Settled: see settled_pnl() for why this is not revenue - cost, attributed to the first
+  // proposal's strategy.
   json settled = store.query(
       "SELECT s.ticker, s.settled_time, s.revenue, s.yes_cost, s.no_cost, s.fee,"
+      " s.market_result, s.yes_count, s.no_count,"
       " (SELECT COALESCE(SUM(f.fee),0) FROM fills f WHERE f.ticker=s.ticker) AS trade_fees,"
       " (SELECT p.strategy FROM proposals p JOIN orders o ON o.proposal_id=p.id WHERE o.ticker=s.ticker ORDER BY p.id LIMIT 1) AS strategy,"
       " (SELECT sr.category FROM markets m JOIN series sr ON sr.ticker=m.series_ticker WHERE m.ticker=s.ticker) AS category"
@@ -234,13 +259,12 @@ json build_pnl(Store& store, const std::string& day_tz) {
   for (const auto& r : settled) {
     std::string t = gstr(r, "ticker");
     settled_tickers.insert(t);
-    // One source per market. Kalshi's realized number (ledger) already includes the settlement
-    // and any earlier closes; the settlement record alone is used only for markets that predate
-    // the ledger (its revenue is 0 for markets that were held on both sides, so it is the
-    // weaker source).
-    double pnl, fees;
-    if (ledger.count(t)) { pnl = ledger[t].first - ledger[t].second; fees = ledger[t].second; }
-    else { pnl = gnum(r, "revenue") - gnum(r, "yes_cost") - gnum(r, "no_cost") - gnum(r, "fee") - gnum(r, "trade_fees"); fees = gnum(r, "trade_fees") + gnum(r, "fee"); }
+    // One source per market, and it is the settlement record. The realized ledger is NOT a
+    // fallback for it: it carries only the closed portion of a market, so preferring it dropped
+    // whatever settled at expiry. It is still the whole story for markets that closed flat and
+    // never settled, which is the loop further down.
+    double pnl = settled_pnl(r);
+    double fees = gnum(r, "fee");
     settled_total += pnl;
     fees_total += fees;
     long long settled_at = parse_iso(gstr(r, "settled_time"));
@@ -303,6 +327,57 @@ json build_pnl(Store& store, const std::string& day_tz) {
   rep["by_strategy"] = bs;
   rep["by_category"] = bc;
   rep["positions"] = pos;
+  // ---- All-time account P&L, measured top-down ---------------------------------------
+  // Everything above is a sum over markets that produced a settlement record, and that sum cannot
+  // see a trade which never produced one. A manual weather trade worth about $36 is exactly that
+  // case on this account. A total that silently omits a trade is the same shape of error this
+  // file already made once, so the all-time number is not built from the per-market pieces. It is
+  // taken from the account balances and the cashflow ledger, which are complete by construction:
+  // whatever the trading did, the money is either sitting in an account or it came in through a
+  // cashflow.
+  {
+    double ev_cash = 0, ev_pos = 0, perps_eq = 0;
+    for (const auto& r : store.query("SELECT balance, portfolio_value FROM account ORDER BY ts DESC LIMIT 1", {})) {
+      ev_cash = gnum(r, "balance");
+      ev_pos = gnum(r, "portfolio_value");
+    }
+    // The perps tables are created by the perps module, not the base schema, so a store that has
+    // never run perps does not have them. Absent means zero, not an error.
+    const bool has_perps =
+        !store.query("SELECT name FROM sqlite_master WHERE type='table' AND name='perp_account'", {}).empty();
+    double perps_traded = 0;
+    if (has_perps) {
+      for (const auto& r : store.query("SELECT equity FROM perp_account ORDER BY ts DESC LIMIT 1", {}))
+        perps_eq = gnum(r, "equity");
+      for (const auto& r : store.query(
+               "SELECT COALESCE(SUM(realized_pnl),0) AS rp, COALESCE(SUM(fees),0) AS fe FROM perp_fills", {}))
+        perps_traded = gnum(r, "rp") - gnum(r, "fe");
+    }
+    // deposit / withdrawal are money crossing the boundary. to_margined / from_margined only move
+    // it between the two accounts, so they cancel in a total that already counts both.
+    double deposits = 0, transfers = 0;
+    for (const auto& r : store.query("SELECT kind, amount FROM cashflows", {})) {
+      const std::string k = gstr(r, "kind");
+      if (k == "deposit" || k == "withdrawal") deposits += gnum(r, "amount");
+      else transfers += gnum(r, "amount");
+    }
+    // Whatever the perps balance holds beyond the money moved into it and what its own fills did
+    // came from outside - on this account, a promo credit for trading volume. It is reported on
+    // its own line and subtracted from the P&L, because free money is not performance. If it ever
+    // stops being exactly a credit this line is where it will show up, rather than quietly
+    // inflating the total.
+    const double credit = has_perps ? perps_eq + transfers - perps_traded : 0.0;
+    const double equity = ev_cash + ev_pos + perps_eq;
+    rep["account"] = {{"equity", equity},
+                      {"events_cash", ev_cash},
+                      {"events_positions", ev_pos},
+                      {"perps_equity", perps_eq},
+                      {"deposits", deposits},
+                      {"transfers", transfers},
+                      {"credits", credit},
+                      {"gain_over_deposits", equity - deposits},
+                      {"all_time", equity - deposits - credit}};
+  }
   rep["n_settled"] = static_cast<int>(settled.size());
   rep["generated_ts"] = now;
   return rep;

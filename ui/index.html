@@ -296,6 +296,7 @@
   <span class="cell"><span class="k">API key</span><span id="armed" class="v">-</span></span>
   <span class="cell" title="mark-to-market since the first sync of the local day, event contracts plus the perps instance; money moved in or out is not P&amp;L"><span class="k">P&amp;L today</span><span id="pnl_today" class="v">-</span><span id="pnl_today_split" class="split"></span></span>
   <span class="cell" title="Events + perps; recorded history may omit older fills and funding"><span class="k" id="pnl_total_label">P&amp;L recorded</span><span id="pnl_total" class="v">-</span><span id="pnl_total_split" class="split"></span></span>
+  <span class="cell" title="Everything the account made since it opened: both balances, less every deposit, less exchange credits. Measured from the balances and the cashflow ledger, not by adding up settled markets, so a trade that never produced a settlement record cannot go missing from it."><span class="k">ALL TIME</span><span id="pnl_alltime" class="v">-</span><span id="pnl_alltime_split" class="split"></span></span>
   <span class="cell" title="open positions marked: event contracts at the mid, perps at the exchange mark"><span class="k">unrealized</span><span id="pnl_unreal" class="v">-</span></span>
   <span class="cell" title="positions in markets that have stopped trading: outcome fixed, payout pending"><span class="k">settling</span><span id="pnl_settling" class="v">-</span></span>
   <span class="cell" title="Cash only: event cash + perps settled funds"><span class="k">cash · events + perps</span><span id="balance" class="v">-</span><span id="balance_split" class="split"></span></span>
@@ -1295,6 +1296,16 @@
   async function refreshRiskPnl() {
     try { risk = await api('/api/risk'); pnl = await api('/api/pnl'); } catch (e) { return; }
     paintStatus();   // committed exposure moves on this loop, not the state one
+    // The header's all-time figure is painted before the early return below, so it lands on the
+    // first load rather than waiting for something else on this loop to change.
+    const acct = pnl.account || null;
+    if (acct) {
+      $('#pnl_alltime').textContent = money(acct.all_time);
+      $('#pnl_alltime').className = 'v ' + c(acct.all_time);
+      $('#pnl_alltime_split').textContent =
+        `equity ${money(acct.equity)} · in ${money(acct.deposits)}` +
+        (Math.abs(acct.credits) > 0.005 ? ` · credit ${money(acct.credits)}` : '');
+    }
     if (unchanged('riskpnl', [risk, pnl])) return;
     const dd = risk.daily || {};
     const mtm = dd.start_pv > 0 ? dd.pnl : null;
@@ -1351,7 +1362,17 @@
       <td>${settle}</td></tr>`; })(p); }).join('') || '<tr><td class="l dim" colspan="8">flat</td></tr>';
     const bs = Object.entries(pnl.by_strategy||{}).map(([k,v])=>`<tr><td class="l">${k}</td><td>${v.n}</td><td class="${c(v.pnl)}">${money(v.pnl)}</td></tr>`).join('');
     const bc = Object.entries(pnl.by_category||{}).map(([k,v])=>`<tr><td class="l">${k}</td><td class="${c(v)}">${money(v)}</td></tr>`).join('');
-    $('#pnl').innerHTML = `<div class="kv"><span class="k">settled</span><span class="${c(pnl.settled_pnl)}">${money(pnl.settled_pnl)} (${pnl.n_settled} markets)</span>
+    // All time first, because it is the number you actually have. It comes from the two account
+    // balances and the cashflow ledger rather than from summing markets, so a trade that never
+    // produced a settlement record cannot go missing from it.
+    const a = pnl.account || null;
+    const allTime = a ? `<div class="kv" style="margin-bottom:10px">
+      <span class="k"><b>ALL TIME</b></span><span class="${c(a.all_time)}" style="font-size:15px"><b>${money(a.all_time)}</b></span>
+      <span class="k">equity now</span><span>${money(a.equity)} <span class="mini dim">= events ${money(a.events_cash + a.events_positions)} + perps ${money(a.perps_equity)}</span></span>
+      <span class="k">less deposits</span><span>${money(-a.deposits)}</span>
+      ${Math.abs(a.credits) > 0.005 ? `<span class="k" title="money that arrived in the perps account from outside it: a promo credit, not trading performance. Subtracted so the P&L is what your trading did.">less credits</span><span>${money(-a.credits)}</span>` : ''}
+      <span class="k mini dim">gain over deposits</span><span class="mini dim">${money(a.gain_over_deposits)} including credits</span></div>` : '';
+    $('#pnl').innerHTML = allTime + `<h3>Per-market, from settlement records</h3><div class="kv"><span class="k">settled</span><span class="${c(pnl.settled_pnl)}">${money(pnl.settled_pnl)} (${pnl.n_settled} markets)</span>
       <span class="k">settled today (${esc(pnl.day||'')} ${esc(pnl.day_tz||'')})</span><span class="${c(pnl.settled_today)}">${money(pnl.settled_today)}</span>
       <span class="k">closed out before expiry</span><span class="${c(pnl.realized_closed||0)}">${money(pnl.realized_closed||0)}</span>
       <span class="k">settling (trading closed)</span><span class="${c(pnl.settling||0)}">${money(pnl.settling||0)}</span>
@@ -2099,6 +2120,12 @@
   // next decisions reflect it. Pairs (/api/poly/pairs) and perps (the basis table) are not router
   // decisions; they keep their own rules below.
   let tradesCat = store.get('tradesCat') || 'all', decisions = null, decisionRows = [], pairsRows = [], perpsRows = [], tradesLoading = false;
+  // The remembered category is a convenience, not an instruction to hide the tradable rows.
+  // It is sticky across sessions, so a tab picked once (weather, say) silently filtered out
+  // every manual row on every later visit and the board looked empty when it was not.
+  // Until you pick a tab yourself in this session, a remembered tab that would hide all of
+  // them gives way to 'all'. Clicking any chip pins your choice and stops this for good.
+  let tradesCatPinned = false;
   const submittedEvents = new Map();
   const eventKey = r => r.event_ticker || r.kalshi_event || (r.ticker||r.kalshi_ticker||'').split('-').slice(0,-1).join('-') || r.ticker || r.kalshi_ticker;
   function lockSubmittedEvent(row) { submittedEvents.set(eventKey(row), Date.now()+120000); renderTrades(); }
@@ -2227,6 +2254,10 @@
     for (const r of rows) counts[r.cat] = (counts[r.cat]||0) + 1;
     const cats = ['all',...new Set(['weather','sports','crypto','commodities','economics','finance','tech_science','pair','perps','other',...Object.keys(counts)].filter(k=>k!=='all'))];
     if (!cats.includes(tradesCat)) tradesCat = 'all';
+    // Same predicate the row renderer uses for `tradable`, so this can never disagree with it.
+    const isTradable = r => r.kind !== 'kalshi' || r.route === 'manual';
+    if (!tradesCatPinned && tradesCat !== 'all' && rows.some(isTradable)
+        && !rows.some(r => r.cat === tradesCat && isTradable(r))) tradesCat = 'all';
     const out = rows.filter(r => (tradesCat === 'all' || r.cat === tradesCat) && (!q || (r.ticker + ' ' + (r.title||'') + ' ' + (r.sub||'') + ' ' + (r.model||'')).toLowerCase().includes(q)));
     return {rows: out, counts, cats, total: rows.length, decisionsFresh};
   }
@@ -2542,7 +2573,7 @@
     if (b) { const r = findTradeRow(b.dataset.tradebtn); if (r) openTradeModal(r); return; }
     const tr = ev.target.closest('tr[data-trade]'); if (tr && tr.dataset.trade.indexOf('|') > 0 && !tr.dataset.trade.startsWith('pair|') && !tr.dataset.trade.startsWith('perp|')) selectTicker(tr.dataset.trade.split('|')[0]);
   });
-  $('#tr_cats').addEventListener('click', (ev) => { const ch = ev.target.closest('[data-trcat]'); if (!ch) return; tradesCat = ch.dataset.trcat; store.set('tradesCat', tradesCat); renderTrades(); });
+  $('#tr_cats').addEventListener('click', (ev) => { const ch = ev.target.closest('[data-trcat]'); if (!ch) return; tradesCat = ch.dataset.trcat; tradesCatPinned = true; store.set('tradesCat', tradesCat); renderTrades(); });
   $('#tr_q').addEventListener('input', renderTrades);
   $('#tr_n').addEventListener('change', renderTrades);
   $('#tr_algo').addEventListener('change', renderTrades);

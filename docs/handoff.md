@@ -14,6 +14,102 @@ Working agreement for every session in this programme:
   geolocation check rejects it, so autonomous execution has to run on the Mac. This constrains
   session 8 and is not negotiable by design choices made earlier.
 
+## Session 19 - the board was reporting a loss on an account that was up (2026-09-12)
+
+Sam asked whether the P&L was right. It was not, by $44, and the three reasons were independent.
+
+**What the board said, and what Kalshi said.** Settled P&L read -$50.03 all time and -$7.09 since
+Sep 5. The account went $100.2273 -> $114.8953 over the same stretch. A number that says you lost
+money on an account whose balance rose is not a rounding problem, so the settlement records were
+reconciled against the balance row by row.
+
+**Defect 1 - `revenue` is the NET payout.** Kalshi nets offsetting contracts when the closing
+trade happens, not at expiry. A market traded in both directions therefore reports a revenue far
+below what its counts imply, and exactly 0 when it ended flat. The old code read `revenue`
+directly and subtracted both legs' cost, so every round trip was booked as a total loss of both
+sides. 31 of 77 settled markets carried this shape. The gross payout is the winning side's own
+count, because a contract on that side is worth $1 whether it was closed early or held.
+
+**Defect 2 - fees were charged twice.** `settlements.fee` and the summed `fills.fee` for the same
+ticker are the same money. They are equal to the cent on all 77 settled markets on this account.
+The old expression subtracted both.
+
+**Defect 3 - the `realized` ledger was preferred, and it is not a total.** Kalshi's
+`realized_pnl` is the P&L of the CLOSED portion only, on a weighted-average cost basis; it omits
+whatever settled at expiry and is 0 for any market never closed early, which was 53 of its 57
+rows. Preferring it dropped the settlement leg of every market it covered. It is still the whole
+story for markets that closed flat and never settled, and that loop is unchanged.
+
+`settled_pnl()` in `src/eval.cpp` is now the single expression, used by both call sites so they
+cannot drift: `payout(winning side count) - yes_cost - no_cost - fee`. Derivation and the two
+hand-worked markets are in the comment above it.
+
+**Verified.** Worked out by hand against two real markets and reproduced exactly:
+ATLPHI-PHI (12 NO at .17, then 9 YES at .57 closing 9 NO at .43; Kalshi realized +2.34 on the
+close, the 3 remaining settled +2.49 over a .51 basis, fees .2731) = +4.5569. BFCSAS-SAS (5.73
+YES at a .2594 average, 1 closed at .19, 4.73 expired, fees .0812) = -1.3772, against -1.3774 by
+hand, the 2e-4 being the tenth-of-a-cent rounding in the stored costs. The function text was
+extracted verbatim from eval.cpp and executed against all six cases: 6 checks, 0 failures.
+
+After the fix: settled P&L -$5.56 all time, +$4.21 since Sep 5.
+
+**The test that encoded the bug.** `tests/test_main.cpp` asserted that for a settled market with a
+ledger row "Kalshi's realized number is the single source; the settlement arithmetic is not added
+on top". That assertion was the bug, written down and green. It now asserts the opposite and says
+why, and four fixture cases pin the netted, partial, fee-once and one-sided shapes.
+
+**What was checked and found NOT to be broken.** The settlements fetch was suspected of leaving a
+hole across the 15-hour outage, and it does not: `get_settlements` pages properly (limit 1000,
+cursor loop) and the 1-hour lookback covered the gap. No change made. The claim was withdrawn
+rather than "fixed" speculatively.
+
+**Still unexplained, and it is not a bug.** Equity moved +$36.46 across the outage that trading
+does not account for, and there is a clean -$25.00 one-minute step on Sep 6. Both look like cash
+movements rather than P&L. Nothing in these tables records deposits or withdrawals, so the
+reconciliation cannot close without Sam saying whether he moved money. Backing out both,
+balance-implied trading P&L since Sep 5 is about +$3.21 against the computed +$4.21.
+
+**All-time P&L is now measured top-down, and it is +$29.76.** Sam asked for one number: the
+all-time P&L on the account. The per-market sum cannot give it, because it can only see markets
+that produced a settlement record, and a manual weather trade worth about $36 never did. So
+`build_pnl` gained an `account` block taken from the two balances and the cashflow ledger, which
+are complete by construction: the money is either in an account or it came through a cashflow.
+
+    equity $164.7602  (events $114.8953 + perps $49.8649)
+    less deposits     $110.00   ($10 on Jul 7, $100 on Sep 5, from `cashflows`)
+    less credits       $25.00
+    = all time        $+29.7602
+
+The two things that looked like unexplained cash were neither a deposit nor a loss, and Sam named
+both before the data did. The -$25.00 step on Sep 6 is a `to_margined` transfer, present in
+`cashflows` with exactly that kind: internal, so it cancels in a total that counts both accounts.
+The other is a promo credit for perps volume, and it reconciles to $25.0000 as the residual
+`perps_equity + transfers - perps_fills_pnl`. It arrived before `perp_account` recording began on
+Sep 8, so there is no step to detect and the residual is the only route to it. It gets its own
+line and is subtracted, because free money is not performance; if that residual ever stops being
+a clean credit, the line is where it will show, rather than quietly inflating the total.
+
+The events account by itself: $110 deposited less $25 moved to perps is $85 staked, against
+$114.8953 now, so +$29.90 there and -$0.14 on perps. That the two routes agree is the check.
+
+Pinned in `tests/test_main.cpp` with these exact figures, plus the absent-perps-tables case (the
+perps tables are created by the perps module, not the base schema, so a store that never ran
+perps must read them as zero rather than throw) and a withdrawal case, since a withdrawal must
+reduce deposits while a transfer must not.
+
+**The Trades board.** `tradesCat` persists in localStorage, so a category picked once (weather)
+filtered out every manual row on every later visit and the board looked empty when it was not.
+Until a tab is clicked in the session, a remembered tab that would hide all tradable rows now
+gives way to `all`; clicking any chip pins the choice and stops it. The predicate is the same one
+the row renderer uses for `tradable`, so the two cannot disagree. `ui-routes` still 63 checks, 0
+failures.
+
+**Not runnable from here.** The full suite needs a build, and the device shell is a Linux VM over
+the mounted folder rather than a macOS shell. eval.cpp, test_main.cpp and the extracted function
+were checked with g++ `-Wall -Wextra` (clean) and the dashboard JS with `node --check` (clean).
+`cmake --build build` and a desk restart are needed on the Mac; the UI is embedded at build time,
+so the board change needs the same rebuild.
+
 ## Session 18 - observability fix, and the impulse lane answered (2026-09-12)
 
 Sam's correction, which was right and which mattered more than naming: a deduplicated stream means
@@ -131,8 +227,27 @@ the table. A number I nearly published as a finding is published as a refusal in
   it, what was measured is "Kalshi leads these four", which is weaker than the conclusion drawn.
   This is the one caveat that could overturn the result, and it needs a feed rather than a model.
 - One quiet session with a seven-hour gap. Nothing here speaks to a volatile session or a release.
-- The commodity recorder has still never run live, so every commodity gate is at zero.
-- Part N (the conditional-maker spread-matched diagnostic) was not run this session.
+- **The commodity lane is blocked, not merely early.** Every commodity gate is at zero because
+  nothing has ever recorded a commodity tick, and it cannot until two things happen on the Mac.
+  The evidence, checked 2026-09-12T04:45Z: no `commodity_*` table exists in any database
+  (`desk.sqlite`, `prod.sqlite`, `perps_research.sqlite`, `history.sqlite`); `build/kalshi-desk`
+  is dated Sep 11 13:04 and contains none of the markers `pyth_value`, `commodity_reference_raw`,
+  `commodity_calibration`, `commodity_quotes`, `KXCOPPER15M` - it predates the entire feed; and
+  `data/prod.log` stops mid-cycle at 2026-09-11T13:46:24Z with no shutdown line, so the desk has
+  been down about 15 hours. The only subscriber to `pyth_value` anywhere in the tree is the C++
+  desk; there is no Python commodity recorder, and one must not be written, because a second
+  implementation of the settlement feed would make replication ambiguous by construction.
+  `config/desk.json` is already correct and complete: all five 15M series watched, five
+  `commodity_terminal_*` at `manual`, `params.commodity.reference.enabled` true with
+  `subscribe: ["all"]`, `replication_windows_required: 50`. Nothing in config needs changing.
+  What is needed is `cmake --build build` and then starting the desk, both on the Mac - neither is
+  doable from here, since the device shell is a Linux VM over the mounted folder rather than a
+  macOS shell, and building there would overwrite the Mac's objects with Linux ones.
+- Part N was already complete before this session: `reports/spread_matched_control.md` (Sep 12
+  00:19) and the lane is archived in `research/conditional_maker_v1_rejected.md`, which cites it
+  as the fifth of five independent routes to the same rejection. Nothing further is owed on it.
+- The live Python perps recorder is healthy and untouched: heartbeat ok, 293 minutes, all seven
+  crypto sources flowing. It records no commodities and is not supposed to.
 
 ## Session 17 - the commodity research ladder, and the capture it needs (2026-09-12)
 
