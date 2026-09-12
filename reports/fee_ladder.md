@@ -1,3 +1,26 @@
+> **CORRECTED 2026-09-12 — THIS IS NOT THIS ACCOUNT'S SCHEDULE.**
+>
+> The ladder below was taken from a CFTC rule filing and treated as authoritative. The account's
+> own `/margin/fee_tier_rates` endpoint disagrees, and it is the authority:
+>
+> | tier | maker bps | taker bps |
+> |---:|---:|---:|
+> | 0 | **2.0** | 12.0 |
+> | 1 | 1.5 | 10.0 |
+> | 2 | 1.2 | 6.0 |
+> | 3 | 0.0 | 2.0 |
+> | 4 | 0.0 | 1.5 |
+> | 5 | 0.0 | 1.0 |
+>
+> Schedule name: `kalshi_prime`. Six tiers, not eleven. **Taker at tier 0 matches at 12.0 bps and
+> is confirmed independently by recorded fills** (XRP paid 0.0103 on 8.5026 of notional, ETH
+> 0.0090 on 7.4484 — both 12.1 bps including rounding). **Maker does not: 2.0, not 5.0.**
+>
+> Every maker figure below is therefore wrong by a factor of 2.5, and every "tier that would allow
+> it" column is too pessimistic. The taker figures stand. The filing was read correctly; it simply
+> describes a different schedule than the one this account trades on, and the account API should
+> have been asked first.
+
 # Fee ladder and repricing
 
 Schedule verified against: CFTC rule filing rules0624267243.pdf, 24 June 2026, effective no earlier than 8 July 2026

@@ -193,3 +193,26 @@ is the open question, and it is open because this study did not ask it.
 The pessimistic and optimistic queue bounds agree throughout: the largest gap between them on any
 market is 1.0 percentage point of fill rate, and no conclusion here flips across it. That is the
 one place this result is unusually safe.
+
+---
+
+## Correction, 2026-09-12: the maker fee in this table is wrong
+
+The `maker fee` column says 5.0 bps throughout. The account's actual tier-0 maker rate, read from
+`/margin/fee_tier_rates`, is **2.0 bps**. The taker rate of 12.0 bps is confirmed and unchanged.
+
+That moves every `net` figure in the table above by +3.0 bps, and it moves the headline claim:
+the best (market, mode) pair was reported at **-1.57 bps**, which at the correct fee is **+1.43
+bps**. Several pairs cross zero.
+
+**This does not reopen the lane, because a second error runs the other way.** The `kept` column is
+computed as half-spread-at-post plus markout-from-fill, which credits a spread against a mid that
+had already moved — the contamination documented in `reports/conditional_maker.md`, worth about
+6.36 bps in the optimistic direction. So this table carries two errors of opposite sign: too
+pessimistic by 3.0 on the fee, too optimistic by roughly 6.4 on the metric. The net is that the
+maker lane is *worse* than reported, not better.
+
+Neither number should be used as it stands. The lane needs a clean re-run at 2.0 bps with the
+corrected `kept` definition before anything is concluded from it in either direction, and until
+that happens `REJECTED_V1` stands on the round-trip evidence in `reports/exit_engine.md` rather
+than on this table.

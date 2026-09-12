@@ -1,6 +1,6 @@
 # Which weather holding horizon actually has edge
 
-Generated 2026-09-12 22:31:29Z. Every number is executable: entry crosses the spread, exit sells into the bid that existed at the horizon, and Kalshi's quadratic fee is charged on each leg. Holding to settlement pays the entry fee only.
+Generated 2026-09-12 22:32:58Z. Every number is executable: entry crosses the spread, exit sells into the bid that existed at the horizon, and Kalshi's quadratic fee is charged on each leg. Holding to settlement pays the entry fee only.
 
 17746 candidate states from 243 contracts over 46 event-days, sampled no more often than every 15 minutes per contract.
 
@@ -20,6 +20,23 @@ Only states the desk would have called a signal (terminal edge >= 3c after fee).
 | 2h | 3139 | **-3.20c** | -2.91c | 13% | [-3.88, -2.33] |
 | 4h | 2537 | **-2.96c** | -3.19c | 19% | [-4.11, -1.53] |
 | **settlement** | 4477 | **-0.77c** | -5.33c | 27% | [-8.12, +7.57] |
+
+## Why every short horizon loses the same amount
+
+
+| | value |
+|---|---|
+| median weather spread | **1.0c** |
+| round-trip taker fee at 20c / 50c / 80c | 2.24c / 3.50c / 2.24c |
+| **cost to enter and exit** | **3.2 - 4.5c** |
+| median move in the mid over 15 minutes | **0.00c** |
+| 15-minute windows where the mid did not move at all | 50% |
+
+The market has to move six to ten times its typical fifteen-minute movement before a taker round trip breaks even. That is arithmetic, not a small sample: it is why every horizon above lands near the same number, and why the horizon barely matters. A short-horizon weather sleeve that crosses the spread cannot work at these spreads and these fees.
+
+
+The version this does NOT measure is resting a maker order. These series are plain `quadratic`, so a maker fill pays **no fee at all** and earns the spread instead of paying it - the same 1.0c becomes a credit rather than a charge. Two of the three Sep-11 trades were maker fills. That is a liquidity-provision strategy with a fill-probability model, not a repricing strategy with a market-reaction model, and nothing here speaks to it either way.
+
 
 ## Does more predicted edge produce more realized profit? (section 16)
 

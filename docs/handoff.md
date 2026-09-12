@@ -1769,3 +1769,38 @@ random subset. Worth measuring before any of the above is treated as settled.
 
 Not yet done: sections 5, 6, 8 (beyond the running-max floor already in the simulator), 9, 10
 (replace the guessed shift with the intraday CLI), 11, 14, 15, 16, 18-25.
+
+## Session 23, part 3: the horizon question, answered
+
+`research/wx_horizons.py` -> `reports/weather_horizons.md`. Executable markouts only: enter at the
+ask, exit into the bid that actually existed at the horizon, quadratic fee on each leg. 17,746
+candidate states, 243 contracts, 46 event-days, sampled no more than once per contract per 15 min,
+inference clustered by event-day.
+
+**Short-horizon weather convergence is dead, and it is dead by arithmetic.** Median spread 1.0c,
+round-trip taker fee 2.24-3.50c, so a round trip costs 3.2-4.5c. Median movement in the mid over
+fifteen minutes: **0.00c**, with half of all 15-minute windows showing no movement at all. Every
+horizon from 5m to 4h returns about -3.6c because that is the round trip; the win rate at 5m is 1%.
+This is not a sample-size problem.
+
+**The 80c -> 90c trade has never occurred.** No state in 46 event-days had an executable entry near
+80c with a desk fair at 90% or better. Closest: KXHIGHMIA-26SEP07-T93 NO at 90c, fair 94.4%.
+
+**Predicted edge is anti-monotonic against realized settlement**: 3-4c predicted -> +7.36c, 10c+
+predicted -> -5.27c. Section 16 of the brief makes monotonicity the test of whether edge is an
+economic quantity; this fails it, and agrees with the Brier result that the model's largest
+disagreements are its largest errors.
+
+What this does NOT measure: maker entry. These series are plain `quadratic`, so a resting fill pays
+no fee and earns the 1.0c spread rather than paying it - the sign of the largest term flips. Two of
+the three Sep-11 trades were maker fills. `WX_MAKER` replaces WX_SCALP and WX_INTRADAY in
+`docs/weather-systematic.md` as the one short-horizon idea still standing, and it needs a
+fill-probability model rather than a market-reaction model.
+
+Settlement is not established either way: mean -0.77c, median -5.33c, CI [-8.12, +7.57]. Unmeasured,
+not negative.
+
+`docs/weather-systematic.md` records the architecture, the sleeve decisions with their evidence, and
+the WX_MANUAL sleeve: hold-to-settlement, never graduates to AUTO, sized from the router probability
+and never the raw model, its own lot attribution, scored separately and never pooled into model
+validation.
