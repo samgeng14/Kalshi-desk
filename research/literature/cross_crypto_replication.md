@@ -82,10 +82,13 @@ Everything above this line was written before the code. What follows is what hap
 
 The four required outputs, in the order they were specified:
 
-1. **Does the published statistical relation appear?** Not as a cross-asset effect. The
-   specifications that topped the leaderboard were own momentum and equal-weight basket. The
-   rules that encode the papers' actual claims — BTC lagged, leader-only, and `seesaw sign
-   (minus basket)` — did not win at any bar length, and neither did the LASSO.
+1. **Does the published statistical relation appear?** No. The two mechanisms the papers
+   actually propose — LASSO over the cross-section of lagged returns, and the seesaw direction
+   in which large coins negatively predict the rest — clear the cost hurdle **zero times out of
+   84 specifications**. The LASSO is the worst model class in the sweep (mean economic ratio
+   −0.1187, best 0.4915, 21.4% of its fits positive). The six specifications that did clear were
+   three own-momentum rules, which have no cross-crypto content, and three equal-weight-basket
+   rules, which are a market factor rather than a lead–lag effect.
 2. **Is it economically large?** The best specification, SOL own momentum at 720m, returned
    +43.47 bp gross per trade against a 28.24 bp Kalshi round trip.
 3. **`economic_ratio` at the traded coin's hurdle:** 1.5424x. The first number in this project to

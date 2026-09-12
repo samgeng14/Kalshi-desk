@@ -28,7 +28,7 @@ gross return covers the Kalshi round trip.
 
 ## The headline number, and what happened to it
 
-The sweep's best specification was **SOLUSDT own momentum at 720m, 1.5424x** — +43.47 bp gross
+The sweep's best specification was **SOLUSDT own momentum at 720m, 1.5424x** — +43.56 bp gross
 per trade against a 28.24 bp round trip, the first thing in this project to clear a cost hurdle.
 It is also the maximum of 210 correlated tries on a 160-bar test slice.
 
@@ -88,14 +88,40 @@ That is the tail-concentration failure mode named in the quarter-hour write-up, 
 directly. A 12-hour momentum signal that works in one 26-day window and is worse than a coin flip
 in the other two is a period, not an edge.
 
-## One more thing this was not
+## The published mechanisms cleared nothing, before the null was applied
 
-The specifications that cleared were **own momentum** and **equal-weight basket**. The
-cross-asset rules the papers are actually about — `BTC lagged return`, `leader-only (BTC+ETH)`,
-and `seesaw sign (minus basket)`, which is the seesaw prediction stated directly — did not produce
-the winner, and neither did the LASSO. Even taken at face value and before the null, this was
-never a cross-crypto replication succeeding. It was a single-asset momentum rule that happened to
-top a leaderboard that also contained cross-crypto rules.
+Set the selection question aside and just read the leaderboard by model class. Six specifications
+out of 210 clear 1.0x, all at 720m:
+
+| rank | asset | model | gross bp | round trip | net bp | ratio |
+|---|---|---|---:|---:|---:|---:|
+| 1 | SOL | own momentum | 43.56 | 28.24 | +15.32 | 1.5424 |
+| 2 | AAVE | own momentum | 58.24 | 38.56 | +19.68 | 1.5104 |
+| 3 | XRP | own momentum | 34.14 | 29.08 | +5.06 | 1.1740 |
+| 4 | ETH | equal-weight basket | 28.12 | 25.00 | +3.12 | 1.1250 |
+| 5 | XRP | equal-weight basket | 32.06 | 29.08 | +2.98 | 1.1024 |
+| 6 | AAVE | equal-weight basket | 40.42 | 38.56 | +1.86 | 1.0483 |
+
+Three are **own momentum** — a single-asset rule with no cross-crypto content at all. Three are
+the **equal-weight basket**, which is a market factor rather than a lead–lag effect.
+
+Now the rules that encode what the papers actually claim:
+
+| model class | specs | mean ratio | best | clear 1.0x |
+|---|---:|---:|---:|---:|
+| LASSO over all 14 assets' lags (both papers' method) | 42 | −0.1187 | 0.4915 | **0** |
+| `seesaw sign (minus basket)` (Jia et al.'s stated direction) | 42 | −0.0840 | 0.7888 | **0** |
+| all cross-asset rules together | 168 | — | 1.1250 | 3 |
+| own momentum | 42 | — | 1.5424 | 3 |
+
+**The LASSO is the worst model class in the sweep** — mean ratio −0.1187 against −0.0376 for the
+field, only 21.4% of its specifications positive, and its single best result reaching 49% of the
+required effect. The seesaw rule clears zero times out of 42 and its best result reaches 79%.
+
+So the leaderboard never contained a cross-crypto replication. It contained a single-asset
+momentum rule and a market-factor rule sitting above the cross-asset rules, and then the null
+established that even those two are ordinary. The failure is not that the effect was too small
+after Kalshi costs; it is that the mechanism did not appear.
 
 ## Verdict, stated narrowly
 
@@ -136,6 +162,15 @@ Raw output preserved in `reports/cross_crypto_null_raw.log` and
 
 - AVAXUSDT has no measured Kalshi one-way cost and uses the 17.0 bp default. It is not the winning
   specification at any bar length.
+- The per-bar CSVs carry **252** rows: the 210 no-model specifications the null sweep covers, plus
+  42 LASSO fits. The LASSO is excluded from the null because its penalty is selected on the
+  validation slice, so shifting the target changes what is fitted and the null would no longer be
+  the same sweep. Excluding it is conservative in the only direction that matters here — the LASSO
+  clears the hurdle zero times, so including it would lower every observed aggregate statistic.
+- `reports/cross_crypto_{60,240,720}m.{md,csv}` were regenerated after the last six assets finished
+  downloading, so they now cover the same 14-asset panel as the null. The earlier 8-asset CSVs put
+  the winner at 1.5394x on a slightly shorter sample; the reconciled figure is 1.5424x, and every
+  number in this report comes from the 14-asset panel.
 - The first null run (`cross_crypto_null.py`) swept 120 specifications over 8 assets and returned
   p = 0.135 for the same 1.5424x. Six more assets had finished downloading by the time of the
   closing run, which swept 210. The observed maximum is unchanged — none of the new assets

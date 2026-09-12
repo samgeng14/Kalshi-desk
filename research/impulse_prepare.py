@@ -62,6 +62,13 @@ CREATE TABLE IF NOT EXISTS kalshi_book(
   ts_us INTEGER, src_ts_us INTEGER, coin TEXT, ticker TEXT, seq INTEGER, kind TEXT,
   side TEXT, price REAL, delta REAL);
 CREATE INDEX IF NOT EXISTS idx_kalshi_book ON kalshi_book(coin, ts_us);
+-- The delta stream compressed to what it can honestly say. No snapshot was ever captured on this
+-- recording, so the absolute book cannot be rebuilt from it and any "best bid" derived from it
+-- would be invented. What the stream CAN say is when the book was touched and where, at a
+-- resolution the 1 Hz ticker channel does not reach - so it is kept as activity per 100 ms.
+CREATE TABLE IF NOT EXISTS book_activity(
+  bucket_us INTEGER, coin TEXT, side TEXT, events INTEGER, min_price REAL, max_price REAL,
+  net_delta REAL, seq_gaps INTEGER, PRIMARY KEY(bucket_us, coin, side));
 CREATE TABLE IF NOT EXISTS kalshi_trade(
   ts_us INTEGER, src_ts_us INTEGER, coin TEXT, ticker TEXT, price REAL, count REAL, taker_side TEXT);
 CREATE INDEX IF NOT EXISTS idx_kalshi_trade ON kalshi_trade(coin, ts_us);
@@ -158,13 +165,16 @@ COLUMNS = {
 }
 
 
-def run(raw, out_path, coins, hours=None, progress=True):
+BOOK_BUCKET_US = 100_000
+
+
+def run(raw, out_path, coins, hours=None, progress=True, sources=None, book_mode='aggregate'):
     con = sqlite3.connect(out_path)
     con.executescript(SCHEMA)
     con.execute('PRAGMA synchronous=OFF')
     con.execute('PRAGMA journal_mode=MEMORY')
-    sources = ['ext_coinbase', 'ext_binance', 'ext_kraken', 'ext_hyperliquid',
-               'kalshi_index', 'kalshi_margin']
+    sources = sources or ['ext_coinbase', 'ext_binance', 'ext_kraken', 'ext_hyperliquid',
+                          'kalshi_index', 'kalshi_margin']
     totals = {}
     for source in sources:
         for path in sorted(glob.glob(os.path.join(raw, f'source={source}', 'hour=*', 'events.jsonl.gz'))):
@@ -173,6 +183,7 @@ def run(raw, out_path, coins, hours=None, progress=True):
                 continue
             t0 = time.time()
             rows, lines, kept, truncated = [], 0, 0, False
+            activity, last_seq, gaps = {}, {}, 0
             # The recorder may be writing this very file. A gzip member that has not been closed
             # raises at the end; that is the normal state of the current hour, not a failure, so
             # take what is there and record that it was cut short.
@@ -186,6 +197,35 @@ def run(raw, out_path, coins, hours=None, progress=True):
                             continue
                         before = len(rows)
                         handle(source, rec, coins, rows)
+                        # The book stream is 300x the ticker stream and cannot be anchored, so by
+                        # default it is folded into activity buckets rather than stored row by row.
+                        if book_mode != 'raw':
+                            keep = []
+                            for table, row in rows[before:]:
+                                if table != 'kalshi_book':
+                                    keep.append((table, row))
+                                    continue
+                                ts, _src, coin, _tk, seq, _kind, side, price, delta = row
+                                if side not in ('bid', 'ask') or price is None:
+                                    continue
+                                if seq is not None:
+                                    prev = last_seq.get(coin)
+                                    if prev is not None and seq > prev + 1:
+                                        gaps += 1
+                                    last_seq[coin] = seq
+                                if book_mode == 'skip':
+                                    continue
+                                key = ((ts // BOOK_BUCKET_US) * BOOK_BUCKET_US, coin, side)
+                                a = activity.get(key)
+                                if a is None:
+                                    activity[key] = [1, price, price, delta or 0.0, 0]
+                                else:
+                                    a[0] += 1
+                                    a[1] = min(a[1], price)
+                                    a[2] = max(a[2], price)
+                                    a[3] += (delta or 0.0)
+                            del rows[before:]
+                            rows.extend(keep)
                         kept += len(rows) - before
                         if len(rows) >= 20000:
                             flush(con, rows)
@@ -196,6 +236,16 @@ def run(raw, out_path, coins, hours=None, progress=True):
                     print(f'{source:18} {hour}  still being written ({type(e).__name__}); '
                           f'keeping the {lines:,} lines that were complete', flush=True)
             flush(con, rows)
+            if activity:
+                con.executemany(
+                    'INSERT INTO book_activity VALUES(?,?,?,?,?,?,?,?) ON CONFLICT DO UPDATE SET '
+                    'events=events+excluded.events, min_price=MIN(min_price,excluded.min_price), '
+                    'max_price=MAX(max_price,excluded.max_price), net_delta=net_delta+excluded.net_delta',
+                    [(k[0], k[1], k[2], v[0], v[1], v[2], v[3], 0) for k, v in activity.items()])
+                kept += len(activity)
+            if gaps:
+                con.execute('UPDATE book_activity SET seq_gaps=? WHERE bucket_us=(SELECT MAX(bucket_us) '
+                            'FROM book_activity)', (gaps,))
             con.execute('INSERT INTO prepare_log VALUES(?,?,?,?,?,?,?)',
                         (int(time.time()), source, hour, lines, kept, time.time() - t0,
                          1 if truncated else 0))
@@ -309,6 +359,10 @@ def main():
     ap.add_argument('--out', default=OUT)
     ap.add_argument('--coins', nargs='*', default=['BTC', 'ETH'])
     ap.add_argument('--hours', nargs='*', default=None)
+    ap.add_argument('--sources', nargs='*', default=None)
+    ap.add_argument('--book-mode', default='aggregate', choices=['raw', 'aggregate', 'skip'],
+                    help='raw keeps every delta (large, and unanchored so it cannot give a book); '
+                         'aggregate keeps activity per 100ms, which is what it can honestly say')
     ap.add_argument('--self-test', action='store_true')
     args = ap.parse_args()
     if args.self_test:
@@ -317,7 +371,7 @@ def main():
     coins = {c: COINS[c] for c in args.coins if c in COINS}
     if not coins:
         raise SystemExit(f'no known coins in {args.coins}; known: {sorted(COINS)}')
-    run(args.raw, args.out, coins, args.hours)
+    run(args.raw, args.out, coins, args.hours, sources=args.sources, book_mode=args.book_mode)
 
 
 if __name__ == '__main__':
