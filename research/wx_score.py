@@ -22,6 +22,20 @@ import argparse, collections, json, math, os, random, sqlite3, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
+
+
+def default_db(root):
+    """The snapshot, not the live file.
+
+    A SQLite connection opened `mode=ro` still participates in WAL shared memory: it maps and
+    updates `<db>-shm`. That was measured here, not assumed - with the desk stopped, a single
+    read-only query moved the -shm mtime. Over the bridge mount this research runs on, that is a
+    second process touching the writer's locking state from a different operating system, and
+    prod.log carries three SQLite failures in one day ("database disk image is malformed", "file
+    is not a database", "disk I/O error") on a file that passes quick_check. Read the snapshot.
+    """
+    snap = os.path.join(root, "data", "snapshots", "prod-latest.sqlite")
+    return snap if os.path.exists(snap) else os.path.join(root, "data", "prod.sqlite")
 HORIZONS = [("T-24h", 86400), ("T-12h", 43200), ("T-6h", 21600),
             ("T-3h", 10800), ("T-1h", 3600), ("T-30m", 1800)]
 
@@ -126,7 +140,7 @@ def table(rows, group, key, L, title):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--db", default=os.path.join(ROOT, "data", "prod.sqlite"))
+    ap.add_argument("--db", default=default_db(ROOT))
     ap.add_argument("--weight", type=float, default=0.5, help="market_weight the router uses")
     ap.add_argument("--out", default=os.path.join(ROOT, "reports", "wx_score.md"))
     a = ap.parse_args()

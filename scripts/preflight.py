@@ -135,24 +135,31 @@ def main():
                 print('   ' + ln.strip())
         # One order per ticker per cycle, and one cross at most. More than that in the log means
         # the loop is duplicating again.
+        # One MAKER post per ticker per CYCLE is correct; several cycles is the loop working.
+        # The bug this guards against is two posts for the same ticker in the SAME cycle, which
+        # is what leaves two live orders for one leg.
         from collections import Counter
         posts = Counter()
+        crosses = Counter()
         for ln in out.splitlines():
             parts = ln.split()
-            if len(parts) > 2 and parts[1] in ('MAKER', 'CROSS'):
-                posts[(parts[0], parts[1], parts[-3] if parts[1] == 'MAKER' else 'x')] += 1
-        dupes = {k: v for k, v in posts.items() if v > 1}
+            if len(parts) < 3:
+                continue
+            if parts[1] == 'MAKER' and 'cycle' in parts:
+                cyc = parts[parts.index('cycle') + 1]
+                posts[(parts[0], cyc)] += 1
+            elif parts[1] == 'CROSS':
+                crosses[parts[0]] += 1
+        dupes = sorted(k for k, v in posts.items() if v > 1)
         if dupes:
-            fatal.append('the execution loop posted the same leg twice in one cycle: %s'
-                         % sorted(dupes)[:3])
-            print('   DUPLICATE POSTS  %s' % sorted(dupes)[:3])
-        crosses = Counter(parts[0] for ln in out.splitlines()
-                          for parts in [ln.split()]
-                          if len(parts) > 2 and parts[1] == 'CROSS')
-        if any(v > 1 for v in crosses.values()):
-            fatal.append('a leg crossed more than once: %s'
-                         % [k for k, v in crosses.items() if v > 1])
-            print('   MULTIPLE CROSSES  %s' % [k for k, v in crosses.items() if v > 1])
+            fatal.append('two maker posts for the same leg in one cycle: %s' % dupes[:4])
+            print('   DUPLICATE POSTS  %s' % dupes[:4])
+        multi = sorted(k for k, v in crosses.items() if v > 1)
+        if multi:
+            fatal.append('a leg crossed more than once: %s' % multi)
+            print('   MULTIPLE CROSSES  %s' % multi)
+        if not dupes and not multi:
+            print('   one post per leg per cycle, one cross per leg — no duplication')
 
     print('\n' + '=' * 72)
     if fatal:

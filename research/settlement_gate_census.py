@@ -22,6 +22,20 @@ from collections import defaultdict
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 
+
+def default_db(root):
+    """The snapshot, not the live file.
+
+    A SQLite connection opened `mode=ro` still participates in WAL shared memory: it maps and
+    updates `<db>-shm`. That was measured here, not assumed - with the desk stopped, a single
+    read-only query moved the -shm mtime. Over the bridge mount this research runs on, that is a
+    second process touching the writer's locking state from a different operating system, and
+    prod.log carries three SQLite failures in one day ("database disk image is malformed", "file
+    is not a database", "disk I/O error") on a file that passes quick_check. Read the snapshot.
+    """
+    snap = os.path.join(root, "data", "snapshots", "prod-latest.sqlite")
+    return snap if os.path.exists(snap) else os.path.join(root, "data", "prod.sqlite")
+
 # ---- settlement_specs(), transcribed from src/universe.cpp -------------------------------------
 # product "" means nobody has read that series' rules; the gate treats that as unverified.
 SPECS = {
@@ -129,7 +143,7 @@ WX_STATIONS = set()
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--db", default=os.path.join(ROOT, "data", "prod.sqlite"))
+    ap.add_argument("--db", default=default_db(ROOT))
     ap.add_argument("--config", default=os.path.join(ROOT, "config", "desk.json"))
     ap.add_argument("--out", default=os.path.join(ROOT, "reports", "settlement_gate_census.md"))
     a = ap.parse_args()

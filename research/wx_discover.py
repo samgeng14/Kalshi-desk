@@ -21,6 +21,20 @@ import argparse, collections, json, os, re, sqlite3, sys, time, urllib.error, ur
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
+
+
+def default_db(root):
+    """The snapshot, not the live file.
+
+    A SQLite connection opened `mode=ro` still participates in WAL shared memory: it maps and
+    updates `<db>-shm`. That was measured here, not assumed - with the desk stopped, a single
+    read-only query moved the -shm mtime. Over the bridge mount this research runs on, that is a
+    second process touching the writer's locking state from a different operating system, and
+    prod.log carries three SQLite failures in one day ("database disk image is malformed", "file
+    is not a database", "disk I/O error") on a file that passes quick_check. Read the snapshot.
+    """
+    snap = os.path.join(root, "data", "snapshots", "prod-latest.sqlite")
+    return snap if os.path.exists(snap) else os.path.join(root, "data", "prod.sqlite")
 UA = "kalshi-desk-research (samgeng14@gmail.com)"
 KALSHI = "https://api.elections.kalshi.com/trade-api/v2"
 NWS = "https://api.weather.gov"
@@ -117,7 +131,7 @@ def main():
     ap.add_argument("--out-db", default=os.path.join(ROOT, "data", "wx_settlement.sqlite"))
     ap.add_argument("--out", default=os.path.join(ROOT, "reports", "weather_city_coverage.md"))
     ap.add_argument("--config-out", default=os.path.join(ROOT, "config", "weather_discovered.json"))
-    ap.add_argument("--desk-db", default=os.path.join(ROOT, "data", "prod.sqlite"))
+    ap.add_argument("--desk-db", default=default_db(ROOT))
     ap.add_argument("--limit", type=int, default=8)
     a = ap.parse_args()
 

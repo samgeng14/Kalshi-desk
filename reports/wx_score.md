@@ -1,6 +1,6 @@
 # Weather probability quality: model versus the price
 
-Generated 2026-09-12 22:19:48Z. Negative `raw - market` means the model's own number beat the mid.
+Generated 2026-09-12 23:06:28Z. Negative `raw - market` means the model's own number beat the mid.
 
 354 observations, 149 contracts, **31 settled event-days**, 6 distinct dates, 6 cities. Skipped: 748 horizons with a one-sided book, 8 with no quote yet.
 

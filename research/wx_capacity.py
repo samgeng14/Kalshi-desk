@@ -20,6 +20,20 @@ import argparse, collections, importlib.util, math, os, random, sqlite3, sys, ti
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
+
+
+def default_db(root):
+    """The snapshot, not the live file.
+
+    A SQLite connection opened `mode=ro` still participates in WAL shared memory: it maps and
+    updates `<db>-shm`. That was measured here, not assumed - with the desk stopped, a single
+    read-only query moved the -shm mtime. Over the bridge mount this research runs on, that is a
+    second process touching the writer's locking state from a different operating system, and
+    prod.log carries three SQLite failures in one day ("database disk image is malformed", "file
+    is not a database", "disk I/O error") on a file that passes quick_check. Read the snapshot.
+    """
+    snap = os.path.join(root, "data", "snapshots", "prod-latest.sqlite")
+    return snap if os.path.exists(snap) else os.path.join(root, "data", "prod.sqlite")
 _spec = importlib.util.spec_from_file_location("wxh", os.path.join(HERE, "wx_horizons.py"))
 WXH = importlib.util.module_from_spec(_spec); _spec.loader.exec_module(WXH)
 fee, iso_to_epoch = WXH.fee, WXH.iso_to_epoch
@@ -123,7 +137,7 @@ def load(db, weight, sample_s, uncertainty_k):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--db", default=os.path.join(ROOT, "data", "prod.sqlite"))
+    ap.add_argument("--db", default=default_db(ROOT))
     ap.add_argument("--weight", type=float, default=0.5)
     ap.add_argument("--sample-seconds", type=int, default=1800)
     ap.add_argument("--uncertainty-k", type=float, default=0.5)
