@@ -165,4 +165,14 @@ if(PYTHON3_EXE)
   # the registered sample.
   add_test(NAME commodity-ladder
            COMMAND ${PYTHON3_EXE} ${CMAKE_SOURCE_DIR}/research/commodity_ladder.py --self-test)
+  # The channel-behaviour report refuses to conclude from a short recording, and a database that
+  # predates the observability fields is described rather than misread.
+  add_test(NAME commodity-channel
+           COMMAND ${PYTHON3_EXE} ${CMAKE_SOURCE_DIR}/research/commodity_channel_behavior.py --self-test)
+  # The impulse lane's causal audit: an adversarial target built on pre-entry information must be
+  # refused, and provenance must survive arithmetic so it cannot be laundered.
+  add_test(NAME impulse-audit
+           COMMAND ${PYTHON3_EXE} ${CMAKE_SOURCE_DIR}/research/impulse_target_audit.py --self-test)
+  add_test(NAME impulse-prepare
+           COMMAND ${PYTHON3_EXE} ${CMAKE_SOURCE_DIR}/research/impulse_prepare.py --self-test)
 endif()

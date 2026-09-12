@@ -82,6 +82,28 @@ struct VolSettings {
   double band_ratio = 0.25;           // +/- this much on sigma gives the quote's own uncertainty
   double max_ratio_to_hour = 4.0;     // a spike cannot take sigma above this times the hourly estimate
   double min_ratio_to_hour = 0.25;
+
+  // What to do with a return that spans a long silence on the feed. This is a modelling choice
+  // forced by an ambiguity the desk cannot presently resolve, so it is a setting with two named
+  // positions rather than a constant buried in a loop:
+  //
+  //   DropUncertain  a return spanning more than `max_return_gap_seconds` of silence is thrown
+  //                  away. Correct if a silence means the source stopped publishing, because then
+  //                  the move happened at an unknown time and dividing it by the gap is a guess.
+  //                  It biases sigma UP if a silence really means "the price did not change",
+  //                  since it discards precisely the calm stretches.
+  //
+  //   IncludeAll     every sampled interval is differenced, however long. Correct if the channel
+  //                  only emits on a change, because then the forward-filled path is exact and a
+  //                  long flat stretch is a genuine run of zero returns.
+  //
+  // Which is right is an empirical question about the channel, and `unchanged_value_messages` in
+  // the feed's status is the measurement that answers it: a channel that suppresses unchanged
+  // values can never send one, so a single occurrence settles it. Until then the conservative
+  // position is the default and the research ladder races both.
+  enum class GapPolicy { DropUncertain, IncludeAll };
+  GapPolicy long_gap_policy = GapPolicy::DropUncertain;
+  long long max_return_gap_seconds = 120;
 };
 
 struct VolEstimate {

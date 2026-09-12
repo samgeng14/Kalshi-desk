@@ -1,3 +1,19 @@
+> **WITHDRAWN — 2026-09-12. Do not cite any number below this line.**
+>
+> An adversarial review of this report found that `evaluate()` charged a full Kalshi round trip on
+> every bar while the position only changes sign on about half of them (median turnover 0.54). The
+> cost hurdle was roughly 1.9x too harsh, and the report's sharpest claim — that the two published
+> mechanisms clear the hurdle zero times out of 84 — is an artifact of that costing. Under the
+> corrected convention the LASSO clears 3 times of 42 and the seesaw rule once of 42.
+>
+> Two further defects: `seesaw sign (minus basket)` is exactly `-1 x` `equal-weight basket`, so 42
+> of the 210 specifications carry no independent information and were double-counted as separate
+> tries; and the null rolled the whole panel rather than the target alone, so each draw silently
+> evaluated a different calendar window, widening the null and biasing it toward this report's own
+> conclusion.
+>
+> The corrected analysis is being rerun. This file is kept unedited so the error is on the record.
+
 # Cross-crypto return predictability — replication result
 
 **Status: `FAILED_SELECTION`.** The one specification that cleared the cost hurdle is inside the

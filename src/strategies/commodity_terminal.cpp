@@ -242,15 +242,17 @@ void CommodityTerminal::record_checkpoints(const std::vector<Market>& markets, S
           "INSERT INTO commodity_calibration(ts,ticker,event_ticker,series_ticker,model,model_version,"
           "checkpoint_seconds,seconds_to_close,tau_seconds,p_model,sigma_model,band,spot,strike,"
           "distance_sigma,vol_sigma,vol_warm,vol_rv_5m,vol_ewma,vol_samples,reference_ts,reference_age,"
-          "reference_gap_ms,reference_fresh,replication_consecutive,settlement_verified,yes_bid,yes_ask,"
+          "reference_message_gap_ms,reference_unchanged_age_ms,reference_observed_fresh,"
+          "replication_consecutive,settlement_verified,yes_bid,yes_ask,"
           "no_bid,no_ask,quote_ts,strike_type) "
-          "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+          "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
           {now, m.ticker, m.event_ticker, m.series_ticker, u_.model_name, std::string("v1"),
            checkpoints_[i], left, e->dist.tau_seconds, e->p, 0.5 * e->band + 0.01, e->band,
            e->dist.spot, e->strike, e->sigma_move, e->vol.sigma, e->vol.warm ? 1LL : 0LL,
            e->vol.rv_5m, e->vol.ewma, static_cast<long long>(e->vol.samples),
-           e->value.received_ts_ms / 1000, static_cast<double>(e->feed_age), e->value.gap_ms,
-           e->value.fresh ? 1LL : 0LL, rep ? rep->consecutive_matches : 0LL,
+           e->value.received_ts_ms / 1000, static_cast<double>(e->feed_age),
+           e->value.message_gap_ms, e->value.unchanged_age_ms,
+           e->value.observed_value_fresh ? 1LL : 0LL, rep ? rep->consecutive_matches : 0LL,
            settlement_verified(m).value_or(false) ? 1LL : 0LL,
            m.yes_bid, m.yes_ask, m.no_bid, m.no_ask, m.quote_ts, m.strike_type});
     }
@@ -379,8 +381,13 @@ std::optional<Fair> CommodityTerminal::fair(const Market& m, const Series&, Stor
   // answered below by research_only, because those rows are worth pricing and recording even
   // though they are worth showing to nobody.
   json reasons = json::array();
+  // The desk will not price from a value whose recency it cannot verify. Note what this says and
+  // what it does not: the observation is old, which is a fact about what we have seen. Whether
+  // the source stopped publishing or simply had nothing new to send is not visible from here, and
+  // the reason shown says so rather than diagnosing the venue.
   if (feed_age > feed_->settings().stale_after_seconds)
-    reasons.push_back("reference feed is " + std::to_string(feed_age) + "s old (limit " +
+    reasons.push_back("reference observation too old: " + std::to_string(feed_age) + "s since the "
+                      "last message for this underlying (limit " +
                       std::to_string(feed_->settings().stale_after_seconds) + "s)");
   if (!vol.warm)
     for (const auto& p2 : vol.problems) reasons.push_back(p2);
@@ -391,6 +398,9 @@ std::optional<Fair> CommodityTerminal::fair(const Market& m, const Series&, Stor
                    {"reference_price", dist.spot},
                    {"reference_source_ts_ms", value.source_ts_ms},
                    {"reference_age_seconds", feed_age},
+                   {"reference_message_gap_ms", value.message_gap_ms},
+                   {"reference_unchanged_age_ms", value.unchanged_age_ms},
+                   {"reference_observed_fresh", value.observed_value_fresh},
                    {"strike", strike},
                    {"payoff", payoff.to_json()},
                    {"seconds_to_close", seconds_to_close},

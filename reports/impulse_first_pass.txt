@@ -1,0 +1,167 @@
+
+========================================================================================================
+BTC: external move >= 3 bps over 1000 ms, cooldown 2s, taker entry 250 ms after the signal
+========================================================================================================
+  RESOLUTION. Kalshi quotes this contract every 1000 ms (median, p90 1004 ms). Nothing below that is measured.
+  The book delta stream is dense enough for millisecond timing but no snapshot was
+  captured, so it gives WHEN the book moved and never to what price.
+  169 events, 164 with a quote to enter on (0 had none, 5 only had one too late to call an entry, 0 refused by the causal audit)
+  14.15 hours recorded, 14.00 hours spanned by these events, 6,901,732 book messages behind the activity column
+  achieved entry latency (signal to the quote we could have taken): median 755 ms, p90 1107 ms, max 2316 ms
+
+  PREDICTION QUALITY - midpoint markout after entry, in the direction of the impulse.
+  This says whether the move continued. It is not money and is never added to the table below.
+    horizon      n   mean bps    median  hit rate          90% CI (by event)
+       250ms    164      -0.66     -0.38    36.0%             [-1.02, -0.30]
+       500ms    164      -0.66     -0.38    36.0%             [-1.02, -0.30]
+      1000ms    164      -0.79     -0.38    37.2%             [-1.23, -0.36]
+      2000ms    164      -0.67     -0.54    42.1%             [-1.22, -0.14]
+      5000ms    164      -0.20     -0.68    42.1%             [-0.95, +0.57]
+     10000ms    164      -0.66     -0.74    42.7%             [-1.64, +0.38]
+     30000ms    164      +0.10     -0.13    49.4%             [-1.77, +1.95]
+     60000ms    164      +0.93     -0.41    48.2%             [-1.23, +2.98]
+
+  EXECUTABLE - taker in at the ask, taker out at the bid, 24 bps of fees.
+  research/impulse_viability.md already shows a perfect oracle on the top decile of
+  one-minute BTC moves loses 3.2 bps at a 17 bps round trip, so a negative here at these
+  horizons is arithmetic, not evidence about the signal.
+    horizon      n   mean bps  hit rate          90% CI (by event)
+       250ms    164     -25.22     0.0%           [-25.58, -24.85]
+       500ms    164     -25.22     0.0%           [-25.58, -24.85]
+      1000ms    164     -25.36     0.0%           [-25.81, -24.92]
+      2000ms    164     -25.24     0.0%           [-25.79, -24.71]
+      5000ms    164     -24.79     0.0%           [-25.52, -24.03]
+     10000ms    164     -25.18     0.6%           [-26.15, -24.16]
+     30000ms    164     -24.37     4.9%           [-26.23, -22.52]
+     60000ms    164     -23.53     7.9%           [-25.70, -21.48]
+
+  164 trades over 14.00 recorded hours at the 10s horizon: -25.18 bps per trade, 11.7 trades per recorded hour.
+  Not extrapolated to a day and not annualized: this is a fraction of one day.
+
+  BASELINES on the chronologically last 41 events, 10s horizon.
+  Nothing richer is worth building until it beats these, out of sample, on these events.
+                            baseline      n   markout bps   executable   agrees w/ impulse
+                           B0 random     41         -0.58       -24.53                46%
+                     B1 target venue     37         -0.41       -24.46                78%
+                         B2 coinbase     41         -1.56       -25.90               100%
+               B3 cross-venue median     41         -1.56       -25.90               100%
+                   B4 threshold only     41         -1.56       -25.90               100%
+     B5 composite minus target (lag)     41         -0.32       -24.49                68%
+
+  MARKET RESPONSE CURVE
+  Three clocks, because the recording supports three claims at three resolutions and
+  running them together would let the coarsest borrow the finest one's precision.
+
+    2-5 bps  (n=165, mean external move 3.4 bps)
+       delay   external bps   % of move   book activity   Kalshi quoted   % of move
+      -1000ms      (control)                      1.15x                            
+       -500ms      (control)                      3.43x                            
+       -250ms      (control)                      2.38x                            
+         50ms          +0.11         3%           2.86x    not measured            
+        100ms          +0.24         7%           2.18x    not measured            
+        250ms          +0.44        13%           2.24x    not measured            
+        500ms          +0.71        21%           2.23x    not measured            
+       1000ms          +1.04        31%           1.94x    not measured            
+       2000ms          +1.42        42%           1.39x           +2.52         74%
+       5000ms          +2.12        62%           0.99x           +2.94         87%
+      10000ms          +2.20        65%               -           +2.61         77%
+
+    "not measured" is where the delay is shorter than Kalshi's own 1000 ms
+    quote cadence. Book activity is a multiple of the message rate in the ten seconds
+    before the event: it says the book was moving, not where it moved to.
+
+    READ THE CONTROL on 2-5 bps: the book was already at 3.43x half a second
+    BEFORE the detector fired, against 2.86x just after. The elevation is not a
+    reaction to this signal. An event stamped at the END of its detection window is
+    already up to that window old, so activity "before" the stamp may be activity
+    during the move. Nothing here supports a claim that Kalshi reacts in 50 ms; what
+    it does support is that the book is busy around these moves, which is not news.
+
+  causal audit: 2,788 realized components checked, 0 refused
+
+========================================================================================================
+ETH: external move >= 3 bps over 1000 ms, cooldown 2s, taker entry 250 ms after the signal
+========================================================================================================
+  RESOLUTION. Kalshi quotes this contract every 1000 ms (median, p90 1004 ms). Nothing below that is measured.
+  The book delta stream is dense enough for millisecond timing but no snapshot was
+  captured, so it gives WHEN the book moved and never to what price.
+  526 events, 512 with a quote to enter on (0 had none, 14 only had one too late to call an entry, 0 refused by the causal audit)
+  14.15 hours recorded, 14.00 hours spanned by these events, 8,076,754 book messages behind the activity column
+  achieved entry latency (signal to the quote we could have taken): median 788 ms, p90 1182 ms, max 2815 ms
+
+  PREDICTION QUALITY - midpoint markout after entry, in the direction of the impulse.
+  This says whether the move continued. It is not money and is never added to the table below.
+    horizon      n   mean bps    median  hit rate          90% CI (by event)
+       250ms    512      -0.79     -0.40    38.1%             [-1.05, -0.54]
+       500ms    512      -1.17     -0.49    38.1%             [-1.97, -0.61]
+      1000ms    512      -0.98     -0.40    39.3%             [-1.77, -0.39]
+      2000ms    512      -0.99     -0.39    42.2%             [-1.83, -0.35]
+      5000ms    512      -0.63     -0.39    45.7%             [-1.52, +0.13]
+     10000ms    512      -0.70     -0.77    43.9%             [-1.69, +0.18]
+     30000ms    512      +0.11     -0.20    48.2%             [-1.62, +1.85]
+     60000ms    512      +0.75     -1.16    47.1%             [-1.53, +2.91]
+
+  EXECUTABLE - taker in at the ask, taker out at the bid, 24 bps of fees.
+  research/impulse_viability.md already shows a perfect oracle on the top decile of
+  one-minute BTC moves loses 3.2 bps at a 17 bps round trip, so a negative here at these
+  horizons is arithmetic, not evidence about the signal.
+    horizon      n   mean bps  hit rate          90% CI (by event)
+       250ms    512     -25.53     0.0%           [-25.80, -25.28]
+       500ms    512     -25.91     0.0%           [-26.70, -25.35]
+      1000ms    512     -25.71     0.0%           [-26.50, -25.11]
+      2000ms    512     -25.70     0.2%           [-26.57, -25.06]
+      5000ms    512     -25.31     0.4%           [-26.20, -24.56]
+     10000ms    512     -25.39     1.4%           [-26.38, -24.53]
+     30000ms    512     -24.56     5.5%           [-26.28, -22.80]
+     60000ms    512     -23.89    11.5%           [-26.16, -21.73]
+
+  512 trades over 14.00 recorded hours at the 10s horizon: -25.39 bps per trade, 36.6 trades per recorded hour.
+  Not extrapolated to a day and not annualized: this is a fraction of one day.
+
+  BASELINES on the chronologically last 128 events, 10s horizon.
+  Nothing richer is worth building until it beats these, out of sample, on these events.
+                            baseline      n   markout bps   executable   agrees w/ impulse
+                           B0 random    128         -2.24       -26.22                51%
+                     B1 target venue    111         +1.12       -23.15                80%
+                         B2 coinbase    128         -2.28       -26.75               100%
+               B3 cross-venue median    128         -2.28       -26.75               100%
+                   B4 threshold only    128         -2.28       -26.75               100%
+     B5 composite minus target (lag)    128         -1.48       -25.71                74%
+
+  MARKET RESPONSE CURVE
+  Three clocks, because the recording supports three claims at three resolutions and
+  running them together would let the coarsest borrow the finest one's precision.
+
+    2-5 bps  (n=479, mean external move 3.5 bps)
+       delay   external bps   % of move   book activity   Kalshi quoted   % of move
+      -1000ms      (control)                      1.03x                            
+       -500ms      (control)                      1.36x                            
+       -250ms      (control)                      1.44x                            
+         50ms          +0.14         4%           2.00x    not measured            
+        100ms          +0.28         8%           1.48x    not measured            
+        250ms          +0.53        15%           1.27x    not measured            
+        500ms          +0.76        22%           1.24x    not measured            
+       1000ms          +1.09        32%           1.12x    not measured            
+       2000ms          +1.43        41%           1.02x           +3.19         92%
+       5000ms          +2.05        59%           1.06x           +3.39         98%
+      10000ms          +2.16        62%               -           +3.11         90%
+
+    5-10 bps  (n=44, mean external move 6.2 bps)
+       delay   external bps   % of move   book activity   Kalshi quoted   % of move
+      -1000ms      (control)                      1.28x                            
+       -500ms      (control)                      0.98x                            
+       -250ms      (control)                      1.26x                            
+         50ms          +0.16         3%           1.20x    not measured            
+        100ms          +0.39         6%           0.93x    not measured            
+        250ms          +0.49         8%           1.03x    not measured            
+        500ms          +0.47         8%           0.97x    not measured            
+       1000ms          +0.71        11%           1.18x    not measured            
+       2000ms          +0.96        15%           1.00x           +2.31         37%
+       5000ms          +2.71        43%           0.88x           +4.85         78%
+      10000ms          +4.94        79%               -           +7.60        122%
+
+    "not measured" is where the delay is shorter than Kalshi's own 1000 ms
+    quote cadence. Book activity is a multiple of the message rate in the ten seconds
+    before the event: it says the book was moving, not where it moved to.
+
+  causal audit: 8,704 realized components checked, 0 refused

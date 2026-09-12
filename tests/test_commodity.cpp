@@ -208,7 +208,7 @@ static void test_volatility_estimate() {
     CHECK(!q.warm);
     CHECK(q.samples < s.min_samples);
     bool said_quiet = false;
-    for (const auto& why : q.problems) said_quiet = said_quiet || why.find("speaking for") != std::string::npos;
+    for (const auto& why : q.problems) said_quiet = said_quiet || why.find("carried observations we can difference") != std::string::npos;
     CHECK(said_quiet);
   }
   // A gap in the middle: a quiet hour, twenty minutes of silence, then the price reappears half a
@@ -609,7 +609,8 @@ static void test_reference_feed() {
     CHECK(f4.status().value("pending_rows", 0) == 2);      // still queued, not lost
     st4.exec("CREATE TABLE commodity_reference(id INTEGER PRIMARY KEY AUTOINCREMENT,"
              "ts_received INTEGER, ts_exchange INTEGER, symbol TEXT, source TEXT, price REAL,"
-             "sequence INTEGER, raw_json TEXT, gap_ms INTEGER, fresh INTEGER)");
+             "sequence INTEGER, raw_json TEXT, message_gap_ms INTEGER, unchanged_age_ms INTEGER,"
+             "value_changed INTEGER, observed_value_fresh INTEGER)");
     CHECK(f4.flush(t4 / 1000 + 3) == 2);                   // and written once the table is back
   }
   // The settlement check: our candle against Kalshi's published strike.
@@ -687,39 +688,139 @@ static void test_raw_capture_and_schema() {
   CHECK(!advertised.empty() && advertised[0] == "Metal.Index.GOLD/USD");
 }
 
-// Silence is not a market that stopped moving. Kalshi deduplicates this channel, so a price that
-// does not change arrives as nothing at all; the contract settles on that carried-forward value,
-// but the desk must know it was carried rather than observed.
-static void test_carried_forward_is_marked_not_rejected() {
+// A silence and an unchanged price are NOT the same observation, and the desk must not record
+// them as though they were.
+//
+// Kalshi documents this channel as deduplicated, which says repeats are removed. It does not say
+// whether a message is emitted on every scheduled source update when the value has not changed.
+// So a gap has two explanations - the source published nothing, or the value did not move and the
+// venue sent nothing - and this desk cannot tell them apart. What it CAN see is when it last
+// heard anything, and when the value last changed. Those are recorded separately, and the
+// trade gate uses the first, because the desk should not price from a value whose recency it
+// cannot verify. Neither field claims the source stopped.
+static void test_message_gap_and_unchanged_age_are_different_facts() {
   const std::string GOLD = "Metal.Index.GOLD/USD";
   Store st(":memory:");
   ReferenceFeedSettings s; s.ws_url = ""; s.record_min_interval_ms = 0;
-  s.stale_gap_multiple = 8.0; s.stale_gap_floor_ms = 2000;
-  ReferenceFeed feed(st, s, nullptr);
+  s.long_gap_multiple = 8.0; s.long_gap_floor_ms = 2000;
   const long long t0 = 1789160400000;
+
+  // Case 1: the messages keep coming and the price does not move. Thirty seconds of an unchanging
+  // market, fully observed.
+  ReferenceFeed talking(st, s, nullptr);
   long long t = t0;
-  // 60 observations at the feed's own cadence (200ms, as gold publishes).
   for (int i = 0; i < 60; ++i, t += 200)
-    feed.on_message_for_tests(pyth_msg(GOLD, 4300.0 + i * 0.01, t, i + 1), t);
-  auto v = feed.latest(GOLD);
-  CHECK(v && v->fresh && v->gap_ms == 200);
-  CHECK(feed.status()["symbols"][GOLD].value("cadence_ms", 0) == 200);
-  CHECK(feed.status()["symbols"][GOLD].value("stale_periods", -1) == 0);
-  // Then thirty seconds of silence, and a price on the far side of it.
-  const long long last_seen = t - 200;          // the loop left t one cadence past the last message
-  t = last_seen + 30000;
-  feed.on_message_for_tests(pyth_msg(GOLD, 4302.0, t, 61), t);
-  v = feed.latest(GOLD);
-  CHECK(v && !v->fresh);                       // the value before it was being carried forward
-  CHECK(v && v->gap_ms == 30000);
-  CHECK(std::fabs(v->price - 4302.0) < 1e-9);  // and it is still the price: not an error
-  CHECK(feed.status()["symbols"][GOLD].value("stale_periods", 0) == 1);
-  CHECK(feed.status()["symbols"][GOLD].value("longest_gap_ms", 0) == 30000);
-  // The recorded row carries both, so a replay can tell an observation from a carry.
-  feed.flush(t / 1000 + 1);
-  json rows = st.query("SELECT gap_ms, fresh FROM commodity_reference ORDER BY id DESC LIMIT 1");
-  CHECK(!rows.empty() && rows[0].value("gap_ms", 0LL) == 30000);
-  CHECK(!rows.empty() && rows[0].value("fresh", 1LL) == 0);
+    talking.on_message_for_tests(pyth_msg(GOLD, 4300.0 + i * 0.01, t, i + 1), t);
+  const long long changed_at = t - 200;
+  for (int i = 0; i < 150; ++i, t += 200)                 // 30s of the SAME value, still arriving
+    talking.on_message_for_tests(pyth_msg(GOLD, 4300.59, t, 100 + i), t);
+  auto v1 = talking.latest(GOLD);
+  CHECK(v1 && v1->message_gap_ms == 200);                 // we are hearing from it constantly
+  CHECK(v1 && v1->observed_value_fresh);                  // so the value's recency is verified
+  CHECK(v1 && !v1->value_changed);                        // and it has not moved
+  CHECK(v1 && v1->unchanged_age_ms >= 29000);             // for about thirty seconds
+  json st1 = talking.status()["symbols"][GOLD];
+  // The measurement that would settle what a silence means: a channel that suppressed unchanged
+  // values could never send one, so seeing them proves it does not suppress them.
+  CHECK(st1.value("unchanged_value_messages", 0) >= 149);
+  CHECK(st1.value("long_message_gaps", -1) == 0);
+  CHECK(v1 && v1->value_change_ts_ms >= changed_at);
+
+  // Case 2: the messages stop for thirty seconds, then one arrives with a different price. The
+  // value is the same age as case 1 in wall-clock terms, and everything else about it differs.
+  Store st2(":memory:");
+  ReferenceFeed silent(st2, s, nullptr);
+  long long u = t0;
+  for (int i = 0; i < 60; ++i, u += 200)
+    silent.on_message_for_tests(pyth_msg(GOLD, 4300.0 + i * 0.01, u, i + 1), u);
+  const long long last_heard = u - 200;
+  u = last_heard + 30000;
+  silent.on_message_for_tests(pyth_msg(GOLD, 4302.0, u, 200), u);
+  auto v2 = silent.latest(GOLD);
+  CHECK(v2 && v2->message_gap_ms == 30000);               // we heard nothing for thirty seconds
+  CHECK(v2 && !v2->observed_value_fresh);                 // so we cannot vouch for what we held
+  CHECK(v2 && v2->value_changed);                         // and the number that arrived is new
+  CHECK(v2 && v2->unchanged_age_ms == 0);                 // it changed just now
+  json st2s = silent.status()["symbols"][GOLD];
+  CHECK(st2s.value("unchanged_value_messages", -1) == 0); // nothing here proves anything about the channel
+  CHECK(st2s.value("long_message_gaps", 0) == 1);
+  CHECK(st2s.value("longest_gap_ms", 0) == 30000);
+
+  // The two cases must be distinguishable in the recorded research output. They agree on the
+  // thing a naive field would have collapsed them into - "the value is thirty seconds old" - and
+  // disagree on everything that matters.
+  talking.flush(t / 1000 + 1);
+  silent.flush(u / 1000 + 1);
+  json a = st.query("SELECT message_gap_ms, unchanged_age_ms, value_changed, observed_value_fresh"
+                    " FROM commodity_reference ORDER BY id DESC LIMIT 1");
+  json b = st2.query("SELECT message_gap_ms, unchanged_age_ms, value_changed, observed_value_fresh"
+                     " FROM commodity_reference ORDER BY id DESC LIMIT 1");
+  CHECK(!a.empty() && !b.empty());
+  if (!a.empty() && !b.empty()) {
+    CHECK(a[0].value("message_gap_ms", -1LL) == 200 && b[0].value("message_gap_ms", -1LL) == 30000);
+    CHECK(a[0].value("observed_value_fresh", -1LL) == 1 && b[0].value("observed_value_fresh", -1LL) == 0);
+    CHECK(a[0].value("value_changed", -1LL) == 0 && b[0].value("value_changed", -1LL) == 1);
+    CHECK(a[0].value("unchanged_age_ms", -1LL) >= 29000 && b[0].value("unchanged_age_ms", -1LL) == 0);
+    // The one field that would have made them look identical.
+    CHECK(a[0].value("message_gap_ms", 0LL) != b[0].value("message_gap_ms", 0LL));
+  }
+}
+
+// The volatility estimator acts on the same ambiguity, so its choice is a named setting rather
+// than a constant in a loop, and the two positions must actually produce different numbers.
+static void test_gap_policy_is_a_choice_not_an_assumption() {
+  const long long now = 1789160000;
+  // A quiet hour with one twenty-minute silence in the middle, and a move across it.
+  std::vector<std::pair<long long, double>> ticks;
+  double px = 4350.0;
+  unsigned long long rng = 999;
+  for (long long t = now - 3600; t <= now - 1800; t += 5) {
+    rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+    px *= std::exp(0.00002 * (static_cast<double>(rng % 2000001) / 1000000.0 - 1.0));
+    ticks.emplace_back(t, px);
+  }
+  const double before = px;
+  for (long long t = now - 600; t <= now; t += 5) {
+    rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+    px *= std::exp(0.00002 * (static_cast<double>(rng % 2000001) / 1000000.0 - 1.0));
+    ticks.emplace_back(t, t == now - 600 ? before * 1.004 : px);
+  }
+  VolSettings drop;                       // the default: a move across a long silence is discarded
+  VolSettings include = drop;
+  include.long_gap_policy = VolSettings::GapPolicy::IncludeAll;
+  VolEstimate a = estimate_volatility(ticks, now, drop);
+  VolEstimate b = estimate_volatility(ticks, now, include);
+  CHECK(a.sigma > 0 && b.sigma > 0);
+  CHECK(a.sigma != b.sigma);              // the choice is not cosmetic
+  CHECK(a.rv_60m != b.rv_60m);
+  // And the estimate says which position produced it, so a recorded sigma can be read later.
+  CHECK(a.basis.find("dropped") != std::string::npos);
+  CHECK(b.basis.find("every sampled interval") != std::string::npos);
+  // Which way the difference goes depends on how big the move across the silence was, so neither
+  // policy is uniformly safer. But the case Sam's objection is about has a determinate direction:
+  // if a silence really means "the price did not change", then the value on the far side is the
+  // SAME, dropping the interval throws away a genuine stretch of calm, and the estimate comes out
+  // too high. Here is that case, with the bias it produces.
+  {
+    std::vector<std::pair<long long, double>> flat;
+    double q = 4350.0;
+    unsigned long long r2 = 4242;
+    for (long long t = now - 3600; t <= now - 1800; t += 5) {
+      r2 ^= r2 << 13; r2 ^= r2 >> 7; r2 ^= r2 << 17;
+      q *= std::exp(0.00002 * (static_cast<double>(r2 % 2000001) / 1000000.0 - 1.0));
+      flat.emplace_back(t, q);
+    }
+    const double held = q;                     // nothing moved for twenty minutes
+    for (long long t = now - 600; t <= now; t += 5) {
+      r2 ^= r2 << 13; r2 ^= r2 >> 7; r2 ^= r2 << 17;
+      q *= std::exp(0.00002 * (static_cast<double>(r2 % 2000001) / 1000000.0 - 1.0));
+      flat.emplace_back(t, t == now - 600 ? held : q);
+    }
+    VolEstimate f_drop = estimate_volatility(flat, now, drop);
+    VolEstimate f_incl = estimate_volatility(flat, now, include);
+    CHECK(f_incl.rv_60m < f_drop.rv_60m);      // the calm is counted rather than discarded
+    CHECK(f_drop.rv_60m > 0 && f_incl.rv_60m > 0);
+  }
 }
 
 // Priority 7's prerequisite. The desk's ordinary market data is a REST poll every five seconds,
@@ -767,6 +868,39 @@ static void test_market_quote_feed() {
   CHECK(q.status().value("unparsed", 0) == 2);
   CHECK(q.flush(t0 / 1000 + 1) == 0);
   CHECK(q.status().value("recorded", 0) == 1);
+
+  // The book, kept as the venue sent it. This is the stream that can answer "could I have
+  // executed this quantity"; the ticker above can only answer "did the quoted price move", and a
+  // fill claim built on ticker data describes a price nobody could have taken.
+  q.on_message_for_tests(
+      R"({"type":"subscribed","id":2,"msg":{"channel":"orderbook_delta","sid":7}})", t0 + 1500);
+  q.on_message_for_tests(
+      R"({"type":"orderbook_snapshot","sid":7,"seq":100,"msg":{"market_ticker":"KXWTI15M-A",)"
+      R"("ts_ms":1789160400100}})", t0 + 1600);
+  q.on_message_for_tests(
+      R"({"type":"orderbook_delta","sid":7,"seq":101,"msg":{"market_ticker":"KXWTI15M-A",)"
+      R"("price":"0.47","delta":"-25.00","side":"bid","ts_ms":1789160400200}})", t0 + 1700);
+  // A missing message is counted rather than interpolated over: a book reconstructed across a
+  // gap is a book that never existed.
+  q.on_message_for_tests(
+      R"({"type":"orderbook_delta","sid":7,"seq":104,"msg":{"market_ticker":"KXWTI15M-A",)"
+      R"("price":"0.48","delta":"10.00","side":"ask","ts_ms":1789160400400}})", t0 + 1800);
+  CHECK(q.flush(t0 / 1000 + 2) == 0);          // no new ticker rows, book rows are their own stream
+  json be = st.query("SELECT kind, sequence, side, price, delta, ts_exchange_ms FROM commodity_book_events ORDER BY id");
+  CHECK(be.size() == 3);
+  if (be.size() == 3) {
+    CHECK(be[0].value("kind", "") == "orderbook_snapshot" && be[0].value("sequence", 0LL) == 100);
+    CHECK(be[1].value("side", "") == "bid" && std::fabs(be[1].value("delta", 0.0) + 25.0) < 1e-9);
+    CHECK(be[2].value("sequence", 0LL) == 104);
+    CHECK(be[1].value("ts_exchange_ms", 0LL) == 1789160400200LL);
+  }
+  json qs = q.status();
+  CHECK(qs.value("book_messages", 0) == 3);
+  CHECK(qs.value("book_snapshots", 0) == 1);
+  CHECK(qs.value("book_sequence_gaps", 0) == 1);      // 101 -> 104
+  CHECK(qs.value("book_recorded", 0) == 3);
+  // And the venue's own subscription id is used, not a guessed one.
+  CHECK(qs["subscription_ids"].value("orderbook_delta", 0) == 7);
 
   MarketQuoteFeed::Settings prod = market_quote_settings(json::object(), "prod");
   CHECK(prod.ws_url == "wss://external-api-ws.kalshi.com/trade-api/ws/v2");
@@ -939,7 +1073,7 @@ static void test_strategy_blocks_without_a_good_reference() {
       CHECK(!f->inputs.value("valid", true));
       bool said_so = false;
       for (const auto& r : f->inputs["reasons"])
-        said_so = said_so || r.get<std::string>().find("reference feed is") != std::string::npos;
+        said_so = said_so || r.get<std::string>().find("reference observation too old") != std::string::npos;
       CHECK(said_so);
       CHECK(!quote_from_fair(gold_market(open, 4350.0), "Commodities", "commodity_terminal_gold", *f,
                              f->research_only, f->research_reason, now, now).inputs_valid);
@@ -1149,7 +1283,7 @@ static void test_calibration_checkpoints() {
   }
   json rows = st.query(
       "SELECT checkpoint_seconds, seconds_to_close, p_model, spot, strike, distance_sigma, vol_sigma,"
-      " yes_ask, reference_fresh, settlement_verified, model, tau_seconds"
+      " yes_ask, reference_observed_fresh, settlement_verified, model, tau_seconds"
       " FROM commodity_calibration ORDER BY checkpoint_seconds DESC");
   CHECK(rows.size() == 7);                     // 14m, 10m, 5m, 2m, 1m, 30s, 10s - each exactly once
   std::vector<double> want{840, 600, 300, 120, 60, 30, 10};
@@ -1162,7 +1296,7 @@ static void test_calibration_checkpoints() {
     CHECK(std::fabs(rows[i].value("strike", 0.0) - w.at_open) < 1e-6);
     CHECK(rows[i].value("vol_sigma", 0.0) > 0);
     CHECK(rows[i].value("model", "") == "commodity_terminal_gold");
-    CHECK(rows[i].value("reference_fresh", -1) == 1);
+    CHECK(rows[i].value("reference_observed_fresh", -1) == 1);
     // The market it was priced against, so the edge can be computed from the row alone.
     CHECK(std::fabs(rows[i].value("yes_ask", 0.0) - 0.52) < 1e-9);
   }
@@ -1408,7 +1542,8 @@ int main() {
   test_market_quote_feed();
   test_reference_feed_settings();
   test_raw_capture_and_schema();
-  test_carried_forward_is_marked_not_rejected();
+  test_message_gap_and_unchanged_age_are_different_facts();
+  test_gap_policy_is_a_choice_not_an_assumption();
   test_strategy_prices_from_the_reference();
   test_strategy_blocks_without_a_good_reference();
   test_replication_checks_the_window_being_priced();

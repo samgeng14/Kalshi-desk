@@ -45,12 +45,20 @@ struct ReferenceFeedSettings {
   // that surprised the parser. The schema of this channel is documented but has never been seen
   // by this desk, and a schema you have inferred from your own parser is not evidence.
   int raw_frames_to_keep = 100;
-  // The feed publishes at a fixed rate (Kalshi's own stream is deduplicated, so an unchanged
-  // value arrives as silence rather than as a repeated message). A gap longer than this many
-  // multiples of the symbol's own measured cadence means the value we are holding is being
-  // carried forward, which is what the contract settles on but is NOT a new observation.
-  double stale_gap_multiple = 8.0;
-  int stale_gap_floor_ms = 2000;           // never call a gap stale below this, whatever the cadence
+  // How long a silence has to be before the desk stops trusting the recency of the value it is
+  // holding. This is a statement about OUR observation and nothing else.
+  //
+  // Kalshi documents this channel as deduplicated. That tells us repeats are removed; it does not
+  // tell us whether a message is emitted on every scheduled source update when the value has not
+  // changed. So a silence has two possible explanations - the source published nothing, or the
+  // value did not change and the venue sent nothing - and this desk cannot presently tell them
+  // apart. It therefore does not claim to. `observed_value_fresh` means "we saw a message for
+  // this symbol recently enough to stand behind the number", which is all that is needed to
+  // decide whether to trade on it, and the counter below is what would settle the question:
+  // a single message carrying a value identical to the previous one proves the channel does NOT
+  // suppress unchanged values, and the interpretation can be strengthened.
+  double long_gap_multiple = 8.0;
+  int long_gap_floor_ms = 2000;            // never call a gap long below this, whatever the cadence
   int ws_stale_after_seconds = 45;         // socket silence that counts as a dead socket
   int ping_interval_seconds = 10;
   size_t max_pending_rows = 20000;         // if the cycle stalls, drop and count rather than grow
@@ -63,12 +71,18 @@ class ReferenceFeed {
  public:
   struct Value {
     double price = 0;
-    long long source_ts_ms = 0;    // the source's own clock, as the venue relayed it
-    long long received_ts_ms = 0;  // ours
+    long long source_ts_ms = 0;       // the source's own clock, as the venue relayed it
+    long long received_ts_ms = 0;     // ours: when this message arrived
     long long sequence = 0;
-    long long gap_ms = 0;          // since the previous accepted observation of this symbol
-    bool fresh = true;             // false: this arrived after a gap, so the value before it was
-                                   // being carried forward for longer than the feed's own cadence
+    // Two different ages, because they answer two different questions and conflating them is how
+    // a desk teaches itself that a quiet market is a broken feed.
+    long long message_gap_ms = 0;     // since the PREVIOUS MESSAGE for this symbol
+    long long unchanged_age_ms = 0;   // since the value last actually changed
+    long long value_change_ts_ms = 0; // when that was
+    bool value_changed = true;        // did this message carry a different number?
+    // Whether we can stand behind the recency of this value. False means the message gap exceeded
+    // the limit - not that the source stopped publishing, which we cannot see from here.
+    bool observed_value_fresh = true;
   };
   struct Replication {
     long long checked_ts = 0;    // when we ran the check (wall clock)
@@ -132,10 +146,15 @@ class ReferenceFeed {
     std::deque<std::pair<long long, double>> ticks;   // (unix seconds, price), oldest first
     Value last;
     long long last_recorded_ms = 0;
-    // The symbol's own measured cadence, so staleness is judged against what this feed does
+    // The symbol's own measured cadence, so the limit is judged against what this feed does
     // rather than against a number someone typed. Median of the recent inter-arrival times.
     std::deque<long long> gaps;
-    long long stale_periods = 0, longest_gap_ms = 0;
+    long long long_message_gaps = 0, longest_gap_ms = 0;
+    // The measurement that would settle what a silence means. If this is ever non-zero the
+    // channel emits unchanged values, so a silence really is the source going quiet; if it stays
+    // at zero over a long recording, silence and "no change" remain indistinguishable from here.
+    long long unchanged_value_messages = 0, value_changes = 0;
+    long long value_change_ts_ms = 0;
     // The newest observation of the minute now in progress, held back until a later minute proves
     // it was that minute's close. `commodity_reference` is the replay's only record of the feed,
     // and the settlement candle is the one value in it that must never be the one we dropped.
@@ -168,6 +187,13 @@ class ReferenceFeed {
 //
 // The set of markets changes every fifteen minutes. `watch()` is called from the cycle with the
 // tickers currently open and sends the difference, rather than reconnecting.
+//
+// Two channels, because they answer two different questions and one of them cannot answer the
+// other. `ticker` says whether the QUOTED PRICE moved. `orderbook_delta` (with the snapshot that
+// seeds it, and a sequence number on every message) is what says whether a given quantity could
+// have been EXECUTED. A study that used ticker data to make a claim about fills would be
+// describing a price nobody could have taken, so the book events are recorded separately, with
+// their sequence numbers intact, and reconstructed offline where the reconstruction can be tested.
 class MarketQuoteFeed {
  public:
   struct Settings {
@@ -204,8 +230,17 @@ class MarketQuoteFeed {
   std::unique_ptr<WsClient> ws_;
   mutable std::mutex mu_;
   std::set<std::string> watching_;
-  std::vector<nlohmann::json> pending_;
+  std::vector<nlohmann::json> pending_, pending_book_;
   long long messages_ = 0, recorded_ = 0, dropped_rows_ = 0, unparsed_ = 0, command_id_ = 100;
+  long long book_messages_ = 0, book_recorded_ = 0, snapshots_ = 0;
+  // The venue assigns a subscription id per channel, and `update_subscription` needs it. Taken
+  // from the acknowledgements rather than assumed, because assuming it works until the day the
+  // venue numbers them differently and the desk quietly stops following the live windows.
+  std::map<std::string, long long> sids_;
+  // Sequence continuity per ticker. A book reconstructed across a gap is a book that never
+  // existed, so the gaps are counted here and the replay refuses those stretches.
+  std::map<std::string, long long> last_seq_;
+  long long sequence_gaps_ = 0;
 };
 
 MarketQuoteFeed::Settings market_quote_settings(const nlohmann::json& params, const std::string& env);

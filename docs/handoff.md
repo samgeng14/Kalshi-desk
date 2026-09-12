@@ -14,6 +14,126 @@ Working agreement for every session in this programme:
   geolocation check rejects it, so autonomous execution has to run on the Mac. This constrains
   session 8 and is not negotiable by design choices made earlier.
 
+## Session 18 - observability fix, and the impulse lane answered (2026-09-12)
+
+Sam's correction, which was right and which mattered more than naming: a deduplicated stream means
+silence does not prove the source stopped publishing. It can equally mean the value did not change
+and the venue sent nothing. Session 17 had written `fresh` and `gap_ms` as though the first
+reading were established, and the volatility estimator was already acting on it.
+
+### Part A: the fields say only what is observed
+
+`Value` now carries four facts instead of two, because they are four different facts:
+
+```
+message_gap_ms        since the previous MESSAGE for this symbol
+unchanged_age_ms      since the value last actually CHANGED
+value_changed         did this message carry a different number
+observed_value_fresh  can we vouch for the recency of what we hold
+```
+
+The trade gate uses `message_gap_ms`, because the desk should not price from a value whose recency
+it cannot verify, and the reason string is now **"reference observation too old"** rather than
+anything about the venue. `commodity_reference` carries all four; the old `gap_ms` and `fresh`
+columns are left in place and stop being filled, because a column that silently changes meaning is
+worse than one that stops.
+
+The measurement that would settle the question is now counted: `unchanged_value_messages`. A
+channel that suppresses unchanged values can never send one, so a single occurrence proves it does
+not suppress them, and the interpretation can be strengthened.
+
+**The volatility estimator was acting on the unproven reading.** Session 16 had it discard any
+return spanning more than 120 s of silence, with a comment asserting an outage. If a silence means
+"the price did not change", that rule throws away precisely the calm stretches and biases sigma up.
+It is now a named setting with both positions documented (`VolSettings::GapPolicy::DropUncertain`
+or `IncludeAll`), the conservative one is still the default, the estimate records which produced
+it, and the research ladder races them. A test constructs the determinate case - a silence with the
+same price on both sides - and shows the discard makes the estimate too high.
+
+The test Sam asked for is `test_message_gap_and_unchanged_age_are_different_facts`: two feeds whose
+value is the same age in wall-clock terms, one because messages kept arriving unchanged and one
+because they stopped. They agree on the thing a single field would have collapsed them into and
+disagree on everything else. Collapsing the two ages back into one breaks three of its assertions.
+
+### Parts B and C
+
+`research/commodity_channel_behavior.py` writes `reports/commodity_channel_behavior.md` from what
+was recorded: messages/s, value changes/s, gap percentiles, and the decisive unchanged-value count.
+It refuses to conclude below 240 minutes and 50,000 messages, and a long recording with no repeats
+is reported as consistent-with-suppression and **not proof**. No data yet: the commodity feed has
+never run live.
+
+The commodity quote feed now subscribes to `orderbook_delta` as well as `ticker`, records book
+events with their sequence numbers into `commodity_book_events`, counts sequence gaps, and takes
+the venue's own subscription ids from its acknowledgements rather than assuming them. Reconstruction
+is deliberately left offline where it can be tested. The two streams are documented as answering
+two different questions: ticker says the quoted price moved, the book says a quantity could have
+been executed.
+
+### Parts D-M: the impulse lane, and its answer
+
+**The answer is no, and the mechanism is the opposite of the thesis.** Full write-up in
+`reports/impulse_first_pass.md`; the short version:
+
+On 14.6 hours of the recorder's output (526 ETH events, 164 BTC, 3 bps cross-venue moves), entering
+as a taker 788 ms after the signal produces a markout of **-0.79 bps at 250 ms, -1.17 at 500 ms,
+-0.98 at 1 s**, with the 90% interval excluding zero, and a hit rate of 38%. Not "no edge":
+negative edge. The response curve says why. At the first moment Kalshi's 1 Hz ticker can be
+measured, two seconds after the move, **Kalshi has priced 92% of a move the external composite has
+only completed 41% of**. On larger moves it reaches 122% by ten seconds. Kalshi leads our external
+composite; it does not lag it. B5, the lag thesis written as a rule, loses.
+
+What was built to get there, in the order the brief set:
+
+- `research/impulse_target_audit.py` (Part D). Provenance tracking through arithmetic: every number
+  carries the earliest observation behind it, operators propagate it, and a realized value drawing
+  on anything before the entry is refused with the path that produced it. The self-test builds the
+  adversarial case Sam specified - pre-entry spread predicts the score, the future is noise - and
+  it reports **+30.1 bps** and is refused on all 400 samples, while the honest taker target on the
+  same data reports -60.1 bps and passes. A pre-entry value laundered through three operations is
+  still caught.
+- `research/impulse_prepare.py`. One pass over the recorder's gzipped JSONL into an aligned
+  dataset. Handles the file the recorder is still writing (that is the normal state of the current
+  hour, not a failure). The delta stream is folded into 100 ms activity buckets rather than stored
+  row by row, because without a snapshot it cannot give a book.
+- `research/impulse_study.py` (Parts E-M). Taker entry from the real quote series, markout and
+  executable P&L in separate tables that are never added together, six baselines, chronological
+  splits by event, event-level bootstrap, and the response curve on three clocks.
+
+Two things the data settled that the brief could not have known:
+
+- **Kalshi's `ticker` channel is 1 Hz.** Measured at 0.48 messages/s per contract, median gap
+  1,000 ms. A 50 ms response study is not possible from it, and the tables print "not measured"
+  rather than interpolating.
+- **No orderbook snapshot was ever captured**, so the dense delta stream cannot be anchored and no
+  price is taken from it. The recorder was *not* restarted to fix this, because it has run
+  continuously since 13:00 and continuity is worth more; the fix is one flag on its next restart.
+
+And one place the method caught me. I first read the book-activity spike (2.0x within 50 ms) as
+Kalshi reacting fast. The pre-event control says the book was already at 1.36x half a second
+*before* the detector fired, which is exactly what an event stamped at the end of a one-second
+window would do. The report now prints that reading itself rather than leaving it to whoever reads
+the table. A number I nearly published as a finding is published as a refusal instead.
+
+### What was run
+
+- ctest 18 of 18 green: desk 896, systematic 350, pipeline 244, commodity 464, routing 40, perps
+  144, poly 142, account-summary 36, manual-orders, pair-models, ui-routes 63, recorder,
+  alpha-decay, commodity-replay, commodity-ladder, commodity-channel, impulse-audit,
+  impulse-prepare.
+- clang `-Wall -Wextra` clean apart from the pre-existing `poly.cpp` warning; ASan/UBSan clean.
+- Every guard mutation-tested.
+
+### Open
+
+- **The composite may itself be lagging.** binance.com answers HTTP 451 from a US address, so the
+  external set is Coinbase, Binance.us, Kraken and Hyperliquid. If the true price leader is outside
+  it, what was measured is "Kalshi leads these four", which is weaker than the conclusion drawn.
+  This is the one caveat that could overturn the result, and it needs a feed rather than a model.
+- One quiet session with a seven-hour gap. Nothing here speaks to a volatile session or a release.
+- The commodity recorder has still never run live, so every commodity gate is at zero.
+- Part N (the conditional-maker spread-matched diagnostic) was not run this session.
+
 ## Session 17 - the commodity research ladder, and the capture it needs (2026-09-12)
 
 Sam's brief: the four terminal models are infrastructure, not assumed alpha. Do not spend days

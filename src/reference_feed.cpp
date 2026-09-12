@@ -75,13 +75,20 @@ ReferenceFeed::ReferenceFeed(Store& store, ReferenceFeedSettings settings, std::
   store_.exec(
       "CREATE TABLE IF NOT EXISTS commodity_reference(id INTEGER PRIMARY KEY AUTOINCREMENT,"
       "ts_received INTEGER, ts_exchange INTEGER, symbol TEXT, source TEXT, price REAL,"
-      "sequence INTEGER, raw_json TEXT)");
+      "sequence INTEGER, raw_json TEXT, message_gap_ms INTEGER, unchanged_age_ms INTEGER,"
+      "value_changed INTEGER, observed_value_fresh INTEGER)");
   store_.exec("CREATE INDEX IF NOT EXISTS idx_commodity_reference ON commodity_reference(symbol, ts_received)");
-  // Session 17: how long the feed had been silent before this observation, and whether that
-  // silence was longer than this symbol's own cadence. The contract settles on a carried-forward
-  // value when the source publishes nothing, so a stale value is not an error - but it is not a
-  // new observation either, and a volatility estimate that counts it as one is reading silence.
-  for (const char* col : {"gap_ms INTEGER", "fresh INTEGER"})
+  // How long since the previous MESSAGE for this symbol, how long since the value last CHANGED,
+  // whether this message changed it, and whether we can vouch for the recency of what we hold.
+  // Four fields because they are four different facts, and the one thing the desk cannot see from
+  // here is whether a silence was the source going quiet or the venue having nothing new to send.
+  // Session 18: these say only what was observed. `gap_ms` and `fresh` came before, and asserted
+  // something about the upstream source that this desk cannot see; they are left in place on an
+  // existing database (empty from here on) rather than rewritten, because a column that silently
+  // changes meaning is worse than one that stops being filled.
+  for (const char* col : {"gap_ms INTEGER", "fresh INTEGER", "message_gap_ms INTEGER",
+                          "unchanged_age_ms INTEGER", "value_changed INTEGER",
+                          "observed_value_fresh INTEGER"})
     try { store_.exec(std::string("ALTER TABLE commodity_reference ADD COLUMN ") + col); }
     catch (const std::exception&) {}   // already migrated
   // Session 17, priority 3: the model's probability at fixed moments before each close, with the
@@ -93,7 +100,8 @@ ReferenceFeed::ReferenceFeed(Store& store, ReferenceFeedSettings settings, std::
       "checkpoint_seconds REAL, seconds_to_close REAL, tau_seconds REAL, p_model REAL, sigma_model REAL,"
       "band REAL, spot REAL, strike REAL, distance_sigma REAL, vol_sigma REAL, vol_warm INTEGER,"
       "vol_rv_5m REAL, vol_ewma REAL, vol_samples INTEGER, reference_ts INTEGER, reference_age REAL,"
-      "reference_gap_ms INTEGER, reference_fresh INTEGER, replication_consecutive INTEGER,"
+      "reference_message_gap_ms INTEGER, reference_unchanged_age_ms INTEGER,"
+      "reference_observed_fresh INTEGER, replication_consecutive INTEGER,"
       "settlement_verified INTEGER, yes_bid REAL, yes_ask REAL, no_bid REAL, no_ask REAL,"
       "quote_ts INTEGER, strike_type TEXT)");
   store_.exec("CREATE INDEX IF NOT EXISTS idx_commodity_calibration ON commodity_calibration(ticker, checkpoint_seconds)");
@@ -251,29 +259,45 @@ void ReferenceFeed::on_text(const std::string& text, long long received_ms) {
   }
   if (first)
     LOG_INFO("reference feed: first %s value for %s: %.6f", s_.name.c_str(), symbol.c_str(), price);
-  // How long this symbol has been silent, against its own measured cadence. The feed publishes at
-  // a fixed rate and Kalshi deduplicates it, so an unchanged price arrives as nothing at all: a
-  // long gap means the value we were holding was being carried forward. The contract settles on
-  // exactly that carried-forward value, so this is not an error - but it is not a new observation
-  // either, and the volatility estimate must not read silence as a market that stopped moving.
+  // Two clocks, two questions.
+  //
+  //   message_gap_ms    how long since we last heard ANYTHING about this symbol
+  //   unchanged_age_ms  how long since the value we are holding last changed
+  //
+  // They are not the same, and the difference is the whole point. A long message gap means we
+  // cannot vouch for the recency of the number we hold; it does NOT establish that the source
+  // stopped publishing, because a deduplicated channel might simply have had nothing new to send.
+  // The desk refuses to trade on a value whose recency it cannot verify, and says exactly that
+  // rather than diagnosing the venue.
   const long long previous_ms = s.last.received_ts_ms;
-  const long long gap_ms = previous_ms > 0 ? received_ms - previous_ms : 0;
-  bool fresh = true;
+  const long long message_gap_ms = previous_ms > 0 ? received_ms - previous_ms : 0;
+  const bool value_changed = previous_ms <= 0 || price != s.last.price;
   if (previous_ms > 0) {
-    s.gaps.push_back(gap_ms);
+    if (value_changed) ++s.value_changes;
+    // The measurement that would settle the ambiguity above. A channel that suppresses unchanged
+    // values can never send one, so a single occurrence proves it does not suppress them.
+    else ++s.unchanged_value_messages;
+  }
+  if (value_changed) s.value_change_ts_ms = received_ms;
+  bool observed_value_fresh = true;
+  if (previous_ms > 0) {
+    s.gaps.push_back(message_gap_ms);
     while (s.gaps.size() > 200) s.gaps.pop_front();
     std::vector<long long> sorted(s.gaps.begin(), s.gaps.end());
     std::nth_element(sorted.begin(), sorted.begin() + sorted.size() / 2, sorted.end());
     const long long cadence = sorted[sorted.size() / 2];
-    const long long limit = std::max<long long>(s_.stale_gap_floor_ms,
-                                                static_cast<long long>(s_.stale_gap_multiple * cadence));
-    if (s.gaps.size() >= 20 && gap_ms > limit) {
-      fresh = false;
-      ++s.stale_periods;
+    const long long limit = std::max<long long>(s_.long_gap_floor_ms,
+                                                static_cast<long long>(s_.long_gap_multiple * cadence));
+    if (s.gaps.size() >= 20 && message_gap_ms > limit) {
+      observed_value_fresh = false;
+      ++s.long_message_gaps;
     }
-    s.longest_gap_ms = std::max(s.longest_gap_ms, gap_ms);
+    s.longest_gap_ms = std::max(s.longest_gap_ms, message_gap_ms);
   }
-  s.last = Value{price, source_ms, received_ms, seq, gap_ms, fresh};
+  const long long unchanged_age_ms =
+      s.value_change_ts_ms > 0 ? received_ms - s.value_change_ts_ms : 0;
+  s.last = Value{price,           source_ms,          received_ms,        seq, message_gap_ms,
+                 unchanged_age_ms, s.value_change_ts_ms, value_changed,    observed_value_fresh};
   const long long ts = (source_ms > 0 ? source_ms : received_ms) / 1000;
   if (s.ticks.empty() || ts >= s.ticks.back().first) s.ticks.emplace_back(ts, price);
   const long long cutoff = ts - s_.history_seconds;
@@ -286,8 +310,10 @@ void ReferenceFeed::on_text(const std::string& text, long long received_ms) {
                 {"source", "kalshi_ws:pyth_value"},
                 {"price", px},
                 {"sequence", sq},
-                {"gap_ms", gap_ms},
-                {"fresh", fresh ? 1 : 0},
+                {"message_gap_ms", message_gap_ms},
+                {"unchanged_age_ms", unchanged_age_ms},
+                {"value_changed", value_changed ? 1 : 0},
+                {"observed_value_fresh", observed_value_fresh ? 1 : 0},
                 {"raw_json", json{{"underlying_ticker", symbol},
                                   {"value_usd", px},
                                   {"source_ts_ms", src_ms},
@@ -444,11 +470,14 @@ int ReferenceFeed::flush(long long now) {
   try {
     for (const auto& r : rows)
       store_.exec(
-          "INSERT INTO commodity_reference(ts_received,ts_exchange,symbol,source,price,sequence,raw_json,gap_ms,fresh)"
-          " VALUES(?,?,?,?,?,?,?,?,?)",
+          "INSERT INTO commodity_reference(ts_received,ts_exchange,symbol,source,price,sequence,raw_json,"
+          "message_gap_ms,unchanged_age_ms,value_changed,observed_value_fresh)"
+          " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
           {r.value("ts_received", 0LL), r.value("ts_exchange", 0LL), r.value("symbol", std::string()),
            r.value("source", std::string()), r.value("price", 0.0), r.value("sequence", 0LL),
-           r.value("raw_json", std::string()), r.value("gap_ms", 0LL), r.value("fresh", 1LL)});
+           r.value("raw_json", std::string()), r.value("message_gap_ms", 0LL),
+           r.value("unchanged_age_ms", 0LL), r.value("value_changed", 1LL),
+           r.value("observed_value_fresh", 1LL)});
     store_.exec("COMMIT");
   } catch (const std::exception& e) {
     store_.exec("ROLLBACK");
@@ -489,10 +518,16 @@ json ReferenceFeed::status() const {
                {"duplicates", s.duplicates},
                {"out_of_order", s.out_of_order},
                {"ticks_in_memory", static_cast<long long>(s.ticks.size())},
-               {"gap_ms", s.last.gap_ms},
-               {"fresh", s.last.fresh},
-               {"stale_periods", s.stale_periods},
-               {"longest_gap_ms", s.longest_gap_ms}};
+               {"message_gap_ms", s.last.message_gap_ms},
+               {"unchanged_age_ms", s.last.unchanged_age_ms},
+               {"observed_value_fresh", s.last.observed_value_fresh},
+               {"long_message_gaps", s.long_message_gaps},
+               {"longest_gap_ms", s.longest_gap_ms},
+               {"value_changes", s.value_changes},
+               // Non-zero proves the channel emits unchanged values, and therefore that a silence
+               // really is the source going quiet. Zero over a long recording leaves the two
+               // explanations indistinguishable from here, which is why nothing claims otherwise.
+               {"unchanged_value_messages", s.unchanged_value_messages}};
       if (!s.gaps.empty()) {
         std::vector<long long> g(s.gaps.begin(), s.gaps.end());
         std::nth_element(g.begin(), g.begin() + g.size() / 2, g.end());
@@ -558,6 +593,14 @@ MarketQuoteFeed::MarketQuoteFeed(Store& store, Settings settings, std::shared_pt
       "ts_received_ms INTEGER, ts_exchange_ms INTEGER, ticker TEXT, yes_bid REAL, yes_ask REAL,"
       "yes_bid_size REAL, yes_ask_size REAL, last REAL, volume REAL, open_interest REAL, raw_json TEXT)");
   store_.exec("CREATE INDEX IF NOT EXISTS idx_commodity_quotes ON commodity_quotes(ticker, ts_received_ms)");
+  // The book, kept as the venue sent it: snapshots and deltas with their sequence numbers, not a
+  // reconstruction. Reconstructing here would bake one interpretation into the record and leave
+  // no way to check it; done offline, the reconstruction is testable and the raw stream survives.
+  store_.exec(
+      "CREATE TABLE IF NOT EXISTS commodity_book_events(id INTEGER PRIMARY KEY AUTOINCREMENT,"
+      "ts_received_ms INTEGER, ts_exchange_ms INTEGER, ticker TEXT, kind TEXT, sequence INTEGER,"
+      "side TEXT, price REAL, delta REAL, raw_json TEXT)");
+  store_.exec("CREATE INDEX IF NOT EXISTS idx_commodity_book ON commodity_book_events(ticker, sequence)");
 }
 
 MarketQuoteFeed::~MarketQuoteFeed() { stop(); }
@@ -586,8 +629,12 @@ void MarketQuoteFeed::start() {
       tickers.assign(watching_.begin(), watching_.end());
     }
     if (tickers.empty()) return std::vector<std::string>{};
-    json params{{"channels", json::array({"ticker"})}, {"market_tickers", tickers}};
-    return std::vector<std::string>{json{{"id", 1}, {"cmd", "subscribe"}, {"params", params}}.dump()};
+    // Separate subscriptions so each channel's own sid comes back on its own acknowledgement.
+    return std::vector<std::string>{
+        json{{"id", 1}, {"cmd", "subscribe"},
+             {"params", json{{"channels", json::array({"ticker"})}, {"market_tickers", tickers}}}}.dump(),
+        json{{"id", 2}, {"cmd", "subscribe"},
+             {"params", json{{"channels", json::array({"orderbook_delta"})}, {"market_tickers", tickers}}}}.dump()};
   };
   ws_ = std::make_unique<WsClient>(o, [this](const std::string& text, long long ms) { on_text(text, ms); });
   ws_->start();
@@ -605,11 +652,20 @@ std::vector<std::string> MarketQuoteFeed::watching() const {
 
 void MarketQuoteFeed::send_delta(const std::vector<std::string>& add, const std::vector<std::string>& remove) {
   if (!ws_) return;
+  std::vector<long long> sids;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    for (const auto& [channel, sid] : sids_) { (void)channel; sids.push_back(sid); }
+  }
+  if (sids.empty()) sids = {1, 2};   // before the first acknowledgement, the ids we asked for
   auto cmd = [&](const char* action, const std::vector<std::string>& tickers) {
     if (tickers.empty()) return;
-    json params{{"sid", 1}, {"action", action}, {"market_tickers", tickers}};
-    if (std::string(action) == "add_markets") params["send_initial_snapshot"] = true;
-    ws_->send(json{{"id", ++command_id_}, {"cmd", "update_subscription"}, {"params", params}}.dump());
+    for (long long sid : sids) {
+      json params{{"sid", sid}, {"action", action}, {"market_tickers", tickers}};
+      // A snapshot on every addition, because a delta stream joined mid-flight is not a book.
+      if (std::string(action) == "add_markets") params["send_initial_snapshot"] = true;
+      ws_->send(json{{"id", ++command_id_}, {"cmd", "update_subscription"}, {"params", params}}.dump());
+    }
   };
   cmd("add_markets", add);
   cmd("delete_markets", remove);
@@ -637,8 +693,52 @@ void MarketQuoteFeed::on_text(const std::string& text, long long received_ms) {
     ++unparsed_;
     return;
   }
-  if (j.value("type", std::string()) != "ticker") return;
+  const std::string type = j.value("type", std::string());
   const json& m = j.contains("msg") && j["msg"].is_object() ? j["msg"] : j;
+  // The venue's own subscription ids, taken from its acknowledgements. `update_subscription`
+  // needs them, and guessing works right up until the day they are numbered differently.
+  if (type == "subscribed") {
+    std::lock_guard<std::mutex> lk(mu_);
+    const std::string channel = m.value("channel", std::string());
+    if (!channel.empty() && m.contains("sid") && m["sid"].is_number())
+      sids_[channel] = m["sid"].get<long long>();
+    return;
+  }
+  if (type == "orderbook_snapshot" || type == "orderbook_delta") {
+    const std::string bt = m.value("market_ticker", std::string());
+    if (bt.empty()) { std::lock_guard<std::mutex> lk(mu_); ++unparsed_; return; }
+    auto dnum = [&m](const char* key) -> double {
+      if (!m.contains(key)) return 0;
+      const json& v = m[key];
+      if (v.is_number()) return v.get<double>();
+      if (v.is_string()) { try { return std::stod(v.get<std::string>()); } catch (...) { return 0; } }
+      return 0;
+    };
+    const long long seq = j.contains("seq") && j["seq"].is_number() ? j["seq"].get<long long>() : 0;
+    const long long ex_ms = m.contains("ts_ms") && m["ts_ms"].is_number() ? m["ts_ms"].get<long long>() : 0;
+    std::lock_guard<std::mutex> lk(mu_);
+    ++book_messages_;
+    if (type == "orderbook_snapshot") ++snapshots_;
+    // A book reconstructed across a missing message is a book that never existed. The gap is
+    // counted here; the replay refuses the stretch rather than interpolating over it.
+    if (seq > 0) {
+      auto it = last_seq_.find(bt);
+      if (it != last_seq_.end() && seq > it->second + 1) ++sequence_gaps_;
+      last_seq_[bt] = seq;
+    }
+    if (pending_book_.size() >= s_.max_pending_rows) { ++dropped_rows_; return; }
+    pending_book_.push_back(json{{"ts_received_ms", received_ms},
+                                 {"ts_exchange_ms", ex_ms},
+                                 {"ticker", bt},
+                                 {"kind", type},
+                                 {"sequence", seq},
+                                 {"side", m.value("side", std::string())},
+                                 {"price", dnum("price")},
+                                 {"delta", dnum("delta")},
+                                 {"raw_json", text.substr(0, 8192)}});
+    return;
+  }
+  if (type != "ticker") return;
   const std::string ticker = m.value("market_ticker", std::string());
   if (ticker.empty()) {
     std::lock_guard<std::mutex> lk(mu_);
@@ -675,10 +775,34 @@ void MarketQuoteFeed::on_text(const std::string& text, long long received_ms) {
 
 int MarketQuoteFeed::flush(long long now) {
   (void)now;
-  std::vector<json> rows;
+  std::vector<json> rows, book;
   {
     std::lock_guard<std::mutex> lk(mu_);
     rows.swap(pending_);
+    book.swap(pending_book_);
+  }
+  if (!book.empty()) {
+    try {
+      store_.exec("BEGIN");
+      for (const auto& r : book)
+        store_.exec("INSERT INTO commodity_book_events(ts_received_ms,ts_exchange_ms,ticker,kind,"
+                    "sequence,side,price,delta,raw_json) VALUES(?,?,?,?,?,?,?,?,?)",
+                    {r.value("ts_received_ms", 0LL), r.value("ts_exchange_ms", 0LL),
+                     r.value("ticker", std::string()), r.value("kind", std::string()),
+                     r.value("sequence", 0LL), r.value("side", std::string()), r.value("price", 0.0),
+                     r.value("delta", 0.0), r.value("raw_json", std::string())});
+      store_.exec("COMMIT");
+      std::lock_guard<std::mutex> lk(mu_);
+      book_recorded_ += static_cast<long long>(book.size());
+    } catch (const std::exception& e) {
+      store_.exec("ROLLBACK");
+      LOG_WARN("%s: could not record %zu book events: %s (they stay queued)", s_.name.c_str(),
+               book.size(), e.what());
+      std::lock_guard<std::mutex> lk(mu_);
+      book.insert(book.end(), std::make_move_iterator(pending_book_.begin()),
+                  std::make_move_iterator(pending_book_.end()));
+      pending_book_.swap(book);
+    }
   }
   if (rows.empty()) return 0;
   store_.exec("BEGIN");
@@ -715,6 +839,15 @@ json MarketQuoteFeed::status() const {
                {"unparsed", unparsed_},
                {"dropped_rows", dropped_rows_},
                {"pending_rows", static_cast<long long>(pending_.size())},
+               // Kept apart from the ticker counts on purpose: one answers "did the quoted price
+               // move", the other "could this quantity have been executed", and a study that
+               // confuses them is describing a price nobody could have taken.
+               {"book_messages", book_messages_},
+               {"book_recorded", book_recorded_},
+               {"book_snapshots", snapshots_},
+               {"book_sequence_gaps", sequence_gaps_},
+               {"pending_book_rows", static_cast<long long>(pending_book_.size())},
+               {"subscription_ids", sids_},
                {"watching", std::vector<std::string>(watching_.begin(), watching_.end())}};
   }
   out["socket"] = ws_ ? ws_->status() : json{{"running", false}};

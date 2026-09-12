@@ -43,15 +43,15 @@ std::vector<GridPoint> grid(const std::vector<std::pair<long long, double>>& tic
   return out;
 }
 
-// The longest silence a return may span. Beyond this the move is not one observation's worth of
-// news, it is an outage with a jump on the far side, and attributing it to the seconds it appears
-// to have taken is how a dead feed becomes a huge volatility.
-constexpr long long kMaxReturnGapSeconds = 120;
-
 // Realized volatility per sqrt(second) over one window of the sampled grid. Returns are taken
-// between observations that really happened, over the time that really elapsed between them, so a
-// feed that goes quiet lowers the sample count rather than filling it with zeros.
-double realized(const std::vector<GridPoint>& g, long long now, long long window, int* n_out = nullptr) {
+// between observations that really happened, over the time that really elapsed between them.
+//
+// `max_gap` is the longest silence a return may span before it is discarded, and it exists
+// because a move observed across a long silence has an unknown duration: we know the value at two
+// instants and not when it changed. See VolSettings::GapPolicy for what that choice costs in
+// either direction; zero means include every interval.
+double realized(const std::vector<GridPoint>& g, long long now, long long window, long long max_gap,
+                int* n_out = nullptr) {
   double sum2 = 0;
   long long span = 0;
   int n = 0;
@@ -63,7 +63,7 @@ double realized(const std::vector<GridPoint>& g, long long now, long long window
     const double px = g[i].price;
     if (prev_ts > 0 && ts >= now - window && px > 0 && prev_px > 0) {
       const long long dt = ts - prev_ts;
-      if (dt > 0 && dt <= kMaxReturnGapSeconds) {
+      if (dt > 0 && (max_gap <= 0 || dt <= max_gap)) {
         const double r = std::log(px / prev_px);
         sum2 += r * r;
         span += dt;
@@ -253,10 +253,12 @@ VolEstimate estimate_volatility(const std::vector<std::pair<long long, double>>&
     return v;
   }
   int n1 = 0, n5 = 0, n15 = 0, n60 = 0;
-  v.rv_1m = realized(g, now, 60, &n1);
-  v.rv_5m = realized(g, now, 300, &n5);
-  v.rv_15m = realized(g, now, 900, &n15);
-  v.rv_60m = realized(g, now, 3600, &n60);
+  const long long max_gap =
+      s.long_gap_policy == VolSettings::GapPolicy::IncludeAll ? 0 : s.max_return_gap_seconds;
+  v.rv_1m = realized(g, now, 60, max_gap, &n1);
+  v.rv_5m = realized(g, now, 300, max_gap, &n5);
+  v.rv_15m = realized(g, now, 900, max_gap, &n15);
+  v.rv_60m = realized(g, now, 3600, max_gap, &n60);
   v.samples = n60;   // real observations differenced in the hour, not grid points
   v.span_seconds = g.back().ts - g.front().ts;
   // How much of that hour the feed was actually speaking for. A grid that spans an hour because
@@ -264,7 +266,7 @@ VolEstimate estimate_volatility(const std::vector<std::pair<long long, double>>&
   long long observed = 0, prev_obs = 0;
   for (const auto& pt : g) {
     if (!pt.fresh) continue;
-    if (prev_obs > 0 && pt.ts - prev_obs <= kMaxReturnGapSeconds) observed += pt.ts - prev_obs;
+    if (prev_obs > 0 && (max_gap <= 0 || pt.ts - prev_obs <= max_gap)) observed += pt.ts - prev_obs;
     prev_obs = pt.ts;
   }
 
@@ -279,7 +281,7 @@ VolEstimate estimate_volatility(const std::vector<std::pair<long long, double>>&
     if (!pt.fresh || !(pt.price > 0)) continue;
     if (prev_ts > 0) {
       const long long dt = pt.ts - prev_ts;
-      if (dt > 0 && dt <= kMaxReturnGapSeconds && prev_px > 0) {
+      if (dt > 0 && (max_gap <= 0 || dt <= max_gap) && prev_px > 0) {
         const double r = std::log(pt.price / prev_px);
         const double per_sec = (r * r) / static_cast<double>(dt);
         var = seeded ? lambda * var + (1 - lambda) * per_sec : per_sec;
@@ -295,6 +297,9 @@ VolEstimate estimate_volatility(const std::vector<std::pair<long long, double>>&
   // not license pricing a contract through a burst that is happening right now.
   double sigma = std::max(v.ewma, s.short_floor_multiplier * v.rv_5m);
   v.basis = sigma == v.ewma ? "ewma" : "5-minute realized";
+  v.basis += s.long_gap_policy == VolSettings::GapPolicy::IncludeAll
+                 ? ", every sampled interval differenced"
+                 : ", returns spanning over " + std::to_string(s.max_return_gap_seconds) + "s of silence dropped";
   if (v.rv_60m > 0) {
     const double hi = s.max_ratio_to_hour * v.rv_60m, lo = s.min_ratio_to_hour * v.rv_60m;
     if (sigma > hi) { sigma = hi; v.basis += ", capped at " + std::to_string(s.max_ratio_to_hour) + "x the hourly estimate"; }
@@ -306,9 +311,9 @@ VolEstimate estimate_volatility(const std::vector<std::pair<long long, double>>&
     v.problems.push_back("volatility warm-up: " + std::to_string(v.samples) + "/" +
                          std::to_string(s.min_samples) + " observed returns");
   if (observed < s.min_span_seconds)
-    v.problems.push_back("the feed has only been speaking for " + std::to_string(observed) + "s of the " +
-                         std::to_string(v.span_seconds) + "s window, under the " +
-                         std::to_string(s.min_span_seconds) + "s minimum");
+    v.problems.push_back("only " + std::to_string(observed) + "s of the " +
+                         std::to_string(v.span_seconds) + "s window carried observations we can "
+                         "difference, under the " + std::to_string(s.min_span_seconds) + "s minimum");
   if (!(v.sigma > 0)) v.problems.push_back("no volatility estimate yet");
   v.warm = v.problems.empty();
   return v;

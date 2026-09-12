@@ -416,7 +416,7 @@ def report(coin, quotes, activity, events, samples, stats, latency_us, threshold
           f'({stats["no_quote"]} had none, {stats["late"]} only had one too late to call an entry, '
           f'{stats["refused"]} refused by the causal audit)')
     print(f'  {span_hours:.2f} hours recorded, {hrs:.2f} hours spanned by these events, '
-          f'{activity["seq_gaps"]} book sequence gaps')
+          f'{sum(activity["events"].values()):,} book messages behind the activity column')
     if not samples:
         print('  Nothing to report.')
         return
@@ -525,8 +525,27 @@ def report_response(curve):
                   f'{accol:>15} {qcol:>15} {qpct:>11}')
     if cad:
         print(f'\n    "not measured" is where the delay is shorter than Kalshi\'s own {cad/1000:.0f} ms')
-        print('    quote cadence. Book activity is a multiple of the pre-event message rate: it says')
-        print('    the book started moving, not where it moved to.')
+        print('    quote cadence. Book activity is a multiple of the message rate in the ten seconds')
+        print('    before the event: it says the book was moving, not where it moved to.')
+    # The control is not decoration. If the book is already elevated before the detector fires,
+    # the post-event elevation is not a reaction to anything, and saying so is the report's job
+    # rather than the reader's.
+    for label, rows in curve['buckets'].items():
+        if len(rows) < 10:
+            continue
+        pre = [r['activity'][-500_000] for r in rows if r['activity'].get(-500_000) is not None]
+        post = [r['activity'][50_000] for r in rows if r['activity'].get(50_000) is not None]
+        if not pre or not post:
+            continue
+        mpre, mpost = sum(pre) / len(pre), sum(post) / len(post)
+        if mpre >= mpost * 0.9:
+            print(f'\n    READ THE CONTROL on {label}: the book was already at {mpre:.2f}x half a second')
+            print(f'    BEFORE the detector fired, against {mpost:.2f}x just after. The elevation is not a')
+            print('    reaction to this signal. An event stamped at the END of its detection window is')
+            print('    already up to that window old, so activity "before" the stamp may be activity')
+            print('    during the move. Nothing here supports a claim that Kalshi reacts in 50 ms; what')
+            print('    it does support is that the book is busy around these moves, which is not news.')
+            break
 
 
 # ---- driver ------------------------------------------------------------------------------------
