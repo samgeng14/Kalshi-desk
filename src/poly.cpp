@@ -456,7 +456,10 @@ PolyDesk::PolyDesk(const Config& cfg, Store& store, std::shared_ptr<PolyClient> 
         side.team_id = s.value("team_id", 0);
         m.sides.push_back(side);
       }
-    if (!m.slug.empty()) markets_[m.slug] = m;
+    if (!m.slug.empty()) {
+      markets_[m.slug] = m;
+      stored_quote_[m.slug] = StoredQuote{m.bid, m.ask, m.active, m.closed, m.quote_ts};
+    }
   }
   for (const auto& r : store_.query("SELECT * FROM poly_pairs")) {
     PolyPair p;
@@ -543,6 +546,35 @@ void PolyDesk::stop_background() {
   bg_stop_ = true;
   if (bg_.joinable()) bg_.join();
   bg_running_ = false;
+  try {
+    persist_quote_times();
+  } catch (const std::exception& e) {
+    LOG_WARN("polymarket: quote times not written at stop: %s", e.what());
+  }
+}
+
+std::map<std::string, long long> PolyDesk::quote_poll_times() {
+  Lock lk(mu_);
+  return quote_poll_ts_;
+}
+
+void PolyDesk::persist_quote_times() {
+  std::vector<std::pair<std::string, long long>> todo;
+  {
+    Lock lk(mu_);
+    for (const auto& [slug, ts] : quote_poll_ts_) {
+      auto st = stored_quote_.find(slug);
+      if (st == stored_quote_.end() || st->second.quote_ts < ts) todo.emplace_back(slug, ts);
+    }
+  }
+  if (todo.empty()) return;
+  store_.transaction([&] {
+    for (const auto& [slug, ts] : todo)
+      store_.exec("UPDATE poly_markets SET quote_ts=? WHERE slug=? AND quote_ts<?", {ts, slug, ts});
+  });
+  Lock lk(mu_);
+  for (const auto& [slug, ts] : todo)
+    if (auto st = stored_quote_.find(slug); st != stored_quote_.end()) st->second.quote_ts = std::max(st->second.quote_ts, ts);
 }
 
 void PolyDesk::refresh_universe(long long now) {
@@ -601,6 +633,9 @@ void PolyDesk::refresh_universe(long long now) {
                 {m.slug, m.event_slug, m.event_title, m.question, m.league, m.sports_type, m.tick, m.min_qty, m.fee_coeff, m.bid, m.ask,
                  m.start_ts, m.end_ts, m.quote_ts, static_cast<long long>(m.active ? 1 : 0), static_cast<long long>(m.closed ? 1 : 0),
                  sides.dump(), now});
+    // This statement sets active and closed (and on a new row bid, ask and quote_ts), so what
+    // refresh_quotes believes the row holds is no longer known: its next pass writes the row.
+    stored_quote_.erase(m.slug);
   }
   // Markets that left the league feeds are over unless something is still held there.
   std::set<std::string> keep;
@@ -611,6 +646,8 @@ void PolyDesk::refresh_universe(long long now) {
     if (!seen.count(it->first) && !keep.count(it->first) && !found.empty() &&
         !failed_leagues.count(it->second.league)) {
       store_.exec("UPDATE poly_markets SET closed=1, updated_ts=? WHERE slug=?", {now, it->first});
+      stored_quote_.erase(it->first);
+      quote_poll_ts_.erase(it->first);
       it = markets_.erase(it);
     } else ++it;
   }
@@ -649,41 +686,76 @@ void PolyDesk::refresh_quotes(long long now) {
       LOG_WARN("poly quotes: %s", e.what());
       return;
     }
-    Lock lk(mu_);
-    for (const auto& mj : j.value("markets", json::array())) {
-      std::string slug = sval(mj, "slug");
-      auto it = markets_.find(slug);
-      if (it == markets_.end()) continue;
-      PolyMarket& m = it->second;
-      double bid = amount(mj, "bestBidQuote"), ask = amount(mj, "bestAskQuote");
-      bool changed = std::fabs(bid - m.bid) > 1e-9 || std::fabs(ask - m.ask) > 1e-9;
-      m.bid = bid; m.ask = ask; m.quote_ts = now;
-      m.active = mj.value("active", m.active); m.closed = mj.value("closed", m.closed);
-      m.updated_ts = iso_ts(sval(mj, "updatedAt"));
-      long long last = 0;
-      json lr = store_.query("SELECT MAX(ts) AS t FROM poly_quotes WHERE slug=?", {slug});
-      if (!lr.empty() && !lr[0]["t"].is_null()) last = lr[0].value("t", 0LL);
-      if ((changed && now - last >= 5) || now - last >= 60) {
-        store_.exec("INSERT INTO poly_quotes(ts,slug,bid,ask) VALUES(?,?,?,?)", {now, slug, bid, ask});
-        // Take Kalshi's side of the same outcome now, not later. The market row carries the book
-        // from this cycle's refresh; k_quote_ts records how old that was, so an analysis can
-        // discard a pair where one side was stale instead of silently trusting it.
-        json mp = store_.query("SELECT kalshi_ticker, pm_yes_is_kalshi_yes FROM poly_pairs WHERE slug=?", {slug});
-        if (!mp.empty()) {
-          const std::string kt = mp[0].value("kalshi_ticker", "");
-          if (auto km = store_.get_market(kt))
-            if (km->yes_bid > 0 && km->yes_ask > 0 && km->yes_ask < 1)
-              store_.exec("INSERT INTO pair_ticks(ts,slug,kalshi_ticker,pm_bid,pm_ask,k_bid,k_ask,"
-                          "k_bid_size,k_ask_size,k_quote_ts,same_side) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                          {now, slug, kt, bid, ask, km->yes_bid, km->yes_ask,
-                           static_cast<double>(km->yes_bid_size), static_cast<double>(km->yes_ask_size),
-                           parse_iso(km->updated_time),
-                           static_cast<long long>(mp[0].value("pm_yes_is_kalshi_yes", 1))});
+    // The batch's writes are collected under mu_ and run after it, in one transaction (2026-10-01).
+    // They were one autocommit each, ~3 per slug every 10 s, and the poly_markets UPDATE ran for
+    // every slug on every pass because quote_ts always changed: 4.5% of the desk's write-weighted
+    // stack samples on 09-28. Now the UPDATE runs when bid, ask, active or closed differ from what
+    // the row holds, or its quote_ts is 60 s behind (quote_ts lives in markets_, and quote_poll_ts_
+    // keeps what the row would have held, for the xvenue strategy); the per-slug SELECT MAX(ts)
+    // probe is a map, read from the table once per slug. The transaction never spans the HTTP call
+    // and takes no lock of ours (Store::transaction), and our maps move only once it has committed,
+    // as the rows they describe did.
+    std::vector<std::pair<const char*, std::vector<SqlValue>>> writes;
+    std::map<std::string, long long> logged, polled;
+    std::map<std::string, StoredQuote> stored;
+    {
+      Lock lk(mu_);
+      for (const auto& mj : j.value("markets", json::array())) {
+        std::string slug = sval(mj, "slug");
+        auto it = markets_.find(slug);
+        if (it == markets_.end()) continue;
+        PolyMarket& m = it->second;
+        double bid = amount(mj, "bestBidQuote"), ask = amount(mj, "bestAskQuote");
+        bool changed = std::fabs(bid - m.bid) > 1e-9 || std::fabs(ask - m.ask) > 1e-9;
+        m.bid = bid; m.ask = ask; m.quote_ts = now;
+        m.active = mj.value("active", m.active); m.closed = mj.value("closed", m.closed);
+        m.updated_ts = iso_ts(sval(mj, "updatedAt"));
+        auto lg = quote_logged_ts_.find(slug);
+        if (lg == quote_logged_ts_.end()) {
+          long long seeded = 0;
+          json lr = store_.query("SELECT MAX(ts) AS t FROM poly_quotes WHERE slug=?", {slug});
+          if (!lr.empty() && !lr[0]["t"].is_null()) seeded = lr[0].value("t", 0LL);
+          lg = quote_logged_ts_.emplace(slug, seeded).first;
         }
+        const long long last = lg->second;
+        if ((changed && now - last >= 5) || now - last >= 60) {
+          writes.push_back({"INSERT INTO poly_quotes(ts,slug,bid,ask) VALUES(?,?,?,?)", {now, slug, bid, ask}});
+          logged[slug] = now;
+          // Take Kalshi's side of the same outcome now, not later. The market row carries the book
+          // from this cycle's refresh; k_quote_ts records how old that was, so an analysis can
+          // discard a pair where one side was stale instead of silently trusting it.
+          json mp = store_.query("SELECT kalshi_ticker, pm_yes_is_kalshi_yes FROM poly_pairs WHERE slug=?", {slug});
+          if (!mp.empty()) {
+            const std::string kt = mp[0].value("kalshi_ticker", "");
+            if (auto km = store_.get_market(kt))
+              if (km->yes_bid > 0 && km->yes_ask > 0 && km->yes_ask < 1)
+                writes.push_back({"INSERT INTO pair_ticks(ts,slug,kalshi_ticker,pm_bid,pm_ask,k_bid,k_ask,"
+                                  "k_bid_size,k_ask_size,k_quote_ts,same_side) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                                  {now, slug, kt, bid, ask, km->yes_bid, km->yes_ask,
+                                   static_cast<double>(km->yes_bid_size), static_cast<double>(km->yes_ask_size),
+                                   parse_iso(km->updated_time),
+                                   static_cast<long long>(mp[0].value("pm_yes_is_kalshi_yes", 1))}});
+          }
+        }
+        auto st = stored_quote_.find(slug);
+        if (st == stored_quote_.end() || st->second.bid != bid || st->second.ask != ask ||
+            st->second.active != m.active || st->second.closed != m.closed || now - st->second.quote_ts >= 60) {
+          writes.push_back({"UPDATE poly_markets SET bid=?, ask=?, quote_ts=?, active=?, closed=? WHERE slug=?",
+                            {bid, ask, now, static_cast<long long>(m.active ? 1 : 0),
+                             static_cast<long long>(m.closed ? 1 : 0), slug}});
+          stored[slug] = StoredQuote{bid, ask, m.active, m.closed, now};
+        }
+        polled[slug] = now;
       }
-      store_.exec("UPDATE poly_markets SET bid=?, ask=?, quote_ts=?, active=?, closed=? WHERE slug=?",
-                  {bid, ask, now, static_cast<long long>(m.active ? 1 : 0), static_cast<long long>(m.closed ? 1 : 0), slug});
     }
+    if (!writes.empty())
+      store_.transaction([&] {
+        for (const auto& [sql, params] : writes) store_.exec(sql, params);
+      });
+    Lock lk(mu_);
+    for (const auto& [slug, ts] : logged) quote_logged_ts_[slug] = ts;
+    for (const auto& [slug, q] : stored) stored_quote_[slug] = q;
+    for (const auto& [slug, ts] : polled) quote_poll_ts_[slug] = ts;
     last_error_.clear();
   }
 }

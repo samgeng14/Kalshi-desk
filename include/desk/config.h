@@ -129,6 +129,15 @@ struct Config {
   // goes each cycle. At 2 and a cycle near 8 s their quotes are at most ~16 s old, inside the
   // freshness bar; 74 series every cycle measured 4.9 s of refresh against 2.0 s for the 32.
   int basket_refresh_every = 2;
+  // How refresh_markets writes market rows (Store, MarketsWriteMode), 2026-10-01:
+  //   "write"   every listed row every cycle, updated_ts = now: the behaviour before this setting.
+  //   "shadow"  the same writes, plus checks on what "skip" would do, counted in the engine status
+  //             (markets_write: would_skip, detector_mismatches, overlay_mismatches). The default:
+  //             run it, see both mismatch counts stay at zero, then switch.
+  //   "skip"    a row is written only when a stored field changed or as a 10-minute heartbeat, and
+  //             the poll time is kept in memory as quote_ts. Rewriting unchanged rows was the
+  //             largest single cause of the 2.96 MB/s macOS measured the desk dirtying while awake.
+  std::string markets_write_mode = "shadow";
   std::map<std::string, std::string> strategy_modes;  // name -> off | research | manual | auto | bot
   nlohmann::json strategy_params;                      // free-form per-strategy params
   // Optional `"systematic": {...}` block. The algorithm's settings otherwise live only in a DB

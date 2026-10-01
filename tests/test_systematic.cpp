@@ -1804,12 +1804,29 @@ static void test_lane_live_sizing() {
   std::remove(pem.c_str());
 }
 
+// persist() writes the state only when its dump differs from the last one it wrote (2026-10-01):
+// step() persists every cycle, and an unchanged blob was rewritten every time.
+static void test_persist_skips_unchanged_state() {
+  Store st(":memory:");
+  Config cfg;
+  SystematicTrader tr(st, nullptr, cfg);
+  CHECK(json::parse(*st.kv_get("systematic:v2")) == tr.state());
+  // A stand-in written behind the trader's back shows whether the next persist wrote at all.
+  st.kv_set("systematic:v2", "sentinel");
+  tr.configure(json::object());                     // persists, and nothing in the state changed
+  CHECK(*st.kv_get("systematic:v2") == "sentinel");
+  tr.configure(json{{"settings", {{"cooldown_minutes", 7}}}});   // a change is written
+  json back = json::parse(*st.kv_get("systematic:v2"));
+  CHECK(back["settings"]["cooldown_minutes"] == 7 && back == tr.state());
+}
+
 int main(int argc, char** argv) {
   if (argc == 2 && std::string(argv[1]) == "--ownership") {
     test_manual_ownership_isolation(); test_manual_position_blocks_new_entry(); test_partial_entry_cancel_race();
     std::printf("%d checks, %d failures\n", checks, fails); return fails == 0 ? 0 : 1;
   }
   test_settings();
+  test_persist_skips_unchanged_state();
   test_lanes();
   test_lane_live_sizing();
   test_routes();

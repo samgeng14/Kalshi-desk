@@ -79,6 +79,8 @@ struct UniverseRow {
 // Builds the universe from what the desk currently knows about these markets. A contract whose
 // settlement cannot be read is kept and marked, never quietly dropped: the gap is the finding.
 std::vector<UniverseRow> build_universe(const std::vector<Market>& markets, long long now);
+// One transaction. A row is rewritten only when a field in it changed, so refreshed_ts is when the
+// row was first written or last changed, not when it was last confirmed (universe.cpp).
 void save_universe(Store& store, const std::vector<UniverseRow>& rows, long long now);
 
 }  // namespace desk

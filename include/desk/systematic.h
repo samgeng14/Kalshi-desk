@@ -125,6 +125,7 @@ class SystematicTrader {
  private:
   json view_unlocked();
   void persist();
+  std::string last_persisted_;   // the state dump persist() last wrote: an identical one is not rewritten
   void log(const std::string& level, const std::string& msg);
   void roll_day(long long now);
   // Lanes (M2, include/desk/lanes.h). All under mu_.

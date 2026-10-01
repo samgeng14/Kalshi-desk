@@ -1,6 +1,7 @@
 #include "desk/config.h"
 #include <algorithm>
 #include "desk/log.h"
+#include "desk/store.h"
 #include "desk/universe.h"
 
 #include <cstdlib>
@@ -101,6 +102,7 @@ Config load_config(const std::string& path) {
   take(j, "watch_series", c.watch_series);
   take(j, "basket_series", c.basket_series);
   take(j, "basket_refresh_every", c.basket_refresh_every);
+  take(j, "markets_write_mode", c.markets_write_mode);
   if (j.contains("strategies") && j["strategies"].is_object()) {
     for (auto& [k, v] : j["strategies"].items()) {
       if (v.is_string()) c.strategy_modes[k] = v.get<std::string>();
@@ -162,6 +164,9 @@ Config load_config(const std::string& path) {
   c.pem_path = expand_home(c.pem_path);
   c.db_path = expand_home(c.db_path);
   if (c.env != "demo" && c.env != "prod") throw std::runtime_error("env must be demo or prod");
+  // Refused rather than defaulted: a typo here would silently pick a write path.
+  if (!parse_markets_write_mode(c.markets_write_mode, nullptr))
+    throw std::runtime_error("markets_write_mode must be write, shadow or skip, not '" + c.markets_write_mode + "'");
   if (c.poll_seconds < 1) c.poll_seconds = 1;
   if (c.market_data_max_age_seconds < 0) c.market_data_max_age_seconds = 0;
   // 50 ms is 20 requests a second, the Basic tier's read ceiling at 10 tokens a request.
@@ -184,6 +189,7 @@ json config_to_json(const Config& c) {
          {"bankroll_dollars", c.bankroll_dollars},
          {"watch_series", c.watch_series},
          {"basket_series", c.basket_series},
+         {"markets_write_mode", c.markets_write_mode},
          {"strategies", c.strategy_modes},
          {"risk",
           {{"kelly_frac", c.risk.kelly_frac},

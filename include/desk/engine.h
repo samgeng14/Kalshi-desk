@@ -17,6 +17,7 @@
 #include "desk/perps.h"
 #include "desk/poly.h"
 #include "desk/pair_models.h"
+#include "desk/record.h"
 #include "desk/reference_feed.h"
 #include "desk/risk.h"
 #include "desk/store.h"
@@ -156,6 +157,9 @@ class Engine {
   // tests do not, so there the cycle does that work inline.
   void start_background() { poly_.start_background(); }
   void stop_background() { poly_.stop_background(); }
+  // At shutdown, after the last cycle: what is held in memory to save writes goes to disk now (the
+  // quote history buffer, queued model_fairs rows, and in skip mode the market poll times).
+  void flush_on_stop();
 
   // Exposed for tests.
   void add_strategy(std::unique_ptr<Strategy> s) { strategies_.insert(strategies_.begin(), std::move(s)); }
@@ -269,6 +273,10 @@ class Engine {
   json capture_book(const std::string& ticker);
   // Records a book already fetched (the batch path). Under mu_.
   json record_book(const std::string& ticker, const Orderbook& book);
+  // record_books() reads the books here, then writes their observations in one transaction.
+  void read_books();
+  bool buffer_observations_ = false;
+  std::vector<Observation> pending_observations_;
   std::set<std::string> basket_only_;   // Config::basket_series not also in watch_series
   std::map<std::string, long long> unlisted_asked_;   // ticker -> last status lookup (refresh_markets)
   bool batch_books_failed_ = false;   // the batch orderbook endpoint refused this run

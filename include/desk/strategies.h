@@ -1,6 +1,7 @@
 #pragma once
 // Concrete strategies. Each one is a hypothesis with a data source; see docs/hypotheses.md.
 #include <deque>
+#include <functional>
 #include <map>
 #include <set>
 #include <string>
@@ -41,10 +42,15 @@ class XVenue : public Strategy {
   std::optional<Fair> fair(const Market& m, const Series& s, Store& store) override;
   std::string describe() const override { return "Polymarket US book as the fair for matched game markets (" + std::to_string(pairs_.size()) + " matched)"; }
   double default_market_weight() const override { return 0.0; }   // a market, not a model
+  // slug -> the quote time PolyDesk's last refresh of it would have written into poly_markets. The
+  // row's own quote_ts is written at most every 60 s since 2026-10-01; the later of the two is the
+  // number the row carried before. Unset (tests, tools): the row alone.
+  void set_quote_ts_source(std::function<std::map<std::string, long long>()> f) { quote_ts_source_ = std::move(f); }
 
  private:
   struct Ref { std::string slug; bool flipped = false; double bid = 0, ask = 0; long long quote_ts = 0; };
   std::map<std::string, Ref> pairs_;
+  std::function<std::map<std::string, long long>()> quote_ts_source_;
 };
 
 // 2. Crypto hourly/daily brackets priced off live spot with a lognormal model.
@@ -167,6 +173,9 @@ class WeatherNws : public Strategy {
   std::map<std::string, Station> stations_;                    // series -> station
   std::map<std::string, DayForecast> fc_;                       // series|date -> forecast
   std::map<std::string, Wx1Dist> wx1_;                          // series|date -> simulated ladder
+  // The last weather_wx1 row written per contract: a row is logged on change or every 5 minutes.
+  struct Wx1Logged { double p = 0, sigma = 0, yes_bid = 0, yes_ask = 0; long long ts = 0; };
+  std::map<std::string, Wx1Logged> wx1_logged_;                // ticker -> last logged
   const Wx1Dist* wx1_for(const Station& st, const DayForecast& d, const std::string& key, long long now);
   double sigma_hour_ = 1.0;    // hour-to-hour wiggle around the day's shared bias
   double rho_ = 0.7;           // its persistence between adjacent hours

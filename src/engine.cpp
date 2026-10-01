@@ -72,6 +72,20 @@ Engine::Engine(Config cfg, Store& store, KalshiClient& client, Executor& exec)
     }
   }
   strategies_ = build_strategies(cfg_, reference_feed_.get());
+  // How market rows are written (Config::markets_write_mode, validated by load_config). A value that
+  // did not come through load_config and names no mode is refused here rather than guessed at.
+  {
+    MarketsWriteMode mode;
+    if (!parse_markets_write_mode(cfg_.markets_write_mode, &mode))
+      throw std::invalid_argument("markets_write_mode must be write, shadow or skip, not '" + cfg_.markets_write_mode + "'");
+    store_.set_markets_write_mode(mode);
+  }
+  // The xvenue strategy reads poly_markets, whose quote_ts PolyDesk now persists at most every 60 s
+  // (2026-10-01). It is handed the poll times the old every-pass UPDATE would have stored, so its
+  // freshness test reads the same number as before.
+  for (auto& st : strategies_)
+    if (auto* xv = dynamic_cast<XVenue*>(st.get()))
+      xv->set_quote_ts_source([this] { return poly_.quote_poll_times(); });
   // Persisted state overrides the config file.
   if (auto k = store_.kv_get("kill")) kill_ = (*k == "1");
   if (auto r = store_.kv_get("kill_reason")) kill_reason_ = *r;
@@ -205,6 +219,11 @@ void Engine::refresh_markets() {
       }
     }
   }
+  // Quote-history rows go to the store's buffer after the transaction commits (2026-10-01): each row
+  // written here landed on its own idx_quotes_ticker leaf. Same rows, same ts, written within
+  // Store::kQuoteFlushSeconds. Collected locally because nothing inside a transaction may take
+  // another lock, the buffer's included; a refresh that rolls back loses them, as it did before.
+  std::vector<QuoteRow> quote_rows;
   store_.transaction([&] {
     for (auto& f : got) {
       const std::string& st = f.series;
@@ -224,7 +243,7 @@ void Engine::refresh_markets() {
         bool changed = lq == last_quote_.end() || lq->second.first != m.yes_bid || lq->second.second != m.yes_ask;
         long long last = last_quote_log_.count(m.ticker) ? last_quote_log_[m.ticker] : 0;
         if (!basket_only_.count(st) && ((changed && now - last >= 5) || now - last >= 60)) {
-          store_.insert_quote(now, m);
+          quote_rows.push_back(QuoteRow::of(now, m));
           last_quote_log_[m.ticker] = now;
           last_quote_[m.ticker] = {m.yes_bid, m.yes_ask};
         }
@@ -237,6 +256,8 @@ void Engine::refresh_markets() {
     }
   });
   markets_seen_ = seen;
+  store_.buffer_quotes(std::move(quote_rows));
+  store_.flush_quotes(now);
   // A market the exchange no longer lists as open but the store still calls open. A finished
   // game is the usual case: it leaves the open listing when it is decided, days before its
   // close_time, and nothing refreshed its status because reconcile only looks at markets we hold.
@@ -329,6 +350,14 @@ void Engine::run_strategies() {
     }
     for (auto it = last_quote_.begin(); it != last_quote_.end();)
       it = last_quote_log_.count(it->first) ? std::next(it) : last_quote_.erase(it);
+    // The store's poll times and change detector, the same way (markets_write_mode). In skip mode
+    // this writes the poll time into the rows it forgets; a failure keeps them for the next prune
+    // rather than costing the cycle its strategies.
+    try {
+      store_.retire_market_poll_times(now - 6 * 3600);
+    } catch (const std::exception& e) {
+      LOG_WARN("market poll times not retired: %s", e.what());
+    }
   }
   // Basket-only series go to the ladder finders and nowhere else: no model prices them.
   const std::vector<Market> ladder_markets = markets;
@@ -394,9 +423,10 @@ void Engine::run_strategies() {
       double raw_p = std::min(0.999, std::max(0.001, f->p));
       f->p_raw = raw_p;
       // Log every raw estimate (traded or not) at most every 5 minutes: this is the Brier sample.
+      // Queued, and written with the rest of the cycle's model_fairs rows after the loop.
       std::string fk = m.ticker + "|" + st->name();
       if (now - last_fair_log_[fk] >= 300) {
-        store_.insert_model_fair(now, m.ticker, st->name(), raw_p, f->sigma, m.yes_bid, m.yes_ask);
+        store_.queue_model_fair(now, m.ticker, st->name(), raw_p, f->sigma, m.yes_bid, m.yes_ask);
         last_fair_log_[fk] = now;
       }
       // Shrink toward the market until the strategy has earned trust: p = (1-w) model + w mid.
@@ -515,6 +545,11 @@ void Engine::run_strategies() {
       break;  // first strategy that covers the market wins
     }
   }
+  // The cycle's model_fairs rows (the Brier samples above, and WX1's from inside fair()) in one
+  // transaction, outside the loop: the loop calls into strategies and the executor, which take their
+  // own locks, and nothing inside a transaction may. Rows a failed cycle left queued go with the
+  // next flush.
+  store_.flush_model_fairs();
   run_ladder_arb(ladder_markets);
   int expired = store_.expire_proposals(now - cfg_.risk.proposal_ttl_seconds);
   if (expired > 0) LOG_INFO("expired %d stale proposals", expired);
@@ -914,17 +949,36 @@ void Engine::refresh_results() {
   // EXISTS against idx_model_fairs(ticker, ...) rather than IN (SELECT DISTINCT ticker FROM
   // model_fairs ...): the DISTINCT walked the whole 250 MB index on every other cycle, which was the
   // 3.5 s "results" step in the live cycle report on 2026-09-23. Same rows, indexed probes.
+  // In skip mode (markets_write_mode) a row's stored updated_ts can trail the last poll by up to
+  // Store::kMarketHeartbeatSeconds, so the 6-hour gate and the order are applied here to the poll
+  // time every other reader sees. Every candidate has a stored updated_ts at or below its poll
+  // time, so the SQL still returns all of them; without the LIMIT, then cut to 10 below.
+  const bool overlay = store_.markets_write_mode() == MarketsWriteMode::Skip;
+  const long long retry_before = now - 6 * 3600;
   json rows = store_.query(
-      "SELECT m.ticker FROM markets m WHERE (m.result IS NULL OR m.result='') AND m.close_time!='' AND m.close_time<? "
-      "AND m.updated_ts<? AND (EXISTS (SELECT 1 FROM model_fairs f WHERE f.ticker=m.ticker) "
-      "OR EXISTS (SELECT 1 FROM positions p WHERE p.ticker=m.ticker) "
-      "OR m.ticker IN (SELECT home_ticker FROM ext_wp)) ORDER BY m.updated_ts LIMIT 10",
-      {iso_of(now - 3600), now - 6 * 3600});
+      std::string("SELECT m.ticker, m.updated_ts FROM markets m WHERE (m.result IS NULL OR m.result='') AND m.close_time!='' AND m.close_time<? "
+                  "AND m.updated_ts<? AND (EXISTS (SELECT 1 FROM model_fairs f WHERE f.ticker=m.ticker) "
+                  "OR EXISTS (SELECT 1 FROM positions p WHERE p.ticker=m.ticker) "
+                  "OR m.ticker IN (SELECT home_ticker FROM ext_wp)) ORDER BY m.updated_ts") +
+          (overlay ? "" : " LIMIT 10"),
+      {iso_of(now - 3600), retry_before});
   // One batched request for all of them. It was one request per ticker, ten a cycle, and when
   // the network dropped each one retried on its own: "results" took five to seven seconds of a
   // cycle on 2026-09-17 and wrote ten warnings a cycle to the log.
   std::vector<std::string> tickers;
-  for (const auto& r : rows) tickers.push_back(r.value("ticker", ""));
+  if (overlay) {
+    std::vector<std::pair<long long, std::string>> due;
+    for (const auto& r : rows) {
+      const std::string t = r.value("ticker", "");
+      const long long ts = store_.effective_quote_ts(t, r.contains("updated_ts") && r["updated_ts"].is_number()
+                                                            ? r["updated_ts"].get<long long>() : 0);
+      if (ts < retry_before) due.emplace_back(ts, t);
+    }
+    std::stable_sort(due.begin(), due.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+    for (size_t i = 0; i < due.size() && i < 10; ++i) tickers.push_back(due[i].second);
+  } else {
+    for (const auto& r : rows) tickers.push_back(r.value("ticker", ""));
+  }
   if (tickers.empty()) return;
   try {
     auto got = client_.get_markets_by_tickers(tickers);
@@ -935,10 +989,10 @@ void Engine::refresh_results() {
       if (!m.result.empty()) results_settled_++;
     }
     for (const auto& t : tickers)
-      if (!answered.count(t)) store_.exec("UPDATE markets SET updated_ts=? WHERE ticker=?", {now, t});
+      if (!answered.count(t)) store_.touch_market(t, now);
   } catch (const std::exception& e) {
     LOG_WARN("results for %zu markets: %s", tickers.size(), e.what());
-    for (const auto& t : tickers) store_.exec("UPDATE markets SET updated_ts=? WHERE ticker=?", {now, t});
+    for (const auto& t : tickers) store_.touch_market(t, now);
   }
 }
 
@@ -1305,6 +1359,9 @@ void Engine::publish_snapshot() {
   // how many cycles in a row have hit a storage error.
   status["cycle_seconds"] = last_cycle_seconds_;
   status["storage_failures"] = consecutive_storage_failures_;
+  // How market rows were written, and the shadow checks behind switching to skip (2026-10-01).
+  status["markets_write"] = store_.markets_write_stats();
+  status["write_buffers"] = {{"quotes", store_.buffered_quotes()}, {"model_fairs", store_.queued_model_fairs()}};
   if (reference_feed_) status["reference"] = reference_feed_->status();
   if (quote_feed_) status["commodity_quotes"] = quote_feed_->status();
   // Where each commodity model stands economically, from what has actually been recorded. Nothing
@@ -1989,12 +2046,33 @@ json Engine::record_book(const std::string& t, const Orderbook& b) {
   if (seen == last_book_.end() || seen->second != o.payload || now - last_book_log_ts_[t] >= 60) {
     last_book_[t] = o.payload;
     last_book_log_ts_[t] = now;
-    record_observation(store_, o);
+    if (buffer_observations_) pending_observations_.push_back(std::move(o));
+    else record_observation(store_, o);
   }
   return row;
 }
 
+// The cycle's book observations go in one transaction after they are all read (2026-10-01): up to 20
+// a cycle, each its own autocommit with two random-key indexes, about 2% of the 09-28 write samples.
+// The rows are the same; they reach the table a few hundred milliseconds later. A book read outside
+// this step (the systematic trader's own refresh) is still written as it is read.
 void Engine::record_books() {
+  pending_observations_.clear();
+  buffer_observations_ = true;
+  std::exception_ptr failed;
+  try {
+    read_books();
+  } catch (...) {
+    failed = std::current_exception();
+  }
+  buffer_observations_ = false;
+  std::vector<Observation> rows;
+  rows.swap(pending_observations_);
+  record_observations(store_, rows);
+  if (failed) std::rethrow_exception(failed);
+}
+
+void Engine::read_books() {
   static constexpr int kMaxBooksPerCycle = 20;
   std::vector<std::string> want;
   for (const auto& t : book_capture_plan()) {
@@ -2036,6 +2114,23 @@ void Engine::record_books() {
       LOG_WARN("book %s: %s", t.c_str(), e.what());
     }
   }
+}
+
+void Engine::flush_on_stop() {
+  std::lock_guard<std::mutex> lk(mu_);
+  const long long now = now_s();
+  auto attempt = [&](const char* what, auto&& fn) {
+    try { fn(); } catch (const std::exception& e) { LOG_ERR("shutdown: %s not written: %s", what, e.what()); }
+  };
+  attempt("model_fairs rows", [&] { store_.flush_model_fairs(); });
+  attempt("quote history", [&] {
+    const int n = store_.flush_quotes(now, true);
+    if (n > 0) LOG_INFO("shutdown: %d buffered quote rows written", n);
+  });
+  attempt("market poll times", [&] {
+    const int n = store_.persist_market_poll_times();
+    if (n > 0) LOG_INFO("shutdown: poll times written to %d market rows", n);
+  });
 }
 
 // Discovery has to redo itself when a day turns over, and the days it cares about are local to

@@ -650,9 +650,15 @@ SystematicTrader::SystematicTrader(Store& store, Executor* exec, const Config& c
   persist();
 }
 
+// Written only when the dump differs from the last one this process wrote (2026-10-01). step() calls
+// this every cycle, and most cycles change nothing in the state: the write was a whole JSON blob with
+// a 200-entry log, rewritten through INSERT OR REPLACE whether or not it had changed. kv_set now
+// skips an identical value too; this also skips building and binding it.
 void SystematicTrader::persist() {
-  json copy = state_;
-  store_.kv_set(kStateKey, copy.dump());
+  std::string dump = state_.dump();
+  if (dump == last_persisted_) return;
+  store_.kv_set(kStateKey, dump);
+  last_persisted_ = std::move(dump);
 }
 
 void SystematicTrader::log(const std::string& level, const std::string& msg) {

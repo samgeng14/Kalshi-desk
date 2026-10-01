@@ -48,6 +48,45 @@ HttpServer::HttpServer(Engine& engine, Store& store, KalshiClient& client, Execu
 
 HttpServer::~HttpServer() { stop(); }
 
+// The scorecard's research counts per strategy: rows logged, distinct markets, first ts. They were
+// `SELECT strategy, COUNT(*), COUNT(DISTINCT ticker), MIN(ts) ... GROUP BY strategy`, whose plan is
+// a scan of idx_model_fairs plus a TEMP B-TREE FOR GROUP BY over every row; past the 8 MB sorter
+// budget it spills and merges through temp files: 56 MB a call at 1M rows, 303 MB at 3M, and the
+// dashboard asks every 3 s while its window is visible (5.2% of the desk's write samples on
+// 2026-09-28, 22% on 09-25, 93% of the 09-24 report). GROUP BY ticker, strategy follows
+// idx_model_fairs(ticker, strategy, ts) in order, so it streams with no temp b-tree (0 bytes at 3M
+// rows), and the sums are done here: one group per (ticker, strategy), so the count of groups is
+// the count of distinct tickers. COUNT(DISTINCT) and MIN skip NULLs, and so does this.
+json model_fair_counts(Store& store) {
+  struct Agg { long long n = 0, markets = 0, since = 0; bool have_since = false; };
+  std::map<std::string, Agg> by;
+  for (const auto& r : store.query("SELECT ticker, strategy, COUNT(*) AS n, MIN(ts) AS since FROM model_fairs "
+                                   "GROUP BY ticker, strategy", {})) {
+    Agg& a = by[r.value("strategy", "")];
+    a.n += r.value("n", 0LL);
+    if (!r["ticker"].is_null()) ++a.markets;
+    if (r["since"].is_number()) {
+      const long long t = r["since"].get<long long>();
+      if (!a.have_since || t < a.since) a.since = t;
+      a.have_since = true;
+    }
+  }
+  json out = json::object();
+  for (const auto& [strategy, a] : by)
+    out[strategy] = {{"fairs_logged", a.n}, {"markets", a.markets}, {"since", a.since}};
+  return out;
+}
+
+// The counts move by a few rows a cycle; they are kept for 5 minutes.
+json HttpServer::fairs_logged_by_strategy() {
+  std::lock_guard<std::mutex> lk(scorecard_mu_);
+  const long long now = now_s();
+  if (scorecard_ts_ > 0 && now >= scorecard_ts_ && now - scorecard_ts_ < 300) return scorecard_fairs_;
+  scorecard_fairs_ = model_fair_counts(store_);
+  scorecard_ts_ = now;
+  return scorecard_fairs_;
+}
+
 void HttpServer::start() {
   th_ = std::thread([this] {
     LOG_INFO("dashboard on http://127.0.0.1:%d", port_);
@@ -159,8 +198,8 @@ void HttpServer::routes() {
     guarded(res, [&] {
       long long limit = 500;
       if (req.has_param("limit")) limit = std::stoll(req.get_param_value("limit"));
-      return store_.query("SELECT ts,yes_bid,yes_ask,last,volume FROM quotes WHERE ticker=? ORDER BY ts DESC LIMIT ?",
-                          {std::string(req.matches[1]), limit});
+      // The database merged with the rows the cycle still holds in memory (Store::buffer_quotes).
+      return store_.recent_quotes(std::string(req.matches[1]), limit);
     });
   });
 
@@ -728,9 +767,7 @@ void HttpServer::routes() {
   // has actually made when traded.
   s.Get("/api/scorecard", [this](const httplib::Request&, httplib::Response& res) {
     guarded(res, [&] {
-      json out = json::object();
-      for (const auto& r : store_.query("SELECT strategy, COUNT(*) AS n, COUNT(DISTINCT ticker) AS markets, MIN(ts) AS since FROM model_fairs GROUP BY strategy", {}))
-        out[r.value("strategy", "")] = {{"fairs_logged", r.value("n", 0LL)}, {"markets", r.value("markets", 0LL)}, {"since", r.value("since", 0LL)}};
+      json out = fairs_logged_by_strategy();
       json rep = build_report(store_, engine_.config());
       if (rep.contains("brier") && rep["brier"].contains("by_strategy"))
         for (auto& [k, v] : rep["brier"]["by_strategy"].items()) out[k]["brier_vs_market"] = v;

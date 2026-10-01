@@ -211,6 +211,9 @@ class PolyDesk {
   struct Quote { double bid = 0, ask = 0; long long ts = 0; std::string slug; bool flipped = false; };
   std::optional<Quote> quote_for(const std::string& kalshi_ticker, long long now);
   std::map<std::string, PolyPair> pairs_by_ticker();
+  // slug -> the quote_ts the poly_markets row would hold if every refresh still wrote it (see
+  // refresh_quotes). The xvenue strategy reads poly_markets and takes the later of the two.
+  std::map<std::string, long long> quote_poll_times();
 
  private:
   void rails(const PolyOrderRequest& r, const PolyMarket& m, double* cost_out);
@@ -251,6 +254,15 @@ class PolyDesk {
   std::atomic<bool> bg_running_{false};
   std::atomic<bool> bg_stop_{false};
   std::atomic<long long> order_gen_{0};   // bumped by every order write; see refresh_account
+  // refresh_quotes' writes (2026-10-01), all under mu_. What poly_markets holds for a slug as far as
+  // this process knows (erased whenever another statement rewrites the row), the quote time the old
+  // every-pass UPDATE would have stored, and MAX(ts) in poly_quotes per slug, read from the table
+  // the first time a slug is quoted and kept here after.
+  struct StoredQuote { double bid = 0, ask = 0; bool active = true, closed = false; long long quote_ts = 0; };
+  std::map<std::string, StoredQuote> stored_quote_;
+  std::map<std::string, long long> quote_poll_ts_, quote_logged_ts_;
+  // At stop: quote_ts into every row whose stored value is behind its last refresh.
+  void persist_quote_times();
 };
 
 }  // namespace desk

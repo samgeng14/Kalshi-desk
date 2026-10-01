@@ -88,3 +88,29 @@ Two alternatives considered and why they lost:
 The desk itself has no retention policy: it will refill `quotes` at 750 MB a day whether or not
 the archive exists. Archiving on a schedule is a chore that will be forgotten. The real fix is a
 retention setting in the engine that rolls quotes out on its own, and that is not written yet.
+
+## Write volume: what changed on 2026-10-01, for anyone reading the tables
+
+macOS measured the desk dirtying 2.96 MB/s while awake (137 GB in 12.9 awake hours), 98% of it
+rewriting pages rather than adding rows. The fixes keep every row a reader sees, but some arrive
+later or are written less often:
+
+- `quotes`: the same rows with the same `ts`, held in memory and written every 5 minutes (and at
+  shutdown). Rowids still increase with `ts`, so `archive_quotes.py`'s day boundary is unchanged.
+  `/api/quotes/<ticker>` merges what is still in memory.
+- `markets.updated_ts`: with `markets_write_mode` "skip", the time the row last changed or a
+  heartbeat at most 10 minutes old, not the last poll. Every reader inside the desk sees the poll
+  time (`Market::quote_ts`); a script reading the column directly is up to 10 minutes behind.
+  "shadow" (the default) and "write" still write every listed row every cycle.
+- `model_fairs`: the cycle's rows are written in one transaction after the strategy loop.
+  `weather_wx1` is logged when its row would differ (estimate, sigma, or the book it is scored
+  against) or every 5 minutes, the Brier sample's rule, instead of every cycle. Consecutive rows
+  were identical but for `ts`, so an as-of read (the latest row at or before a moment, as
+  `research/wx_score.py` does) gets the same values; counting rows, or reading `ts` as the time of
+  the last estimate, no longer works. No study in the repo assumed one row per cycle.
+- `contract_universe.refreshed_ts`: when the row was first written or last changed. Nothing reads
+  it.
+- `poly_markets.quote_ts`: written at most every 60 s unless the book or state changed, and at
+  stop. The xvenue strategy adds the in-memory refresh time, so it reads what it read before.
+- `observations` (book captures), `kv`: one transaction per cycle; an unchanged `kv` value is
+  not rewritten.

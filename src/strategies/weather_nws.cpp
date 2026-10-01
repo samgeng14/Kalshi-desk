@@ -339,6 +339,10 @@ void WeatherNws::refresh_ensemble(Station& st, long long now) {
 
 void WeatherNws::prepare(const std::vector<Market>& markets, Store& store) {
   long long now = now_s();
+  // The WX1 log's last-written state, for contracts no longer priced (their day is long settled).
+  const long long clock = now_override_ ? now_override_ : now;   // fair()'s clock, which stamped them
+  for (auto it = wx1_logged_.begin(); it != wx1_logged_.end();)
+    it = clock - it->second.ts > 86400 ? wx1_logged_.erase(it) : std::next(it);
   std::map<std::string, bool> done;
   // Each refresh is two or three HTTP round trips inside the engine cycle; cap them per cycle so
   // a slow api.weather.gov cannot stall the desk for a minute (10 stations x 2 dates otherwise).
@@ -545,7 +549,20 @@ std::optional<Fair> WeatherNws::fair(const Market& m, const Series&, Store& stor
     if (q >= 0) {
       const double qh = read_bracket(w->hi, m), ql = read_bracket(w->lo, m);
       const double qsig = (qh >= 0 && ql >= 0) ? 0.5 * std::fabs(qh - ql) + 0.02 : f.sigma;
-      store.insert_model_fair(now, m.ticker, "weather_wx1", q, qsig, m.yes_bid, m.yes_ask);
+      // Logged when the row would differ from the last one (the estimate, its sigma or the book it
+      // was scored against) and otherwise every 5 minutes, the Brier sample's rule (2026-10-01). It
+      // was a row for every weather market on every cycle, bypassing that rule, one autocommit each:
+      // 4.4% of the desk's write-weighted stack samples on 09-28 by itself. Consecutive rows were
+      // identical but for ts, so a study that takes the latest row at or before a moment (as
+      // research/wx_score.py does) reads the same values; one that counts rows, or reads ts as the
+      // time of the last estimate, no longer can. The row is queued and written with the cycle's
+      // other model_fairs rows in one transaction.
+      Wx1Logged& logged = wx1_logged_[m.ticker];
+      if (logged.ts == 0 || q != logged.p || qsig != logged.sigma || m.yes_bid != logged.yes_bid ||
+          m.yes_ask != logged.yes_ask || now - logged.ts >= 300) {
+        store.queue_model_fair(now, m.ticker, "weather_wx1", q, qsig, m.yes_bid, m.yes_ask);
+        logged = Wx1Logged{q, qsig, m.yes_bid, m.yes_ask, now};
+      }
       f.inputs["wx1_p"] = q;
       f.inputs["wx1_sigma"] = qsig;
       f.inputs["wx1_mean_f"] = w->mid.mean();

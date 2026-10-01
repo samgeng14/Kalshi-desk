@@ -29,6 +29,7 @@
 #include "desk/store.h"
 #include "desk/universe.h"
 #include "desk/record.h"
+#include "desk/server.h"
 #include "desk/wxdist.h"
 #include "desk/strategies.h"
 #include "desk/timeutil.h"
@@ -4372,7 +4373,500 @@ static void test_store_readers() {
   for (const char* sfx : {"", "-wal", "-shm"}) std::remove((path + sfx).c_str());
 }
 
+// ---- write volume (2026-10-01) ----------------------------------------------------------------------
+// macOS measured the desk dirtying 2.96 MB/s while awake, 98% of it rewrites. These check that each
+// fix writes less while every reader still sees exactly what it saw before.
+
+static long long total_changes(Store& st) {
+  return st.query("SELECT total_changes() AS n")[0]["n"].get<long long>();
+}
+static long long stored_updated_ts(Store& st, const std::string& t) {
+  return st.query("SELECT updated_ts FROM markets WHERE ticker=?", {t})[0]["updated_ts"].get<long long>();
+}
+
+// markets_write_mode: skip writes a market row only when a stored field changed or as a 10-minute
+// heartbeat, while quote_ts still reads the last poll; shadow writes every row as before and checks
+// what skip would have done.
+static void test_markets_write_modes() {
+  Market m;
+  m.ticker = "KXT-W-B0"; m.event_ticker = "KXT-W"; m.series_ticker = "KXT"; m.status = "active";
+  m.close_time = "2099-01-01T00:00:00Z"; m.yes_bid = 0.40; m.yes_ask = 0.42; m.no_bid = 0.58; m.no_ask = 0.60;
+  m.yes_bid_size = 10; m.yes_ask_size = 12; m.rules_primary = "If the high is above 80"; m.exchange_index = 1;
+  const long long t0 = 1790000000;
+  {
+    Store st(":memory:");
+    st.set_markets_write_mode(MarketsWriteMode::Skip);
+    st.set_clock_for_tests(t0);
+    st.upsert_market(m);                                   // first sight: written
+    CHECK(stored_updated_ts(st, m.ticker) == t0);
+    const long long before = total_changes(st);
+    st.set_clock_for_tests(t0 + 9);
+    st.upsert_market(m);                                   // unchanged: nothing is written...
+    CHECK(total_changes(st) == before);
+    CHECK(stored_updated_ts(st, m.ticker) == t0);
+    CHECK(st.get_market(m.ticker)->quote_ts == t0 + 9);    // ...and every reader sees the new poll
+    CHECK(st.open_markets("KXT").at(0).quote_ts == t0 + 9);
+    CHECK(st.open_markets().at(0).quote_ts == t0 + 9);
+    CHECK(st.markets_in_event("KXT-W").at(0).quote_ts == t0 + 9);
+    CHECK(st.markets_write_stats()["skipped"] == 1);
+    // A changed field is written at once, the routing index and the rules text included.
+    Market c = m;
+    c.yes_ask = 0.43;
+    st.set_clock_for_tests(t0 + 18);
+    st.upsert_market(c);
+    CHECK(total_changes(st) > before);
+    CHECK(stored_updated_ts(st, m.ticker) == t0 + 18 && st.get_market(m.ticker)->yes_ask == 0.43);
+    Market r = c;
+    r.exchange_index = 2;
+    st.set_clock_for_tests(t0 + 27);
+    st.upsert_market(r);
+    CHECK(stored_updated_ts(st, m.ticker) == t0 + 27 && st.get_market(m.ticker)->exchange_index == 2);
+    Market rules = r;
+    rules.rules_secondary = "rounded to the nearest degree";
+    st.set_clock_for_tests(t0 + 36);
+    st.upsert_market(rules);
+    CHECK(stored_updated_ts(st, m.ticker) == t0 + 36);
+    // Nothing moves for 599 s: no write. Ten minutes after the last write: the heartbeat.
+    const long long quiet = total_changes(st);
+    st.set_clock_for_tests(t0 + 36 + 599);
+    st.upsert_market(rules);
+    CHECK(total_changes(st) == quiet && stored_updated_ts(st, m.ticker) == t0 + 36);
+    CHECK(st.get_market(m.ticker)->quote_ts == t0 + 36 + 599);
+    st.set_clock_for_tests(t0 + 36 + 600);
+    st.upsert_market(rules);
+    CHECK(stored_updated_ts(st, m.ticker) == t0 + 36 + 600);
+    CHECK(st.markets_write_stats()["heartbeats"] == 1);
+    // A refresh that rolls back moves no poll time: a quote_ts never vouches for a book that was
+    // not stored. And the detector forgets the rolled-back write, so the same book is written next.
+    Market moved = rules;
+    moved.yes_bid = 0.10;
+    st.set_clock_for_tests(t0 + 2000);
+    bool threw = false;
+    try {
+      st.transaction([&] { st.upsert_market(moved); throw std::runtime_error("boom"); });
+    } catch (const std::exception&) { threw = true; }
+    CHECK(threw);
+    CHECK(st.get_market(m.ticker)->yes_bid == 0.40 && st.get_market(m.ticker)->quote_ts == t0 + 36 + 600);
+    st.upsert_market(moved);
+    CHECK(stored_updated_ts(st, m.ticker) == t0 + 2000 && st.get_market(m.ticker)->yes_bid == 0.10);
+    // Inside a transaction its own reads see the poll times it staged; everyone after the commit.
+    st.set_clock_for_tests(t0 + 2009);
+    st.transaction([&] {
+      st.upsert_market(moved);
+      CHECK(st.get_market(m.ticker)->quote_ts == t0 + 2009);
+    });
+    CHECK(st.get_market(m.ticker)->quote_ts == t0 + 2009 && stored_updated_ts(st, m.ticker) == t0 + 2000);
+    // refresh_results' retry stamp still writes the row, and quote_ts becomes exactly that stamp.
+    st.touch_market(m.ticker, t0 + 2100);
+    CHECK(stored_updated_ts(st, m.ticker) == t0 + 2100 && st.get_market(m.ticker)->quote_ts == t0 + 2100);
+    // A reader holding an older version of the row (it read just before a write committed) gets
+    // that row's own time, never the poll time of the newer book.
+    Market newer = moved;
+    newer.yes_bid = 0.11;
+    st.set_clock_for_tests(t0 + 2200);
+    st.upsert_market(newer);
+    CHECK(st.effective_quote_ts(m.ticker, t0 + 2100) == t0 + 2100);
+    CHECK(st.effective_quote_ts(m.ticker, t0 + 2200) == t0 + 2200);
+    // At shutdown the poll times go into the rows, so a restart reads what every-cycle writes left.
+    st.set_clock_for_tests(t0 + 2300);
+    st.upsert_market(newer);
+    CHECK(stored_updated_ts(st, m.ticker) == t0 + 2200);
+    CHECK(st.persist_market_poll_times() == 1);
+    CHECK(stored_updated_ts(st, m.ticker) == t0 + 2300);
+    CHECK(st.persist_market_poll_times() == 0);
+    // Forgetting a market that left the listings is lossless for the same reason.
+    st.set_clock_for_tests(t0 + 2400);
+    st.upsert_market(newer);
+    st.retire_market_poll_times(t0 + 3000);
+    CHECK(stored_updated_ts(st, m.ticker) == t0 + 2400 && st.get_market(m.ticker)->quote_ts == t0 + 2400);
+  }
+  // Shadow: every row is written as before and quote_ts is the stored one; what skip would skip is
+  // counted and checked against the stored row.
+  {
+    Store st(":memory:");
+    st.set_markets_write_mode(MarketsWriteMode::Shadow);
+    std::vector<Market> ms;
+    for (int i = 0; i < 5; ++i) {
+      Market x = m;
+      x.ticker = "KXT-W-B" + std::to_string(i);
+      x.yes_bid = 0.1 * i;
+      ms.push_back(x);
+    }
+    for (int cycle = 0; cycle < 4; ++cycle) {
+      st.set_clock_for_tests(t0 + 9 * cycle);
+      st.transaction([&] {
+        for (auto x : ms) {
+          if (cycle == 2 && x.ticker == "KXT-W-B3") x.yes_ask = 0.5;
+          st.upsert_market(x);
+        }
+      });
+      for (const auto& x : st.open_markets("KXT")) CHECK(x.quote_ts == t0 + 9 * cycle);
+      CHECK(stored_updated_ts(st, "KXT-W-B0") == t0 + 9 * cycle);   // written every cycle, as before
+    }
+    json s = st.markets_write_stats();
+    CHECK(s["mode"] == "shadow" && s["shadow_rows"] == 20 && s["written"] == 20 && s["skipped"] == 0);
+    // Cycles 1-3 would skip all five, less B3 in cycle 2 (changed) and in cycle 3 (changed back).
+    CHECK(s["would_skip"] == 13);
+    CHECK(s["detector_mismatches"] == 0 && s["overlay_mismatches"] == 0);
+    // The detector deliberately fed a row that differs from what it last saw: skipping would lose it.
+    st.exec("UPDATE markets SET yes_bid=0.99 WHERE ticker='KXT-W-B1'");
+    st.set_clock_for_tests(t0 + 100);
+    st.upsert_market(ms[1]);
+    CHECK(st.markets_write_stats()["detector_mismatches"] == 1);
+    CHECK(st.get_market("KXT-W-B1")->yes_bid == ms[1].yes_bid);    // shadow still wrote it
+    // And a stored updated_ts the poll time does not explain.
+    st.exec("UPDATE markets SET updated_ts=updated_ts-50 WHERE ticker='KXT-W-B1'");
+    CHECK(st.get_market("KXT-W-B1")->quote_ts == t0 + 50);         // shadow reads the row, as before
+    CHECK(st.markets_write_stats()["overlay_mismatches"] == 1);
+  }
+  // Write (Store's own default): the old statements, no checks.
+  {
+    Store st(":memory:");
+    st.set_clock_for_tests(t0);
+    st.upsert_market(m);
+    const long long before = total_changes(st);
+    st.set_clock_for_tests(t0 + 9);
+    st.upsert_market(m);
+    CHECK(total_changes(st) > before && stored_updated_ts(st, m.ticker) == t0 + 9);
+    CHECK(st.markets_write_stats()["shadow_rows"] == 0 && st.markets_write_stats()["mode"] == "write");
+  }
+  // The setting: shadow by default, and nothing else but the three names.
+  CHECK(Config().markets_write_mode == "shadow");
+  MarketsWriteMode mode = MarketsWriteMode::Write;
+  CHECK(parse_markets_write_mode("skip", &mode) && mode == MarketsWriteMode::Skip);
+  CHECK(!parse_markets_write_mode("Skip", &mode) && !parse_markets_write_mode("", &mode));
+  {
+    const std::string cfg_path = "/tmp/desk_test_write_mode.json";
+    std::ofstream(cfg_path) << R"({"markets_write_mode": "skipp"})";
+    bool refused = false;
+    try { load_config(cfg_path); } catch (const std::exception& e) {
+      refused = std::string(e.what()).find("markets_write_mode") != std::string::npos;
+    }
+    CHECK(refused);
+    std::ofstream(cfg_path) << R"({"markets_write_mode": "skip"})";
+    CHECK(load_config(cfg_path).markets_write_mode == "skip");
+    std::ofstream(cfg_path) << R"({})";
+    CHECK(load_config(cfg_path).markets_write_mode == "shadow");
+    std::remove(cfg_path.c_str());
+  }
+}
+
+// open_markets(series) sorts in C++ instead of SQL: the same markets in the same order as
+// ORDER BY ticker, which compares bytes.
+static void test_open_markets_series_order() {
+  Store st(":memory:");
+  const long long now = now_s();
+  const std::vector<std::string> tickers = {"KXZ-B10", "KXZ-B9", "KXZ-a1", "KXZ-B1", "KXZ-\xC3\x84", "KXZ-B10.5",
+                                            "KXZ-B-1", "KXZ-~", "KXZ-B0"};
+  for (const auto& t : tickers) {
+    Market m;
+    m.ticker = t; m.series_ticker = "KXZ"; m.event_ticker = "KXZ-E";
+    m.status = t == "KXZ-B9" ? "open" : "active";
+    m.close_time = t == "KXZ-B0" ? iso_of(now - 60) : iso_of(now + 3600);   // B0: closed but stored active
+    st.upsert_market(m);
+  }
+  Market other;
+  other.ticker = "KXY-B1"; other.series_ticker = "KXY"; other.status = "active"; other.close_time = iso_of(now + 3600);
+  st.upsert_market(other);
+  Market done;
+  done.ticker = "KXZ-B2"; done.series_ticker = "KXZ"; done.status = "finalized"; done.close_time = iso_of(now + 3600);
+  st.upsert_market(done);
+  std::vector<std::string> want;
+  for (const auto& r : st.query("SELECT ticker FROM markets WHERE status IN ('active','open') AND series_ticker='KXZ' "
+                                "ORDER BY ticker"))
+    if (r["ticker"] != "KXZ-B0") want.push_back(r["ticker"]);
+  std::vector<std::string> got, full;
+  for (const auto& m : st.open_markets("KXZ")) got.push_back(m.ticker);
+  for (const auto& m : st.open_markets())
+    if (m.series_ticker == "KXZ") full.push_back(m.ticker);
+  CHECK(got.size() == 8 && got == want && full == want);
+}
+
+// Quote history is buffered and written every Store::kQuoteFlushSeconds: the same rows, in the
+// same order, as insert_quote wrote, and the dashboard's history sees them before they are written.
+static void test_quote_history_buffer() {
+  const std::string path = "/tmp/desk_test_quote_buffer.sqlite";
+  for (const char* sfx : {"", "-wal", "-shm"}) std::remove((path + sfx).c_str());
+  Market a, b;
+  a.ticker = "KXQ-A"; a.yes_bid = 0.11; a.yes_ask = 0.13; a.no_bid = 0.87; a.no_ask = 0.89; a.last = 0.12;
+  a.yes_bid_size = 5; a.yes_ask_size = 6; a.volume = 70; a.open_interest = 80;
+  b = a; b.ticker = "KXQ-B"; b.yes_bid = 0.21;
+  const long long t0 = 1790000000;
+  const char* cols = "SELECT ts,ticker,yes_bid,yes_ask,no_bid,no_ask,last,yes_bid_size,yes_ask_size,volume,open_interest "
+                     "FROM quotes ORDER BY id";
+  json direct;
+  {
+    Store old_way(":memory:");
+    old_way.insert_quote(t0, a);
+    old_way.insert_quote(t0, b);
+    Market a2 = a; a2.yes_bid = 0.12;
+    old_way.insert_quote(t0 + 60, a2);
+    direct = old_way.query(cols);
+  }
+  {
+    Store st(path);
+    Market a2 = a; a2.yes_bid = 0.12;
+    st.buffer_quotes({QuoteRow::of(t0, a), QuoteRow::of(t0, b)});
+    st.buffer_quotes({QuoteRow::of(t0 + 60, a2)});
+    CHECK(st.buffered_quotes() == 3);
+    CHECK(st.flush_quotes(t0 + 60) == 0);                       // not due yet
+    CHECK(st.query("SELECT COUNT(*) AS n FROM quotes")[0]["n"] == 0);
+    json h = st.recent_quotes("KXQ-A", 500);                  // the history endpoint sees them anyway
+    CHECK(h.size() == 2 && h[0]["ts"] == t0 + 60 && h[1]["ts"] == t0 && h[0]["yes_bid"] == 0.12);
+    CHECK(st.recent_quotes("KXQ-A", 1).size() == 1 && st.recent_quotes("KXQ-B", 500).size() == 1);
+    CHECK(st.flush_quotes(t0 + 300) == 3);                      // due: 300 s after the first row
+    CHECK(st.buffered_quotes() == 0);
+    CHECK(st.query(cols) == direct);                            // identical rows, identical order
+    CHECK(st.recent_quotes("KXQ-A", 500) == h);                 // and the same history, now from the table
+    // A failed write keeps the rows for the next attempt.
+    st.buffer_quotes({QuoteRow::of(t0 + 400, b)});
+    st.exec("ALTER TABLE quotes RENAME TO quotes_away");
+    bool threw = false;
+    try { st.flush_quotes(t0 + 400, true); } catch (const std::exception&) { threw = true; }
+    CHECK(threw && st.buffered_quotes() == 1);
+    st.exec("ALTER TABLE quotes_away RENAME TO quotes");
+    CHECK(st.flush_quotes(t0 + 401, true) == 1 && st.buffered_quotes() == 0);
+    // Whatever is still held when the store closes is written then.
+    st.buffer_quotes({QuoteRow::of(t0 + 500, a)});
+  }
+  {
+    Store st(path);
+    CHECK(st.query("SELECT COUNT(*) AS n FROM quotes")[0]["n"] == 5);
+  }
+  for (const char* sfx : {"", "-wal", "-shm"}) std::remove((path + sfx).c_str());
+}
+
+// The universe refresh: one transaction, and a row whose only change would be refreshed_ts is left
+// alone, so refreshed_ts is when the row was first written or last changed.
+static void test_universe_save_skips_unchanged() {
+  Store st(":memory:");
+  std::vector<UniverseRow> rows(2);
+  rows[0].ticker = "KXHIGHNY-26OCT01-B70"; rows[0].event_ticker = "KXHIGHNY-26OCT01"; rows[0].series = "KXHIGHNY";
+  rows[0].local_date = "2026-10-01"; rows[0].tz = "America/New_York"; rows[0].settle_product = "CLINYC";
+  rows[0].phase = ContractPhase::Today; rows[0].close_ts = 1790000000; rows[0].expiration_ts = 1790003600;
+  rows[1] = rows[0];
+  rows[1].ticker = "KXHIGHNY-26OCT01-B72";
+  save_universe(st, rows, 1000);
+  auto refreshed = [&](const std::string& t) {
+    return st.query("SELECT refreshed_ts FROM contract_universe WHERE ticker=?", {t})[0]["refreshed_ts"].get<long long>();
+  };
+  CHECK(refreshed(rows[0].ticker) == 1000 && refreshed(rows[1].ticker) == 1000);
+  const long long before = total_changes(st);
+  save_universe(st, rows, 1300);
+  CHECK(total_changes(st) == before);                     // nothing changed: nothing written
+  CHECK(refreshed(rows[0].ticker) == 1000);
+  rows[1].phase = ContractPhase::DayDone;
+  save_universe(st, rows, 1600);
+  CHECK(refreshed(rows[0].ticker) == 1000 && refreshed(rows[1].ticker) == 1600);
+  CHECK(st.query("SELECT phase FROM contract_universe WHERE ticker=?", {rows[1].ticker})[0]["phase"] ==
+        phase_label(ContractPhase::DayDone));
+  rows[0].close_ts += 60;                                 // every stored column counts
+  save_universe(st, rows, 1900);
+  CHECK(refreshed(rows[0].ticker) == 1900 && refreshed(rows[1].ticker) == 1600);
+}
+
+// model_fairs rows are queued and written in one transaction; WX1 logs on change with the Brier
+// sample's 5-minute heartbeat, and the Fair it returns is the same as before.
+static void test_model_fairs_queue_and_wx1() {
+  {
+    Store st(":memory:");
+    st.queue_model_fair(100, "KXA", "s1", 0.4, 0.02, 0.38, 0.41);
+    st.queue_model_fair(101, "KXB", "s1", 0.5, 0.03, 0.48, 0.52);
+    CHECK(st.queued_model_fairs() == 2 && st.query("SELECT COUNT(*) AS n FROM model_fairs")[0]["n"] == 0);
+    CHECK(st.flush_model_fairs() == 2 && st.queued_model_fairs() == 0);
+    json r = st.query("SELECT ts,ticker,strategy,p,sigma,yes_bid,yes_ask FROM model_fairs ORDER BY id");
+    CHECK(r.size() == 2 && r[0]["ticker"] == "KXA" && r[1]["ts"] == 101 && r[1]["yes_ask"] == 0.52);
+    CHECK(st.flush_model_fairs() == 0);
+    // A failed write keeps them, in order, ahead of anything queued since.
+    st.queue_model_fair(102, "KXC", "s1", 0.6, 0.02, 0.58, 0.61);
+    st.exec("ALTER TABLE model_fairs RENAME TO model_fairs_away");
+    bool threw = false;
+    try { st.flush_model_fairs(); } catch (const std::exception&) { threw = true; }
+    CHECK(threw && st.queued_model_fairs() == 1);
+    st.queue_model_fair(103, "KXD", "s1", 0.6, 0.02, 0.58, 0.61);
+    st.exec("ALTER TABLE model_fairs_away RENAME TO model_fairs");
+    CHECK(st.flush_model_fairs() == 2);
+    json t = st.query("SELECT ticker FROM model_fairs ORDER BY id");
+    CHECK(t.size() == 4 && t[2]["ticker"] == "KXC" && t[3]["ticker"] == "KXD");
+  }
+  WeatherNws::DayForecast d;
+  d.date = "2026-09-05";
+  d.fc_max = 79; d.fc_min = 68; d.fc_day_max = 79;
+  d.obs_max = 79; d.obs_min = 66; d.have_obs = true;
+  d.t_now = 79; d.fc_at_now = 76; d.resid = 3; d.have_resid = true;
+  d.offset_seconds = -7 * 3600;
+  d.fetched = 1;
+  const long long t = parse_iso("2026-09-05T18:33:00Z");
+  d.hourly = {{t - 1800, 79}, {t + 1800, 80}, {t + 5400, 81}, {t + 9000, 80}};
+  Market m;
+  m.ticker = "KXHIGHLAX-26SEP05-B79.5"; m.event_ticker = "KXHIGHLAX-26SEP05"; m.series_ticker = "KXHIGHLAX";
+  m.strike_type = "between"; m.floor_strike = 79; m.cap_strike = 80; m.yes_bid = 0.30; m.yes_ask = 0.34;
+  Series s{"KXHIGHLAX", "Climate and Weather", "", "quadratic", "daily", 1.0};
+  Store st(":memory:");
+  auto wx1_rows = [&] {
+    st.flush_model_fairs();
+    return st.query("SELECT ts,p,sigma,yes_bid,yes_ask FROM model_fairs WHERE strategy='weather_wx1' ORDER BY id");
+  };
+  WeatherNws wx(json::object(), "t");
+  wx.set_day_forecast("KXHIGHLAX", d);
+  wx.set_clock(t);
+  auto f1 = wx.fair(m, s, st);
+  CHECK(f1.has_value());
+  CHECK(wx1_rows().size() == 1);
+  auto f2 = wx.fair(m, s, st);                    // the next cycle, nothing different: no row
+  CHECK(wx1_rows().size() == 1);
+  CHECK(f2 && f2->p == f1->p && f2->sigma == f1->sigma && f2->note == f1->note && f2->inputs == f1->inputs);
+  Market moved = m;
+  moved.yes_bid = 0.31;                           // the book it is scored against moved: a row
+  wx.fair(moved, s, st);
+  CHECK(wx1_rows().size() == 2);
+  wx.set_clock(t + 299);
+  wx.fair(moved, s, st);
+  CHECK(wx1_rows().size() == 2);
+  wx.set_clock(t + 300);                           // five minutes since the last row: the heartbeat
+  wx.fair(moved, s, st);
+  json rows = wx1_rows();
+  CHECK(rows.size() == 3 && rows[0]["ts"] == t && rows[1]["ts"] == t && rows[2]["ts"] == t + 300);
+  CHECK(rows[1]["yes_bid"] == 0.31 && rows[2]["p"] == rows[1]["p"]);
+  // What the engine trades on is untouched: a fresh instance with no log state returns the same Fair.
+  WeatherNws fresh(json::object(), "t");
+  fresh.set_day_forecast("KXHIGHLAX", d);
+  fresh.set_clock(t + 300);
+  Store other(":memory:");
+  auto a = wx.fair(moved, s, st), b = fresh.fair(moved, s, other);
+  CHECK(a && b && a->p == b->p && a->sigma == b->sigma && a->note == b->note && a->inputs == b->inputs &&
+        a->research_only == b->research_only && a->research_reason == b->research_reason);
+}
+
+// /api/scorecard's counts, now from GROUP BY ticker, strategy summed here: the same numbers as the
+// old GROUP BY strategy query, NULL tickers and timestamps included.
+static void test_scorecard_counts() {
+  Store st(":memory:");
+  auto add = [&](SqlValue ts, SqlValue ticker, const std::string& strategy) {
+    st.exec("INSERT INTO model_fairs(ts,ticker,strategy,p,sigma,yes_bid,yes_ask) VALUES(?,?,?,0.5,0.02,0.4,0.6)",
+            {ts, ticker, strategy});
+  };
+  add(500LL, std::string("KXA"), "s1"); add(300LL, std::string("KXA"), "s1"); add(900LL, std::string("KXB"), "s1");
+  add(200LL, std::string("KXA"), "s2"); add(nullptr, std::string("KXC"), "s2"); add(150LL, nullptr, "s2");
+  add(nullptr, nullptr, "s2"); add(700LL, std::string("KXB"), "s3");
+  json old = json::object();
+  for (const auto& r : st.query("SELECT strategy, COUNT(*) AS n, COUNT(DISTINCT ticker) AS markets, MIN(ts) AS since "
+                                "FROM model_fairs GROUP BY strategy"))
+    old[r.value("strategy", "")] = {{"fairs_logged", r.value("n", 0LL)}, {"markets", r.value("markets", 0LL)},
+                                    {"since", r.value("since", 0LL)}};
+  json now = model_fair_counts(st);
+  CHECK(now == old);
+  CHECK(now["s2"]["fairs_logged"] == 4 && now["s2"]["markets"] == 2 && now["s2"]["since"] == 150);
+  // The new query streams the covering index: no temp b-tree for the GROUP BY.
+  bool temp = false;
+  for (const auto& r : st.query("EXPLAIN QUERY PLAN SELECT ticker, strategy, COUNT(*) AS n, MIN(ts) AS since "
+                                "FROM model_fairs GROUP BY ticker, strategy"))
+    if (r.value("detail", "").find("TEMP B-TREE") != std::string::npos) temp = true;
+  CHECK(!temp);
+}
+
+// kv_set writes nothing when the value is unchanged, and updates the row in place when it is not.
+static void test_kv_set_writes_only_changes() {
+  Store st(":memory:");
+  st.kv_set("k", std::string(5000, 'x'));
+  const long long rowid = st.query("SELECT rowid AS r FROM kv WHERE key='k'")[0]["r"].get<long long>();
+  const long long before = total_changes(st);
+  st.kv_set("k", std::string(5000, 'x'));
+  CHECK(total_changes(st) == before);
+  st.kv_set("k", std::string(5000, 'y'));
+  CHECK(total_changes(st) == before + 1 && *st.kv_get("k") == std::string(5000, 'y'));
+  CHECK(st.query("SELECT rowid AS r FROM kv WHERE key='k'")[0]["r"].get<long long>() == rowid);
+  st.kv_set("other", "");
+  CHECK(st.kv_get("other") && st.kv_get("other")->empty());
+}
+
+// The engine end to end on a mock exchange, in skip mode: the second cycle writes no unchanged
+// market row yet the markets read as just polled; quote history waits in the buffer and the history
+// endpoint still sees it; book observations land after the books step; shutdown writes it all.
+static void test_write_paths_in_the_cycle() {
+  httplib::Server server;
+  std::atomic<double> ask{0.12};
+  auto mk = [&](const std::string& t) {
+    return json{{"ticker", t}, {"event_ticker", "KXT-E"}, {"status", "active"}, {"exchange_index", 0},
+                {"close_time", "2099-01-01T00:00:00Z"}, {"yes_bid_dollars", "0.1000"},
+                {"yes_ask_dollars", fmt_dollars(ask.load())}, {"yes_bid_size_fp", "500.00"}, {"yes_ask_size_fp", "500.00"}};
+  };
+  server.Get("/trade-api/v2/markets", [&](const httplib::Request& q, httplib::Response& r) {
+    json list = json::array();
+    if (q.get_param_value("series_ticker") == "KXT") list = json::array({mk("KXT-E-B0"), mk("KXT-E-B1")});
+    r.set_content(json{{"markets", list}, {"cursor", ""}}.dump(), "application/json");
+  });
+  server.Get(R"(/trade-api/v2/markets/([^/]+)/orderbook)", [&](const httplib::Request&, httplib::Response& r) {
+    r.set_content(R"({"orderbook_fp":{"yes_dollars":[["0.1000","250.00"]],"no_dollars":[["0.8800","300.00"]]}})", "application/json");
+  });
+  server.Get(R"(/trade-api/v2/series/([^/]+))", [&](const httplib::Request&, httplib::Response& r) {
+    r.set_content(R"({"series":{"ticker":"KXT","category":"Crypto","fee_type":"quadratic","fee_multiplier":1}})", "application/json");
+  });
+  server.Get(".*", [](const httplib::Request&, httplib::Response& r) {
+    r.set_content(R"({"orders":[],"fills":[],"settlements":[],"transfers":[],"deposits":[],"withdrawals":[],"series":[],"cursor":""})", "application/json");
+  });
+  int port = server.bind_to_any_port("127.0.0.1");
+  CHECK(port > 0);
+  std::thread thread([&] { server.listen_after_bind(); });
+  const std::string path = "/tmp/desk_test_write_paths.sqlite";
+  for (const char* sfx : {"", "-wal", "-shm"}) std::remove((path + sfx).c_str());
+  try {
+    Store st(path);
+    Config cfg;
+    cfg.bankroll_dollars = 100;
+    cfg.watch_series = {"KXT"};
+    cfg.markets_write_mode = "skip";
+    KalshiClient client("http://127.0.0.1:" + std::to_string(port) + "/trade-api/v2", nullptr, "t");
+    Executor ex(cfg, st, client);
+    Engine eng(cfg, st, client, ex);
+    CHECK(st.markets_write_mode() == MarketsWriteMode::Skip);
+    // A position, so the books step reads this market's book.
+    st.exec("INSERT INTO positions(ticker,position,exposure,updated_ts) VALUES('KXT-E-B0',3,0.3,?)", {now_s()});
+    const long long t0 = now_s();
+    st.set_clock_for_tests(t0);
+    eng.cycle();
+    CHECK(stored_updated_ts(st, "KXT-E-B0") == t0 && st.markets_write_stats()["written"] == 2);
+    // Two quote rows: buffered, not yet in the table, already in the history.
+    CHECK(st.buffered_quotes() == 2 && st.query("SELECT COUNT(*) AS n FROM quotes")[0]["n"] == 0);
+    CHECK(st.recent_quotes("KXT-E-B0", 500).size() == 1);
+    // The book observation was written after the books step.
+    CHECK(st.query("SELECT COUNT(*) AS n FROM observations WHERE subject='KXT-E-B0'")[0]["n"] == 1);
+    st.set_clock_for_tests(t0 + 9);
+    eng.cycle();                                   // the same listing: no market row written
+    json s = st.markets_write_stats();
+    CHECK(s["written"] == 2 && s["skipped"] == 2);
+    CHECK(stored_updated_ts(st, "KXT-E-B0") == t0);
+    CHECK(st.get_market("KXT-E-B0")->quote_ts == t0 + 9 && st.open_markets("KXT").at(1).quote_ts == t0 + 9);
+    CHECK(eng.status()["markets_write"]["skipped"] == 2);
+    ask = 0.14;
+    st.set_clock_for_tests(t0 + 18);
+    eng.cycle();                                   // the ask moved: both rows written
+    CHECK(st.markets_write_stats()["written"] == 4);
+    CHECK(stored_updated_ts(st, "KXT-E-B1") == t0 + 18 && std::fabs(st.get_market("KXT-E-B1")->yes_ask - 0.14) < 1e-9);
+    st.set_clock_for_tests(t0 + 27);
+    eng.cycle();                                   // skipped again
+    CHECK(stored_updated_ts(st, "KXT-E-B1") == t0 + 18);
+    eng.flush_on_stop();
+    CHECK(st.buffered_quotes() == 0 && st.query("SELECT COUNT(*) AS n FROM quotes")[0]["n"] >= 2);
+    CHECK(stored_updated_ts(st, "KXT-E-B1") == t0 + 27);   // the last poll, as every-cycle writes left it
+  } catch (const std::exception& e) {
+    std::cerr << "write paths test error: " << e.what() << "\n";
+    CHECK(false);
+  }
+  server.stop();
+  thread.join();
+  for (const char* sfx : {"", "-wal", "-shm"}) std::remove((path + sfx).c_str());
+}
+
 int main() {
+  test_markets_write_modes();
+  test_open_markets_series_order();
+  test_quote_history_buffer();
+  test_universe_save_skips_unchanged();
+  test_model_fairs_queue_and_wx1();
+  test_scorecard_counts();
+  test_kv_set_writes_only_changes();
+  test_write_paths_in_the_cycle();
   test_store_readers();
   test_sportsbook_line();
   test_ladder_scan_coverage();

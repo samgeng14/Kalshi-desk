@@ -20,6 +20,13 @@ void record_observation(Store& store, const Observation& o) {
        o.received_ts ? o.received_ts : now_s(), o.payload});
 }
 
+void record_observations(Store& store, const std::vector<Observation>& os) {
+  if (os.empty()) return;
+  store.transaction([&] {
+    for (const auto& o : os) record_observation(store, o);
+  });
+}
+
 ReplayCursor::ReplayCursor(Store& store, long long as_of, Arrival basis)
     : store_(store), as_of_(as_of), basis_(basis) {
   if (as_of <= 0) throw std::invalid_argument("replay: as_of must be a real time");

@@ -24,6 +24,7 @@
 #include "desk/poly.h"
 #include "desk/risk.h"
 #include "desk/store.h"
+#include "desk/strategies.h"
 #include "desk/timeutil.h"
 
 using namespace desk;
@@ -851,6 +852,75 @@ static void test_pm_hedge_ownership_and_reconciliation() {
   CHECK(st.kv_get("poly_pair_send_pending:" + slug).value_or("") != "");
 }
 
+// refresh_quotes' writes (2026-10-01): one transaction per batch after its HTTP call; poly_markets
+// written when the book or state changed or its quote_ts is 60 s behind; poly_quotes logged on
+// change or every 60 s from an in-memory clock seeded from the table; and the xvenue strategy still
+// reads the quote time every pass used to write.
+static void test_quote_writes() {
+  MockPoly x;
+  seed_poly(x);
+  Store st(":memory:");
+  seed_kalshi(st);
+  Config cfg = poly_cfg();
+  auto client = std::make_shared<PolyClient>(x.base(), x.base(), nullptr, "tests");
+  const std::string slug = "aec-nfl-ne-sea-2026-09-09", ne = "KXNFLGAME-26SEP09NESEA-NE";
+  auto stored = [&] { return st.query("SELECT bid, ask, quote_ts FROM poly_markets WHERE slug=?", {slug})[0]; };
+  auto count = [&](const char* table) {
+    return st.query(std::string("SELECT COUNT(*) AS n FROM ") + table + " WHERE slug=?", {slug})[0]["n"].get<long long>();
+  };
+  const long long now = now_s();
+  Market km = *st.get_market(ne);
+  Series ks = *st.get_series("KXNFLGAME");
+  auto xvenue_age = [&](bool with_source, PolyDesk* desk) {
+    XVenue xv;
+    if (with_source) xv.set_quote_ts_source([desk] { return desk->quote_poll_times(); });
+    xv.prepare({}, st);
+    auto f = xv.fair(km, ks, st);
+    return f ? f->inputs.value("polymarket_quote_age_s", -1LL) : -1LL;
+  };
+  {
+    PolyDesk desk(cfg, st, client, nullptr);
+    desk.refresh_universe(now);
+    desk.match(now);
+    x.quote(slug, 0.40, 0.405);
+    desk.refresh_quotes(now);
+    CHECK(count("poly_quotes") == 1 && count("pair_ticks") == 1);
+    CHECK(stored()["quote_ts"] == now && stored()["bid"] == 0.40);
+    desk.refresh_quotes(now + 10);                  // unchanged: no history row, no row write
+    CHECK(count("poly_quotes") == 1 && stored()["quote_ts"] == now);
+    CHECK(desk.quote_for(ne, now + 10)->ts == now + 10);           // the desk's own view is current
+    CHECK(desk.quote_poll_times()[slug] == now + 10);
+    // The xvenue strategy reads the row and the later poll time: ten seconds younger than the row.
+    const long long with = xvenue_age(true, &desk), without = xvenue_age(false, &desk);
+    CHECK(with != -1 && without - with >= 9 && without - with <= 11);
+    desk.refresh_quotes(now + 60);                  // the 60 s heartbeat, and quote_ts 60 s behind
+    CHECK(count("poly_quotes") == 2 && count("pair_ticks") == 2 && stored()["quote_ts"] == now + 60);
+    x.quote(slug, 0.41, 0.415);
+    desk.refresh_quotes(now + 70);                  // the book moved: both at once
+    CHECK(count("poly_quotes") == 3 && stored()["bid"] == 0.41 && stored()["quote_ts"] == now + 70);
+    desk.refresh_quotes(now + 80);
+    CHECK(count("poly_quotes") == 3 && stored()["quote_ts"] == now + 70);
+    // The universe refresh rewrites the row's state (and its listing carries the older 0.38 bid, so
+    // the next quote is a change), so the next pass writes the row whatever it holds.
+    desk.refresh_universe(now + 85);
+    desk.refresh_quotes(now + 90);
+    CHECK(count("poly_quotes") == 4 && stored()["quote_ts"] == now + 90 && stored()["bid"] == 0.41);
+    desk.refresh_quotes(now + 100);
+    CHECK(count("poly_quotes") == 4 && stored()["quote_ts"] == now + 90);
+  }
+  // At stop the last pass's time goes into the row, as every-pass writes would have left it.
+  CHECK(stored()["quote_ts"] == now + 100);
+  // A new desk reads the last history row's ts from the table once and carries on from it: 20 s
+  // after it an unchanged book writes no history row, 60 s after it the heartbeat does.
+  {
+    PolyDesk desk(cfg, st, client, nullptr);
+    desk.refresh_quotes(now + 110);
+    CHECK(count("poly_quotes") == 4);
+    desk.refresh_quotes(now + 150);
+    CHECK(count("poly_quotes") == 5);
+  }
+}
+
 int main(int argc, char** argv) {
   if (argc == 2 && std::string(argv[1]) == "--hedge-lifecycle") {
     test_pm_hedge_ownership_and_reconciliation();
@@ -859,6 +929,7 @@ int main(int argc, char** argv) {
   test_auth();
   test_parsers_and_math();
   test_matching_quotes_and_locks();
+  test_quote_writes();
   test_matching_daily_league();
   test_account_rails_and_orders();
   test_pair_rule_paper();

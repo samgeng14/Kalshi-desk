@@ -151,6 +151,7 @@ int main(int argc, char** argv) {
   }
   if (cmd == "once") {
     engine.cycle();
+    engine.flush_on_stop();
     std::cout << engine.status().dump(2) << "\n";
     return 0;
   }
@@ -228,6 +229,8 @@ int main(int argc, char** argv) {
   }
   LOG_INFO("shutting down");
   engine.stop_background();
+  // Rows held in memory to save writes (quote history, model_fairs, poll times) go to disk now.
+  engine.flush_on_stop();
   server.stop();
   return exit_code;
 }

@@ -1,5 +1,6 @@
 #pragma once
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 
@@ -31,8 +32,15 @@ class HttpServer {
   std::unique_ptr<httplib::Server> svr_;
   std::thread th_;
   long long series_synced_ = 0;
+  // /api/scorecard's model_fairs counts, computed without a sort and kept for 5 minutes.
+  json fairs_logged_by_strategy();
+  std::mutex scorecard_mu_;
+  json scorecard_fairs_ = json::object();
+  long long scorecard_ts_ = 0;
 };
 
 void seed_hypotheses(Store& store);
+// /api/scorecard's research counts per strategy ({fairs_logged, markets, since}), without a sort.
+json model_fair_counts(Store& store);
 
 }  // namespace desk

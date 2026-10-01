@@ -5,9 +5,16 @@ namespace desk {
 
 void XVenue::prepare(const std::vector<Market>&, Store& store) {
   pairs_.clear();
+  // Read before the rows, so a refresh that commits in between can only make the time older than
+  // the book it is put on, never newer.
+  const std::map<std::string, long long> polled = quote_ts_source_ ? quote_ts_source_() : std::map<std::string, long long>();
   std::map<std::string, std::pair<std::pair<double, double>, long long>> quotes;   // slug -> ((bid, ask), quote_ts)
-  for (const auto& r : store.query("SELECT slug, bid, ask, quote_ts FROM poly_markets WHERE closed=0"))
-    quotes[r.value("slug", "")] = {{r.value("bid", 0.0), r.value("ask", 0.0)}, r.value("quote_ts", 0LL)};
+  for (const auto& r : store.query("SELECT slug, bid, ask, quote_ts FROM poly_markets WHERE closed=0")) {
+    const std::string slug = r.value("slug", "");
+    long long ts = r.value("quote_ts", 0LL);
+    if (auto p = polled.find(slug); p != polled.end()) ts = std::max(ts, p->second);
+    quotes[slug] = {{r.value("bid", 0.0), r.value("ask", 0.0)}, ts};
+  }
   for (const auto& r : store.query("SELECT kalshi_ticker, slug, pm_yes_is_kalshi_yes FROM poly_pairs")) {
     auto q = quotes.find(r.value("slug", ""));
     if (q == quotes.end()) continue;

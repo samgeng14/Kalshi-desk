@@ -45,6 +45,8 @@ enum class StudyKind { PredictionOnly, Execution };
 const char* study_label(StudyKind k);
 
 void record_observation(Store& store, const Observation& o);
+// Several at once, in one transaction (nothing when empty).
+void record_observations(Store& store, const std::vector<Observation>& os);
 
 // Serves only what had arrived by `as_of`. There is no way to ask it for anything later: that is
 // the entire value of the type. A row whose chosen arrival clock is unknown (published_ts 0 under

@@ -178,17 +178,33 @@ std::vector<UniverseRow> build_universe(const std::vector<Market>& markets, long
   return out;
 }
 
+// One transaction for the whole refresh, and a row is rewritten only when something in it changed
+// (2026-10-01). It was one autocommit per open market, basket series included (~16k rows) every
+// 300 s, each rewriting its row because refreshed_ts changed and re-inserting its
+// idx_universe_phase entry because phase is in the SET list: about 2 WAL frames a row, 152 MB per
+// refresh in the harness and 15% of the desk's write-weighted stack samples on 2026-09-28.
+// refreshed_ts therefore means "when this row was first written or last changed", not "when it was
+// last confirmed": the refresh itself still runs every 300 s and on every zone's day roll. Nothing
+// in the code, scripts or research reads the column.
 void save_universe(Store& store, const std::vector<UniverseRow>& rows, long long now) {
-  for (const auto& r : rows)
-    store.exec(
-        "INSERT INTO contract_universe(ticker,event_ticker,series_ticker,local_date,tz,"
-        "settle_source,settle_product,phase,close_ts,expiration_ts,refreshed_ts) "
-        "VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(ticker) DO UPDATE SET "
-        "local_date=excluded.local_date,tz=excluded.tz,settle_source=excluded.settle_source,"
-        "settle_product=excluded.settle_product,phase=excluded.phase,close_ts=excluded.close_ts,"
-        "expiration_ts=excluded.expiration_ts,refreshed_ts=excluded.refreshed_ts",
-        {r.ticker, r.event_ticker, r.series, r.local_date, r.tz, r.settle_source, r.settle_product,
-         std::string(phase_label(r.phase)), r.close_ts, r.expiration_ts, now});
+  if (rows.empty()) return;
+  store.transaction([&] {
+    for (const auto& r : rows)
+      store.exec(
+          "INSERT INTO contract_universe(ticker,event_ticker,series_ticker,local_date,tz,"
+          "settle_source,settle_product,phase,close_ts,expiration_ts,refreshed_ts) "
+          "VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(ticker) DO UPDATE SET "
+          "local_date=excluded.local_date,tz=excluded.tz,settle_source=excluded.settle_source,"
+          "settle_product=excluded.settle_product,phase=excluded.phase,close_ts=excluded.close_ts,"
+          "expiration_ts=excluded.expiration_ts,refreshed_ts=excluded.refreshed_ts "
+          "WHERE contract_universe.local_date IS NOT excluded.local_date OR contract_universe.tz IS NOT excluded.tz "
+          "OR contract_universe.settle_source IS NOT excluded.settle_source "
+          "OR contract_universe.settle_product IS NOT excluded.settle_product "
+          "OR contract_universe.phase IS NOT excluded.phase OR contract_universe.close_ts IS NOT excluded.close_ts "
+          "OR contract_universe.expiration_ts IS NOT excluded.expiration_ts",
+          {r.ticker, r.event_ticker, r.series, r.local_date, r.tz, r.settle_source, r.settle_product,
+           std::string(phase_label(r.phase)), r.close_ts, r.expiration_ts, now});
+  });
 }
 
 }  // namespace desk
