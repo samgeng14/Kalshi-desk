@@ -13,6 +13,7 @@
 #include <chrono>
 #include <atomic>
 #include <httplib.h>
+#include "desk/team_names.h"
 
 #include "desk/auth.h"
 #include "desk/client.h"
@@ -2122,6 +2123,45 @@ static void test_sports_live() {
   CHECK(SportsLive::parse_us_teams("If New York G wins the NY Giants vs LA Rams Pro Football game originally scheduled for Sep 21, 2026, then the market resolves to Yes.", a, b));
   CHECK(a == "NY Giants" && b == "LA Rams");
   CHECK(!SportsLive::parse_us_teams("If the high temperature is 80 or above", a, b));
+  // Matching orientation, the 2026-09-12 Oklahoma vs Michigan case. Tickers sort MICH before OKLA;
+  // ESPN has Michigan at home as MICH and Oklahoma as OU. With each ticker named from its OWN market
+  // the home orientation wins clearly. With the game-order names the old code paired with the
+  // sorted codes (Oklahoma with MICH), both orientations scored 2.0 and the tie made MICH away.
+  {
+    Market mich; mich.ticker = "KXNCAAFGAME-26SEP12OKLAMICH-MICH"; mich.yes_sub_title = "Michigan";
+    Market okla; okla.ticker = "KXNCAAFGAME-26SEP12OKLAMICH-OKLA";
+    okla.rules_primary = "If Oklahoma wins the Oklahoma vs Michigan college football game originally scheduled for Sep 12, 2026, then the market resolves to Yes.";
+    CHECK(SportsLive::market_team(mich) == "Michigan");
+    CHECK(SportsLive::market_team(okla) == "Oklahoma");   // from its own rules when there is no subtitle
+    auto [away, home] = SportsLive::orientation_scores("MICH", "OKLA", "Michigan", "Oklahoma", "OU", "MICH",
+                                                       "Oklahoma Sooners", "Michigan Wolverines");
+    CHECK(home - away >= 1.0);                             // MICH is home, decisively
+    auto [old_away, old_home] = SportsLive::orientation_scores("MICH", "OKLA", "Oklahoma", "Michigan", "OU", "MICH",
+                                                               "Oklahoma Sooners", "Michigan Wolverines");
+    CHECK(std::fabs(old_away - old_home) < 1.0);           // the old pairing: a tie, now refused
+    // 2026-09-23, live: Texas at Minnesota (tickers MIN, TEX) against ESPN's Mets at Texas. The total
+    // (3.0 one way, 0 the other) passed the orientation margin on one team alone; Minnesota has no
+    // evidence against the Mets, so it is refused.
+    auto [tm_away, tm_home] = SportsLive::orientation_scores("MIN", "TEX", "Minnesota", "Texas", "NYM", "TEX",
+                                                             "New York Mets", "Texas Rangers");
+    CHECK(tm_away >= 2.0 && tm_away - tm_home >= 1.0);    // what used to be accepted
+    CHECK(SportsLive::team_evidence("MIN", "Minnesota", "NYM", "New York Mets") < 0.5);
+    CHECK(SportsLive::team_evidence("TEX", "Texas", "TEX", "Texas Rangers") >= 2.0);
+    // Names (team_names.h). A one-letter token is an initial, not noise: the Cubs are not the White Sox.
+    CHECK(team_name_overlap("Chicago C", "Chicago Cubs") == 1.0);
+    CHECK(team_name_overlap("Chicago C", "Chicago White Sox") < 0.75);
+    CHECK(team_name_overlap("New York Y", "New York Yankees") == 1.0);
+    CHECK(team_name_overlap("New York Y", "New York Mets") < 0.75);
+    CHECK(team_name_overlap("Los Angeles D", "Los Angeles Dodgers") == 1.0);
+    CHECK(team_name_overlap("Los Angeles D", "Los Angeles Angels") < 0.75);
+    // City short forms, the A's, and A&M, which matched nothing before.
+    CHECK(team_name_overlap("LA Rams", "Los Angeles Rams") == 1.0);
+    CHECK(team_name_overlap("LA Rams", "Los Angeles Chargers") < 0.75);
+    CHECK(team_name_overlap("NY Giants", "New York Giants") == 1.0);
+    CHECK(team_name_overlap("A's", "Athletics") == 1.0);
+    CHECK(team_name_overlap("Texas A&M", "Texas A&M Aggies") == 1.0);
+    CHECK(team_name_overlap("Michigan", "Michigan Wolverines") == 1.0);
+  }
   CHECK(SportsLive::default_leagues().count("KXNFLGAME") == 1);
   CHECK(us_eastern_offset(parse_iso("2026-09-06T04:00:00Z")) == -4 * 3600);  // EDT
   CHECK(us_eastern_offset(parse_iso("2026-12-06T04:00:00Z")) == -5 * 3600);  // EST
@@ -3906,10 +3946,10 @@ static void test_auto_submit_soft_rejection() {
     auto still = st.get_proposal(stray.id);
     CHECK(still && still->status == "pending" && still->order_id.empty());
     st.exec("UPDATE proposals SET status='expired' WHERE id=?", {stray.id});
-    // 2. What the queue still sends unattended is a locked basket leg, and a refusal on it is read
-    //    the same way as before. First the executor's own read: the exchange's offer is already at
-    //    the 0.11 bid, so the post-only price would cross. Nothing is written, nothing stops, the
-    //    leg stays pending with the reason, and it gets a breather rather than a retry every cycle.
+    // 2. The queue does not send locked-basket legs either (2026-09-23): it checks each proposal on
+    //    its own against the auto budgets, so it could send one leg and hold another, leaving a
+    //    naked position. Baskets go out whole through the algorithm, or by hand. A pending leg stays
+    //    pending however many cycles pass, and nothing stops.
     auto leg = [&](const std::string& ticker) {
       Proposal p;
       p.ticker = ticker; p.event_ticker = "KXT-E"; p.series_ticker = "KXT"; p.strategy = "ladder_arb"; p.mode = "bot";
@@ -3918,20 +3958,20 @@ static void test_auto_submit_soft_rejection() {
       p.id = st.insert_proposal(p);
       return p.id;
     };
-    { std::lock_guard<std::mutex> lk(mu); ask_dollars = "0.1100"; }
-    const long long first_leg = leg("KXT-E-B0");
-    st.exec("UPDATE markets SET updated_ts=?", {now_s()});
-    eng.cycle();
-    CHECK(writes == 0 && !eng.killed());
-    auto noted_leg = st.get_proposal(first_leg);
-    CHECK(noted_leg && noted_leg->status == "pending" && noted_leg->note.find("would cross") != std::string::npos);
-    const std::string backed_off = "KXT-E-B0";
     { std::lock_guard<std::mutex> lk(mu); ask_dollars = "0.1200"; }
-    st.exec("UPDATE markets SET updated_ts=?", {now_s()});
-    eng.cycle();
-    CHECK(writes == 0);                               // inside the breather: not tried again yet
-    // The breather holds back entries only. A stop on the same ticker goes out inside it: hold
-    // one YES there with an auto bracket whose stop is above the bid, and the stop is sent.
+    const long long first_leg = leg("KXT-E-B0");
+    for (int i = 0; i < 3; ++i) {
+      st.exec("UPDATE markets SET updated_ts=?", {now_s()});
+      eng.clear_soft_backoff_for_tests();
+      eng.cycle();
+    }
+    CHECK(writes == 0 && !eng.killed());
+    auto pending_leg = st.get_proposal(first_leg);
+    CHECK(pending_leg && pending_leg->status == "pending" && pending_leg->order_id.empty());
+    st.exec("UPDATE proposals SET status='expired' WHERE id=?", {first_leg});
+    // A stop still goes out unattended from the queue: hold one YES with an auto bracket whose stop
+    // is above the bid, and the stop is sent (the exchange refuses it here).
+    const std::string backed_off = "KXT-E-B0";
     { std::lock_guard<std::mutex> lk(mu); held = backed_off; }
     st.exec("INSERT INTO brackets(ticker,tp_price,sl_price,trail,mode,created_ts,updated_ts,alerted) VALUES(?,0,0.5,0,'auto',?,?,'')",
             {backed_off, now_s(), now_s()});
@@ -3941,35 +3981,10 @@ static void test_auto_submit_soft_rejection() {
     for (const auto& p : st.proposals("failed", 20))
       if (p.strategy == "stop" && p.ticker == backed_off && p.note.find("exit refused") != std::string::npos) stop_sent = true;
     CHECK(stop_sent);                                 // it reached the exchange (which refused it)
-    CHECK(writes == 1);                               // and no entry went with it
+    CHECK(writes == 1);                               // and no basket leg went with it
     CHECK(!eng.killed());
     { std::lock_guard<std::mutex> lk(mu); held.clear(); }
     st.exec("DELETE FROM brackets WHERE ticker=?", {backed_off});
-    // Out of the breather the leg is sent; the exchange refuses it as a post-only cross: soft.
-    const int before_entries = writes;
-    st.exec("UPDATE markets SET updated_ts=?", {now_s()});
-    eng.clear_soft_backoff_for_tests();
-    eng.cycle();
-    CHECK(writes > before_entries);
-    CHECK(!eng.killed());                             // the market moved; the desk is fine
-    auto refused_leg = st.get_proposal(first_leg);
-    CHECK(refused_leg && refused_leg->status == "failed" && refused_leg->note.find("soft_market_state") != std::string::npos);
-    // The exchange's own soft refusal earns the same breather: a new leg is not sent next cycle.
-    const int refused_writes = writes;
-    leg("KXT-E-B0");
-    st.exec("UPDATE markets SET updated_ts=?", {now_s()});
-    eng.cycle();
-    CHECK(writes == refused_writes);
-    // A malformed order is still the desk's fault, and still stops it.
-    { std::lock_guard<std::mutex> lk(mu); refusal = R"({"error":{"code":"invalid_order","message":"count must be positive"}})"; }
-    int before = writes;
-    for (int i = 0; i < 3 && !eng.killed(); ++i) {
-      st.exec("UPDATE markets SET updated_ts=?", {now_s()});
-      eng.clear_soft_backoff_for_tests();
-      eng.cycle();
-    }
-    CHECK(writes > before);
-    CHECK(eng.killed());
     // Every order that went out carries a decision snapshot (decision_log.h).
     for (const auto& o : st.query("SELECT order_id, decision_id FROM orders")) CHECK(!o.value("decision_id", std::string()).empty());
     for (const auto& p : st.proposals("failed", 20))
@@ -4086,7 +4101,282 @@ static void test_failed_cancel_is_retried() {
   std::remove(path.c_str());
 }
 
+// M0: the store's transaction helper, and the cycle's retention prune of raw commodity book events.
+static void test_transaction_and_retention() {
+  {
+    Store st(":memory:");
+    st.exec("CREATE TABLE t(x INTEGER)");
+    st.transaction([&] { st.exec("INSERT INTO t VALUES(1)"); st.exec("INSERT INTO t VALUES(2)"); });
+    CHECK(st.query("SELECT COUNT(*) AS n FROM t")[0]["n"] == 2);
+    bool threw = false;
+    try {
+      st.transaction([&] { st.exec("INSERT INTO t VALUES(3)"); throw std::runtime_error("boom"); });
+    } catch (const std::exception&) { threw = true; }
+    CHECK(threw);
+    CHECK(st.query("SELECT COUNT(*) AS n FROM t")[0]["n"] == 2);   // rolled back
+    st.transaction([&] { st.exec("DELETE FROM t WHERE x=1"); CHECK(st.changes() == 1); });
+  }
+  {
+    Store st(":memory:");
+    st.exec("CREATE TABLE commodity_book_events(id INTEGER PRIMARY KEY AUTOINCREMENT,ts_received_ms INTEGER, "
+            "ts_exchange_ms INTEGER, ticker TEXT, kind TEXT, sequence INTEGER,side TEXT, price REAL, delta REAL, raw_json TEXT)");
+    const long long now_ms_v = now_s() * 1000;
+    // 4,500 rows ten days old, then 30 from today: more than two prune batches of old rows.
+    st.transaction([&] {
+      for (int i = 0; i < 4500; ++i)
+        st.exec("INSERT INTO commodity_book_events(ts_received_ms,ticker) VALUES(?,?)", {now_ms_v - 10LL * 86400000, std::string("OLD")});
+      for (int i = 0; i < 30; ++i)
+        st.exec("INSERT INTO commodity_book_events(ts_received_ms,ticker) VALUES(?,?)", {now_ms_v - 1000, std::string("NEW")});
+    });
+    Config cfg;
+    cfg.watch_series = {"KXT"};
+    cfg.commodity_book_retain_days = 7;
+    KalshiClient client("http://127.0.0.1:1/trade-api/v2", nullptr, "retention-test");
+    Executor ex(cfg, st, client);
+    Engine eng(cfg, st, client, ex);
+    eng.cycle();   // the network is unreachable: every fetch fails, and the cycle still completes
+    CHECK(st.query("SELECT COUNT(*) AS n FROM commodity_book_events WHERE ticker='OLD'")[0]["n"] == 0);
+    CHECK(st.query("SELECT COUNT(*) AS n FROM commodity_book_events WHERE ticker='NEW'")[0]["n"] == 30);
+    CHECK(eng.consecutive_storage_failures() == 0);   // network errors are not storage errors
+    CHECK(eng.status().contains("cycle_seconds"));
+  }
+}
+
+// M4: the engine's basket scan. A lone market early in the event order no longer ends the scan,
+// a basket settling past the T+2 horizon is not proposed, and every leg fits the per-order cap.
+static void test_ladder_scan_coverage() {
+  Store st(":memory:");
+  Series sr{"KXBTC", "Crypto", "", "quadratic", "hourly", 1.0};
+  st.upsert_series(sr);
+  const long long now = now_s();
+  auto mk = [&](const std::string& ev, const std::string& code, double lo, double hi, double bid, double ask,
+                long long settle) {
+    Market m; m.ticker = ev + "-" + code; m.event_ticker = ev; m.series_ticker = "KXBTC"; m.status = "active";
+    m.strike_type = "between"; m.floor_strike = lo; m.cap_strike = hi;
+    m.close_time = iso_of(settle - 60); m.expected_expiration_time = iso_of(settle);
+    m.yes_bid = bid; m.yes_ask = ask; m.no_bid = 1 - ask; m.no_ask = 1 - bid;
+    m.yes_bid_size = 40; m.yes_ask_size = 40; m.yes_sub_title = code;
+    st.upsert_market(m);
+  };
+  // Sorts first: one open market, no basket possible.
+  mk("KXBTC-26SEP0600", "B1", 1, 2, 0.40, 0.45, now + 3 * 3600);
+  // A locked sell basket (bids sum to 1.07), settling in five hours.
+  const std::string EV = "KXBTC-26SEP0612";
+  mk(EV, "B1", 1, 2, 0.45, 0.48, now + 5 * 3600);
+  mk(EV, "B2", 2, 3, 0.42, 0.45, now + 5 * 3600);
+  mk(EV, "B3", 3, 4, 0.20, 0.23, now + 5 * 3600);
+  // The same basket five days out: past the horizon.
+  const std::string FAR = "KXBTC-26SEP2812";
+  mk(FAR, "B1", 1, 2, 0.45, 0.48, now + 5 * 86400);
+  mk(FAR, "B2", 2, 3, 0.42, 0.45, now + 5 * 86400);
+  mk(FAR, "B3", 3, 4, 0.20, 0.23, now + 5 * 86400);
+  for (const std::string& ev : {EV, FAR})
+    st.exec("INSERT INTO event_meta(event_ticker,mutually_exclusive,exhaustive,checked_ts) VALUES(?,1,0,?)", {ev, now});
+  st.insert_account(now, 100.0, 100.0);
+  Config cfg;
+  cfg.bankroll_dollars = 100;
+  cfg.watch_series = {"KXBTC"};
+  cfg.risk.max_entry_horizon_hours = 48;
+  cfg.risk.max_order_dollars = 3.0;   // each leg's order must fit $3
+  KalshiClient client("http://127.0.0.1:1/trade-api/v2", nullptr, "ladder-scan-test");
+  Executor ex(cfg, st, client);
+  Engine eng(cfg, st, client, ex);
+  eng.cycle();
+  int near_legs = 0, far_legs = 0;
+  double max_leg_cost = 0;
+  for (const auto& p : st.proposals("pending", 50)) {
+    if (p.strategy != "ladder_arb") continue;
+    if (p.event_ticker == EV) { ++near_legs; max_leg_cost = std::max(max_leg_cost, p.count * (p.price + p.fee_per)); }
+    if (p.event_ticker == FAR) ++far_legs;
+  }
+  CHECK(near_legs >= 2);            // found despite the lone market sorting before it
+  CHECK(far_legs == 0);             // five days out: not proposed
+  CHECK(max_leg_cost <= 3.0 + 1e-9);   // every leg fits the per-order cap
+}
+
+// M5: the pregame sportsbook line. De-vig, sharp-book preference, the median fallback, and the
+// whole path against a stub of The Odds API: pregame only, both teams, the NFL tie, no key.
+static void test_sportsbook_line() {
+  auto p = SportsbookLine::devig({1.80, 2.10});
+  CHECK(p.size() == 2);
+  CHECK_NEAR(p[0] + p[1], 1.0, 1e-12);
+  CHECK_NEAR(p[0], (1 / 1.80) / (1 / 1.80 + 1 / 2.10), 1e-12);
+  CHECK(SportsbookLine::devig({1.0, 2.0}).empty());   // a price of 1.0 is not odds
+  auto book = [](const std::string& key, double home, double away) {
+    return json{{"key", key}, {"markets", json::array({{{"key", "h2h"}, {"outcomes", json::array({
+                   {{"name", "Kansas City Chiefs"}, {"price", home}}, {{"name", "Buffalo Bills"}, {"price", away}}})}}})}};
+  };
+  const long long now = now_s();
+  json ev = {{"id", "e1"}, {"home_team", "Kansas City Chiefs"}, {"away_team", "Buffalo Bills"},
+             {"commence_time", iso_of(now + 3 * 3600)},
+             {"bookmakers", json::array({book("draftkings", 1.55, 2.60), book("pinnacle", 1.60, 2.50), book("fanduel", 1.58, 2.55)})}};
+  auto L = SportsbookLine::consensus(ev, {"pinnacle"}, 2, now);
+  CHECK(L && L->source == "pinnacle");
+  CHECK_NEAR(L->p_home, 0.625 / (0.625 + 0.4), 1e-9);
+  // No sharp book: the median of the three.
+  auto M = SportsbookLine::consensus(ev, {"circasports"}, 2, now);
+  CHECK(M && M->books == 3 && M->source == "median of 3 books");
+  CHECK_NEAR(M->p_home, SportsbookLine::devig({1.58, 2.55})[0], 1e-9);
+  // One book is not a consensus.
+  json thin = ev; thin["bookmakers"] = json::array({book("draftkings", 1.55, 2.60)});
+  CHECK(!SportsbookLine::consensus(thin, {"pinnacle"}, 2, now));
+  CHECK(SportsbookLine::redact("GET https://x/odds?apiKey=s3cret&regions=us", "s3cret") == "GET https://x/odds?apiKey=***&regions=us");
+
+  // The whole path, against a stub.
+  httplib::Server server;
+  std::string seen_query;
+  server.Get("/v4/sports/americanfootball_nfl/odds", [&](const httplib::Request& q, httplib::Response& r) {
+    seen_query = q.get_param_value("apiKey") + "|" + q.get_param_value("markets");
+    r.set_content(json::array({ev}).dump(), "application/json");
+  });
+  const int port = server.bind_to_any_port("127.0.0.1");
+  CHECK(port > 0);
+  std::thread thread([&] { server.listen_after_bind(); });
+  const std::string key_path = "/tmp/desk_test_odds_key";
+  { std::ofstream f(key_path); f << "testkey\n"; }
+  SportsbookLine sl(json{{"base_url", "http://127.0.0.1:" + std::to_string(port)}, {"api_key_path", key_path}}, "t");
+  const std::string date = date_of(now, us_eastern_offset(now));
+  static const char* MON[] = {"JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"};
+  const std::string ev_ticker = "KXNFLGAME-" + date.substr(2, 2) + MON[std::stoi(date.substr(5, 2)) - 1] + date.substr(8, 2) + "BUFKC";
+  auto mk = [&](const std::string& code, const std::string& team) {
+    Market m; m.ticker = ev_ticker + "-" + code; m.event_ticker = ev_ticker; m.series_ticker = "KXNFLGAME";
+    m.strike_type = "structured"; m.status = "active"; m.yes_sub_title = team;
+    m.rules_primary = "If " + team + " wins the Buffalo vs Kansas City pro football game originally scheduled for today, then the market resolves to Yes.";
+    return m;
+  };
+  Market buf = mk("BUF", "Buffalo"), kc = mk("KC", "Kansas City");
+  Series sr; sr.ticker = "KXNFLGAME"; sr.category = "Sports";
+  Store st(":memory:");
+  CHECK(sl.covers(buf, sr));
+  sl.prepare({buf, kc}, st);
+  CHECK(seen_query == "testkey|h2h");
+  auto fk = sl.fair(kc, sr, st), fb = sl.fair(buf, sr, st);
+  CHECK(fk && fb);
+  if (fk && fb) {
+    CHECK_NEAR(fk->p, (0.625 / 1.025) * (1 - 0.003), 1e-9);       // home, less the NFL tie
+    CHECK_NEAR(fb->p, (0.4 / 1.025) * (1 - 0.003), 1e-9);
+    CHECK(fk->inputs.value("auto_eligible", false));
+  }
+  CHECK(sl.settlement_verified(kc).value_or(false));
+  CHECK(sl.default_market_weight() == 0.0);
+  // Kickoff: nothing in-game.
+  SportsbookLine::Line started = *L;
+  started.commence_ts = now - 10;
+  sl.set_lines_for_test("americanfootball_nfl", {started});
+  CHECK(!sl.fair(kc, sr, st));
+  // Doubleheaders (review 2026-09-23): two games, same teams, same day, told apart by the ticker's
+  // start time. And a market whose own game has no line yet must not borrow the next day's.
+  CHECK(event_start_minutes("KXMLBGAME-26SEP101310HOUPHI") == 13 * 60 + 10);
+  CHECK(event_start_minutes("KXNFLGAME-26SEP24ATLGB") == -1);
+  {
+    // Tomorrow's doubleheader, 13:10 and 18:40 Eastern.
+    const std::string tmr = date_of(now + 86400, us_eastern_offset(now + 86400));
+    static const char* MN[] = {"JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"};
+    const std::string code = tmr.substr(2, 2) + MN[std::stoi(tmr.substr(5, 2)) - 1] + tmr.substr(8, 2);
+    const long long midnight_et = parse_iso(tmr + "T00:00:00Z") - us_eastern_offset(now + 86400);
+    auto mlb_line = [&](const std::string& id, long long start, double p_home) {
+      SportsbookLine::Line x; x.id = id; x.home = "Philadelphia Phillies"; x.away = "Houston Astros";
+      x.commence_ts = start; x.fetched_ts = now; x.p_home = p_home; x.p_away = 1 - p_home; x.books = 3; x.source = "t";
+      return x;
+    };
+    const long long g1 = midnight_et + 13 * 3600 + 10 * 60, g2 = midnight_et + 18 * 3600 + 40 * 60;
+    SportsbookLine mlb(json{{"base_url", "http://127.0.0.1:1"}, {"api_key_env", ""}}, "t");
+    mlb.set_key_for_test("k");
+    mlb.set_lines_for_test("baseball_mlb", {mlb_line("g1", g1, 0.60), mlb_line("g2", g2, 0.45)});
+    auto phi = [&](const std::string& day, const std::string& hhmm) {
+      Market m; m.event_ticker = "KXMLBGAME-" + day + hhmm + "HOUPHI";
+      m.ticker = m.event_ticker + "-PHI"; m.series_ticker = "KXMLBGAME"; m.strike_type = "structured";
+      m.yes_sub_title = "Philadelphia";
+      m.rules_primary = "If Philadelphia wins the Houston vs Philadelphia professional baseball game originally scheduled for today, then the market resolves to Yes.";
+      return m;
+    };
+    Series mlb_s; mlb_s.ticker = "KXMLBGAME"; mlb_s.category = "Sports";
+    auto f1 = mlb.fair(phi(code, "1310"), mlb_s, st), f2 = mlb.fair(phi(code, "1840"), mlb_s, st);
+    CHECK(f1 && std::fabs(f1->p - 0.60) < 1e-9);   // game 1's line
+    CHECK(f2 && std::fabs(f2->p - 0.45) < 1e-9);   // game 2's line, not game 1's
+    // Today's market, when only tomorrow's games are posted: nothing.
+    CHECK(!mlb.fair(phi(ev_ticker.substr(10, 7), "1310"), mlb_s, st));
+  }
+  // No key: inert.
+  SportsbookLine none(json{{"base_url", "http://127.0.0.1:" + std::to_string(port)}, {"api_key_env", ""}}, "t");
+  none.prepare({buf, kc}, st);
+  CHECK(!none.fair(kc, sr, st));
+  server.stop();
+  thread.join();
+  std::remove(key_path.c_str());
+}
+
+// The store's read-only pool: other threads read without waiting on the writer's lock, and a
+// transaction a thread opened itself still sees its own uncommitted rows.
+static void test_store_readers() {
+  CHECK(Store(":memory:").reader_count() == 0);   // a second ":memory:" connection would be empty
+  const std::string path = "/tmp/desk_test_readers.sqlite";
+  for (const char* sfx : {"", "-wal", "-shm"}) std::remove((path + sfx).c_str());
+  {
+    Store st(path);
+    CHECK(st.reader_count() == 3);
+    st.exec("CREATE TABLE t(x INTEGER)");
+    // No writer designated yet: everything on the one connection, from any thread.
+    std::thread([&] { st.exec("INSERT INTO t VALUES(1)"); CHECK(st.query("SELECT COUNT(*) AS n FROM t")[0]["n"] == 1); }).join();
+    st.set_writer_thread();
+    // Another thread writes (writer connection) and reads (a reader): it sees its own committed row.
+    std::thread([&] {
+      st.exec("INSERT INTO t VALUES(2)");
+      CHECK(st.query("SELECT COUNT(*) AS n FROM t")[0]["n"] == 2);
+      // Inside its own transaction its reads stay on the writer and see the uncommitted row...
+      st.exec("BEGIN IMMEDIATE");
+      st.exec("INSERT INTO t VALUES(3)");
+      CHECK(st.query("SELECT COUNT(*) AS n FROM t")[0]["n"] == 3);
+      st.exec("ROLLBACK");
+      // ...and after the rollback it is gone, read from a reader again.
+      CHECK(st.query("SELECT COUNT(*) AS n FROM t")[0]["n"] == 2);
+    }).join();
+    // The point of the pool: while the writer thread holds a long transaction (and so the store's
+    // lock), another thread's read finishes at once, on the last committed state.
+    std::atomic<bool> in_tx{false};
+    std::atomic<long long> read_ms{-1}, seen{-1};
+    std::thread reader([&] {
+      while (!in_tx.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      const auto t0 = std::chrono::steady_clock::now();
+      seen = st.query("SELECT COUNT(*) AS n FROM t")[0]["n"].get<long long>();
+      read_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+    });
+    st.transaction([&] {
+      st.exec("INSERT INTO t VALUES(4)");
+      in_tx = true;
+      std::this_thread::sleep_for(std::chrono::milliseconds(400));
+    });
+    reader.join();
+    CHECK(read_ms.load() >= 0 && read_ms.load() < 300);   // did not wait out the 400 ms transaction
+    CHECK(seen.load() == 2);                               // and saw only what was committed
+    CHECK(st.query("SELECT COUNT(*) AS n FROM t")[0]["n"] == 3);
+    // Review 2026-09-23: a request thread that WRITES while the writer is inside a transaction must
+    // still read its own row back. The transaction holds the store lock from BEGIN to COMMIT, so the
+    // write waits for the commit instead of joining it, and the read-back finds the row.
+    st.exec("CREATE TABLE r(id TEXT PRIMARY KEY)");
+    std::atomic<bool> tx_open{false};
+    std::atomic<long long> own_rows{-1};
+    std::thread request([&] {
+      while (!tx_open.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      st.exec("INSERT INTO r VALUES('ticket-1')");
+      own_rows = static_cast<long long>(st.query("SELECT id FROM r WHERE id='ticket-1'").size());
+    });
+    st.transaction([&] {
+      st.exec("INSERT INTO t VALUES(5)");
+      tx_open = true;
+      std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    });
+    request.join();
+    CHECK(own_rows.load() == 1);
+  }
+  for (const char* sfx : {"", "-wal", "-shm"}) std::remove((path + sfx).c_str());
+}
+
 int main() {
+  test_store_readers();
+  test_sportsbook_line();
+  test_ladder_scan_coverage();
+  test_transaction_and_retention();
   test_cancel_pending_transitions();
   test_failed_cancel_is_retried();
   test_route_capture_and_freshness();

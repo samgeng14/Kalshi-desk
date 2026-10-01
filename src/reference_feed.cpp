@@ -4,6 +4,8 @@
 #include <set>
 #include <cctype>
 #include <cmath>
+#include <cstdlib>
+#include <optional>
 
 #include "desk/auth.h"
 #include "desk/log.h"
@@ -40,6 +42,51 @@ long long to_ms(const json& j) {
   if (v > 1e14) return static_cast<long long>(v / 1e3);   // microseconds
   if (v > 1e11) return static_cast<long long>(v);         // milliseconds
   return static_cast<long long>(v * 1000);                // seconds
+}
+
+// A documented field read as a number, or nothing. Nothing is not zero: a column that says 0 when
+// the field never arrived is how commodity_book_events came to record a price and a size of 0 on
+// every delta from 2026-09-12 to 2026-09-24, because the parser asked for keys the venue does not
+// send and nothing noticed.
+std::optional<double> field_num(const json& m, const char* key) {
+  auto it = m.find(key);
+  if (it == m.end()) return std::nullopt;
+  if (it->is_number()) return it->get<double>();
+  if (!it->is_string()) return std::nullopt;
+  const std::string& s = it->get_ref<const std::string&>();
+  char* end = nullptr;
+  const double v = std::strtod(s.c_str(), &end);
+  if (end == s.c_str() || *end != '\0' || !std::isfinite(v)) return std::nullopt;
+  return v;
+}
+
+std::optional<long long> field_int(const json& m, const char* key) {
+  auto it = m.find(key);
+  if (it == m.end() || !it->is_number()) return std::nullopt;
+  return it->get<long long>();
+}
+
+json or_null(const std::optional<double>& v) { return v ? json(*v) : json(nullptr); }
+json or_null(const std::optional<long long>& v) { return v ? json(*v) : json(nullptr); }
+
+// One queued row of commodity_book_events. JSON null becomes SQL NULL when it is written.
+json book_row(long long received_ms, json exchange_ms, json ticker, const std::string& kind, json seq,
+              json side, json price, json delta, std::string raw) {
+  return json{{"ts_received_ms", received_ms}, {"ts_exchange_ms", std::move(exchange_ms)},
+              {"ticker", std::move(ticker)},     {"kind", kind},
+              {"sequence", std::move(seq)},      {"side", std::move(side)},
+              {"price", std::move(price)},       {"delta", std::move(delta)},
+              {"raw_json", std::move(raw)}};
+}
+
+// A queued value as the store binds it: a JSON null (or a missing key) stays NULL.
+SqlValue sql_value(const json& r, const char* key) {
+  auto it = r.find(key);
+  if (it == r.end() || it->is_null()) return nullptr;
+  if (it->is_number_integer()) return it->get<long long>();
+  if (it->is_number()) return it->get<double>();
+  if (it->is_string()) return it->get<std::string>();
+  return it->dump();
 }
 
 }  // namespace
@@ -247,7 +294,12 @@ void ReferenceFeed::on_text(const std::string& text, long long received_ms) {
   ++messages_;
   if (seq > 0) {
     if (last_seq_ > 0 && seq > last_seq_ + 1) { ++seq_gaps_; last_gap_seq_ = seq; }
-    last_seq_ = std::max(last_seq_, seq);
+    // Backwards is a new subscription, not a late message: the venue starts again at 1 on every
+    // connection. Holding on to the old maximum, as this did until 2026-09-24, hid every gap after
+    // a reconnect until the new count passed the old one, which takes about as long as the
+    // previous connection lived.
+    else if (last_seq_ > 0 && seq <= last_seq_) ++seq_restarts_;
+    last_seq_ = seq;
   }
   Series& s = series_[symbol];
   const bool first = s.messages == 0;
@@ -466,8 +518,10 @@ int ReferenceFeed::flush(long long now) {
     }
   }
   if (rows.empty()) return 0;
-  store_.exec("BEGIN");
   try {
+    // Store::transaction holds the store lock for the whole batch: another thread's statement
+    // cannot join this transaction (or be rolled back with it).
+    store_.transaction([&] {
     for (const auto& r : rows)
       store_.exec(
           "INSERT INTO commodity_reference(ts_received,ts_exchange,symbol,source,price,sequence,raw_json,"
@@ -478,9 +532,8 @@ int ReferenceFeed::flush(long long now) {
            r.value("raw_json", std::string()), r.value("message_gap_ms", 0LL),
            r.value("unchanged_age_ms", 0LL), r.value("value_changed", 1LL),
            r.value("observed_value_fresh", 1LL)});
-    store_.exec("COMMIT");
+    });
   } catch (const std::exception& e) {
-    store_.exec("ROLLBACK");
     LOG_WARN("reference feed: could not record %zu observations: %s (they stay queued)", rows.size(), e.what());
     // The rows were taken off the queue before the write, so a rolled-back transaction would
     // otherwise throw them away silently: `recorded` simply stops rising and `status()` says
@@ -557,6 +610,7 @@ json ReferenceFeed::status() const {
                {"advertised_underlyings", advertised_},
                {"pending_rows", static_cast<long long>(pending_.size())},
                {"sequence_gaps", seq_gaps_},
+               {"sequence_restarts", seq_restarts_},
                {"stale_after_seconds", s_.stale_after_seconds},
                {"symbols", symbols}};
   }
@@ -580,14 +634,41 @@ MarketQuoteFeed::Settings market_quote_settings(const json& params, const std::s
     s.ws_stale_after_seconds = q["ws_stale_after_seconds"].get<int>();
   if (q.contains("ping_interval_seconds") && q["ping_interval_seconds"].is_number())
     s.ping_interval_seconds = q["ping_interval_seconds"].get<int>();
+  if (q.contains("min_free_gb") && q["min_free_gb"].is_number())
+    s.min_free_gb = std::max(0.0, q["min_free_gb"].get<double>());
+  if (q.contains("keep_delta_raw") && q["keep_delta_raw"].is_boolean())
+    s.keep_delta_raw = q["keep_delta_raw"].get<bool>();
   return s;
 }
+
+namespace {
+// Whether a delta frame holds nothing the columns do not. Its columns keep the market, seq, side,
+// price, size and venue millisecond; what else it carries is the sid (in the 'subscribed' and
+// 'connect' rows), market_id (one per market, and in the snapshot and ticker rows), the type (the
+// kind), and the microseconds of `ts`, which agree with ts_ms to the millisecond on 499,986 of
+// 499,986 deltas checked. Any other key keeps the frame whole: the venue documents two optional ones,
+// client_order_id and subaccount, present only when our own order moved the book, and they exist
+// nowhere else.
+bool delta_fully_held(const json& j, const json& m) {
+  static const std::set<std::string> top = {"type", "sid", "seq", "msg"};
+  static const std::set<std::string> inner = {"market_ticker", "market_id", "price_dollars", "delta_fp",
+                                              "side", "ts", "ts_ms"};
+  for (auto it = j.begin(); it != j.end(); ++it)
+    if (!top.count(it.key())) return false;
+  for (auto it = m.begin(); it != m.end(); ++it)
+    if (!inner.count(it.key())) return false;
+  return true;
+}
+}  // namespace
 
 MarketQuoteFeed::MarketQuoteFeed(Store& store, Settings settings, std::shared_ptr<Signer> signer)
     : store_(store), s_(std::move(settings)), signer_(std::move(signer)) {
   // One row per update the venue sends, with both clocks. `ts_exchange_ms` is the venue's own
-  // millisecond stamp and `ts_received_ms` is ours; the difference between them is the only
-  // honest way to say whether a lag we measure is theirs or the network's.
+  // millisecond stamp and `ts_received_ms` is ours, from this machine's clock. Their difference is
+  // latency PLUS the offset between the two clocks, and the offset is not small: on 2026-09-23/24
+  // our receipt time was earlier than the venue's stamp on 99.4% of book deltas, by a median of
+  // 34 ms one evening and 8 ms the next afternoon. So the difference cannot say whose lag is whose
+  // below a few tens of milliseconds; for that, compare the venue's stamps with each other.
   store_.exec(
       "CREATE TABLE IF NOT EXISTS commodity_quotes(id INTEGER PRIMARY KEY AUTOINCREMENT,"
       "ts_received_ms INTEGER, ts_exchange_ms INTEGER, ticker TEXT, yes_bid REAL, yes_ask REAL,"
@@ -620,23 +701,18 @@ void MarketQuoteFeed::start() {
   auto signer = signer_;
   const std::string path = s_.sign_path;
   o.auth_headers = [signer, path] { return signer->headers("GET", path, now_ms()); };
-  // Re-subscribed on every connect, from whatever the cycle last asked for: a reconnect must not
-  // leave the desk watching the windows that were open twenty minutes ago.
-  o.on_connect = [this] {
-    std::vector<std::string> tickers;
-    {
-      std::lock_guard<std::mutex> lk(mu_);
-      tickers.assign(watching_.begin(), watching_.end());
-    }
-    if (tickers.empty()) return std::vector<std::string>{};
-    // Separate subscriptions so each channel's own sid comes back on its own acknowledgement.
-    return std::vector<std::string>{
-        json{{"id", 1}, {"cmd", "subscribe"},
-             {"params", json{{"channels", json::array({"ticker"})}, {"market_tickers", tickers}}}}.dump(),
-        json{{"id", 2}, {"cmd", "subscribe"},
-             {"params", json{{"channels", json::array({"orderbook_delta"})}, {"market_tickers", tickers}}}}.dump()};
-  };
-  ws_ = std::make_unique<WsClient>(o, [this](const std::string& text, long long ms) { on_text(text, ms); });
+  // A connect records the old set and clears it, and subscribes nothing itself (a ticker subscribe
+  // naming only closed windows is the whole exchange): the next watch() subscribes to the engine's
+  // open windows. See connect_frames.
+  o.on_connect = [this] { return connect_frames(now_ms()); };
+  ws_ = std::make_unique<WsClient>(
+      o, [this](const std::string& text, long long ms) { on_text(text, ms); },
+      [this](const std::string& event, const std::string&) {
+        // 'stale', 'disconnected' and 'error' all come before the next connection is made.
+        if (event == "connected") return;
+        std::lock_guard<std::mutex> lk(mu_);
+        conn_ready_ = false;
+      });
   ws_->start();
 }
 
@@ -650,40 +726,183 @@ std::vector<std::string> MarketQuoteFeed::watching() const {
   return std::vector<std::string>(watching_.begin(), watching_.end());
 }
 
-void MarketQuoteFeed::send_delta(const std::vector<std::string>& add, const std::vector<std::string>& remove) {
-  if (!ws_) return;
-  std::vector<long long> sids;
-  {
-    std::lock_guard<std::mutex> lk(mu_);
-    for (const auto& [channel, sid] : sids_) { (void)channel; sids.push_back(sid); }
+namespace {
+// One subscribe per channel, so each channel's own sid comes back on its own acknowledgement. The
+// venue numbers a connection's subscriptions from 1 in the order they are asked for: ticker 1,
+// orderbook_delta 2 on every connection recorded.
+std::vector<std::string> subscribe_frames(const std::vector<std::string>& tickers) {
+  // The ticker channel sends a market's current quote on subscribe only when asked; without it a
+  // quiet window has no row until its quote next changes. The book always starts with a snapshot.
+  return {json{{"id", 1}, {"cmd", "subscribe"},
+               {"params", json{{"channels", json::array({"ticker"})}, {"market_tickers", tickers},
+                               {"send_initial_snapshot", true}}}}.dump(),
+          json{{"id", 2}, {"cmd", "subscribe"},
+               {"params", json{{"channels", json::array({"orderbook_delta"})}, {"market_tickers", tickers}}}}.dump()};
+}
+}  // namespace
+
+void MarketQuoteFeed::watch(const std::vector<std::string>& tickers) {
+  // Deciding and queueing under one lock, and only on a connection whose connect handler has run,
+  // so a new connection can never get a subscribe from here and another from its handler. The
+  // lock order is this feed's, then the socket's: the socket calls back without holding its own.
+  std::lock_guard<std::mutex> lk(mu_);
+  for (const auto& f : watch_frames(tickers, ws_ != nullptr)) ws_->send(f);
+}
+
+void MarketQuoteFeed::force_reconnect(long long now_ms) {
+  reconnect_due_ = false;
+  last_forced_reconnect_ms_ = now_ms;
+  ++forced_reconnects_;
+  conn_ready_ = false;
+  LOG_WARN("%s: a refusal left the subscription broken; reconnecting to subscribe afresh", s_.name.c_str());
+  if (ws_) ws_->reconnect();
+}
+
+std::vector<std::string> MarketQuoteFeed::watch_frames(const std::vector<std::string>& tickers, bool has_socket) {
+  // A refusal that came inside the minute after the last forced reconnect is acted on here.
+  if (reconnect_due_ && now_ms() - last_forced_reconnect_ms_ >= 60000) force_reconnect(now_ms());
+  // Never down to nothing. On the ticker channel a subscription with no markets left in it is a
+  // subscription to every market on the exchange (the venue documents market_tickers as optional,
+  // "omit to receive all markets"), and the cycle asks for nothing at every roll: it drops a window
+  // the moment it closes and only learns of the next one from the market refresh later in the
+  // cycle. On 2026-09-24 that made 46,583 of the last 60,000 commodity_quotes rows (77.6%) quotes
+  // for 15,863 unrelated markets, in bursts of 4 to 11 seconds, at five rolls and after one reconnect
+  // (14:50:07Z) that re-subscribed closed windows. A closed window sends nothing, so keeping it
+  // until its successor is known costs nothing, and the successor is added before the old one is
+  // deleted, so the set never passes through empty.
+  if (tickers.empty()) return {};
+  std::vector<std::string> add, remove, frames;
+  std::set<std::string> want(tickers.begin(), tickers.end());
+  for (const auto& t : want) if (!watching_.count(t)) add.push_back(t);
+  for (const auto& t : watching_) if (!want.count(t)) remove.push_back(t);
+  if (add.empty() && remove.empty()) return {};
+  watching_ = std::move(want);
+  // No connection to send on, or one whose connect handler has not run yet, or one about to be
+  // dropped: the first watch() after the next connect subscribes.
+  if (!has_socket || !conn_ready_ || reconnect_due_) return {};
+  // The first set on a connection is a subscribe, not an update. A fresh process connects before
+  // its first cycle has chosen any market, subscribes to nothing (nothing is right: an empty list
+  // is the whole exchange), and then had only update_subscription to offer, which the venue
+  // refused twice at the 2026-09-24 17:49Z start ("Unknown subscription ID"): the feed then
+  // believed it watched five markets and received nothing.
+  if (!subscribed_) {
+    subscribed_ = true;
+    return subscribe_frames(std::vector<std::string>(watching_.begin(), watching_.end()));
   }
-  if (sids.empty()) sids = {1, 2};   // before the first acknowledgement, the ids we asked for
-  auto cmd = [&](const char* action, const std::vector<std::string>& tickers) {
-    if (tickers.empty()) return;
+  // Each channel's own sid, from its acknowledgement; until that arrives, the number the venue
+  // gives it (see subscribe_frames). Commands are handled in order on one socket, so an update sent
+  // after the subscribe finds the subscription even before the acknowledgement is back.
+  const long long sids[2] = {sids_.count("ticker") ? sids_.at("ticker") : 1,
+                             sids_.count("orderbook_delta") ? sids_.at("orderbook_delta") : 2};
+  auto cmd = [&](const char* action, const std::vector<std::string>& list) {
+    if (list.empty()) return;
     for (long long sid : sids) {
-      json params{{"sid", sid}, {"action", action}, {"market_tickers", tickers}};
-      // A snapshot on every addition, because a delta stream joined mid-flight is not a book.
-      if (std::string(action) == "add_markets") params["send_initial_snapshot"] = true;
-      ws_->send(json{{"id", ++command_id_}, {"cmd", "update_subscription"}, {"params", params}}.dump());
+      json params{{"sid", sid}, {"action", action}, {"market_tickers", list}};
+      const long long id = ++command_id_;
+      // A snapshot on every addition, because a delta stream joined mid-flight is not a book. The
+      // ids are kept: a refused add followed by an accepted delete would empty the ticker
+      // subscription, which is the whole exchange.
+      if (std::string(action) == "add_markets") {
+        params["send_initial_snapshot"] = true;
+        add_ids_.insert(id);
+      }
+      frames.push_back(json{{"id", id}, {"cmd", "update_subscription"}, {"params", params}}.dump());
     }
   };
   cmd("add_markets", add);
   cmd("delete_markets", remove);
+  return frames;
 }
 
-void MarketQuoteFeed::watch(const std::vector<std::string>& tickers) {
-  std::vector<std::string> add, remove;
-  {
-    std::lock_guard<std::mutex> lk(mu_);
-    std::set<std::string> want(tickers.begin(), tickers.end());
-    for (const auto& t : want) if (!watching_.count(t)) add.push_back(t);
-    for (const auto& t : watching_) if (!want.count(t)) remove.push_back(t);
-    if (add.empty() && remove.empty()) return;
-    watching_ = std::move(want);
+std::vector<std::string> MarketQuoteFeed::connect_frames(long long now) {
+  std::lock_guard<std::mutex> lk(mu_);
+  const std::vector<std::string> before(watching_.begin(), watching_.end());
+  // A new connection is a new subscription. The venue starts `seq` again at 1 and sends every
+  // book again as a snapshot, but it reuses the same sid (2 on all 17 connections in the sample
+  // of 2026-09-23/24), so nothing on the wire marks the boundary. Continuity starts over here,
+  // and the row tells the replay that no book survives this point without its next snapshot.
+  // The old connection's subscriptions went with it: their ids mean nothing on this one.
+  last_seq_by_sid_.clear();
+  sids_.clear();
+  add_ids_.clear();
+  reconnect_due_ = false;
+  ++connects_;
+  queue_book(book_row(now, nullptr, nullptr, "connect", nullptr, nullptr, nullptr, nullptr,
+                      json{{"watching", before}}.dump()));
+  // Nothing is subscribed from here. What was watched may be only windows that have closed: from a
+  // roll until the refresh finds the next ones, and after any sleep longer than a window. The venue
+  // takes a ticker subscribe naming only closed markets as a subscribe to every market: the
+  // reconnect at 14:50:06Z on 2026-09-24 re-subscribed the closed 10:45 windows and recorded 12,727
+  // quotes for unrelated markets in 11 s. So the set starts empty and the next watch() subscribes
+  // to the engine's list, which holds only open windows. It costs at most one cycle of book.
+  watching_.clear();
+  subscribed_ = false;
+  conn_ready_ = true;
+  return {};
+}
+
+// Called under mu_. If the cycle stalls, book rows are dropped and counted rather than held without
+// limit, and the hole is written down as soon as there is room again, so that a replay can tell
+// rows this desk lost from messages the venue never sent. Both leave the same hole in `seq`.
+void MarketQuoteFeed::queue_book(json row) {
+  const json& sq = row["sequence"];
+  const long long seq = sq.is_number() ? sq.get<long long>() : 0;
+  if (pending_book_.size() >= s_.max_pending_rows) {
+    ++book_dropped_rows_;
+    if (drop_rows_++ == 0) {
+      drop_first_ms_ = row.value("ts_received_ms", 0LL);
+      drop_first_seq_ = seq;
+    }
+    if (seq > 0) drop_last_seq_ = seq;
+    return;
   }
-  // A first set with nothing subscribed yet means the socket has not been told anything: the
-  // connect handler will subscribe from watching_, so only a live socket needs the delta.
-  if (ws_ && ws_->running()) send_delta(add, remove);
+  if (drop_rows_ > 0) {
+    pending_book_.push_back(book_row(row.value("ts_received_ms", 0LL), nullptr, nullptr, "dropped",
+                                     nullptr, nullptr, nullptr, nullptr,
+                                     json{{"rows", drop_rows_},
+                                          {"first_seq", drop_first_seq_},
+                                          {"last_seq", drop_last_seq_},
+                                          {"first_received_ms", drop_first_ms_}}.dump()));
+    drop_rows_ = drop_first_seq_ = drop_last_seq_ = drop_first_ms_ = 0;
+  }
+  pending_book_.push_back(std::move(row));
+}
+
+// Called under mu_. Continuity per subscription, because that is how the venue numbers `seq`: once
+// per sid, across every market on it, and its replies to update_subscription take a number too.
+// Counted per market, as it was until 2026-09-24, each switch from one market to the next looked
+// like a gap: 30.3% and 31.3% of book messages in the two stretches checked, where the per-sid
+// count finds 0 and 5 numbers missing, and all 5 are replies to our own commands at a roll.
+void MarketQuoteFeed::note_sequence(long long sid, long long seq, bool book_frame) {
+  auto it = last_seq_by_sid_.find(sid);
+  if (it == last_seq_by_sid_.end()) {
+    // Only a book frame starts the count. The ticker channel's own messages carry no seq, so a
+    // reply on that sid would otherwise start a sequence that nothing continues.
+    if (book_frame) last_seq_by_sid_[sid] = seq;
+    return;
+  }
+  const long long expected = it->second + 1;
+  if (seq > expected) {
+    ++sid_gaps_;
+    seqs_missing_ += seq - expected;
+    if (sid_gaps_ <= 20 || sid_gaps_ % 100 == 0)
+      LOG_WARN("%s: sid %lld went from seq %lld to %lld, so every book on it is unreliable until "
+               "its next snapshot (%lld gaps so far)",
+               s_.name.c_str(), sid, it->second, seq, sid_gaps_);
+  } else if (seq < expected) {
+    // Backwards is a new subscription on the same sid, not a late message: the venue does not
+    // reorder within a subscription.
+    ++seq_restarts_;
+  }
+  it->second = seq;
+}
+
+// Called under mu_.
+void MarketQuoteFeed::note_missing(const std::string& kind, const char* key) {
+  if (schema_misses_[kind + "." + key]++ == 0)
+    LOG_WARN("%s: %s frame without a usable %s, so that column is not filled from it; the frame is "
+             "kept whole in raw_json and counted in status (logged once per field)",
+             s_.name.c_str(), kind.c_str(), key);
 }
 
 void MarketQuoteFeed::on_text(const std::string& text, long long received_ms) {
@@ -695,82 +914,155 @@ void MarketQuoteFeed::on_text(const std::string& text, long long received_ms) {
   }
   const std::string type = j.value("type", std::string());
   const json& m = j.contains("msg") && j["msg"].is_object() ? j["msg"] : j;
-  // The venue's own subscription ids, taken from its acknowledgements. `update_subscription`
-  // needs them, and guessing works right up until the day they are numbered differently.
-  if (type == "subscribed") {
-    std::lock_guard<std::mutex> lk(mu_);
-    const std::string channel = m.value("channel", std::string());
-    if (!channel.empty() && m.contains("sid") && m["sid"].is_number())
-      sids_[channel] = m["sid"].get<long long>();
-    return;
-  }
+  const std::optional<long long> sid = field_int(j, "sid"), seq = field_int(j, "seq");
   if (type == "orderbook_snapshot" || type == "orderbook_delta") {
     const std::string bt = m.value("market_ticker", std::string());
     if (bt.empty()) { std::lock_guard<std::mutex> lk(mu_); ++unparsed_; return; }
-    auto dnum = [&m](const char* key) -> double {
-      if (!m.contains(key)) return 0;
-      const json& v = m[key];
-      if (v.is_number()) return v.get<double>();
-      if (v.is_string()) { try { return std::stod(v.get<std::string>()); } catch (...) { return 0; } }
-      return 0;
-    };
-    const long long seq = j.contains("seq") && j["seq"].is_number() ? j["seq"].get<long long>() : 0;
-    const long long ex_ms = m.contains("ts_ms") && m["ts_ms"].is_number() ? m["ts_ms"].get<long long>() : 0;
+    const bool snapshot = type == "orderbook_snapshot";
+    // Read from the keys the venue sends. A delta has price_dollars (a dollar string, not a whole
+    // cent on 38% of deltas: "0.9980", "0.0210"), delta_fp (contracts with two decimals, negative
+    // removes), side "yes" or "no", and ts_ms. A snapshot has its levels and none of those, so its columns stay
+    // NULL rather than 0, which would read as a level at a price of zero. `price` and `delta` are
+    // deliberately not read as a fallback: they are the margin socket's names, and on this venue's
+    // older schema `price` was in cents, so a frame carrying them is counted as a miss rather than
+    // recorded in what may be the wrong unit.
+    std::optional<double> price, delta;
+    const std::optional<long long> ex_ms = field_int(m, "ts_ms");
+    const std::string side = m.value("side", std::string());
+    size_t levels = 0;
+    std::vector<const char*> missing;
+    if (snapshot) {
+      for (const char* k : {"yes_dollars_fp", "no_dollars_fp"})
+        if (m.contains(k) && m[k].is_array()) levels += m[k].size();
+    } else {
+      price = field_num(m, "price_dollars");
+      delta = field_num(m, "delta_fp");
+      if (!price) missing.push_back("price_dollars");
+      if (!delta) missing.push_back("delta_fp");
+      if (side != "yes" && side != "no") missing.push_back("side");
+      if (!ex_ms) missing.push_back("ts_ms");
+    }
+    if (!seq) missing.push_back("seq");
+    // A delta whose columns hold all of it goes without its frame, which is most of the row. A
+    // snapshot never does (its levels are only in the frame), nor does a delta with a field missing
+    // or one the columns do not hold.
+    const bool trim = !snapshot && !s_.keep_delta_raw && missing.empty() && delta_fully_held(j, m);
     std::lock_guard<std::mutex> lk(mu_);
     ++book_messages_;
-    if (type == "orderbook_snapshot") ++snapshots_;
-    // A book reconstructed across a missing message is a book that never existed. The gap is
-    // counted here; the replay refuses the stretch rather than interpolating over it.
-    if (seq > 0) {
-      auto it = last_seq_.find(bt);
-      if (it != last_seq_.end() && seq > it->second + 1) ++sequence_gaps_;
-      last_seq_[bt] = seq;
+    if (snapshot) {
+      ++snapshots_;
+      if (levels == 0) ++empty_snapshots_;
     }
-    if (pending_book_.size() >= s_.max_pending_rows) { ++dropped_rows_; return; }
-    pending_book_.push_back(json{{"ts_received_ms", received_ms},
-                                 {"ts_exchange_ms", ex_ms},
-                                 {"ticker", bt},
-                                 {"kind", type},
-                                 {"sequence", seq},
-                                 {"side", m.value("side", std::string())},
-                                 {"price", dnum("price")},
-                                 {"delta", dnum("delta")},
-                                 {"raw_json", text.substr(0, 8192)}});
+    for (const char* k : missing) note_missing(type, k);
+    if (sid && seq) note_sequence(*sid, *seq, true);
+    if (disk_low_) {
+      // Under the disk floor: followed, counted, not kept. set_disk_low writes the stretch down.
+      ++paused_total_;
+      if (pause_rows_++ == 0) {
+        pause_first_ms_ = received_ms;
+        pause_first_seq_ = seq.value_or(0);
+      }
+      pause_last_ms_ = received_ms;
+      if (seq) pause_last_seq_ = *seq;
+      return;
+    }
+    if (trim) ++raw_trimmed_;
+    // Otherwise the frame is kept whole. A snapshot's levels exist nowhere else, and one cut short
+    // is not JSON, which would silently cost every later delta for that market; the largest seen
+    // was 3,558 bytes for 170 levels, and a 0.001 tick allows nearly 2,000.
+    json row = book_row(received_ms, or_null(ex_ms), bt, type, or_null(seq),
+                        side == "yes" || side == "no" ? json(side) : json(nullptr), or_null(price),
+                        or_null(delta), trim ? std::string() : text);
+    if (trim) row["raw_json"] = nullptr;
+    queue_book(std::move(row));
     return;
   }
-  if (type != "ticker") return;
+  if (type != "ticker") {
+    if (type.empty()) { std::lock_guard<std::mutex> lk(mu_); ++unparsed_; return; }
+    // Everything else on this socket is the venue answering a command: subscribed, ok, error,
+    // unsubscribed. Kept verbatim with its seq, because a reply to update_subscription takes a
+    // number in the book's sequence (the 5 numbers missing from the 400,000 book messages recorded
+    // on 2026-09-24, one for each delete and add at the 15:30 roll), and without these rows a
+    // replay cannot tell a change of subscription from a lost delta.
+    std::lock_guard<std::mutex> lk(mu_);
+    ++control_frames_;
+    if (type == "subscribed" && m.contains("sid") && m["sid"].is_number()) {
+      // The venue's own subscription ids, taken from its acknowledgements. `update_subscription`
+      // needs them, and guessing works right up until the day they are numbered differently. A
+      // new subscription numbers from 1 again.
+      const long long new_sid = m["sid"].get<long long>();
+      const std::string channel = m.value("channel", std::string());
+      if (!channel.empty()) sids_[channel] = new_sid;
+      last_seq_by_sid_.erase(new_sid);
+    }
+    if (type == "error") {
+      // A refused add_markets leaves watching_ naming a market the socket does not carry, and
+      // nothing else would ever say so.
+      ++errors_;
+      LOG_WARN("%s: the venue refused a command: %s", s_.name.c_str(), text.substr(0, 300).c_str());
+      // Some refusals leave a subscription that cannot be repaired on this connection: a subscribe
+      // of ours refused (ids 1 and 2), an add refused (the delete after it would still empty the
+      // ticker subscription, which is the whole exchange), an unknown subscription id (7), and the
+      // two the venue calls terminal, a channel error (10) and a subscription buffer overflow (25).
+      // The keep-alive holds the socket up regardless, so without this the feed would believe it
+      // watched markets and receive nothing until something else broke the connection, as it did
+      // at 17:49Z on 2026-09-24. Drop the connection instead; the next one subscribes afresh. At
+      // most once a minute, so a venue that keeps refusing is not hammered; one that comes inside
+      // the minute is kept, and acted on by the first watch() after it.
+      const long long code =
+          j.contains("msg") && j["msg"].is_object() ? field_int(j["msg"], "code").value_or(0) : 0;
+      const long long id = field_int(j, "id").value_or(0);
+      if (id == 1 || id == 2 || add_ids_.count(id) || code == 7 || code == 10 || code == 25) {
+        if (received_ms - last_forced_reconnect_ms_ >= 60000) force_reconnect(received_ms);
+        else reconnect_due_ = true;
+      }
+    }
+    if (sid && seq) note_sequence(*sid, *seq, false);
+    queue_book(book_row(received_ms, nullptr, nullptr, type, or_null(seq), nullptr, nullptr, nullptr, text));
+    return;
+  }
   const std::string ticker = m.value("market_ticker", std::string());
   if (ticker.empty()) {
     std::lock_guard<std::mutex> lk(mu_);
     ++unparsed_;
     return;
   }
-  // Prices arrive as dollar strings; sizes as fixed point with two decimals. Both are read
-  // tolerantly, because a number that fails to parse must cost one field rather than the row.
-  auto num = [&m](const char* key) -> double {
-    if (!m.contains(key)) return 0;
-    const json& v = m[key];
-    if (v.is_number()) return v.get<double>();
-    if (v.is_string()) { try { return std::stod(v.get<std::string>()); } catch (...) { return 0; } }
-    return 0;
-  };
-  const long long exchange_ms = m.contains("ts_ms") && m["ts_ms"].is_number()
-                                    ? m["ts_ms"].get<long long>()
-                                    : (m.contains("ts") && m["ts"].is_number() ? m["ts"].get<long long>() * 1000 : 0);
+  // Prices arrive as dollar strings ("0.8400"). Sizes, volume and open interest arrive as *_fp
+  // strings, a count of contracts with two decimals: "360.00" is 360 contracts, as fixed.h and the
+  // REST parser (types.cpp) read the same fields. Until 2026-09-24 these were divided by 100, so
+  // every non-zero size, volume and open interest in commodity_quotes before then is 100 times too
+  // small; the book rebuilt from the raw deltas has the unscaled size at the best bid on 854 of
+  // 854 ticker frames checked. A field that is missing or does not parse is NULL and counted.
+  static const char* const kFields[] = {"yes_bid_dollars", "yes_ask_dollars", "yes_bid_size_fp",
+                                        "yes_ask_size_fp", "price_dollars",   "volume_fp",
+                                        "open_interest_fp"};
+  std::optional<double> v[7];
+  for (int i = 0; i < 7; ++i) v[i] = field_num(m, kFields[i]);
+  std::optional<long long> exchange_ms = field_int(m, "ts_ms");
+  if (!exchange_ms) {
+    const std::optional<long long> secs = field_int(m, "ts");
+    if (secs) exchange_ms = *secs * 1000;
+  }
   std::lock_guard<std::mutex> lk(mu_);
   ++messages_;
+  // Recorded either way (a market just removed can still send a last update), but counted, so
+  // the status shows at once if the subscription ever widens to the whole exchange again.
+  if (!watching_.count(ticker)) ++unwatched_;
+  for (int i = 0; i < 7; ++i)
+    if (!v[i]) note_missing(type, kFields[i]);
+  if (!exchange_ms) note_missing(type, "ts_ms");
   if (pending_.size() >= s_.max_pending_rows) { ++dropped_rows_; return; }
   pending_.push_back(json{{"ts_received_ms", received_ms},
-                          {"ts_exchange_ms", exchange_ms},
+                          {"ts_exchange_ms", or_null(exchange_ms)},
                           {"ticker", ticker},
-                          {"yes_bid", num("yes_bid_dollars")},
-                          {"yes_ask", num("yes_ask_dollars")},
-                          {"yes_bid_size", num("yes_bid_size_fp") / 100.0},
-                          {"yes_ask_size", num("yes_ask_size_fp") / 100.0},
-                          {"last", num("price_dollars")},
-                          {"volume", num("volume_fp") / 100.0},
-                          {"open_interest", num("open_interest_fp") / 100.0},
-                          {"raw_json", text.substr(0, 4096)}});
+                          {"yes_bid", or_null(v[0])},
+                          {"yes_ask", or_null(v[1])},
+                          {"yes_bid_size", or_null(v[2])},
+                          {"yes_ask_size", or_null(v[3])},
+                          {"last", or_null(v[4])},
+                          {"volume", or_null(v[5])},
+                          {"open_interest", or_null(v[6])},
+                          {"raw_json", text}});
 }
 
 int MarketQuoteFeed::flush(long long now) {
@@ -783,19 +1075,17 @@ int MarketQuoteFeed::flush(long long now) {
   }
   if (!book.empty()) {
     try {
-      store_.exec("BEGIN");
+      store_.transaction([&] {
       for (const auto& r : book)
         store_.exec("INSERT INTO commodity_book_events(ts_received_ms,ts_exchange_ms,ticker,kind,"
                     "sequence,side,price,delta,raw_json) VALUES(?,?,?,?,?,?,?,?,?)",
-                    {r.value("ts_received_ms", 0LL), r.value("ts_exchange_ms", 0LL),
-                     r.value("ticker", std::string()), r.value("kind", std::string()),
-                     r.value("sequence", 0LL), r.value("side", std::string()), r.value("price", 0.0),
-                     r.value("delta", 0.0), r.value("raw_json", std::string())});
-      store_.exec("COMMIT");
+                    {sql_value(r, "ts_received_ms"), sql_value(r, "ts_exchange_ms"), sql_value(r, "ticker"),
+                     sql_value(r, "kind"), sql_value(r, "sequence"), sql_value(r, "side"),
+                     sql_value(r, "price"), sql_value(r, "delta"), sql_value(r, "raw_json")});
+      });
       std::lock_guard<std::mutex> lk(mu_);
       book_recorded_ += static_cast<long long>(book.size());
     } catch (const std::exception& e) {
-      store_.exec("ROLLBACK");
       LOG_WARN("%s: could not record %zu book events: %s (they stay queued)", s_.name.c_str(),
                book.size(), e.what());
       std::lock_guard<std::mutex> lk(mu_);
@@ -805,19 +1095,18 @@ int MarketQuoteFeed::flush(long long now) {
     }
   }
   if (rows.empty()) return 0;
-  store_.exec("BEGIN");
   try {
+    store_.transaction([&] {
     for (const auto& r : rows)
       store_.exec(
           "INSERT INTO commodity_quotes(ts_received_ms,ts_exchange_ms,ticker,yes_bid,yes_ask,"
           "yes_bid_size,yes_ask_size,last,volume,open_interest,raw_json) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-          {r.value("ts_received_ms", 0LL), r.value("ts_exchange_ms", 0LL), r.value("ticker", std::string()),
-           r.value("yes_bid", 0.0), r.value("yes_ask", 0.0), r.value("yes_bid_size", 0.0),
-           r.value("yes_ask_size", 0.0), r.value("last", 0.0), r.value("volume", 0.0),
-           r.value("open_interest", 0.0), r.value("raw_json", std::string())});
-    store_.exec("COMMIT");
+          {sql_value(r, "ts_received_ms"), sql_value(r, "ts_exchange_ms"), sql_value(r, "ticker"),
+           sql_value(r, "yes_bid"), sql_value(r, "yes_ask"), sql_value(r, "yes_bid_size"),
+           sql_value(r, "yes_ask_size"), sql_value(r, "last"), sql_value(r, "volume"),
+           sql_value(r, "open_interest"), sql_value(r, "raw_json")});
+    });
   } catch (const std::exception& e) {
-    store_.exec("ROLLBACK");
     LOG_WARN("%s: could not record %zu quotes: %s (they stay queued)", s_.name.c_str(), rows.size(), e.what());
     std::lock_guard<std::mutex> lk(mu_);
     rows.insert(rows.end(), std::make_move_iterator(pending_.begin()), std::make_move_iterator(pending_.end()));
@@ -829,6 +1118,20 @@ int MarketQuoteFeed::flush(long long now) {
   return static_cast<int>(rows.size());
 }
 
+void MarketQuoteFeed::set_disk_low(bool low, long long now_ms) {
+  std::lock_guard<std::mutex> lk(mu_);
+  if (low == disk_low_) return;
+  disk_low_ = low;
+  if (low || pause_rows_ == 0) return;
+  queue_book(book_row(now_ms, nullptr, nullptr, "paused_low_disk", nullptr, nullptr, nullptr, nullptr,
+                      json{{"rows", pause_rows_},
+                           {"first_seq", pause_first_seq_},
+                           {"last_seq", pause_last_seq_},
+                           {"first_received_ms", pause_first_ms_},
+                           {"last_received_ms", pause_last_ms_}}.dump()));
+  pause_rows_ = pause_first_ms_ = pause_last_ms_ = pause_first_seq_ = pause_last_seq_ = 0;
+}
+
 json MarketQuoteFeed::status() const {
   json out;
   {
@@ -837,15 +1140,32 @@ json MarketQuoteFeed::status() const {
                {"messages", messages_},
                {"recorded", recorded_},
                {"unparsed", unparsed_},
-               {"dropped_rows", dropped_rows_},
+               {"dropped_rows", dropped_rows_},      // ticker rows; book rows are counted apart
                {"pending_rows", static_cast<long long>(pending_.size())},
+               {"unwatched_ticker_messages", unwatched_},
+               {"schema_misses", schema_misses_},
+               {"connects", connects_},
+               {"control_frames", control_frames_},
+               {"errors", errors_},
                // Kept apart from the ticker counts on purpose: one answers "did the quoted price
                // move", the other "could this quantity have been executed", and a study that
                // confuses them is describing a price nobody could have taken.
                {"book_messages", book_messages_},
                {"book_recorded", book_recorded_},
                {"book_snapshots", snapshots_},
-               {"book_sequence_gaps", sequence_gaps_},
+               {"book_empty_snapshots", empty_snapshots_},
+               // Per subscription id. Named apart from the per-market count it replaces
+               // (book_sequence_gaps, about 30% of messages, nearly all of them market switches)
+               // so that the two are never compared.
+               {"book_sid_gaps", sid_gaps_},
+               {"book_seqs_missing", seqs_missing_},
+               {"book_seq_restarts", seq_restarts_},
+               {"book_dropped_rows", book_dropped_rows_},
+               {"book_raw_trimmed", raw_trimmed_},
+               {"forced_reconnects", forced_reconnects_},
+               {"book_paused_low_disk", disk_low_},
+               {"book_not_kept_low_disk", paused_total_},
+               {"min_free_gb", s_.min_free_gb},
                {"pending_book_rows", static_cast<long long>(pending_book_.size())},
                {"subscription_ids", sids_},
                {"watching", std::vector<std::string>(watching_.begin(), watching_.end())}};

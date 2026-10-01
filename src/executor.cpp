@@ -1,4 +1,5 @@
 #include "desk/executor.h"
+#include <cmath>
 
 #include "desk/edge.h"
 #include "desk/reject.h"
@@ -61,10 +62,29 @@ std::string Executor::submit(Proposal& p, const std::string& client_order_id, lo
   // sent and nothing about the desk is wrong; the caller re-prices from a fresh book.
   if (p.exec_style == "maker") {
     const double ask = normalize_prices(market).ask(side_from(p.outcome_side));
-    if (ask > 0 && ask < 1 && p.price >= ask - 1e-9)
-      throw SoftRejection(RejectClass::SoftMarketState,
-                          "book moved: a post-only " + p.outcome_side + " bid at " + fmt2(p.price) +
-                              " would cross the " + fmt2(ask) + " offer; not sent");
+    if (ask > 0 && ask < 1 && p.price >= ask - 1e-9) {
+      // The book moved between the review and the send. Refusing threw the order away and made
+      // the operator start over, which on a fast book means never getting filled at all.
+      // Re-price to the best price that still posts instead. This can only move the bid DOWN, so
+      // it is never worse than what was reviewed: a buyer filled lower paid less. If there is no
+      // room left below - the offer is at the minimum tick - there is no non-crossing price and
+      // the refusal stands.
+      // Nor below the configured risk range: validate_entry above checked min_price against the
+      // reviewed price, and the re-price must not step outside what that check allowed.
+      const double tick = market.tick > 0 ? market.tick : 0.01;
+      const double reprice = std::floor((ask - tick) / tick + 1e-9) * tick;
+      if (reprice >= std::max(tick, cfg_.risk.min_price) - 1e-9 && reprice < p.price - 1e-9) {
+        LOG_INFO("post-only %s %s: book moved to %s, re-pricing %s -> %s (never above the review)",
+                 p.ticker.c_str(), p.outcome_side.c_str(), fmt2(ask).c_str(),
+                 fmt2(p.price).c_str(), fmt2(reprice).c_str());
+        p.price = reprice;
+      } else {
+        throw SoftRejection(RejectClass::SoftMarketState,
+                            "book moved: a post-only " + p.outcome_side + " bid at " + fmt2(p.price) +
+                                " would cross the " + fmt2(ask) + " offer, and there is no lower "
+                                "price left to post at inside the risk range; not sent");
+      }
+    }
   }
   // Fresh from the exchange: an ordinary strategy proposal never silently adds to or flips a
   // position. Qualified additions and verified hedges were classified by entry_context above.
@@ -99,7 +119,14 @@ std::string Executor::submit(Proposal& p, const std::string& client_order_id, lo
     // account whose cash has drifted elsewhere: on 2026-09-11 shard 0 held $0.25 against $65.29
     // on shard 3, and every weather market on shard 0 was untradeable with a funded account.
     // Ask every shard, move from the richest one that is not this one.
-    if (client_order_id.empty() && cfg_.risk.shard_topup_on_demand && client_.authenticated()) {
+    // NOT gated on client_order_id being empty any more. It used to be, and the effect was that
+    // on-demand top-up never ran for the only orders that need it: every hand-approved order
+    // arrives through the manual queue carrying its client_request_id, so the guard was false on
+    // exactly those and true only for the algorithm's own sends. In the whole log the on-demand
+    // path fired zero times while the operator was refused for collateral repeatedly.
+    // The per-shard 60-second rate limit below is what stops a transfer storm, and it does that
+    // job whether or not the order carries an id, so this condition was protecting nothing.
+    if (cfg_.risk.shard_topup_on_demand && client_.authenticated()) {
       long long now = now_s();
       std::string key = "ondemand_ts:" + std::to_string(market.exchange_index);
       long long last = std::stoll(store_.kv_get(key).value_or("0"));

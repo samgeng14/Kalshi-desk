@@ -61,6 +61,11 @@ class WsClient {
 
   void start();
   void stop();                       // idempotent; joins the thread
+  // Drop the socket so the thread connects again, as it would after a lost connection (with the
+  // same backoff). For a caller whose subscription the venue has refused or ended: that cannot be
+  // repaired on the same connection. Safe from any thread, including the callbacks: it ends reads
+  // only, and the socket is set not to raise SIGPIPE.
+  void reconnect();
   bool running() const { return running_.load(); }
   // Queue a text frame. Returns false when the socket is not up (the frame is dropped: a
   // subscription is re-sent on connect anyway, and a stale command is worse than no command).

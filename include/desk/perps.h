@@ -96,6 +96,10 @@ json perp_order_body(const PerpOrderRequest& r);
 // algorithm order passes through them; the exchange's own margin checks come after.
 struct PerpsConfig {
   bool enabled = true;
+  // M1 (2026-09-23): perps are retired from live trading and kept as research. The basis rule
+  // may still run in paper; it may not be switched to live while this is set, and a saved live
+  // "running" state is stopped at startup. Rule trades already open keep their exit rules.
+  bool retired = true;
   double max_order_notional = 30.0;    // dollars of notional per order
   double max_total_notional = 60.0;    // dollars of notional across all perp positions and resting orders
   double max_leverage = 2.0;           // total notional / perps equity
@@ -120,6 +124,9 @@ PerpsConfig perps_config(const nlohmann::json& params);
 class PerpsDesk {
  public:
   PerpsDesk(const Config& cfg, Store& store, KalshiClient& client);
+  bool retired() const { return pc_.retired; }
+  // The rule is running live (not paper). Read by the engine to decide how often to call it.
+  bool live_rule_running();
 
   // Cycle hooks. Public data is cheap (one request for every market); the account is read on
   // its own cadence and whenever something was sent. Exceptions are logged, never thrown.

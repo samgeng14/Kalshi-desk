@@ -291,8 +291,33 @@ static Config perps_cfg(const json& perps = json::object()) {
   json p = perps;
   if (!p.contains("refresh_seconds")) p["refresh_seconds"] = 0;
   if (!p.contains("account_refresh_seconds")) p["account_refresh_seconds"] = 0;
+  // These tests exercise the live machinery, so they opt out of the M1 retirement explicitly.
+  if (!p.contains("retired")) p["retired"] = false;
   cfg.strategy_params = json{{"perps", p}};
   return cfg;
+}
+
+// M1: retired perps refuse live mode, allow paper, and stop a saved live rule at startup.
+static void test_perps_retired() {
+  CHECK(perps_config(json::object()).retired == true);   // the default is retired
+  Store st(":memory:");
+  const std::string pem = "/tmp/perps-retired-test.pem";
+  auto signer = test_signer(pem);
+  KalshiClient client("http://127.0.0.1:1/trade-api/v2", signer, "t");
+  // A live rule saved as running before the retirement...
+  st.kv_set("perps_algo:v1", json{{"running", true}, {"paper", false}}.dump());
+  Config cfg = perps_cfg(json{{"retired", true}});
+  PerpsDesk desk(cfg, st, client);
+  // ...comes back stopped.
+  CHECK(desk.view()["algo"]["running"] == false);
+  CHECK(!desk.live_rule_running());
+  CHECK_THROWS(desk.configure_algo(json{{"paper", false}}), "retired");
+  // Paper remains available for research.
+  json v = desk.configure_algo(json{{"paper", true}, {"running", true}});
+  CHECK(v["algo"]["running"] == true && v["algo"]["paper"] == true);
+  CHECK(!desk.live_rule_running());
+  CHECK(desk.summary()["retired"] == true);
+  std::remove(pem.c_str());
 }
 
 static json algo_trades(Store& st, const std::string& state = "") {
@@ -495,7 +520,8 @@ static void test_paper_rule() {
   desk.step(now + 3);
   t = algo_trades(st);
   CHECK(t[0]["state"] == "open" && t[0]["filled_ts"] == now + 3);
-  CHECK_NEAR(t[0]["fees"].get<double>(), 7.8602 * 5.0 / 1e4, 1e-9);   // maker in, default tier
+  // Maker in at the 2 bps fallback: no API key, so /margin/fee_tiers never answers here.
+  CHECK_NEAR(t[0]["fees"].get<double>(), 7.8602 * 2.0 / 1e4, 1e-9);   // 0.00157204
   json view = desk.view();
   CHECK(view["algo"]["positions"].size() == 1);
   // The perp comes back to the index: basis inside 5 bps -> out at the offer.
@@ -504,7 +530,8 @@ static void test_paper_rule() {
   desk.step(now + 4);
   t = algo_trades(st);
   CHECK(t[0]["state"] == "closed" && std::string(t[0]["reason"]).find("basis reverted") != std::string::npos);
-  double expect = (7.8602 - 7.8402) - 7.8602 * 5.0 / 1e4 - 7.8402 * 12.0 / 1e4;
+  // Fallback fees both ways: maker 2 bps in, taker 12 bps out. 0.02 - 0.00157204 - 0.00940824 = 0.00901972.
+  double expect = (7.8602 - 7.8402) - 7.8602 * 2.0 / 1e4 - 7.8402 * 12.0 / 1e4;
   CHECK_NEAR(t[0]["realized_pnl"].get<double>(), expect, 1e-6);
   CHECK_NEAR(t[0]["exit_price"].get<double>(), 7.8402, 1e-9);
   view = desk.view();
@@ -702,6 +729,7 @@ static void test_live_rule() {
 }
 
 int main() {
+  test_perps_retired();
   test_parsers();
   test_config();
   test_rails_and_tickets();

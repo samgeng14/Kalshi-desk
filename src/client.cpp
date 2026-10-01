@@ -1,3 +1,4 @@
+#include <algorithm>
 #include "desk/client.h"
 
 #include <cmath>
@@ -16,6 +17,37 @@ KalshiClient::KalshiClient(std::string base, std::shared_ptr<Signer> signer, std
   prefix_ = pos == std::string::npos ? "" : base_.substr(pos);
 }
 
+// Every exchange call waits its turn here, whichever path it comes from (call() or the batch
+// orderbook request), so the pacing and its 429 adaptation cover all of them.
+void KalshiClient::pace() {
+  // A monotonic clock: if the wall clock stepped backward, "time since the last call" would go
+  // negative and every exchange call from every thread would wait out the difference.
+  std::lock_guard<std::mutex> lk(mu_);
+  auto mono = [] {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch()).count();
+  };
+  long long now = mono();
+  if (interval_ms_ > 0 && now - last_call_ms_ < interval_ms_)
+    std::this_thread::sleep_for(std::chrono::milliseconds(interval_ms_ - (now - last_call_ms_)));
+  last_call_ms_ = mono();
+}
+
+void KalshiClient::note_status(long status) {
+  HttpResponse r;
+  r.status = status;
+  std::lock_guard<std::mutex> lk(mu_);
+  if (r.status == 429) {
+    const int before = interval_ms_;
+    interval_ms_ = std::min(std::max(1000, min_interval_ms_), std::max(interval_ms_ * 2, 100));
+    if (interval_ms_ != before)
+      LOG_WARN("rate limited: spacing exchange calls %dms -> %dms", before, interval_ms_);
+  } else if (r.ok() && interval_ms_ > min_interval_ms_) {
+    // 5% per success: back from a second to the floor in about 55 calls (a few seconds).
+    interval_ms_ = std::max(min_interval_ms_, static_cast<int>(interval_ms_ * 0.95));
+  }
+}
+
 json KalshiClient::call(const std::string& method, const std::string& path,
                         const std::map<std::string, std::string>& query, const json* body) {
   std::string url = base_ + path;
@@ -31,18 +63,14 @@ json KalshiClient::call(const std::string& method, const std::string& path,
   for (int attempt = 1; attempt <= attempts; ++attempt) {
     std::map<std::string, std::string> headers;
     if (signer_) headers = signer_->headers(method, prefix_ + path, now_ms());
-    // Gentle pacing: ~6 calls/second from this process.
-    {
-      std::lock_guard<std::mutex> lk(mu_);
-      long long now = now_ms();
-      if (now - last_call_ms_ < 150)
-        std::this_thread::sleep_for(std::chrono::milliseconds(150 - (now - last_call_ms_)));
-      last_call_ms_ = now_ms();
-    }
+    // Pacing, shared by every thread that calls the exchange: the sleep happens under the lock
+    // on purpose, so concurrent callers queue behind it instead of all firing at once.
+    pace();
     if (method == "GET") r = http_.get(url, headers);
     else if (method == "POST") r = http_.post(url, body ? body->dump() : "{}", headers);
     else if (method == "DELETE") r = http_.del(url, headers);
     else throw std::runtime_error("unsupported method " + method);
+    note_status(r.status);
     if (r.ok()) break;
     bool retryable = r.status == 429 || r.status >= 500;
     if (!retryable || attempt == attempts) break;
@@ -151,7 +179,9 @@ std::vector<Orderbook> KalshiClient::get_orderbooks(const std::vector<std::strin
       qs += (qs.empty() ? "?" : "&") + std::string("tickers=") + url_encode(tickers[k]);
     std::map<std::string, std::string> headers;
     if (signer_) headers = signer_->headers("GET", prefix_ + "/markets/orderbooks", now_ms());
+    pace();
     HttpResponse r = http_.get(url + qs, headers);
+    note_status(r.status);
     if (!r.ok()) throw ApiError(r.status, r.body, "GET /markets/orderbooks -> " + std::to_string(r.status));
     json j = json::parse(r.body, nullptr, false);
     for (const auto& ob : j.value("orderbooks", json::array()))

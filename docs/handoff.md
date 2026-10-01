@@ -14,6 +14,404 @@ Working agreement for every session in this programme:
   geolocation check rejects it, so autonomous execution has to run on the Mac. This constrains
   session 8 and is not negotiable by design choices made earlier.
 
+## Session 24 - M0 stabilize and M1 retire perps (2026-09-23)
+
+The operator's plan (volume, live-sizing, maker-first) orders M0 first: the desk had been down
+since 2026-09-17 16:24Z, six days, and nothing else matters until it stays up. This session is
+M0 and M1. Nothing in it changes what the desk decides to trade.
+
+**Why it kept dying.** Seven `terminating due to uncaught exception` lines in `data/prod.log`,
+all SQLite errors (`disk I/O error`, `file is not a database`, `malformed`). The cycle's step
+guard caught exceptions from each step, but the manual-order drain it ran after every step sat
+outside the try, as did the kill sweep and the snapshot, and the serve loop had no catch at all.
+The last outage had no exception: the log ends in a burst of `Couldn't resolve host name` (the
+laptop lost its network) and the process was simply gone. Nothing restarted it.
+
+**What changed.**
+
+- Every call inside `Engine::cycle` goes through the guard, including the manual drain, the kill
+  sweep and the snapshot. SQLite errors are counted as storage failures; network errors are not.
+- The serve loop catches anything that still escapes, backs off (1x, 2x, 4x the poll, capped at a
+  minute), trips the kill switch after `max_consecutive_cycle_failures` (5) storage-failing cycles,
+  and after three times that exits with code 75 so the supervisor starts a fresh process with a
+  fresh SQLite connection. A network outage never trips the kill switch.
+- `scripts/desk_supervise.sh` keeps the desk up. `tradeit up` starts it and `tradeit down` stops
+  it first. Liveness is the desk's own `last_cycle_ts`, not the pid: three stale readings (180 s)
+  in a row restart it, so a laptop waking from sleep is not killed for its first slow cycle.
+  Verified in a dry run: SIGKILL was restarted within 30 s; SIGSTOP (alive, not cycling, not
+  answering) was detected, killed and restarted.
+- The WebSocket feed thread and the new Polymarket thread catch everything; a callback that
+  throws reconnects instead of calling `std::terminate`.
+
+**The cycle.** `prod.log` on 2026-09-17: 30-36 s cycles on Polymarket universe refreshes,
+17-25 s otherwise, against a 25 s freshness bar. Measured per step:
+
+| step | before | after | how |
+|---|---|---|---|
+| polymarket | 15-16 s | 0 s in the cycle | own thread (`PolyDesk::start_background`), off the engine lock |
+| refresh | 6.1-6.5 s | 2.0 s | 4 threads, reused TLS connections, 60 ms pacing instead of 150 ms |
+| results | 5.4-7.3 s | 1 call | batched `get_markets_by_tickers` |
+| books | 3.05 s | 0.08 s | `GET /markets/orderbooks`, 100 per call; single-book fallback kept |
+| perps | 0.3-2.5 s | once a minute | retired (M1) |
+
+"after" for refresh and books was measured authenticated and read-only against production (the
+account is Basic tier: 20 reads/s, burst 60; listings and books cost the default 10 tokens). The
+full production cycle was NOT measured: that needs the desk running with keys. Estimate 5-7 s,
+dominated now by `strategies` (NWS, ESPN, Coinbase fetches, 2-4 s in the old log). Cycles over
+`cycle_report_seconds` (8) are logged with their five slowest steps, once a minute. The log line
+used to say "quotes go stale past 0s"; it reads the real bar now.
+
+Pacing adapts: a 429 doubles the spacing (to at most 1 s) and each success eases it back. A
+keyless dry run hit the stricter public limit and the desk throttled itself instead of retrying
+in a storm.
+
+**The 98 markets skipped every cycle** were 80 MLB and 18 La Liga games the exchange had stopped
+listing as open (decided, days before their close_time) while the store still said active; their
+quote could never refresh. The refresh now asks the exchange for the real status of any stored
+open market missing from a complete, non-empty listing, batched, each at most every 10 minutes.
+Absence alone never changes a status: an empty or failed listing retires nothing.
+
+**Disk.** `commodity_book_events` is 38.6M rows and ~15 GB with its index after three days of
+capture, about 4 GB a day, on a disk with 31 GB free. That is the next outage. Not fixed by
+default because it is research data:
+- `scripts/archive_quotes.py --table commodity_book_events --days 3 [--apply [--vacuum]]` archives
+  whole UTC days to gzipped CSV, streamed and verified by row count and SHA-256 on read-back,
+  before deleting. Desk must be stopped for `--apply`. Tested on a synthetic database. The same
+  script also fixes a bug where a day archived on an earlier run was never deleted later.
+- `commodity_book_retain_days` makes the cycle delete old rows without archiving. Off.
+
+**M1, perps retired.** `params.perps.retired` (default true): the basis rule may run in paper,
+not live; a saved live "running" state is stopped at startup; open rule trades keep their exits.
+The engine's rule holds nothing. The PORTFOLIO_V1 daemon does: it shut down on 2026-09-17 16:24Z
+"LEAVING POSITIONS OPEN", about $4.37 of position value then. Closing them is the operator's call
+(`scripts/portfolio_safety.py --flatten`, which the daemon names as its close path, or the Perps tab).
+
+### What was run
+
+- All C++ suites. New: 8 checks (transaction, retention, cycle survives an unreachable network),
+  7 checks (perps retirement). Every remaining failure is also present at HEAD plus the
+  operator's uncommitted changes without this session's (post-only re-price in `executor.cpp`,
+  the 2 bps maker fallback in `perps.cpp`): desk 10, systematic 3, perps 3.
+- `ui-desk-ux` 122, `ui-routes` 63, 0 failures. Four UI suites need Playwright, not installed.
+- Dry run: keyless production config, scratch database, port 8799, under the supervisor, 25+
+  cycles, zero skipped markets, zero storage failures, Polymarket refreshing on its thread.
+
+### Found by the dry run, fixed
+
+- **A deadlock this session introduced, then removed.** `refresh_markets` ran its upserts inside
+  `Store::transaction` (which holds the store lock) and took `snap_mu_` inside it; the dashboard's
+  `board_view` holds `snap_mu_` and then queries the store. A dry run with the browser open froze
+  solid. The snapshot update now happens before the transaction, and `store.h` states the rule:
+  nothing inside a transaction takes another lock.
+- **The book plan queued behind the dashboard.** `book_capture_plan` built the full systematic view
+  (under the trader's lock) to learn its open tickers; under dashboard load the books step went from
+  ~5 s to 70 s. It reads the open trades and the settings copy directly now: 1.9 s under the same load.
+- **Supervisor stop could orphan a desk** that outlived its 45 s wait. It waits 120 s, then SIGKILL.
+- **Pacing recovered too slowly** after a 429 (2 ms per success). 5% per success now.
+
+## Session 24, part 2 - M2 lanes, M3 sports_live and the ESPN study, M4 baskets, M5 the line
+
+**M2, lanes** (`include/desk/lanes.h`, `src/lanes.cpp`, settings `lanes` and `lane_*`). A model
+listed in `settings.lanes` is gated by its stage (research, paper, live_candidate, live), not by
+`graduated_models`. Its stake starts at `lane_base_stake` ($5) and moves at the day roll: every 30
+settled live trades, doubled when the mean is positive and its lower 80% band (z 1.2816) clears
+minus one fee, halved when the mean is negative, research after three negative windows in a row;
+capped at `lane_max_stake` (40) and, per order, at `risk.max_order_dollars` ($10), which risk would
+otherwise refuse outright. Per lane and trading day: `lane_daily_volume_dollars` (50) of stake and a
+loss stop at `lane_daily_loss_stop_frac` (8%) of bankroll, which demotes to research as the plan
+says (`lane_loss_stop_action: halt_day` stops it for the day instead; the plan's own numbers put a
+$5 cheap-side book's daily sd near the stop, so expect demotions by variance). The cheap-side filter
+(`asymmetric_filter`, price <= 0.45 unless the edge after the buffer exceeds 0.10) replaces the
+`min_win_probability` floor for lanes, and sends the rest to the manual board. Lane trades hold to
+settlement (`hold_to_settlement`): no take-profit, no model-value exit, no time stop; the thesis and
+price stops stay. Promotion by hand resets the lane's evidence clock. Attribution per model is in
+the systematic view (`lanes`) and a Lanes table on the Systematic tab, with a stage selector.
+
+**M3, sports_live: held at research.** The study the plan asked for is `reports/espn_leadlag.md`
+(`research/espn_leadlag.py`, run on an extract, never on the live file):
+- A mapping bug: in 8 college games home and away were swapped (ESPN's number applied to the other
+  team). Cause: names in the game's order paired with ticker codes in sorted order, and a tie
+  between orientations defaulted to "first ticker is away". Fixed in `sports_live.cpp`
+  (`market_team`, `orientation_scores`, ambiguous matches refused) with a regression test.
+- Lead/lag: over 613 ESPN jumps averaging 10c, Kalshi moved 3.2c in the minute BEFORE ESPN's previous
+  sample and 2.5c in the five minutes after; for jumps of 10c+, 5.7c before and 3.8c after. Kalshi
+  moves first and ESPN overshoots, at the resolution the recordings allow (30 s ESPN, one desk cycle
+  for Kalshi).
+- The trade, with the mapping corrected: the plan's trigger (ESPN edge >= 8c, ask <= 0.45, taker,
+  held to settlement) made 106 trades, won 26 against 48.4 ESPN expected and 29.0 the asks implied,
+  -$1.23 a trade, t -1.83. Every trigger tried loses on average. An approximation of the router the
+  lane actually uses: 34 trades, -$0.98 a trade, t -0.46 (negative, not conclusive). See part 3.
+By the plan's own gate ("a reading that is not negative") the lane does not start live. It is a
+lane at `research`; the category and its route are set to auto so that promotion is: set
+`strategies.sports_live` to `auto` in config, restart, and pick live_candidate on the Lanes table.
+The saved algorithm state is `running: true, mode: live` with AUTO armed, so a promoted lane trades
+as soon as the desk is up.
+
+**M4, baskets.** `basket_series` in config (42 series: crypto and index hourly, natgas, palladium,
+the econ releases, the 26 weather series discovery holds back): refreshed for the ladder and
+dominance finders only, not priced by a model, not written to quote history, not on the board, and
+staggered across cycles (`basket_refresh_every` 2). Authenticated, all 74 series refresh in 4.9 s,
+so about 3.5 s a cycle staggered. The scan no longer ends at the first one-market event (it used
+`break`), skips baskets settling past the T+2 horizon, sizes each basket so every leg fits the
+per-order cap (a refused leg would leave a directional position), and proposes up to
+`risk.ladder_max_baskets_per_cycle` (2). Baskets have their own budget in the algorithm
+(`arbitrage_daily_dollars` 60, `arbitrage_max_open_dollars` 40), no longer the model lanes'. A
+read-only scan of the live books at 22:50Z found no dominance lock in 515 events: these pay when
+they appear.
+
+**M5, the sportsbook line** (`src/strategies/sportsbook_line.cpp`). The Odds API v4, h2h, regions
+us,eu, one call per league an hour (2 credits); sharp book first (pinnacle, circa, betonline,
+lowvig), else the median of 2+ books; multiplicative de-vig; both teams matched with a margin;
+priced only before kickoff and from a line under two intervals old; NFL scaled by the tie. Market
+weight 0 and settlement verified (it reports the line). Registered before sports_live. A lane at
+`paper` with the cheap-side filter off. **Inert: there is no key.** Put one line in
+`~/.kalshi/odds_api_key` (chmod 600) and restart; the free tier (500 credits a month) does not
+cover seven leagues hourly.
+
+**M7, first half: `reports/wx_known_outcome.md`.** The running maximum is a lower bound on the
+settlement value (KXHIGHNY 2026-09-15: 71.06F recorded, settled 72-73), so it decides brackets
+below it NO and "above" brackets below it YES. Rule: edge + 1 + 0.5F. (The YES direction was added
+in part 3: 2 cases, both already priced at $1.00.) 163 decided bracket-days, 0 settled YES; the YES bid when the desk
+first saw the crossing was 0.00 in 161 of them. The book is not slow here; this source does not
+earn a place in lane A at the desk's observation speed.
+
+### Not done, and why
+
+- **M6 quoting engine**: the plan says build it after B and C. B came back negative and C has no key.
+- **M7 nowcast model** on the ASOS archive: not built; the known-outcome half is above.
+- **M8 bankroll stage 1**: unlocked by 100 live lane trades with a positive rolling P&L; none yet.
+- Four UI suites need Playwright, which is not installed here.
+
+### Open (for the operator)
+
+1. Rebuild and restart: `cmake --build build -j && scripts/tradeit up`. Read `data/supervisor.log`
+   and the `cycle N took` lines in the first hour; the production cycle time is estimated, not measured.
+2. The disk: archive or stop the commodity capture before it fills (above).
+3. Perps positions the daemon left open: close them or leave them; nothing new opens.
+4. sports_live: leave at research, or promote knowing the study.
+5. An Odds API key to start collecting evidence on lane C (it stays at paper until promoted).
+
+## Session 24, part 3 - live after the restart, two reviews, and what they changed (2026-09-23/24)
+
+The operator restarted the desk on the new build at 22:46Z. Two things showed up at once, and two
+multi-agent reviews (7 areas, then the late changes; every finding tried by two skeptics) found 66
+defects that survived verification. All are fixed below unless marked. None is deployed until the
+next `tradeit down && tradeit up`: the live supervisor (pid 41760) and desk (pid 42219) run the
+previous code.
+
+**Live, first hour.** Steady cycles 8.7-9.3 s with the dashboard closed, 17-37 s with it open. A
+`sample` of the live process: the cycle spent ~45% of its time waiting for the store's single lock
+behind dashboard reads (report, execution stats, a per-market entry check on every board row). The
+supervisor then restarted a healthy desk at 22:50:52Z because `/api/state` (which waited on the
+board's snapshot lock) missed its 5 s probe three times running.
+
+**Fixes for that.**
+- Store: three read-only connections; reads from any thread but the cycle's go there (SQLite WAL
+  readers). Every multi-statement transaction now goes through `Store::transaction`, which holds the
+  lock from BEGIN to COMMIT (the reference-feed flushes and Polymarket hedges used a bare BEGIN that
+  released it between statements: a manual order's read-back could return null inside that window).
+  `Store::insert` returns a row id atomically (three `SELECT last_insert_rowid()` queries were racy
+  and read 0 from a reader).
+- `/api/state` reads its own copy under its own lock. The desk writes `<db>.heartbeat` every loop
+  pass; the supervisor judges liveness by it, allows 10 minutes for a first pass, and resets strikes
+  when the wall clock jumps across a 30 s wait (laptop sleep).
+- The settlement sweep query used `IN (SELECT DISTINCT ticker FROM model_fairs ...)`: 3.5 s every
+  other cycle. Now indexed `EXISTS` probes.
+- The book plan read the whole systematic view (under the trader's lock) for its open tickers: 70 s
+  books steps under load in a dry run. Reads the trades table directly now.
+
+**Money safety.**
+- Order POSTs never reuse a connection. With connection reuse libcurl re-sends a request on its own
+  when a reused connection dies before any response byte, POST included: a Polymarket order could
+  have been sent twice.
+- The legacy auto path no longer sends locked-basket legs one at a time (it could send one leg and
+  hold the other: a naked position). Baskets go whole through the algorithm, or by hand.
+- Baskets no longer count against the model lanes' open cost, positions or capital.
+- A resting lane entry was cancelled on the next cycle (the resting-order check still demanded
+  graduation and the 0.55 floor). It mirrors the router now.
+- The kill sweep re-arms when a storage error or a refused cancel stops it.
+
+**Matching.** sports_live and sportsbook_line both: an MLB ticker's start time must meet the game's
+(doubleheaders); an event is matched only once its own date's scoreboard is in (a Sep 25 event was
+matched to Sep 24's game); a near tie between candidates is refused; both teams need their own
+evidence (0.75), with names compared by `team_names.h` (one-letter initials: "Chicago C" is the Cubs,
+not the White Sox; LA/NY/SF/KC/TB/GB/LV; the A's; A&M). Live logs had shown Texas at Minnesota
+matched to the Mets at Texas.
+
+**Archive script, rewritten.** Rowid ranges instead of three full scans a day; manifests bound to the
+database and to the first and last archived rows; one all-or-nothing delete; the desk's lock held for
+the whole run and a refusal while a supervisor is alive; a range already deleted by a run that died
+before marking its manifest is marked, not blocked; days chain onto earlier runs; fsync before any
+delete; VACUUM needs ~2x in WAL. Benchmark: ~144k rows/s archived with read-back.
+
+**Smaller, all fixed:** thread-creation failure no longer terminates; storage-failure escalation
+counts only storage errors; the failure limit is clamped; batch orderbooks share the pacing and a 429
+no longer disables them; pacing uses a monotonic clock and respects a floor above 1 s; Polymarket
+market lookups are locked, the pairs table is rebuilt in one transaction, an order during an account
+fetch discards that snapshot, auth backoff keys on the HTTP status, a failed league keeps its markets;
+the basket series survive a saved watch list; lane promotion resets the stake; a lane added live
+starts its evidence then; paper losses do not demote a lane; halt_day works with sizing off; the entry
+ladder respects the cheap-side ceiling; halving never raises a stake; the retired perps rule cannot
+switch to paper with live trades open; a perps close refreshes its book first; one malformed odds
+event no longer drops a league; tradeit checks the supervisor's identity; the Lanes table keeps
+unapplied settings, cannot swallow a choice mid-refresh, and says what a stage change does; the
+Trades board's "rank by net edge" ranks (it read fields the rows do not have).
+
+**Studies, corrected.** The ESPN report now separates the plan's raw trigger (-$1.23/trade, t -1.83,
+n 106) from an approximation of the router the lane actually uses (-$0.98/trade, t -0.46, n 34:
+negative, not conclusive), and its readings are computed from the table. The weather study now also
+measures the "above" brackets the running max decides YES (2 cases, both already priced at $1.00);
+the claim that the running max "can only decide NO" was wrong and is gone. Both extracts hold the
+desk's lock while they read.
+
+**Not changed:** sports_live stays at research; the pre-existing failures from the operator's own
+uncommitted changes (8 checks: manual queue submit, post-only re-price, perps maker fee).
+
+### Deploy, then archive
+
+    scripts/tradeit down
+    python3 scripts/archive_quotes.py --table commodity_book_events --days 3 --apply --vacuum
+    scripts/tradeit up
+
+`tradeit down` also stops the supervisor. The archive refuses to run while either is alive, and
+while it runs it holds the desk's lock. Expect 10-20 minutes for 38.6M rows including the VACUUM.
+
+## Session 24, part 4 - the eight old failures, one hang, and the disk (2026-09-24)
+
+**The eight failures are fixed; all 19 suites pass.**
+
+- **Manual queue (desk 2): a bug in the two-strike cap.** `kMaxAttempts = 2` counted every
+  put-back, `RetryManualOrder` included, and that one is the desk waiting on its own next estimate.
+  The queue runs after every cycle step, so a request waiting for a fresh estimate spent both
+  strikes before the strategies step produced it: it failed every time. Waits now go to the back of
+  the queue without a strike (`expires_ts` bounds them, as before); only book refusals
+  (`SoftRejection`) count, on a new `strikes` column. The test is unchanged.
+- **Post-only re-price (systematic 3): the tests were stale.** The executor's re-price to one tick
+  under the offer is intended; the tests now assert the re-priced send. One real bug came with it:
+  the re-price ran after `validate_entry` and could go under `risk.min_price` (reviewed at 0.02,
+  sent at 0.01). It is floored at `max(tick, min_price)`, with a test.
+- **Perps maker fee (perps 3): the test was stale.** The 2 bps fallback is intended; expectations
+  recomputed (fees 0.00157204, realized 0.00901972). `docs/perps.md` and the Open note under
+  Session 12 said 5/12 bps; both say 2/12 now.
+
+**One hang, 04:16:30-04:21Z, caused by this session.** Three agents started full builds with an
+unlimited `-j` next to the live desk; the machine thrashed for about 18 minutes, the desk stopped
+cycling and did not answer SIGTERM, and the supervisor killed and restarted it as designed. No lock
+was involved: every `Store::transaction` body was re-checked and none takes another lock. Build
+next to the live desk with `-j 4` at most, one build at a time.
+
+**The disk is the next outage.** `commodity_book_events` takes a few hundred rows a second (230/s
+on 2026-09-14, 487/s on 09-17, 360/s now) at about 415 bytes a row: 8-17 GB a day while the desk
+runs around the clock. The rate is not new; the uptime is. At 2026-09-24 06:11Z the database was
+10.4 GB with 31 GB free on the disk: full in two to three days. There is no free-space guard, so
+SQLite would fail every write and the desk would exit and restart in a loop. Choices, not made:
+archive on a schedule (`archive_quotes.py` needs the desk down), `commodity_book_retain_days`
+(deletes without archiving), drop `raw_json` from the book rows (most of the 415 bytes), or a
+free-space floor that pauses this one feed. Not the `raw_json` option before the 2026-09-24 recorder fix
+has run and the backfill is verified: until then `raw_json` is the only correct copy of every delta's
+price and size (the `price` and `delta` columns hold 0 on every delta recorded before it).
+
+## Session 24, part 5 - the commodity recorder never recorded a price (2026-09-24)
+
+Found while sizing the disk, then audited on 500,465 live book rows and 60,000 ticker rows (copied
+under the lock) against the venue's docs, each finding checked by a second agent. Every trading
+decision is unaffected: the commodity models route on REST quotes, not these tables.
+
+**What was wrong in `MarketQuoteFeed`, since the tables were created.**
+
+- Book deltas read `price` and `delta`; the venue sends `price_dollars` and `delta_fp`. Every delta
+  ever recorded has price 0 and delta 0 (about 56M rows counting the archive). `raw_json` was right.
+- Ticker `*_fp` fields were divided by 100. They are contracts with two decimals ("360.00" is
+  360), so every non-zero size, volume and open interest in `commodity_quotes` is 100x too small.
+- Gaps were counted per market on a sequence the venue numbers per subscription (sid), so every
+  switch between markets was a "gap": `book_sequence_gaps` was about 30% of messages on a stream
+  that lost none. The replay the comments said "refuses those stretches" does not exist.
+- At every 15-minute roll the cycle asked for an empty ticker subscription, which is the whole
+  exchange: 77.6% of `commodity_quotes` rows (15,863 markets) were unrelated.
+- Snapshots were stored as ''/0/0/0; the replies to our own commands (which take a sequence number)
+  and the venue's error replies were dropped; frames were cut at 8,192 / 4,096 bytes.
+
+**The fix** (`src/reference_feed.cpp`, `include/desk/reference_feed.h`): the venue's keys; a field
+that is missing is NULL and counted (`schema_misses`), never 0; sequence per sid, with restarts;
+replies, connects and queue drops written as rows, so a hole is explainable; the subscription never
+goes empty; frames kept whole; the pyth feed's sequence survives a reconnect. The status field is
+now `book_sid_gaps`: never compare it with the old `book_sequence_gaps`. `test_market_quote_feed`
+uses frames copied from the live table, and each original bug put back fails it.
+
+Two additions the operator chose: a delta whose columns hold its whole frame is stored without
+`raw_json` (414 bytes a row becomes about 127; `params.commodity.quotes.keep_delta_raw` keeps every
+frame), and a free-space floor: under `min_free_gb` (10) the book stream is followed but not kept,
+until 12 GB is free, and a `paused_low_disk` row records the stretch.
+
+**Run on the production database, desk stopped, lock held:**
+- `scripts/backfill_book_columns.py`: 17,404,272 book rows and 2,211,422 ticker rows recomputed from
+  `raw_json`, 0 left disagreeing with their frame. Running it again changes nothing.
+- `archive_quotes.py --table commodity_book_events --days 0 --apply`: 2026-09-23, 1,418,534 rows
+  into 37 MB, with the corrected columns.
+- `backfill_book_columns.py --trim`: the frame dropped from 15,985,294 deltas (all of today's; none
+  carried a key the columns do not hold).
+
+**The disk after it:** the trim left 4.86 GB unused inside the book table's pages, which appended
+rows do not reuse, plus 0.61 GB of free pages. The operator then ran `archive_quotes.py ... --vacuum`:
+14.24 GB -> 8.68 GB in 173 s, 35.1 GB free on the disk. New book rows are about a third of the old
+size: roughly 3 GB a day.
+
+**Still wrong, or now known to be void:**
+- The archived day files for 2026-09-14 to 09-17 (38.6M rows): price and delta are 0. Their
+  `raw_json` is whole; recompute from it when reading them (the SQL is in the backfill script).
+- `book_sequence_gaps` in any old status or note. The pyth `sequence_gaps` undercounted after the
+  first reconnect of every run: a lower bound.
+- The "two clocks" latency method at the 50 ms scale: the clocks differ by 8-34 ms, and the ticker
+  channel arrives in about one-second batches (receipt minus venue time averages +180 ms).
+- COM-2, COM-3 and COM-4 wait for data recorded after this fix. Nothing was published from them.
+- `dollar_volume` and `dollar_open_interest` are floor(fp / 2) on every row: not notional.
+- Ordering book rows by (ticker, sequence) mixes subscriptions across reconnects; order by id.
+- `reports/espn_leadlag.md` suggests this recorder for game markets: only after this fix.
+
+**A regression the fix shipped with, found on its first start (17:49Z) and fixed the same hour.**
+The fix stopped subscribing to an empty list on connect (an empty list is the whole exchange),
+which is right, but a fresh process connects before its first cycle has chosen a market, so
+nothing was subscribed and the first `watch()` went out as `update_subscription` on guessed sids.
+The venue refused both ("Unknown subscription ID"), the feed believed it watched five markets and
+received nothing, and the keep-alive kept the socket looking healthy, so it never reconnected. The
+old code only worked because its empty subscribe on connect subscribed to every market and so
+created sids 1 and 2. Two reviews of the repair found more, all fixed with it:
+- A connection now subscribes nothing itself and forgets the old set; the next `watch()`
+  subscribes from the engine's open windows. Re-subscribing the old set on a reconnect after a
+  roll or a sleep names only closed windows, which the venue takes as every market: the 14:50:06Z
+  flood in the recording was exactly that.
+- `watch()` decides and queues under the feed's lock, and only once the connection's handler has
+  run, so one connection cannot be subscribed twice (the venue no longer refuses a duplicate).
+- Updates use each channel's own acknowledged sid (one acknowledgement used to send both channels'
+  updates to one sid).
+- A refusal that leaves a subscription broken (our subscribe refused, code 7, or the terminal 10
+  and 25) drops the connection, at most once a minute, so the next one subscribes afresh
+  (`WsClient::reconnect`, status `forced_reconnects`).
+- The ticker subscribe asks for each market's current quote (`send_initial_snapshot`).
+- A refused add also forces the reconnect (the delete after it would still go through and empty
+  the ticker subscription), and a refusal inside the minute is kept and acted on by the next
+  `watch()` rather than dropped.
+- The engine leaves out windows closing within 2 s, so a first subscribe cannot name only windows
+  that close before it reaches the venue.
+- A third review found that the forced reconnect could kill the desk: over TLS the socket loop can
+  still write (a pong, a queued frame) after the shutdown, OpenSSL's write raises SIGPIPE, and
+  nothing ignored it. A probe on a loopback TLS server died with exit 141. The socket is now set
+  `SO_NOSIGPIPE`, `reconnect()` ends reads only, and `main` ignores SIGPIPE; the same probe survives.
+  This also covered an existing SIGPIPE on `stop()` during a TLS handshake.
+Tests cover each (the reconnect test fails if `reconnect()` does nothing); the first fails with the
+17:49Z behaviour.
+
+**Live, 2026-09-25 04:36-04:48Z, across the 04:45 roll:** subscribed on the first cycle (sids 1
+and 2); 358,482 book messages with every delta stored without its frame; no schema misses, no sid
+gaps, no seq missing (the roll's command replies now take their numbers in the record); 0 errors,
+0 forced reconnects, 0 ticker messages for unwatched markets; the watch set moved from the 00:45
+to the 01:00 windows with 5 empty close snapshots and 5 new books.
+
+**Not done:** the watch set is built before `refresh_markets`, so each new window's book starts a
+median 31 s late; no snapshot is requested after a real gap; the pyth feed stamps receipt in
+seconds; `scripts/live_data_audit.py` and `research/impulse_prepare.py` still check sequence per
+market; `commodity_quotes` keeps its 1.3 GB of pre-fix flood rows.
+
 ## Session 21 - "post only cross" on /margin/orders (2026-09-12)
 
 Sam reported `POST /margin/orders -> 400 invalid_order / "post only cross"`.
@@ -1077,7 +1475,7 @@ cmake --build build-ci && ./build-ci/desk-tests && ./build-ci/systematic-tests &
 ### Open
 
 - Perps fees: `/margin/fee_tiers` is read hourly; until it answers, the rule and the ticket
-  preview assume 5/12 bps.
+  preview assume 2/12 bps maker/taker.
 - The basis rule has no queue model in paper mode (a resting entry fills when the touch trades
   through it), same caveat as the systematic trader's paper fills.
 - Paper P&L for perps ignores funding (a position held across a funding time pays or receives

@@ -1,7 +1,11 @@
 #pragma once
 // SQLite persistence: everything the desk sees or does, so research and the
 // $100 -> $1,000 gate can be computed from one file.
+#include <atomic>
+#include <functional>
+#include <memory>
 #include <mutex>
+#include <thread>
 #include <optional>
 #include <string>
 #include <variant>
@@ -52,6 +56,33 @@ class Store {
   // Generic read: rows as JSON objects keyed by column name.
   json query(const std::string& sql, const std::vector<SqlValue>& params = {});
   void exec(const std::string& sql, const std::vector<SqlValue>& params = {});
+  // An INSERT and its new rowid, atomically: `SELECT last_insert_rowid()` as a separate query can
+  // read another thread's insert, or (from a request thread) a read-only connection's 0.
+  long long insert(const std::string& sql, const std::vector<SqlValue>& params = {});
+  // Runs fn inside one transaction while holding the store lock for its whole duration, so a
+  // statement from another thread cannot land inside it (or be rolled back with it). Rolls back
+  // and rethrows on any exception. Must not be nested.
+  // fn must take NO other lock: other threads take their own locks first and the store's second
+  // (the dashboard holds Engine::snap_mu_ while it queries), so a lock taken inside fn inverts
+  // that order and deadlocks. Store calls and plain computation only.
+  void transaction(const std::function<void()>& fn);
+  // Rows changed by the last statement on this connection. Only meaningful inside transaction().
+  long long changes();
+
+  // Readers (2026-09-23). The engine cycle is the writer; the dashboard's request threads and the
+  // Polymarket thread mostly read. On one connection behind one lock, the dashboard's heavy reads
+  // (the account report, execution stats, a per-market entry check on every board row) held the
+  // cycle up for about 45% of its time, measured with `sample` on the live desk. So a file-backed
+  // store also opens a small pool of read-only connections (SQLite WAL lets them read while the
+  // writer writes), and a query goes to one of them when it is made on a thread other than the
+  // writer thread and outside a transaction that thread opened itself (such a query must see the
+  // transaction's own uncommitted rows). Every write, every transaction, and every query on the
+  // writer thread use the one writer connection, exactly as before.
+  // Until set_writer_thread() is called nothing is routed, which keeps tools and tests that never
+  // run a cycle on the single connection. An in-memory store never has readers (a second
+  // connection to ":memory:" would be a different, empty database).
+  void set_writer_thread();
+  size_t reader_count() const { return readers_.size(); }
 
   // reference data
   void upsert_series(const Series& s);
@@ -116,6 +147,11 @@ class Store {
   void migrate();
   sqlite3* db_ = nullptr;
   std::recursive_mutex mu_;
+  struct Reader { sqlite3* db = nullptr; std::mutex mu; };
+  std::vector<std::unique_ptr<Reader>> readers_;
+  std::atomic<size_t> next_reader_{0};
+  std::atomic<std::thread::id> writer_{};
+  bool use_reader() const;
 };
 
 }  // namespace desk

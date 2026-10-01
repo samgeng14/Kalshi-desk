@@ -289,6 +289,8 @@ void HttpServer::routes() {
   s.Post(R"(/api/perps/positions/([^/]+)/close)", [this](const httplib::Request& req, httplib::Response& res) {
     guarded(res, [&] {
       if (engine_.killed()) throw std::runtime_error("kill switch is on");
+      // Retired perps are read once a minute by the cycle; price the close from a fresh read.
+      engine_.perps().refresh_public(now_s());
       return engine_.perps().close_position(req.matches[1]);
     });
   });

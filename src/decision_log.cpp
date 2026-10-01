@@ -33,7 +33,7 @@ long long record_decision(Store& store, const json& row, const std::string& even
                               quote["diagnostics"].contains("inputs") ? quote["diagnostics"]["inputs"] : json::object();
   json reasons = row.contains("reasons") && row["reasons"].is_array() ? row["reasons"] : json::array();
   const double p_win = num(row, "p_win", NAN);
-  store.exec(
+  const long long new_id = store.insert(
       "INSERT INTO trade_decisions(ts,decision_id,event,ticker,event_ticker,side,category,model_name,model_version,"
       "p_yes,fair_probability,sigma,bid,ask,entry_price,fee,slippage,uncertainty_buffer,raw_edge,executable_edge,"
       "route,verdict,style,count,reasons_json,inputs_json,quote_json,model_ts,book_ts,proposal_id,note,"
@@ -46,8 +46,7 @@ long long record_decision(Store& store, const json& row, const std::string& even
        opt(row, "executable_edge"), text(row, "route"), text(row, "verdict"),
        style.empty() ? text(row, "style") : style, count, reasons.dump(), inputs.dump(), quote.dump(),
        whole(row, "model_ts"), whole(row, "book_ts"), proposal_id, note, text(row, "approved_from")});
-  json id = store.query("SELECT last_insert_rowid() AS id");
-  return id.empty() ? 0 : id[0].value("id", 0LL);
+  return new_id;
 }
 
 json last_decision_snapshot(Store& store, const std::string& decision_id) {

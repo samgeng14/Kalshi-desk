@@ -456,6 +456,37 @@ static void test_ws_reconnects() {
   CHECK(st.value("reconnects", 0) >= 1);
 }
 
+// A caller whose subscription the venue has refused asks for a new connection from inside its own
+// message handler (MarketQuoteFeed does, on the socket thread). The client drops the socket, comes
+// back, and subscribes again; a pong or frame written after the drop must not end the process.
+static void test_ws_reconnect_on_request() {
+  MockWs server;
+  server.to_send = {R"({"type":"error","id":1,"msg":{"code":18,"msg":"refused"}})"};
+  server.send_ping = true;
+  std::atomic<int> frames{0};
+  std::atomic<int> disconnects{0};
+  WsClient::Options o;
+  o.url = server.url();
+  o.name = "test-reconnect-request";
+  o.ping_interval_seconds = 1;
+  o.stale_after_seconds = 30;
+  o.backoff_initial_seconds = 0.2;
+  o.backoff_max_seconds = 0.4;
+  o.on_connect = [] { return std::vector<std::string>{R"({"id":1,"cmd":"subscribe","params":{"channels":["ticker"]}})"}; };
+  WsClient* self = nullptr;
+  WsClient ws(o, [&](const std::string&, long long) { if (frames++ == 0 && self) self->reconnect(); },
+              [&](const std::string& ev, const std::string&) { if (ev == "disconnected") ++disconnects; });
+  self = &ws;
+  ws.start();
+  // Three seconds: the mock drops every connection after six, which would also bring it back.
+  for (int i = 0; i < 30 && (server.connections.load() < 2 || server.subscriptions.load() < 2); ++i)
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  ws.stop();
+  CHECK(server.connections.load() >= 2);     // it came back, because it was asked to
+  CHECK(server.subscriptions.load() >= 2);   // and subscribed again on the new connection
+  CHECK(disconnects.load() >= 1);            // having said the old one was gone
+}
+
 // A server that accepts the upgrade and immediately hangs up - a stale signature, a rate limit,
 // a close frame on subscribe - used to be reconnected to as fast as the machine could open
 // sockets, because the backoff was reset the moment a handshake completed and reapplied only when
@@ -825,87 +856,551 @@ static void test_gap_policy_is_a_choice_not_an_assumption() {
 
 // Priority 7's prerequisite. The desk's ordinary market data is a REST poll every five seconds,
 // which cannot measure a reprice at 50 ms; this is the exchange's own ticker stream, stamped with
-// the venue's millisecond clock and with ours, which can.
+// the venue's millisecond clock and with ours, and the book stream that says what could have been
+// executed.
+//
+// Every venue frame below is copied byte for byte from what the recorder stored in raw_json on
+// 2026-09-23/24; the table and id are given with each, and the receipt time passed with each is the
+// one recorded. The frames this test used before were written by hand in a shape the venue does not
+// send (`price`/`delta`, side "bid"/"ask", sizes without decimals, a snapshot with a timestamp and
+// no levels), and the recorder passed them while it stored a price and size of 0 for every real
+// delta and every ticker size 100 times too small. Two kinds of frame are not in the recording,
+// because the recorder never kept them: the replies to subscribe and update_subscription. Those
+// follow the venue's documented examples (docs.kalshi.com/websockets/websocket-connection), and
+// say so where they appear. Each recorded frame ends in the newline the venue sends, kept as sent.
+namespace venue {
+// commodity_quotes 2211422, 2026-09-24 15:33:21Z.
+const long long kTickerNatgasAt = 1790264001119;
+const char* const kTickerNatgas =
+    R"({"type":"ticker","sid":1,"msg":{"market_id":"4a7acdee-83c0-4030-b857-19e30d47ba45","market_ticker":"KXNATGAS15M-26SEP241145-45",)"
+    R"("price_dollars":"0.8400","yes_bid_dollars":"0.8400","yes_ask_dollars":"0.8500","volume_fp":"10120.38",)"
+    R"("open_interest_fp":"8004.38","dollar_volume":5060,"dollar_open_interest":4002,"yes_bid_size_fp":"360.00",)"
+    R"("yes_ask_size_fp":"300.00","last_trade_size_fp":"0.07","ts":1790264001,"ts_ms":1790264001093,"time":"2026-09-24T15:33:21.093259Z"}}
+)";
+// commodity_quotes 2156149: a market nobody watched, from the flood at the 14:00Z roll.
+const long long kTickerUnwatchedAt = 1790258427675;
+const char* const kTickerUnwatched =
+    R"({"type":"ticker","sid":1,"msg":{"market_id":"a57607a4-d392-4137-94bc-2ad6d6a90a86","market_ticker":"KXBTCD-26SEP2411-T85199.99",)"
+    R"("price_dollars":"0.0000","yes_bid_dollars":"0.0000","yes_ask_dollars":"0.4100","volume_fp":"0.00",)"
+    R"("open_interest_fp":"0.00","dollar_volume":0,"dollar_open_interest":0,"yes_bid_size_fp":"0.00","yes_ask_size_fp":"7.00",)"
+    R"("last_trade_size_fp":"0.00","ts":1790258427,"ts_ms":1790258427595,"time":"2026-09-24T14:00:27.595813Z"}}
+)";
+// commodity_book_events 56004938: price 0.51, 30 contracts on the NO side. Stored as 0 and 0.
+const long long kDeltaWtiAt = 1790264001987;
+const char* const kDeltaWti =
+    R"({"type":"orderbook_delta","sid":2,"seq":2455956,"msg":{"market_ticker":"KXWTI15M-26SEP241145-45",)"
+    R"("market_id":"1b8e56c9-7dbd-4dd5-b5de-864346d03de8","price_dollars":"0.5100","delta_fp":"30.00","side":"no",)"
+    R"("ts":"2026-09-24T15:33:21.996783Z","ts_ms":1790264001996}}
+)";
+// commodity_book_events 55835828-55835833: seq 2286841-2286846, five markets interleaved, WTI twice.
+const long long kInterleavedAt[6] = {1790263796288, 1790263796504, 1790263796991, 1790263796992, 1790263796992, 1790263796998};
+const char* const kInterleaved[6] = {
+    R"({"type":"orderbook_delta","sid":2,"seq":2286841,"msg":{"market_ticker":"KXCOPPER15M-26SEP241130-30",)"
+    R"("market_id":"5a62782f-40e6-4c3d-ba9a-f96f0bc1fdef","price_dollars":"0.0100","delta_fp":"9.00","side":"no",)"
+    R"("ts":"2026-09-24T15:29:56.297224Z","ts_ms":1790263796297}}
+)",
+    R"({"type":"orderbook_delta","sid":2,"seq":2286842,"msg":{"market_ticker":"KXSILVER15M-26SEP241130-30",)"
+    R"("market_id":"51bd9805-2aca-4672-8bc7-665061ae3710","price_dollars":"0.9980","delta_fp":"31.00","side":"yes",)"
+    R"("ts":"2026-09-24T15:29:56.513365Z","ts_ms":1790263796513}}
+)",
+    R"({"type":"orderbook_delta","sid":2,"seq":2286843,"msg":{"market_ticker":"KXWTI15M-26SEP241130-30",)"
+    R"("market_id":"7330877b-2ec4-4dfa-8207-50e42693cd0a","price_dollars":"0.9990","delta_fp":"-62.00",)"
+    R"("side":"yes","ts":"2026-09-24T15:29:57.000051Z","ts_ms":1790263797000}}
+)",
+    R"({"type":"orderbook_delta","sid":2,"seq":2286844,"msg":{"market_ticker":"KXGOLD15M-26SEP241130-30",)"
+    R"("market_id":"9dbc5400-3f68-440b-9ed2-881672804d31","price_dollars":"0.9990","delta_fp":"-93.62",)"
+    R"("side":"yes","ts":"2026-09-24T15:29:57.000051Z","ts_ms":1790263797000}}
+)",
+    R"({"type":"orderbook_delta","sid":2,"seq":2286845,"msg":{"market_ticker":"KXNATGAS15M-26SEP241130-30",)"
+    R"("market_id":"52e0a2fd-2c3b-46fd-9a5a-bcc229e49ee8","price_dollars":"0.9900","delta_fp":"-15.00",)"
+    R"("side":"yes","ts":"2026-09-24T15:29:57.000051Z","ts_ms":1790263797000}}
+)",
+    R"({"type":"orderbook_delta","sid":2,"seq":2286846,"msg":{"market_ticker":"KXWTI15M-26SEP241130-30",)"
+    R"("market_id":"7330877b-2ec4-4dfa-8207-50e42693cd0a","price_dollars":"0.0210","delta_fp":"-19.00",)"
+    R"("side":"yes","ts":"2026-09-24T15:29:57.007549Z","ts_ms":1790263797007}}
+)"};
+// commodity_book_events 55836168-55836172: the 11:30 windows close at 15:30:00Z and the venue sends
+// each an empty snapshot, seq 2287181-2287185.
+const long long kCloseAt[5] = {1790263800087, 1790263800087, 1790263800087, 1790263800088, 1790263800089};
+const char* const kClose[5] = {
+    R"({"type":"orderbook_snapshot","sid":2,"seq":2287181,"msg":{"market_ticker":"KXGOLD15M-26SEP241130-30",)"
+    R"("market_id":"9dbc5400-3f68-440b-9ed2-881672804d31"}}
+)",
+    R"({"type":"orderbook_snapshot","sid":2,"seq":2287182,"msg":{"market_ticker":"KXSILVER15M-26SEP241130-30",)"
+    R"("market_id":"51bd9805-2aca-4672-8bc7-665061ae3710"}}
+)",
+    R"({"type":"orderbook_snapshot","sid":2,"seq":2287183,"msg":{"market_ticker":"KXWTI15M-26SEP241130-30",)"
+    R"("market_id":"7330877b-2ec4-4dfa-8207-50e42693cd0a"}}
+)",
+    R"({"type":"orderbook_snapshot","sid":2,"seq":2287184,"msg":{"market_ticker":"KXCOPPER15M-26SEP241130-30",)"
+    R"("market_id":"5a62782f-40e6-4c3d-ba9a-f96f0bc1fdef"}}
+)",
+    R"({"type":"orderbook_snapshot","sid":2,"seq":2287185,"msg":{"market_ticker":"KXNATGAS15M-26SEP241130-30",)"
+    R"("market_id":"52e0a2fd-2c3b-46fd-9a5a-bcc229e49ee8"}}
+)"};
+// commodity_book_events 55836173: the 11:45 NATGAS window's first book, seq 2287188, 25 YES and 22 NO
+// levels. Three numbers after the last close snapshot, not one.
+const long long kNatgasSnapshotAt = 1790263809564;
+const char* const kNatgasSnapshot =
+    R"({"type":"orderbook_snapshot","sid":2,"seq":2287188,"msg":{"market_ticker":"KXNATGAS15M-26SEP241145-45",)"
+    R"("market_id":"4a7acdee-83c0-4030-b857-19e30d47ba45","yes_dollars_fp":[["0.0100","2774.20"],["0.0200",)"
+    R"("1728.00"],["0.0300","1098.00"],["0.0400","904.00"],["0.0500","1540.00"],["0.0600","900.00"],["0.0700",)"
+    R"("1578.00"],["0.0800","750.00"],["0.0900","806.00"],["0.1000","450.00"],["0.1100","450.00"],["0.1200",)"
+    R"("300.00"],["0.1300","1332.20"],["0.1500","390.00"],["0.1700","90.00"],["0.2500","20.00"],["0.2600",)"
+    R"("19.00"],["0.3400","14.00"],["0.3500","1.00"],["0.3600","11.00"],["0.4200","20.20"],["0.4300","3.00"],)"
+    R"(["0.5000","4.60"],["0.5500","2.00"],["0.5700","15.00"]],"no_dollars_fp":[["0.0100","2779.20"],["0.0200",)"
+    R"("1718.00"],["0.0300","1102.67"],["0.0400","904.00"],["0.0500","1540.00"],["0.0600","900.00"],["0.0700",)"
+    R"("1428.00"],["0.0800","750.00"],["0.0900","806.00"],["0.1000","1782.20"],["0.1100","450.00"],["0.1200",)"
+    R"("1632.20"],["0.1500","300.00"],["0.2600","19.00"],["0.2800","17.00"],["0.2900","17.00"],["0.3100",)"
+    R"("16.00"],["0.3400","20.20"],["0.3500","1.00"],["0.3800","19.20"],["0.4000","5.00"],["0.4100","73.20"]]}}
+)";
+// commodity_book_events 46413836-46413840: a reconnect at 05:20:39Z re-subscribes the 01:15 windows,
+// closed four hours before. Seq starts again at 1 on the same sid; market_id is empty.
+const long long kStaleAt = 1790227239713;
+const char* const kStale[5] = {
+    R"({"type":"orderbook_snapshot","sid":2,"seq":1,"msg":{"market_ticker":"KXCOPPER15M-26SEP240115-15",)"
+    R"("market_id":""}}
+)",
+    R"({"type":"orderbook_snapshot","sid":2,"seq":2,"msg":{"market_ticker":"KXGOLD15M-26SEP240115-15","market_id":""}}
+)",
+    R"({"type":"orderbook_snapshot","sid":2,"seq":3,"msg":{"market_ticker":"KXNATGAS15M-26SEP240115-15",)"
+    R"("market_id":""}}
+)",
+    R"({"type":"orderbook_snapshot","sid":2,"seq":4,"msg":{"market_ticker":"KXSILVER15M-26SEP240115-15",)"
+    R"("market_id":""}}
+)",
+    R"({"type":"orderbook_snapshot","sid":2,"seq":5,"msg":{"market_ticker":"KXWTI15M-26SEP240115-15","market_id":""}}
+)"};
+}  // namespace venue
+
+static bool is_null(const json& row, const char* col) { return row.contains(col) && row[col].is_null(); }
+// A numeric column, or NaN when it is NULL or absent, so a NULL where a number belongs fails a CHECK
+// rather than throwing out of the test.
+static double num(const json& row, const char* col) {
+  return row.contains(col) && row[col].is_number() ? row[col].get<double>() : std::nan("");
+}
+
 static void test_market_quote_feed() {
-  Store st(":memory:");
+  using namespace venue;
   MarketQuoteFeed::Settings s;
   s.ws_url = "";                        // nothing connects in a test
-  MarketQuoteFeed q(st, s, nullptr);
-  const long long t0 = 1789160400000;
 
-  q.watch({"KXGOLD15M-A", "KXWTI15M-A"});
-  CHECK(q.watching().size() == 2);
-  q.on_message_for_tests(
-      R"({"type":"ticker","sid":1,"msg":{"market_ticker":"KXGOLD15M-A","price_dollars":"0.51",)"
-      R"("yes_bid_dollars":"0.50","yes_ask_dollars":"0.52","yes_bid_size_fp":"12500",)"
-      R"("yes_ask_size_fp":"8000","volume_fp":"430000","open_interest_fp":"1200000","ts_ms":1789160399950}})",
-      t0);
-  // Both clocks, because the difference between them is the only honest way to say whether a lag
-  // we measure is the exchange's or our own network's.
-  CHECK(q.flush(t0 / 1000) == 1);
-  json rows = st.query("SELECT * FROM commodity_quotes ORDER BY id");
-  CHECK(rows.size() == 1);
-  if (!rows.empty()) {
-    CHECK(rows[0].value("ticker", "") == "KXGOLD15M-A");
-    CHECK(rows[0].value("ts_received_ms", 0LL) == t0);
-    CHECK(rows[0].value("ts_exchange_ms", 0LL) == 1789160399950LL);   // 50 ms before we saw it
-    CHECK(std::fabs(rows[0].value("yes_bid", 0.0) - 0.50) < 1e-9);
-    CHECK(std::fabs(rows[0].value("yes_ask", 0.0) - 0.52) < 1e-9);
-    CHECK(std::fabs(rows[0].value("yes_bid_size", 0.0) - 125.0) < 1e-9);   // fixed point, 2 decimals
-    CHECK(std::fabs(rows[0].value("volume", 0.0) - 4300.0) < 1e-9);
-    CHECK(rows[0].value("raw_json", "").find("market_ticker") != std::string::npos);
-  }
-  // Windows roll every fifteen minutes: the set is a difference, not a reconnect.
-  q.watch({"KXWTI15M-A", "KXGOLD15M-B"});
-  auto watching = q.watching();
-  CHECK(watching.size() == 2);
-  CHECK(std::find(watching.begin(), watching.end(), "KXGOLD15M-B") != watching.end());
-  CHECK(std::find(watching.begin(), watching.end(), "KXGOLD15M-A") == watching.end());
-  // Anything that is not a ticker update is counted, never priced.
-  q.on_message_for_tests(R"({"type":"subscribed","id":1})", t0 + 1000);
-  q.on_message_for_tests("{not json", t0 + 1000);
-  q.on_message_for_tests(R"({"type":"ticker","msg":{"yes_bid_dollars":"0.5"}})", t0 + 1000);
-  CHECK(q.status().value("unparsed", 0) == 2);
-  CHECK(q.flush(t0 / 1000 + 1) == 0);
-  CHECK(q.status().value("recorded", 0) == 1);
+  // The ticker. Sizes, volume and open interest are counts of contracts with two decimals:
+  // "360.00" is 360 contracts, and the recorder stored it as 3.6 until 2026-09-24.
+  {
+    Store st(":memory:");
+    MarketQuoteFeed q(st, s, nullptr);
+    q.watch({"KXNATGAS15M-26SEP241145-45", "KXWTI15M-26SEP241145-45"});
+    CHECK(q.watching().size() == 2);
+    q.on_message_for_tests(kTickerNatgas, kTickerNatgasAt);
+    q.on_message_for_tests(kTickerUnwatched, kTickerUnwatchedAt);
+    CHECK(q.flush(kTickerNatgasAt / 1000) == 2);
+    json rows = st.query("SELECT * FROM commodity_quotes ORDER BY id");
+    CHECK(rows.size() == 2);
+    if (rows.size() == 2) {
+      const json& r = rows[0];
+      CHECK(r.value("ticker", "") == "KXNATGAS15M-26SEP241145-45");
+      // Both clocks. The venue stamped this 26 ms before we did, but on a different clock, so the
+      // 26 ms is latency plus an offset between the clocks that this row cannot separate.
+      CHECK(num(r, "ts_received_ms") == 1790264001119LL);
+      CHECK(num(r, "ts_exchange_ms") == 1790264001093LL);
+      CHECK_NEAR(num(r, "yes_bid"), 0.84, 1e-12);
+      CHECK_NEAR(num(r, "yes_ask"), 0.85, 1e-12);
+      CHECK_NEAR(num(r, "last"), 0.84, 1e-12);
+      CHECK_NEAR(num(r, "yes_bid_size"), 360.0, 1e-9);
+      CHECK_NEAR(num(r, "yes_ask_size"), 300.0, 1e-9);
+      CHECK_NEAR(num(r, "volume"), 10120.38, 1e-9);
+      CHECK_NEAR(num(r, "open_interest"), 8004.38, 1e-9);
+      CHECK(r.value("raw_json", "") == std::string(kTickerNatgas));
+      // A market nobody asked for is still recorded, and counted, so the status shows at once if
+      // the subscription ever widens to the whole exchange again.
+      CHECK(rows[1].value("ticker", "") == "KXBTCD-26SEP2411-T85199.99");
+      CHECK_NEAR(num(rows[1], "yes_ask_size"), 7.0, 1e-9);
+      CHECK_NEAR(num(rows[1], "yes_bid"), 0.0, 1e-12);   // a real zero: no bid
+    }
+    json qs = q.status();
+    CHECK(qs.value("unwatched_ticker_messages", -1) == 1);
+    CHECK(qs["schema_misses"].empty());
 
-  // The book, kept as the venue sent it. This is the stream that can answer "could I have
-  // executed this quantity"; the ticker above can only answer "did the quoted price move", and a
-  // fill claim built on ticker data describes a price nobody could have taken.
-  q.on_message_for_tests(
-      R"({"type":"subscribed","id":2,"msg":{"channel":"orderbook_delta","sid":7}})", t0 + 1500);
-  q.on_message_for_tests(
-      R"({"type":"orderbook_snapshot","sid":7,"seq":100,"msg":{"market_ticker":"KXWTI15M-A",)"
-      R"("ts_ms":1789160400100}})", t0 + 1600);
-  q.on_message_for_tests(
-      R"({"type":"orderbook_delta","sid":7,"seq":101,"msg":{"market_ticker":"KXWTI15M-A",)"
-      R"("price":"0.47","delta":"-25.00","side":"bid","ts_ms":1789160400200}})", t0 + 1700);
-  // A missing message is counted rather than interpolated over: a book reconstructed across a
-  // gap is a book that never existed.
-  q.on_message_for_tests(
-      R"({"type":"orderbook_delta","sid":7,"seq":104,"msg":{"market_ticker":"KXWTI15M-A",)"
-      R"("price":"0.48","delta":"10.00","side":"ask","ts_ms":1789160400400}})", t0 + 1800);
-  CHECK(q.flush(t0 / 1000 + 2) == 0);          // no new ticker rows, book rows are their own stream
-  json be = st.query("SELECT kind, sequence, side, price, delta, ts_exchange_ms FROM commodity_book_events ORDER BY id");
-  CHECK(be.size() == 3);
-  if (be.size() == 3) {
-    CHECK(be[0].value("kind", "") == "orderbook_snapshot" && be[0].value("sequence", 0LL) == 100);
-    CHECK(be[1].value("side", "") == "bid" && std::fabs(be[1].value("delta", 0.0) + 25.0) < 1e-9);
-    CHECK(be[2].value("sequence", 0LL) == 104);
-    CHECK(be[1].value("ts_exchange_ms", 0LL) == 1789160400200LL);
+    // Windows roll every fifteen minutes: the set is a difference, not a reconnect.
+    q.watch({"KXWTI15M-26SEP241145-45", "KXGOLD15M-26SEP241145-45"});
+    auto watching = q.watching();
+    CHECK(watching.size() == 2);
+    CHECK(std::find(watching.begin(), watching.end(), "KXGOLD15M-26SEP241145-45") != watching.end());
+    CHECK(std::find(watching.begin(), watching.end(), "KXNATGAS15M-26SEP241145-45") == watching.end());
+    // And it never goes to nothing. Between a window's close and the refresh that finds its
+    // successor the cycle asks for an empty set, and an empty ticker subscription is every market
+    // on the exchange: 77.6% of the rows recorded on 2026-09-24.
+    q.watch({});
+    CHECK(q.watching().size() == 2);
+    // Nonsense is counted, never priced (a frame without a market cannot be a quote).
+    q.on_message_for_tests("{not json", kTickerNatgasAt + 1000);
+    q.on_message_for_tests(R"({"type":"ticker","msg":{"yes_bid_dollars":"0.5"}})", kTickerNatgasAt + 1000);
+    CHECK(q.status().value("unparsed", 0) == 2);
+    CHECK(q.flush(kTickerNatgasAt / 1000 + 1) == 0);
+    CHECK(q.status().value("recorded", 0) == 2);
+    // A connection is written down with what was watched, and subscribes nothing itself: what was
+    // watched may be only closed windows, and a subscribe naming only closed markets is a
+    // subscribe to every market. The next watch() subscribes from the engine's open windows.
+    auto frames = q.on_connect_for_tests(kTickerNatgasAt + 2000);
+    CHECK(frames.empty() && q.watching().empty());
+    q.flush(kTickerNatgasAt / 1000 + 2);
+    json c = st.query("SELECT kind, ticker, sequence, raw_json FROM commodity_book_events");
+    CHECK(c.size() == 1 && c[0].value("kind", "") == "connect" && is_null(c[0], "sequence") &&
+          is_null(c[0], "ticker"));
+    CHECK(c.size() == 1 && c[0].value("raw_json", "").find("KXWTI15M-26SEP241145-45") != std::string::npos);
+    CHECK(q.status().value("connects", 0) == 1);
   }
-  json qs = q.status();
-  CHECK(qs.value("book_messages", 0) == 3);
-  CHECK(qs.value("book_snapshots", 0) == 1);
-  CHECK(qs.value("book_sequence_gaps", 0) == 1);      // 101 -> 104
-  CHECK(qs.value("book_recorded", 0) == 3);
-  // And the venue's own subscription id is used, not a guessed one.
-  CHECK(qs["subscription_ids"].value("orderbook_delta", 0) == 7);
+
+  // The case that exposed it: a real delta. The venue sends price_dollars and delta_fp; the parser
+  // asked for price and delta, found neither, and stored 0 and 0 on every delta it ever recorded.
+  {
+    Store st(":memory:");
+    MarketQuoteFeed q(st, s, nullptr);
+    q.on_message_for_tests(kDeltaWti, kDeltaWtiAt);
+    q.flush(kDeltaWtiAt / 1000);
+    json be = st.query("SELECT * FROM commodity_book_events ORDER BY id");
+    CHECK(be.size() == 1);
+    if (be.size() == 1) {
+      CHECK(be[0].value("kind", "") == "orderbook_delta");
+      CHECK(be[0].value("ticker", "") == "KXWTI15M-26SEP241145-45");
+      CHECK(num(be[0], "sequence") == 2455956);
+      CHECK(be[0].value("side", "") == "no");
+      CHECK_NEAR(num(be[0], "price"), 0.51, 1e-12);
+      CHECK_NEAR(num(be[0], "delta"), 30.0, 1e-12);
+      CHECK(num(be[0], "ts_exchange_ms") == 1790264001996LL);
+      // Every field of this frame is held by a column (or, for sid and market_id, by other rows),
+      // so it is stored without the frame: most of the row.
+      CHECK(is_null(be[0], "raw_json"));
+    }
+    CHECK(q.status()["schema_misses"].empty());
+    CHECK(q.status().value("book_raw_trimmed", 0) == 1);
+    // And the shape this test used to send, which is the margin socket's (written by hand, as it
+    // was then). None of it is read as a price: on this venue's older schema `price` was in cents.
+    // The row is kept with NULLs and the miss is counted, where it used to be stored as 0 and pass.
+    q.on_message_for_tests(
+        R"({"type":"orderbook_delta","sid":2,"seq":2455957,"msg":{"market_ticker":"KXWTI15M-26SEP241145-45",)"
+        R"("price":"0.47","delta":"-25.00","side":"bid","ts_ms":1790264002100}})",
+        kDeltaWtiAt + 100);
+    q.flush(kDeltaWtiAt / 1000);
+    be = st.query("SELECT * FROM commodity_book_events WHERE sequence = 2455957");
+    CHECK(be.size() == 1 && is_null(be[0], "price") && is_null(be[0], "delta") && is_null(be[0], "side"));
+    CHECK(be.size() == 1 && be[0].value("raw_json", "").find(R"("side":"bid")") != std::string::npos);
+    json misses = q.status()["schema_misses"];
+    CHECK(misses.value("orderbook_delta.price_dollars", 0) == 1);
+    CHECK(misses.value("orderbook_delta.delta_fp", 0) == 1);
+    CHECK(misses.value("orderbook_delta.side", 0) == 1);
+    CHECK(q.status().value("book_sid_gaps", -1) == 0);      // 2455956 -> 2455957
+    CHECK(q.status().value("book_raw_trimmed", 0) == 1);    // that one kept its frame
+  }
+
+  // What keeps a delta's frame. A key the columns do not hold: the venue documents client_order_id
+  // (present only when our own order moved the book) and subaccount, and neither is anywhere else.
+  // And the setting that keeps every frame.
+  {
+    Store st(":memory:");
+    MarketQuoteFeed q(st, s, nullptr);
+    std::string own = kDeltaWti;
+    const std::string at = R"("side":"no",)";
+    own.replace(own.find(at), at.size(), at + R"("client_order_id":"5e1f0c2a-0000-4000-8000-000000000001",)");
+    q.on_message_for_tests(own, kDeltaWtiAt);
+    MarketQuoteFeed::Settings keep = s;
+    keep.keep_delta_raw = true;
+    Store st2(":memory:");
+    MarketQuoteFeed q2(st2, keep, nullptr);
+    q2.on_message_for_tests(kDeltaWti, kDeltaWtiAt);
+    q.flush(0);
+    q2.flush(0);
+    json a = st.query("SELECT price, raw_json FROM commodity_book_events");
+    json b = st2.query("SELECT price, raw_json FROM commodity_book_events");
+    CHECK(a.size() == 1 && a[0].value("raw_json", "") == own);
+    CHECK(a.size() == 1 && std::fabs(num(a[0], "price") - 0.51) < 1e-12);
+    CHECK(b.size() == 1 && b[0].value("raw_json", "") == std::string(kDeltaWti));
+    CHECK(q.status().value("book_raw_trimmed", -1) == 0 && q2.status().value("book_raw_trimmed", -1) == 0);
+  }
+
+  // Under the disk floor the book is followed but not kept, the small streams are kept, and the
+  // stretch is written down when the floor clears, so a replay reads it as missing and not as a
+  // quiet book.
+  {
+    Store st(":memory:");
+    MarketQuoteFeed q(st, s, nullptr);
+    q.watch({"KXNATGAS15M-26SEP241145-45"});
+    q.set_disk_low(true, kInterleavedAt[0] - 10);
+    for (int i = 0; i < 3; ++i) q.on_message_for_tests(kInterleaved[i], kInterleavedAt[i]);
+    q.on_message_for_tests(kTickerNatgas, kTickerNatgasAt);
+    q.flush(0);
+    CHECK(st.query("SELECT id FROM commodity_book_events").empty());
+    CHECK(st.query("SELECT id FROM commodity_quotes").size() == 1);
+    json qs = q.status();
+    CHECK(qs.value("book_paused_low_disk", false) && qs.value("book_not_kept_low_disk", 0) == 3);
+    q.set_disk_low(false, kInterleavedAt[3] - 1);
+    for (int i = 3; i < 6; ++i) q.on_message_for_tests(kInterleaved[i], kInterleavedAt[i]);
+    q.flush(0);
+    json be = st.query("SELECT kind, sequence, raw_json FROM commodity_book_events ORDER BY id");
+    CHECK(be.size() == 4);
+    if (be.size() == 4) {
+      CHECK(be[0].value("kind", "") == "paused_low_disk" && is_null(be[0], "sequence"));
+      json note = json::parse(be[0].value("raw_json", "{}"));
+      CHECK(note.value("rows", 0) == 3 && num(note, "first_seq") == 2286841 && num(note, "last_seq") == 2286843);
+      CHECK(num(be[1], "sequence") == 2286844);
+    }
+    qs = q.status();
+    CHECK(!qs.value("book_paused_low_disk", true));
+    CHECK(qs.value("book_sid_gaps", -1) == 0);   // the sequence was followed through the pause
+    q.set_disk_low(false, 0);                    // no change, no second marker
+    q.flush(0);
+    CHECK(st.query("SELECT id FROM commodity_book_events").size() == 4);
+  }
+
+  // Sequence is per subscription. Five markets on sid 2 with no number missing is no gap. The
+  // per-market count this replaces called the second WTI message one (2286843 -> 2286846), and did
+  // the same to about 30% of all book messages.
+  {
+    Store st(":memory:");
+    MarketQuoteFeed q(st, s, nullptr);
+    for (int i = 0; i < 6; ++i) q.on_message_for_tests(kInterleaved[i], kInterleavedAt[i]);
+    json qs = q.status();
+    CHECK(qs.value("book_messages", 0) == 6);
+    CHECK(qs.value("book_sid_gaps", -1) == 0);
+    CHECK(qs.value("book_seqs_missing", -1) == 0);
+    q.flush(0);
+    json be = st.query("SELECT ticker, side, price, delta FROM commodity_book_events ORDER BY id");
+    CHECK(be.size() == 6);
+    if (be.size() == 6) {
+      // Prices below a cent and fractional sizes survive as sent.
+      const double price[6] = {0.01, 0.998, 0.999, 0.999, 0.99, 0.021};
+      const double delta[6] = {9, 31, -62, -93.62, -15, -19};
+      for (int i = 0; i < 6; ++i) {
+        CHECK_NEAR(num(be[i], "price"), price[i], 1e-12);
+        CHECK_NEAR(num(be[i], "delta"), delta[i], 1e-12);
+      }
+      CHECK(be[0].value("side", "") == "no" && be[3].value("side", "") == "yes");
+      CHECK(be[2].value("ticker", "") == "KXWTI15M-26SEP241130-30" &&
+            be[5].value("ticker", "") == "KXWTI15M-26SEP241130-30");
+    }
+  }
+
+  // A roll. The 11:30 windows close and the venue empties their books; our delete and add commands
+  // are answered; the 11:45 NATGAS book arrives. The two replies take seq 2287186 and 2287187.
+  {
+    // Without the replies, which is what the table holds for every roll before 2026-09-24: a hole
+    // of two that looks exactly like lost messages.
+    Store st(":memory:");
+    MarketQuoteFeed q(st, s, nullptr);
+    for (int i = 0; i < 5; ++i) q.on_message_for_tests(kClose[i], kCloseAt[i]);
+    q.on_message_for_tests(kNatgasSnapshot, kNatgasSnapshotAt);
+    CHECK(q.status().value("book_sid_gaps", -1) == 1);
+    CHECK(q.status().value("book_seqs_missing", -1) == 2);
+  }
+  {
+    Store st(":memory:");
+    MarketQuoteFeed q(st, s, nullptr);
+    for (int i = 0; i < 5; ++i) q.on_message_for_tests(kClose[i], kCloseAt[i]);
+    // The replies, in the venue's documented shape (not in the recording: the recorder dropped
+    // them). One on the ticker channel's sid too, whose own messages carry no seq, so it must not
+    // start a sequence there.
+    q.on_message_for_tests(
+        R"({"id":203,"sid":1,"seq":41,"type":"ok","msg":{"market_tickers":["KXNATGAS15M-26SEP241145-45"]}})",
+        1790263804100);
+    q.on_message_for_tests(
+        R"({"id":204,"sid":2,"seq":2287186,"type":"ok","msg":{"market_tickers":[]}})", 1790263804123);
+    q.on_message_for_tests(
+        R"({"id":205,"sid":2,"seq":2287187,"type":"ok","msg":{"market_tickers":["KXNATGAS15M-26SEP241145-45"]}})",
+        1790263809500);
+    q.on_message_for_tests(kNatgasSnapshot, kNatgasSnapshotAt);
+    json qs = q.status();
+    CHECK(qs.value("book_sid_gaps", -1) == 0);
+    CHECK(qs.value("book_snapshots", 0) == 6);
+    CHECK(qs.value("book_empty_snapshots", 0) == 5);
+    CHECK(qs.value("control_frames", 0) == 3);
+    q.flush(0);
+    json be = st.query("SELECT * FROM commodity_book_events ORDER BY id");
+    CHECK(be.size() == 9);
+    if (be.size() == 9) {
+      // A snapshot has no side, price, size or venue time, and says so with NULL rather than 0.
+      for (int i : {0, 8}) {
+        CHECK(be[i].value("kind", "") == "orderbook_snapshot");
+        CHECK(is_null(be[i], "side") && is_null(be[i], "price") && is_null(be[i], "delta"));
+        CHECK(is_null(be[i], "ts_exchange_ms"));
+      }
+      // Its levels exist only in raw_json, so raw_json is the whole frame.
+      CHECK(be[8].value("raw_json", "") == std::string(kNatgasSnapshot));
+      CHECK(num(be[8], "sequence") == 2287188);
+      CHECK(be[6].value("kind", "") == "ok" && num(be[6], "sequence") == 2287186 && is_null(be[6], "ticker"));
+      CHECK(be[7].value("kind", "") == "ok" && num(be[7], "sequence") == 2287187);
+    }
+  }
+
+  // A reconnect. The venue starts seq again at 1 on the same sid, so a replay has to know where one
+  // connection ends. Seen through the connect handler, it is a new start and neither a gap nor a
+  // restart; the acknowledgement (documented shape) gives the sid to use for updates.
+  {
+    Store st(":memory:");
+    MarketQuoteFeed q(st, s, nullptr);
+    q.watch({"KXCOPPER15M-26SEP240115-15", "KXGOLD15M-26SEP240115-15", "KXNATGAS15M-26SEP240115-15",
+             "KXSILVER15M-26SEP240115-15", "KXWTI15M-26SEP240115-15"});
+    q.on_message_for_tests(kDeltaWti, kDeltaWtiAt);   // the previous connection, far along
+    q.on_connect_for_tests(kStaleAt - 100);
+    q.on_message_for_tests(R"({"id":2,"type":"subscribed","msg":{"channel":"orderbook_delta","sid":2}})",
+                           kStaleAt - 50);
+    for (int i = 0; i < 5; ++i) q.on_message_for_tests(kStale[i], kStaleAt);
+    json qs = q.status();
+    CHECK(qs.value("book_sid_gaps", -1) == 0);
+    CHECK(qs.value("book_seq_restarts", -1) == 0);
+    CHECK(qs.value("connects", 0) == 1);
+    CHECK(qs.value("book_empty_snapshots", 0) == 5);
+    CHECK(qs["subscription_ids"].value("orderbook_delta", 0) == 2);
+    q.flush(0);
+    json kinds = st.query("SELECT kind FROM commodity_book_events ORDER BY id");
+    CHECK(kinds.size() == 8 && kinds[1].value("kind", "") == "connect" && kinds[2].value("kind", "") == "subscribed");
+  }
+  {
+    // Not seen (a new subscription without a new connection): counted as a restart, not a gap.
+    Store st(":memory:");
+    MarketQuoteFeed q(st, s, nullptr);
+    q.on_message_for_tests(kDeltaWti, kDeltaWtiAt);
+    for (int i = 0; i < 5; ++i) q.on_message_for_tests(kStale[i], kStaleAt);
+    CHECK(q.status().value("book_seq_restarts", -1) == 1);
+    CHECK(q.status().value("book_sid_gaps", -1) == 0);
+  }
+
+  // Subscribing. A fresh process connects before its first cycle has chosen a market, so the
+  // connect handler has nothing to ask for, and asks for nothing (an empty list would be the whole
+  // exchange). The first set must then go out as a subscribe: on 2026-09-24 17:49Z it went out as
+  // update_subscription on sids that did not exist, the venue refused both, and the feed believed
+  // it watched five markets while it received nothing.
+  {
+    Store st(":memory:");
+    MarketQuoteFeed q(st, s, nullptr);
+    CHECK(q.on_connect_for_tests(kTickerNatgasAt).empty());
+    auto f = q.watch_for_tests({"KXGOLD15M-26SEP241145-45", "KXWTI15M-26SEP241145-45"});
+    CHECK(f.size() == 2);
+    if (f.size() == 2) {
+      json a = json::parse(f[0]), b = json::parse(f[1]);
+      CHECK(a.value("cmd", "") == "subscribe" && b.value("cmd", "") == "subscribe");
+      CHECK(a["params"]["channels"][0] == "ticker" && b["params"]["channels"][0] == "orderbook_delta");
+      CHECK(b["params"]["market_tickers"].size() == 2);
+      // The ticker's current quote at once, not at its next change.
+      CHECK(a["params"].value("send_initial_snapshot", false));
+    }
+    // The next change is an update, before the acknowledgements are back: on the numbers the venue
+    // gives a connection's subscriptions in order, ticker 1 and orderbook_delta 2. Added first,
+    // then deleted, so the set never passes through empty.
+    f = q.watch_for_tests({"KXWTI15M-26SEP241145-45", "KXNATGAS15M-26SEP241145-45"});
+    CHECK(f.size() == 4);
+    if (f.size() == 4) {
+      json u[4];
+      for (int i = 0; i < 4; ++i) u[i] = json::parse(f[i]);
+      CHECK(u[0]["cmd"] == "update_subscription" && u[0]["params"]["action"] == "add_markets");
+      CHECK(u[0]["params"]["sid"] == 1 && u[1]["params"]["sid"] == 2);
+      CHECK(u[1]["params"].value("send_initial_snapshot", false));
+      CHECK(u[2]["params"]["action"] == "delete_markets" && u[3]["params"]["sid"] == 2);
+      CHECK(u[2]["params"]["market_tickers"][0] == "KXGOLD15M-26SEP241145-45");
+    }
+    // Once acknowledged, each channel's own sid, even when only one acknowledgement is back.
+    q.on_message_for_tests(R"({"id":2,"type":"subscribed","msg":{"channel":"orderbook_delta","sid":8}})", kTickerNatgasAt);
+    f = q.watch_for_tests({"KXNATGAS15M-26SEP241145-45", "KXCOPPER15M-26SEP241145-45"});
+    CHECK(f.size() == 4);
+    if (f.size() == 4) {
+      CHECK(json::parse(f[0])["params"]["sid"] == 1 && json::parse(f[1])["params"]["sid"] == 8);
+    }
+    // A reconnect forgets the old connection's ids and its set, and the next watch() subscribes
+    // afresh rather than updating subscriptions that went with the old connection.
+    CHECK(q.on_connect_for_tests(kTickerNatgasAt + 1000).empty());
+    f = q.watch_for_tests({"KXCOPPER15M-26SEP241145-45", "KXSILVER15M-26SEP241145-45"});
+    CHECK(f.size() == 2 && json::parse(f[0]).value("cmd", "") == "subscribe");
+    f = q.watch_for_tests({"KXSILVER15M-26SEP241145-45", "KXGOLD15M-26SEP241200-00"});
+    CHECK(f.size() == 4 && json::parse(f[0])["params"]["sid"] == 1 && json::parse(f[1])["params"]["sid"] == 2);
+    // Between a roll and the refresh that finds the next windows the engine asks for nothing.
+    // Nothing is not a request: the set stays, and a closed window sends nothing.
+    CHECK(q.watch_for_tests({}).empty() && q.watching().size() == 2);
+
+    // A refusal that leaves the subscription broken drops the connection, once a minute at most;
+    // one that does not (an ordinary bad command) is only counted.
+    q.on_message_for_tests(R"({"type":"error","id":101,"msg":{"code":7,"msg":"Unknown subscription ID"}})",
+                           kTickerNatgasAt + 2000);
+    q.on_message_for_tests(R"({"type":"error","id":102,"msg":{"code":7,"msg":"Unknown subscription ID"}})",
+                           kTickerNatgasAt + 2001);
+    json qs = q.status();
+    CHECK(qs.value("errors", 0) == 2 && qs.value("forced_reconnects", 0) == 1);
+    q.on_message_for_tests(R"({"type":"error","id":103,"msg":{"code":8,"msg":"Unknown channel name"}})",
+                           kTickerNatgasAt + 70000);
+    CHECK(q.status().value("forced_reconnects", 0) == 1);
+    q.on_message_for_tests(R"({"type":"error","id":1,"msg":{"code":18,"msg":"refused"}})", kTickerNatgasAt + 70001);
+    CHECK(q.status().value("forced_reconnects", 0) == 2);
+    // A connection being dropped is sent nothing; the next one subscribes.
+    CHECK(q.watch_for_tests({"KXGOLD15M-26SEP241200-00", "KXWTI15M-26SEP241200-00"}).empty());
+    CHECK(q.on_connect_for_tests(kTickerNatgasAt + 72000).empty());
+    f = q.watch_for_tests({"KXGOLD15M-26SEP241200-00", "KXWTI15M-26SEP241200-00"});
+    CHECK(f.size() == 2 && json::parse(f[0]).value("cmd", "") == "subscribe");
+    // A refused add, even with an ordinary code: the delete after it still goes through, and would
+    // empty the ticker subscription. Inside the minute it is kept, and acted on by the next
+    // watch() once the minute has passed (the frames here carry times from the recording).
+    f = q.watch_for_tests({"KXGOLD15M-26SEP241215-15", "KXWTI15M-26SEP241215-15"});
+    CHECK(f.size() == 4);
+    const long long add_id = f.size() == 4 ? json::parse(f[0]).value("id", 0LL) : 0;
+    q.on_message_for_tests(
+        json{{"type", "error"}, {"id", add_id}, {"msg", {{"code", 16}, {"msg", "Market not found"}}}}.dump(),
+        kTickerNatgasAt + 73000);
+    CHECK(q.status().value("forced_reconnects", 0) == 2);          // inside the minute: kept
+    CHECK(q.watch_for_tests({"KXGOLD15M-26SEP241230-30"}).empty());   // and acted on here
+    CHECK(q.status().value("forced_reconnects", 0) == 3);
+  }
+
+  // When the cycle stalls, the queue drops rather than grows, and the hole is written down, so a
+  // replay can tell rows this desk lost from messages the venue never sent.
+  {
+    Store st(":memory:");
+    MarketQuoteFeed::Settings small = s;
+    small.max_pending_rows = 3;
+    MarketQuoteFeed q(st, small, nullptr);
+    for (int i = 0; i < 5; ++i) q.on_message_for_tests(kInterleaved[i], kInterleavedAt[i]);
+    CHECK(q.status().value("book_dropped_rows", 0) == 2);
+    CHECK(q.status().value("book_sid_gaps", -1) == 0);    // the venue lost nothing
+    q.flush(0);
+    q.on_message_for_tests(kInterleaved[5], kInterleavedAt[5]);
+    q.flush(0);
+    json be = st.query("SELECT kind, sequence, raw_json FROM commodity_book_events ORDER BY id");
+    CHECK(be.size() == 5);
+    if (be.size() == 5) {
+      CHECK(be[3].value("kind", "") == "dropped");
+      json note = json::parse(be[3].value("raw_json", "{}"));
+      CHECK(note.value("rows", 0) == 2 && num(note, "first_seq") == 2286844 &&
+            num(note, "last_seq") == 2286845);
+      CHECK(num(be[4], "sequence") == 2286846);
+    }
+  }
 
   MarketQuoteFeed::Settings prod = market_quote_settings(json::object(), "prod");
   CHECK(prod.ws_url == "wss://external-api-ws.kalshi.com/trade-api/ws/v2");
   CHECK(prod.enabled);
   CHECK(!market_quote_settings(json{{"quotes", {{"enabled", false}}}}, "prod").enabled);
+  CHECK(std::fabs(prod.min_free_gb - 10.0) < 1e-9 && !prod.keep_delta_raw);
+  CHECK(std::fabs(market_quote_settings(json{{"quotes", {{"min_free_gb", 25}}}}, "prod").min_free_gb - 25.0) < 1e-9);
+  CHECK(market_quote_settings(json{{"quotes", {{"min_free_gb", -3}}}}, "prod").min_free_gb == 0.0);
+  CHECK(market_quote_settings(json{{"quotes", {{"keep_delta_raw", true}}}}, "prod").keep_delta_raw);
+}
+
+// The reference feed's count of missing messages has to survive a reconnect. The venue starts seq
+// again at 1 on every connection, and a high-water mark kept across it saw no gap until the new
+// count passed the old one. (Frames in the shape of the reference tests above: commodity_reference
+// was not in the sample these fixes were checked against.)
+static void test_reference_feed_sequence_restart() {
+  Store st(":memory:");
+  ReferenceFeedSettings s;
+  s.ws_url = "";
+  s.record_min_interval_ms = 0;
+  ReferenceFeed feed(st, s, nullptr);
+  const std::string GOLD = "Metal.Index.GOLD/USD";
+  const long long t0 = 1789160400000;
+  for (long long n = 1; n <= 50; ++n) feed.on_message_for_tests(pyth_msg(GOLD, 4350.0 + n, t0 + n * 200, n), t0 + n * 200);
+  CHECK(feed.status().value("sequence_gaps", -1) == 0);
+  feed.on_message_for_tests(pyth_msg(GOLD, 4401.0, t0 + 20000, 1), t0 + 20000);   // reconnected
+  feed.on_message_for_tests(pyth_msg(GOLD, 4402.0, t0 + 20200, 2), t0 + 20200);
+  feed.on_message_for_tests(pyth_msg(GOLD, 4404.0, t0 + 20600, 4), t0 + 20600);   // 3 never came
+  CHECK(feed.status().value("sequence_restarts", -1) == 1);
+  CHECK(feed.status().value("sequence_gaps", -1) == 1);
 }
 
 static void test_reference_feed_settings() {
@@ -1535,11 +2030,13 @@ int main() {
   test_minute_close();
   test_ws_codec();
   test_ws_client_live();
+  test_ws_reconnect_on_request();
   test_ws_reconnects();
   test_ws_backs_off_after_a_connection_that_dies_immediately();
   test_ws_stale_socket_is_dead();
   test_reference_feed();
   test_market_quote_feed();
+  test_reference_feed_sequence_restart();
   test_reference_feed_settings();
   test_raw_capture_and_schema();
   test_message_gap_and_unchanged_age_are_different_facts();

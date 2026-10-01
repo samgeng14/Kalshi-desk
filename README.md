@@ -50,6 +50,10 @@ Linux: `apt install cmake g++ libcurl4-openssl-dev libssl-dev libsqlite3-dev`, s
 ./build/kalshi-desk report        # the $100 -> $1,000 gate as JSON
 ```
 
+For unattended running use `scripts/tradeit up` / `tradeit down` / `tradeit status`. `up` starts
+`scripts/desk_supervise.sh`, which restarts the desk if it exits or stops cycling (three stale
+readings of `last_cycle_ts`, 180 s) and logs to `data/supervisor.log`.
+
 Without keys the desk still runs: market data, quotes history, model fairs and proposals all
 work; only submit/cancel/close are disabled.
 

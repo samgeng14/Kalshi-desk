@@ -53,6 +53,18 @@ inline std::string kalshi_date(const std::string& code) {
 }
 
 // The date part of an event ticker like KXHIGHNY-26SEP06 -> "2026-09-06".
+// The scheduled start, in minutes after Eastern midnight, when the event ticker carries one:
+// KXMLBGAME-26SEP101310HOUPHI -> 13:10 -> 790. -1 when it does not (NFL, NHL, college tickers).
+// Two games between the same teams on one day (an MLB doubleheader) differ only here.
+inline int event_start_minutes(const std::string& event_ticker) {
+  auto p = event_ticker.find('-');
+  if (p == std::string::npos || event_ticker.size() < p + 1 + 11) return -1;
+  const std::string hhmm = event_ticker.substr(p + 1 + 7, 4);
+  for (char c : hhmm) if (c < '0' || c > '9') return -1;
+  const int hh = std::stoi(hhmm.substr(0, 2)), mm = std::stoi(hhmm.substr(2, 2));
+  return hh < 24 && mm < 60 ? hh * 60 + mm : -1;
+}
+
 inline std::string event_date(const std::string& event_ticker) {
   auto p = event_ticker.find('-');
   if (p == std::string::npos) return "";

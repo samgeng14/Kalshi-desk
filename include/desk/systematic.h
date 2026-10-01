@@ -127,6 +127,11 @@ class SystematicTrader {
   void persist();
   void log(const std::string& level, const std::string& msg);
   void roll_day(long long now);
+  // Lanes (M2, include/desk/lanes.h). All under mu_.
+  void evaluate_lanes(long long now);          // the live-sizing rule, at the day roll
+  json lane_today(const std::string& mode, long long now);   // per model: volume, realized, mark
+  void check_lane_loss_stops(long long now);   // per-lane daily loss stop
+  json lanes_view(long long now);              // attribution per lane and model
   json performance(long long now);
   // Live path.
   void live_manage(const json& markets, long long now);

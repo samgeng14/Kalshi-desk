@@ -60,6 +60,7 @@ add_library(desk STATIC
   src/decision_router.cpp
   src/decision_log.cpp
   src/systematic.cpp
+  src/lanes.cpp
   src/perps.cpp
   src/poly.cpp
   src/pair_models.cpp
@@ -85,6 +86,7 @@ add_library(desk STATIC
   src/strategies/weather_nws.cpp
   src/strategies/sports_inplay.cpp
   src/strategies/sports_live.cpp
+  src/strategies/sportsbook_line.cpp
   src/strategies/sports_totals.cpp
   src/strategies/stubs.cpp)
 add_dependencies(desk ui_embed)

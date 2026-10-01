@@ -40,11 +40,35 @@ HttpResponse Http::del(const std::string& url, const std::map<std::string, std::
   return request("DELETE", url, "", h);
 }
 
+namespace {
+// One libcurl handle per thread, kept for the life of the thread. A handle keeps its connection
+// pool, so the second request to the same host reuses the TCP+TLS session instead of paying a
+// fresh handshake. Measured on 2026-09-17: a cycle of ~60 exchange calls with a new handle per
+// call spent about 100-150 ms per call on setup alone, which is most of what made the market
+// refresh take six seconds. Thread-local rather than shared because a CURL easy handle must not
+// be used from two threads at once, and the desk now fetches from several.
+struct ThreadHandle {
+  CURL* c = nullptr;
+  ~ThreadHandle() { if (c) curl_easy_cleanup(c); }
+  CURL* get() {
+    if (!c) c = curl_easy_init();
+    return c;
+  }
+};
+CURL* thread_handle() {
+  thread_local ThreadHandle h;
+  return h.get();
+}
+}  // namespace
+
 HttpResponse Http::request(const std::string& method, const std::string& url,
                            const std::string& body,
                            const std::map<std::string, std::string>& headers) const {
-  CURL* c = curl_easy_init();
+  CURL* c = thread_handle();
   if (!c) throw std::runtime_error("curl_easy_init failed");
+  // Every option is set below for this request; nothing from the previous one may leak (a POST
+  // body, a custom DELETE verb, the redirect policy).
+  curl_easy_reset(c);
   HttpResponse resp;
   struct curl_slist* hl = nullptr;
   for (const auto& [k, v] : headers) hl = curl_slist_append(hl, (k + ": " + v).c_str());
@@ -71,6 +95,15 @@ HttpResponse Http::request(const std::string& method, const std::string& url,
   curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, write_cb);
   curl_easy_setopt(c, CURLOPT_WRITEDATA, &resp.body);
   curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
+  // Writes never ride a reused connection. On a reused connection that dies before any response
+  // byte arrives, libcurl re-sends the request by itself on a new one, POST included, and the caller
+  // never knows: an order the server already accepted would be sent twice (Polymarket order bodies
+  // carry no client id). A fresh connection that is then closed is never auto-retried, which keeps
+  // the desk's rule that an order write is never retried blindly. Reads keep the reuse.
+  if (method != "GET") {
+    curl_easy_setopt(c, CURLOPT_FRESH_CONNECT, 1L);
+    curl_easy_setopt(c, CURLOPT_FORBID_REUSE, 1L);
+  }
   if (method == "POST") {
     curl_easy_setopt(c, CURLOPT_POST, 1L);
     curl_easy_setopt(c, CURLOPT_POSTFIELDS, body.c_str());
@@ -82,12 +115,10 @@ HttpResponse Http::request(const std::string& method, const std::string& url,
   if (rc != CURLE_OK) {
     std::string err = curl_easy_strerror(rc);
     curl_slist_free_all(hl);
-    curl_easy_cleanup(c);
     throw std::runtime_error("http " + method + " " + url + ": " + err);
   }
   curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &resp.status);
   curl_slist_free_all(hl);
-  curl_easy_cleanup(c);
   return resp;
 }
 

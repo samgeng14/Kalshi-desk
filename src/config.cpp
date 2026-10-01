@@ -46,6 +46,11 @@ Config load_config(const std::string& path) {
   take(j, "reconcile_every", c.reconcile_every);
   take(j, "series_refresh_minutes", c.series_refresh_minutes);
   take(j, "market_data_max_age_seconds", c.market_data_max_age_seconds);
+  take(j, "rest_min_interval_ms", c.rest_min_interval_ms);
+  take(j, "refresh_threads", c.refresh_threads);
+  take(j, "cycle_report_seconds", c.cycle_report_seconds);
+  take(j, "max_consecutive_cycle_failures", c.max_consecutive_cycle_failures);
+  take(j, "commodity_book_retain_days", c.commodity_book_retain_days);
   take(j, "bankroll_dollars", c.bankroll_dollars);
   if (j.contains("risk")) {
     const json& r = j["risk"];
@@ -59,6 +64,7 @@ Config load_config(const std::string& path) {
     take(r, "min_edge_taker", c.risk.min_edge_taker);
     take(r, "sigma_mult", c.risk.sigma_mult);
     take(r, "min_price", c.risk.min_price);
+    take(r, "manual_review_seconds", c.risk.manual_review_seconds);
     take(r, "proposal_ttl_seconds", c.risk.proposal_ttl_seconds);
     take(r, "max_order_dollars", c.risk.max_order_dollars);
     take(r, "max_turnover_dollars_per_day", c.risk.max_turnover_dollars_per_day);
@@ -85,6 +91,7 @@ Config load_config(const std::string& path) {
       for (auto& [k, v] : r["auto_budget_shard"].items())
         if (v.is_number()) c.risk.auto_budget_shard[std::atoi(k.c_str())] = v.get<double>();
     take(r, "ladder_max_cost", c.risk.ladder_max_cost);
+    take(r, "ladder_max_baskets_per_cycle", c.risk.ladder_max_baskets_per_cycle);
     take(r, "max_auto_dollars_per_day", c.risk.max_auto_dollars_per_day);
     take(r, "day_tz", c.risk.day_tz);
     if (r.contains("shard_topup") && r["shard_topup"].is_object())
@@ -92,6 +99,8 @@ Config load_config(const std::string& path) {
     take(r, "max_orders_per_cycle", c.risk.max_orders_per_cycle);
   }
   take(j, "watch_series", c.watch_series);
+  take(j, "basket_series", c.basket_series);
+  take(j, "basket_refresh_every", c.basket_refresh_every);
   if (j.contains("strategies") && j["strategies"].is_object()) {
     for (auto& [k, v] : j["strategies"].items()) {
       if (v.is_string()) c.strategy_modes[k] = v.get<std::string>();
@@ -155,6 +164,12 @@ Config load_config(const std::string& path) {
   if (c.env != "demo" && c.env != "prod") throw std::runtime_error("env must be demo or prod");
   if (c.poll_seconds < 1) c.poll_seconds = 1;
   if (c.market_data_max_age_seconds < 0) c.market_data_max_age_seconds = 0;
+  // 50 ms is 20 requests a second, the Basic tier's read ceiling at 10 tokens a request.
+  c.rest_min_interval_ms = std::clamp(c.rest_min_interval_ms, 50, 2000);
+  c.refresh_threads = std::clamp(c.refresh_threads, 1, 16);
+  c.basket_refresh_every = std::clamp(c.basket_refresh_every, 1, 4);
+  c.max_consecutive_cycle_failures = std::clamp(c.max_consecutive_cycle_failures, 1, 1000);
+  if (c.commodity_book_retain_days < 0) c.commodity_book_retain_days = 0;
   return c;
 }
 
@@ -168,6 +183,7 @@ json config_to_json(const Config& c) {
          {"market_data_max_age_seconds", c.data_max_age()},
          {"bankroll_dollars", c.bankroll_dollars},
          {"watch_series", c.watch_series},
+         {"basket_series", c.basket_series},
          {"strategies", c.strategy_modes},
          {"risk",
           {{"kelly_frac", c.risk.kelly_frac},

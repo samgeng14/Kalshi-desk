@@ -25,6 +25,7 @@
 #include "desk/route.h"
 #include "desk/store.h"
 #include "desk/systematic.h"
+#include "desk/lanes.h"
 #include "desk/timeutil.h"
 
 using namespace desk;
@@ -1033,7 +1034,12 @@ static void test_basket_send() {
   for (const auto& p : st.proposals("", 20)) if (p.strategy == "ladder_arb" && p.status == "submitted") ++submitted;
   CHECK(submitted == 2);
   json v = tr.view();
-  CHECK(v["spent_today"].get<double>() > 0);
+  // Baskets have their own budget (M4): the model lanes' daily spend is untouched, and the
+  // basket's stake shows as the arbitrage lane's volume today.
+  CHECK(v["spent_today"].get<double>() == 0);
+  double arb_volume = -1;
+  for (const auto& l : v["lanes"]) if (l["model"] == "ladder_arb") arb_volume = l["today"]["volume"].get<double>();
+  CHECK(arb_volume > 0);
   bool logged = false;
   for (const auto& e : v["log"]) if (std::string(e["msg"]).find("2/2 legs sent") != std::string::npos) logged = true;
   CHECK(logged);
@@ -1400,7 +1406,8 @@ static void test_post_only_cross_does_not_halt() {
   json board3 = {{"markets", json::array({row(x.ticker, "KXHIGHNY-26SEP08X", "Climate and Weather", 0.66, 0.67, 0.03, 0.60, 0.64, 20, 30, now + 5)})}};
   tr.step(board3, now + 5);
   CHECK(x.writes == writes_before + 1);
-  // The executor's own read of the book catches a crossing post-only price before sending.
+  // The executor's own read of the book catches a crossing post-only price before sending, and
+  // re-prices it to one tick under the offer instead of refusing: never above the reviewed price.
   {
     std::lock_guard<std::mutex> lk(x.mu);
     x.yes_bid = 0.60; x.yes_ask = 0.61;
@@ -1414,14 +1421,35 @@ static void test_post_only_cross_does_not_halt() {
   bool soft = false;
   try { ex.submit(p); } catch (const SoftRejection& e) { soft = e.cls == RejectClass::SoftMarketState; }
   catch (const std::exception&) {}
-  CHECK(soft && x.writes == w0);                     // refused before anything was sent
+  CHECK(!soft && x.writes == w0 + 1);                // not refused: sent once...
+  CHECK(x.last_order.value("post_only", false) == true && x.last_order["price"] == "0.6000");   // ...one tick under the 0.61 offer
+  CHECK(std::fabs(p.price - 0.60) < 1e-9);           // and the proposal carries the price that went
+  // No price left under the offer inside the risk range (min_price 0.05): the refusal stands, nothing
+  // is sent, and it still reads as a post-only cross, so the algorithm's retry re-reads the book.
+  {
+    std::lock_guard<std::mutex> lk(x.mu);
+    x.markets["KXHIGHNY-26SEP08Z-B40"] = {{"event_ticker", "KXHIGHNY-26SEP08Z"}, {"yes_bid", 0.03}, {"yes_ask", 0.05}};
+  }
+  Proposal q;
+  q.ticker = "KXHIGHNY-26SEP08Z-B40"; q.event_ticker = "KXHIGHNY-26SEP08Z"; q.series_ticker = "KXHIGHNY"; q.strategy = "systematic";
+  q.mode = "bot"; q.outcome_side = "yes"; q.exec_style = "maker"; q.status = "pending"; q.price = 0.05; q.count = 1;
+  st.insert_proposal(q);
+  st.exec("DELETE FROM kv WHERE key='last_write_ts'");
+  const int w1 = x.writes;
+  std::string floor_why;
+  soft = false;
+  try { ex.submit(q); } catch (const SoftRejection& e) { soft = e.cls == RejectClass::SoftMarketState; floor_why = e.what(); }
+  catch (const std::exception& e) { floor_why = e.what(); }
+  CHECK(soft && x.writes == w1);                     // refused before anything was sent
+  CHECK(is_post_only_cross(floor_why));
   std::remove(pem.c_str());
 }
 
 
-// The other ways a re-priced retry can go: the executor itself refuses the crossing price before
-// anything is sent, and the retry goes out at the fresh bid; the retry meets a malformed-order
-// refusal, which still stops everything; the retry is refused softly again, and there is no third try.
+// The other ways a crossing post-only price can go: the executor sees it first and re-prices it
+// under the offer itself, so nothing is refused and nothing is retried; the retry after an exchange
+// refusal meets a malformed-order refusal, which still stops everything; the retry is refused softly
+// again, and there is no third try.
 static void test_post_only_retry_paths() {
   std::string pem = "/tmp/desk_sys_retry_key.pem";
   auto signer = test_signer(pem);
@@ -1461,11 +1489,11 @@ static void test_post_only_retry_paths() {
     tr.step(board, now + 1);
     verify(x, tr, killed.load(), fresh_reads);
   };
-  // 1. The exchange's offer is already 0.61: the executor refuses the 0.61 post-only bid before
-  //    sending (no write), the book is re-read (0.57 / 0.62) and the bid goes out at 0.58.
+  // 1. The exchange's offer is already 0.61: the executor re-prices the 0.61 post-only bid to 0.60,
+  //    one tick under that offer, and sends it once. Nothing was refused, so the book is not re-read.
   run(0.61, {}, [&](MockExchange& x, SystematicTrader& tr, bool killed, int fresh_reads) {
-    CHECK(x.writes == 1 && fresh_reads == 1);
-    CHECK(x.last_order["price"] == "0.5800" && x.last_order.value("post_only", false) == true);
+    CHECK(x.writes == 1 && fresh_reads == 0);
+    CHECK(x.last_order["price"] == "0.6000" && x.last_order.value("post_only", false) == true);
     CHECK(!killed && tr.view()["halted"] == false);
   });
   // 2. The retry meets a malformed-order refusal: that is the desk being wrong, and it stops.
@@ -1572,12 +1600,218 @@ static void test_stale_halt_cleared_at_startup() {
   }
 }
 
+// M2 lanes: the live-sizing rule, the stage gate and the cheap-side filter in the router, and the
+// trader's stake, hold-to-settlement and per-lane loss stop.
+static void test_lanes() {
+  // ---- the rule, pure ----
+  json s = systematic_defaults();
+  std::vector<double> win(30, 0.40), fee(30, 0.02);
+  for (int i = 0; i < 30; i += 3) win[i] = -0.30;   // mean ~ +0.17, noisy
+  LaneWindow w = evaluate_lane_window(win, fee, 1.2816);
+  CHECK(w.n == 30 && w.mean > 0 && w.verdict == "double");
+  std::vector<double> flat(30, 0.0);
+  flat[0] = 5; flat[1] = -4.9;                       // mean ~0, wide band: hold
+  CHECK(evaluate_lane_window(flat, fee, 1.2816).verdict == "hold");
+  std::vector<double> lose(30, -0.10);
+  CHECK(evaluate_lane_window(lose, fee, 1.2816).verdict == "halve");
+  json lane = lane_object(json{{"stage", "live_candidate"}, {"stake", 5.0}}, 5.0);
+  std::vector<std::string> notes;
+  // 29 settled trades: no complete window, nothing moves.
+  std::vector<double> p29(win.begin(), win.begin() + 29), f29(fee.begin(), fee.begin() + 29);
+  json l0 = apply_lane_windows(lane, "m", p29, f29, s, &notes);
+  CHECK(l0["stake"] == 5.0 && l0["evaluated_trades"] == 0 && notes.empty());
+  // One good window: 5 -> 10, and the stage says live.
+  json l1 = apply_lane_windows(lane, "m", win, fee, s, &notes);
+  CHECK(l1["stake"] == 10.0 && l1["stage"] == "live" && l1["evaluated_trades"] == 30 && notes.size() == 1);
+  // Applying the same history again changes nothing: each window is evaluated once.
+  CHECK(apply_lane_windows(l1, "m", win, fee, s, nullptr) == l1);
+  // Then three losing windows: 10 -> 5 -> 2.5 -> research.
+  std::vector<double> hist = win, fh = fee;
+  for (int k = 0; k < 3; ++k) { hist.insert(hist.end(), lose.begin(), lose.end()); fh.insert(fh.end(), fee.begin(), fee.end()); }
+  notes.clear();
+  json l2 = apply_lane_windows(l1, "m", hist, fh, s, &notes);
+  CHECK(l2["stage"] == "research" && l2["negative_windows"] == 3 && l2["evaluated_trades"] == 120);
+  CHECK(l2["windows"].size() == 4 && l2["windows"].back().value("demoted", false));
+  CHECK(notes.back().find("back to research") != std::string::npos);
+  // The cap: 40 does not double past lane_max_stake.
+  json top = lane_object(json{{"stage", "live"}, {"stake", 40.0}}, 5.0);
+  CHECK(apply_lane_windows(top, "m", win, fee, s, nullptr)["stake"] == 40.0);
+
+  // ---- settings ----
+  json d = validate_systematic_settings(json::object(), json::object());
+  CHECK(d["lanes"].contains("sports_live") && d["lanes"]["sports_live"]["stage"] == "research" &&
+        d["lanes"]["sports_live"]["stake"] == 5.0);
+  bool threw = false;
+  try { validate_systematic_settings(json{{"lanes", {{"x", {{"stage", "moon"}}}}}}, d); } catch (const std::invalid_argument&) { threw = true; }
+  CHECK(threw);
+  // A patch to one lane keeps the others.
+  json d2 = validate_systematic_settings(json{{"lanes", {{"test_model", {{"stage", "research"}}}}}}, d);
+  CHECK(d2["lanes"].contains("sports_live") && d2["lanes"]["test_model"]["stake"] == 5.0);
+
+  // ---- the router ----
+  long long now = now_s();
+  // A cheap YES: p(win) 0.45 against an ask of 0.35. Under the 0.55 win-probability floor, which
+  // for a lane with the asymmetric filter is replaced by the price ceiling.
+  json cheap = row("KXNFLGAME-26SEP28A-A", "KXNFLGAME-26SEP28A", "Sports", 0.45, 0.45, 0.04, 0.33, 0.35, 50, 50, now);
+  // An expensive YES: ask 0.65, edge about 0.07 after the buffer: over the manual floor, under
+  // the 0.10 override.
+  json dear = row("KXNFLGAME-26SEP28B-B", "KXNFLGAME-26SEP28B", "Sports", 0.76, 0.76, 0.04, 0.63, 0.65, 50, 50, now);
+  json board = {{"markets", json::array({cheap, dear})}};
+  auto lane_settings = [&](const std::string& stage) {
+    json x = algo_settings();
+    x["graduated_models"] = json::array();   // the lane stage is the gate now, not graduation
+    x["kelly_fraction"] = 0;
+    x["lanes"]["test_model"] = lane_object(json{{"stage", stage}}, 5.0);
+    return validate_systematic_settings(json::object(), x);
+  };
+  json sc = systematic_screen(board, lane_settings("live_candidate"), now);
+  auto a = find_row(sc, "KXNFLGAME-26SEP28A-A", "yes");
+  CHECK(a && (*a)["verdict"] == "algo");
+  auto b = find_row(sc, "KXNFLGAME-26SEP28B-B", "yes");
+  CHECK(b && (*b)["verdict"] == "manual" && (*b)["reasons"].dump().find("asymmetric filter") != std::string::npos);
+  // A lane at research: priced for you, not sent, whatever graduated_models says.
+  json rs = lane_settings("research");
+  rs["graduated_models"] = json::array({"test_model_v1"});
+  sc = systematic_screen(board, rs, now);
+  a = find_row(sc, "KXNFLGAME-26SEP28A-A", "yes");
+  CHECK(a && (*a)["verdict"] == "manual" && (*a)["reasons"].dump().find("stage research") != std::string::npos);
+  // A model that is not a lane is untouched: graduated, and the win-probability floor still binds.
+  json legacy = algo_settings();
+  legacy["kelly_fraction"] = 0;
+  sc = systematic_screen(board, legacy, now);
+  a = find_row(sc, "KXNFLGAME-26SEP28A-A", "yes");
+  CHECK(a && (*a)["verdict"] == "weak" && (*a)["reasons"].dump().find("win probability") != std::string::npos);
+
+  // ---- the trader, in paper ----
+  MockExchange x;
+  Store st(":memory:");
+  Config cfg; cfg.bankroll_dollars = 100;
+  json seed = algo_settings();
+  seed["graduated_models"] = json::array();
+  seed["lanes"] = {{"test_model", {{"stage", "live_candidate"}, {"stake", 5.0}}}};
+  cfg.systematic_settings = seed;
+  KalshiClient client(x.base(), nullptr, "tests");
+  Executor ex(cfg, st, client);
+  SystematicTrader tr(st, &ex, cfg);
+  json v = tr.configure(json{{"mode", "paper"}, {"running", true},
+                             {"settings", {{"per_trade_dollars", 2}, {"sports_per_trade_dollars", 2}, {"take_profit", 0.06},
+                                           {"stop_loss", 0}, {"cooldown_minutes", 0}, {"paper_slippage", 0.0},
+                                           {"daily_loss_stop_enabled", false}, {"lane_daily_loss_stop_frac", 0.02}}}});
+  CHECK(v["settings"]["lanes"]["test_model"]["stage"] == "live_candidate");
+  Market m; m.ticker = x.ticker; m.event_ticker = "KXNFLGAME-26SEP28A"; m.series_ticker = "KXNFLGAME"; m.status = "active";
+  m.close_time = "2099-01-01T00:00:00Z"; m.yes_bid = 0.33; m.yes_ask = 0.35;
+  st.upsert_market(m);
+  auto board_at = [&](long long t, double p, double bid, double ask) {
+    json r = row(x.ticker, "KXNFLGAME-26SEP28A", "Sports", p, p, 0.04, bid, ask, 50, 50, t);
+    return json{{"markets", json::array({r})}};
+  };
+  tr.step(board_at(now, 0.45, 0.33, 0.35), now);
+  v = tr.view();
+  CHECK(v["positions"].size() == 1);
+  // Sized by the lane's $5, not the $2 per-trade setting.
+  FeeModel fm{"quadratic", 1};
+  const double cost_per = 0.35 + fm.fee(0.35, 1, true);
+  CHECK_NEAR(v["positions"][0]["filled"].get<double>(), std::floor(5.0 / cost_per), 1e-9);
+  // The bid jumps past the take-profit and past p(win): a lane trade holds to settlement.
+  long long t = now + 60;
+  tr.step(board_at(t, 0.45, 0.52, 0.54), t);
+  v = tr.view();
+  CHECK(v["positions"].size() == 1);
+  // Attribution names the lane.
+  bool seen = false;
+  for (const auto& l : v["lanes"]) if (l["model"] == "test_model") seen = l["lane"]["stage"] == "live_candidate";
+  CHECK(seen);
+  // The mark collapses past the $2 stop (2% of $100). In paper that changes nothing about the lane:
+  // its stage is about live trading, and paper losses must not demote it (review 2026-09-23).
+  t = now + 120;
+  tr.step(board_at(t, 0.45, 0.05, 0.07), t);
+  v = tr.view();
+  CHECK(v["settings"]["lanes"]["test_model"]["stage"] == "live_candidate");
+  // Demoted by hand: nothing new is opened in it.
+  tr.configure(json{{"settings", {{"lanes", {{"test_model", {{"stage", "research"}}}}}}}});
+  st.exec("DELETE FROM systematic_trades");
+  t = now + 180;
+  tr.step(board_at(t, 0.45, 0.33, 0.35), t);
+  CHECK(tr.view()["positions"].empty());
+  // Promoting it by hand starts its evidence afresh, at the base stake.
+  tr.configure(json{{"settings", {{"lanes", {{"test_model", {{"stake", 20.0}}}}}}}});
+  v = tr.configure(json{{"settings", {{"lanes", {{"test_model", {{"stage", "live_candidate"}}}}}}}});
+  CHECK(v["settings"]["lanes"]["test_model"]["negative_windows"] == 0 &&
+        v["settings"]["lanes"]["test_model"]["since_ts"].get<long long>() >= now);
+  CHECK(v["settings"]["lanes"]["test_model"]["stake"] == 5.0);
+}
+
+// M2 lanes, live: the order is sized by the lane's stake, capped by the lane's daily volume.
+static void test_lane_live_sizing() {
+  std::string pem = "/tmp/desk_sys_lane_key.pem";
+  auto signer = test_signer(pem);
+  if (!signer) { std::fprintf(stderr, "skip live lane test: openssl CLI not available\n"); return; }
+  auto first_order_count = [&](double volume_cap, double stake = 5.0) {
+    MockExchange x;
+    Store st(":memory:");
+    Config cfg;
+    json seed = algo_routes();
+    seed["graduated_models"] = json::array();
+    seed["lanes"] = {{"test_model", {{"stage", "live_candidate"}, {"stake", stake}}}};
+    cfg.systematic_settings = seed;
+    cfg.bankroll_dollars = 100;
+    cfg.risk.max_entry_horizon_hours = 48;
+    cfg.risk.max_order_dollars = 10;
+    KalshiClient client(x.base(), signer, "tests");
+    Executor ex(cfg, st, client);
+    SystematicTrader tr(st, &ex, cfg);
+    const long long now = now_s();
+    Market m; m.ticker = x.ticker; m.event_ticker = "KXHIGHNY-26SEP08"; m.series_ticker = "KXHIGHNY"; m.status = "active";
+    m.close_time = "2099-01-01T00:00:00Z"; m.yes_bid = 0.33; m.yes_ask = 0.35; m.tick = 0.01;
+    m.expected_expiration_time = iso_of(now + 5 * 3600);
+    st.upsert_market(m);
+    Series se; se.ticker = "KXHIGHNY"; se.category = "Climate and Weather"; se.fee_type = "quadratic"; se.fee_multiplier = 1;
+    st.upsert_series(se);
+    ex.reconcile(true);
+    tr.configure(json{{"settings", {{"per_trade_dollars", 3}, {"lane_daily_volume_dollars", volume_cap}, {"entry_style", "taker"}}},
+                      {"mode", "live"}, {"running", true}});
+    json board = {{"markets", json::array({row(x.ticker, "KXHIGHNY-26SEP08", "Climate and Weather", 0.45, 0.45, 0.04, 0.33, 0.35, 50, 50, now)})}};
+    tr.step(board, now + 1);
+    return x.writes == 1 ? x.last_order.value("count", std::string()) : std::string("no order");
+  };
+  // $5 at 0.35 + 0.0160 fee a contract: 13 contracts (the $3 per-trade setting does not apply).
+  CHECK(first_order_count(50) == "13.00");
+  // $3 of lane volume left today: 8.
+  CHECK(first_order_count(3) == "8.00");
+  // A stake doubled past the desk's $10 per-order cap is sent at the cap, not refused: 27.
+  CHECK(first_order_count(50, 40.0) == "27.00");
+  // The lane's daily loss stop, live: a closed live loss today past 8% of $100 puts it back to research.
+  {
+    MockExchange x;
+    Store st(":memory:");
+    Config cfg;
+    json seed = algo_routes();
+    seed["graduated_models"] = json::array();
+    seed["lanes"] = {{"test_model", {{"stage", "live_candidate"}, {"stake", 5.0}}}};
+    cfg.systematic_settings = seed;
+    cfg.bankroll_dollars = 100;
+    KalshiClient client(x.base(), signer, "tests");
+    Executor ex(cfg, st, client);
+    SystematicTrader tr(st, &ex, cfg);
+    tr.configure(json{{"mode", "live"}, {"running", true}});
+    const long long now = now_s();
+    tr.step(json{{"markets", json::array()}}, now);   // rolls the day in
+    st.exec("INSERT INTO systematic_trades(ticker,event_ticker,side,state,mode,opened_ts,closed_ts,realized_pnl,fair_strategy) "
+            "VALUES('T','E','yes','closed','live',?,?,-9.0,'test_model')", {now, now});
+    tr.step(json{{"markets", json::array()}}, now + 1);
+    CHECK(tr.view()["settings"]["lanes"]["test_model"]["stage"] == "research");
+  }
+  std::remove(pem.c_str());
+}
+
 int main(int argc, char** argv) {
   if (argc == 2 && std::string(argv[1]) == "--ownership") {
     test_manual_ownership_isolation(); test_manual_position_blocks_new_entry(); test_partial_entry_cancel_race();
     std::printf("%d checks, %d failures\n", checks, fails); return fails == 0 ? 0 : 1;
   }
   test_settings();
+  test_lanes();
+  test_lane_live_sizing();
   test_routes();
   test_screen_routes();
   test_rejection_classes();

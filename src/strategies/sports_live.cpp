@@ -8,6 +8,7 @@
 #include "desk/log.h"
 #include "desk/mathutil.h"
 #include "desk/strategies.h"
+#include "desk/team_names.h"
 #include "desk/timeutil.h"
 
 namespace desk {
@@ -54,6 +55,9 @@ SportsLive::SportsLive(const json& params, const std::string& user_agent) : http
   sigma_wp_ = params.value("sigma_wp", 0.04);
   sigma_leadtime_ = params.value("sigma_leadtime", 0.07);
   sigma_pregame_ = params.value("sigma_pregame", 0.10);
+  // Off by default: the lead/time fallback is an unvalidated approximation and saying so is a
+  // fact. Turning it on makes those rows tradable, it does not make the model better.
+  allow_approximation_ = params.value("allow_approximation", false);
 }
 
 bool SportsLive::covers(const Market& m, const Series& s) const {
@@ -68,24 +72,38 @@ static std::string lower(std::string s) {
   return s;
 }
 
-static std::vector<std::string> tokens(const std::string& s) {
-  std::vector<std::string> out;
-  std::string cur;
-  for (char c : lower(s)) {
-    if (std::isalnum(static_cast<unsigned char>(c))) cur += c;
-    else if (!cur.empty()) { out.push_back(cur); cur.clear(); }
-  }
-  if (!cur.empty()) out.push_back(cur);
-  return out;
-}
 
 static double token_overlap(const std::string& a, const std::string& b) {
-  auto ta = tokens(a), tb = tokens(b);
-  if (ta.empty() || tb.empty()) return 0;
-  int hit = 0;
-  for (const auto& x : ta)
-    if (x.size() >= 2 && std::find(tb.begin(), tb.end(), x) != tb.end()) ++hit;
-  return static_cast<double>(hit) / std::max<size_t>(1, std::min(ta.size(), tb.size()));
+  return team_name_overlap(a, b);   // include/desk/team_names.h: initials, city short forms, A's
+}
+
+// The team a market pays on: its YES subtitle ("Michigan"), else the "If <team> wins the" of its
+// own rules. Per MARKET, so the name always belongs to the same ticker as its code.
+std::string SportsLive::market_team(const Market& m) {
+  if (!m.yes_sub_title.empty()) return m.yes_sub_title;
+  const std::string& r = m.rules_primary;
+  if (r.rfind("If ", 0) == 0) {
+    const size_t p = r.find(" wins the ");
+    if (p != std::string::npos && p > 3) return r.substr(3, p - 3);
+  }
+  return "";
+}
+
+double SportsLive::team_evidence(const std::string& code, const std::string& name, const std::string& abbr,
+                                 const std::string& full_name) {
+  return (!code.empty() && lower(code) == lower(abbr) ? 2.0 : 0.0) + token_overlap(name, full_name);
+}
+
+std::pair<double, double> SportsLive::orientation_scores(const std::string& code_a, const std::string& code_b,
+                                                         const std::string& name_a, const std::string& name_b,
+                                                         const std::string& away_abbr, const std::string& home_abbr,
+                                                         const std::string& away_name, const std::string& home_name) {
+  auto ab = [](const std::string& code, const std::string& abbr) {
+    return !code.empty() && lower(code) == lower(abbr) ? 2.0 : 0.0;
+  };
+  const double s1 = ab(code_a, away_abbr) + ab(code_b, home_abbr) + token_overlap(name_a, away_name) + token_overlap(name_b, home_name);
+  const double s2 = ab(code_a, home_abbr) + ab(code_b, away_abbr) + token_overlap(name_a, home_name) + token_overlap(name_b, away_name);
+  return {s1, s2};
 }
 
 // "If Los Angeles D wins the Cincinnati vs Los Angeles D professional baseball game originally
@@ -329,11 +347,20 @@ void SportsLive::prepare(const std::vector<Market>& markets, Store& store) {
       info.event_ticker = ev;
       info.series = ms.front()->series_ticker;
       info.date = event_date(ev);
-      parse_us_teams(ms.front()->rules_primary, info.name_a, info.name_b);
+      info.start_min = event_start_minutes(ev);
+      // Each ticker's name comes from its own market. It used to come from the rules text in the
+      // game's order ("Oklahoma vs Michigan") while the codes came in ticker order (MICH, OKLA),
+      // so name_a could be the OTHER ticker's team. When the ticker codes did not match ESPN's
+      // abbreviations exactly (OKLA vs OU) the two orientations then scored the same, and the tie
+      // silently made the first ticker the away team. On 2026-09-06..12 that swapped home and away
+      // in 10 college football games: ESPN's number was applied to the wrong team, and every
+      // "edge" it produced there was the size of the game.
       for (const Market* m : ms) {
         std::string code = m->ticker.substr(m->ticker.find_last_of('-') + 1);
-        if (info.ticker_a.empty()) { info.ticker_a = m->ticker; info.code_a = code; }
-        else if (info.ticker_b.empty() && m->ticker != info.ticker_a) { info.ticker_b = m->ticker; info.code_b = code; }
+        if (info.ticker_a.empty()) { info.ticker_a = m->ticker; info.code_a = code; info.name_a = market_team(*m); }
+        else if (info.ticker_b.empty() && m->ticker != info.ticker_a) {
+          info.ticker_b = m->ticker; info.code_b = code; info.name_b = market_team(*m);
+        }
       }
     }
     if (info.date.empty()) continue;
@@ -351,10 +378,27 @@ void SportsLive::prepare(const std::vector<Market>& markets, Store& store) {
   for (auto& [ev, info] : events_) {
     if (!info.espn_id.empty() || info.date.empty()) continue;
     const League& lg = leagues_.at(info.series);
-    double best = 0;
+    // Only once the event's own date has been fetched: before that the only candidates are the same
+    // teams' games on the neighbouring day, and a match, once made, is never revisited.
+    if (!sb_ts_.count(lg.league + "|" + info.date)) continue;
+    double best = 0, second = 0;
+    std::string best_id;
+    bool best_home = false;
     long long t_info = parse_iso(info.date + "T12:00:00Z");
     for (const auto& [id, g] : games_) {
       if (g.home_abbr.empty() || g.league != lg.league) continue;
+      double closeness = 0;   // 1 at the ticker's exact start, 0 at 90 minutes off
+      // A ticker that carries its start time (MLB) must meet a game that starts then: the two games
+      // of a doubleheader have the same teams and date and differ only in the time.
+      if (info.start_min >= 0) {
+        const long long t = parse_iso(g.start_utc);
+        if (t <= 0) continue;
+        const int off = us_eastern_offset(t);
+        if (date_of(t, off) != info.date) continue;
+        const int m = static_cast<int>((((t + off) % 86400) + 86400) % 86400 / 60);
+        if (std::abs(m - info.start_min) > 90) continue;
+        closeness = 1.0 - std::abs(m - info.start_min) / 90.0;
+      }
       // Kalshi's event date and ESPN's kickoff can straddle a date line (late West-coast games,
       // UTC vs Eastern); accept a day either side but let the exact date win ties.
       std::string gd = us_date(g.start_utc);
@@ -362,17 +406,39 @@ void SportsLive::prepare(const std::vector<Market>& markets, Store& store) {
       long long dd = std::llabs(parse_iso(gd + "T12:00:00Z") - t_info);
       if (dd > 24 * 3600) continue;
       double score = 0;
-      auto ab = [&](const std::string& code, const std::string& abbr) { return !code.empty() && lower(code) == lower(abbr) ? 2.0 : 0.0; };
-      double s1 = ab(info.code_a, g.away_abbr) + ab(info.code_b, g.home_abbr) + token_overlap(info.name_a, g.away_name) + token_overlap(info.name_b, g.home_name);
-      double s2 = ab(info.code_a, g.home_abbr) + ab(info.code_b, g.away_abbr) + token_overlap(info.name_a, g.home_name) + token_overlap(info.name_b, g.away_name);
-      bool a_is_home = s2 > s1;
-      score = std::max(s1, s2) + (gd == info.date ? 0.5 : 0.0);
-      if (score > best && score >= 2.0) {
-        best = score;
-        info.espn_id = id;
-        info.home_is_a = a_is_home;
+      const auto [s1, s2] = orientation_scores(info.code_a, info.code_b, info.name_a, info.name_b, g.away_abbr,
+                                               g.home_abbr, g.away_name, g.home_name);
+      // Both teams, in the orientation that wins, need their own evidence (see team_evidence).
+      {
+        const bool a_home = s2 > s1;
+        const double ea = team_evidence(info.code_a, info.name_a, a_home ? g.home_abbr : g.away_abbr,
+                                        a_home ? g.home_name : g.away_name);
+        const double eb = team_evidence(info.code_b, info.name_b, a_home ? g.away_abbr : g.home_abbr,
+                                        a_home ? g.away_name : g.home_name);
+        if (std::min(ea, eb) < 0.75) continue;
       }
+      bool a_is_home = s2 > s1;
+      score = std::max(s1, s2) + (gd == info.date ? 0.5 : 0.0) + closeness;
+      // An orientation that barely beats its mirror image is a guess. A wrong side is far worse
+      // than no price (it trades the whole game the wrong way), so an ambiguous match is not taken.
+      if (std::fabs(s1 - s2) < 1.0) {
+        if (score >= 2.0 && ambiguous_logged_.insert(ev + "|" + id).second)
+          LOG_WARN("sports_live %s: espn %s (%s vs %s) matches both ways round (%.1f vs %.1f); not priced", ev.c_str(),
+                   id.c_str(), g.away_abbr.c_str(), g.home_abbr.c_str(), s1, s2);
+        continue;
+      }
+      if (score < 2.0) continue;
+      if (score > best) { second = best; best = score; best_id = id; best_home = a_is_home; }
+      else if (score > second) second = score;
     }
+    // Two candidates this close are two games we cannot tell apart (the same teams again): no price
+    // rather than whichever the map happened to list first.
+    if (!best_id.empty() && second >= best - 0.25) {
+      if (ambiguous_logged_.insert(ev + "|tie").second)
+        LOG_WARN("sports_live %s: two ESPN games match equally well (%.1f, %.1f); not priced", ev.c_str(), best, second);
+      best_id.clear();
+    }
+    if (!best_id.empty()) { info.espn_id = best_id; info.home_is_a = best_home; }
     if (!info.espn_id.empty())
       LOG_INFO("sports_live %s -> espn %s (%s vs %s, score %.1f)", ev.c_str(), info.espn_id.c_str(),
                games_[info.espn_id].away_abbr.c_str(), games_[info.espn_id].home_abbr.c_str(), best);
@@ -469,7 +535,17 @@ std::optional<Fair> SportsLive::fair(const Market& m, const Series&, Store&) {
   f.cluster = m.event_ticker;
   f.inputs={{"valid",true},{"source",src},{"source_ts",src=="espn wp"?g.wp_ts:g.updated},
             {"state_signature",state_signature(g)},{"auto_eligible",src=="espn wp"}};
-  if(src!="espn wp") {f.research_only=true;f.research_reason="Unvalidated sports approximation; manual research only";}
+  // When ESPN publishes a win probability the model uses it; otherwise it falls back to its own
+  // lead-and-time Gaussian, which has never been validated against outcomes. That fallback was
+  // unconditionally research-only, which is why a board full of game rows could not be traded.
+  // It is now a setting, because "this estimate is unvalidated" and "you may not look at it" are
+  // different statements and only the first one is a fact.
+  if(src!="espn wp" && !allow_approximation_) {
+    f.research_only=true;
+    f.research_reason="Unvalidated sports approximation; manual research only";
+  } else if(src!="espn wp") {
+    f.note += " | APPROXIMATION: lead/time model, no ESPN win probability, never validated against outcomes";
+  }
   return f;
 }
 

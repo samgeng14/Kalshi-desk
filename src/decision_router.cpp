@@ -1,4 +1,5 @@
 #include "desk/decision_router.h"
+#include "desk/lanes.h"
 
 #include <algorithm>
 #include <cctype>
@@ -157,6 +158,10 @@ TradeDecision decide(const json& m, Side side, const json& s, const RouterContex
                                                                             : quote_from_board_row(m);
   const std::string model_key = q.model_key();
 
+  // Lanes (M2): a model listed in settings.lanes is gated by its lane stage and, with the
+  // asymmetric filter on, buys the cheap side only.
+  const bool in_lane = lane_managed(s, q.model_name);
+  const bool asymmetric = in_lane && lane_asymmetric(s, q.model_name);
   // Routes: the category is the outer permission, the model's own route decides inside it.
   bool model_known = false;
   const RouteMode cat_route = route_setting(s, cat);
@@ -183,7 +188,12 @@ TradeDecision decide(const json& m, Side side, const json& s, const RouterContex
   if (route == RouteMode::Off) blocked.push_back(binding(RouteMode::Off) + ": switched off");
   else if (route == RouteMode::Research) research.push_back(binding(RouteMode::Research) + ": priced and recorded, offered to nobody");
   else if (route == RouteMode::Manual) manual.push_back(binding(RouteMode::Manual) + ": priced for you, never sent");
-  else if (!model_graduated(s, q.model_name, q.model_version))
+  else if (in_lane && !lane_trades_live(s, q.model_name))
+    // A lane's stage is the gate, not graduated_models: a lane the sizing rule demoted stops here
+    // even if the model was once graduated by hand.
+    manual.push_back("lane " + q.model_name + " is at stage " + lane_stage(s, q.model_name) +
+                     ": the algorithm does not send it; priced for you");
+  else if (!in_lane && !model_graduated(s, q.model_name, q.model_version))
     manual.push_back("model " + model_key + " has not graduated to unattended execution: priced for you, never sent");
 
   double close = number(m, "close_ts"), settle = number(m, "settlement_ts");
@@ -237,9 +247,16 @@ TradeDecision decide(const json& m, Side side, const json& s, const RouterContex
     // One event, one entry decision while it has exposure or working orders. The one exception is
     // a qualified same-side addition to a position you hold yourself: yours to review, never sent
     // by the algorithm, and never on top of the algorithm's own trade or a working order.
-    if (addition && !ctx.algo_events.count(event) && !ctx.working_events.count(event))
+    const bool offer_additions = str(s, "manual_additions", "offer") != "hide";
+    if (addition && !ctx.algo_events.count(event) && !ctx.working_events.count(event) && offer_additions)
       manual.push_back("an addition to the position you hold here (" + str(entry, "reason", "qualified") +
                        "): it adds concentration, so it is yours to review");
+    else if (addition && !ctx.algo_events.count(event) && !ctx.working_events.count(event))
+      // manual_additions=hide. Still a legitimate addition, and the algorithm may still take it;
+      // it is simply not put in front of you again. An event you have already traded coming back
+      // as a manual row every cycle crowds out the events you have not.
+      blocked.push_back("already traded this event: additions are hidden from the manual board "
+                        "(settings.manual_additions), though the algorithm may still add");
     else
       blocked.push_back("this event already has a position or working trade; it belongs to whoever opened it, and "
                         "nothing new is opened in it or on its other side");
@@ -318,8 +335,17 @@ TradeDecision decide(const json& m, Side side, const json& s, const RouterContex
   // A same-side addition has its own, higher bar (risk.add_min_edge and the improvement rule).
   if (addition && two_sided && c.net_edge + 1e-9 < number(entry, "required_edge"))
     weak.push_back("an addition needs edge " + fmt2(number(entry, "required_edge")) + " at this price; it has " + fmt2(c.net_edge));
-  if (two_sided && valid_model && p_win + 1e-9 < number(s, "min_win_probability"))
+  // The win-probability floor refuses exactly the trades the asymmetric profile is built on (the
+  // side bought at 20-45c wins less than half the time by construction), so for a lane with the
+  // filter on the price ceiling below replaces it.
+  if (!asymmetric && two_sided && valid_model && p_win + 1e-9 < number(s, "min_win_probability"))
     weak.push_back("win probability " + fmt2(p_win) + " is under the " + fmt2(number(s, "min_win_probability")) + " floor");
+  if (asymmetric && two_sided && valid_model && c.entry_price > number(s, "asymmetric_max_price", .45) + 1e-9 &&
+      buffered <= number(s, "asymmetric_override_edge", .10) + 1e-9)
+    manual.push_back("asymmetric filter: the algorithm buys a side priced at or under " +
+                     fmt2(number(s, "asymmetric_max_price", .45)) + " unless the edge after the buffer exceeds " +
+                     fmt2(number(s, "asymmetric_override_edge", .10)) + "; this side costs " + fmt2(c.entry_price) +
+                     " with edge " + fmt2(buffered));
   if (two_sided && valid_model && buffered + 1e-9 < min_edge)
     weak.push_back("edge " + fmt2(c.net_edge) + " less " + fmt2(es.uncertainty_multiplier) + "x sigma " + fmt2(sigma) +
                    (c.estimated_slippage > 0 ? " and slippage " + fmt2(c.estimated_slippage) : std::string()) + " = " +

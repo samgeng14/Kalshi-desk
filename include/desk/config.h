@@ -17,6 +17,9 @@ struct RiskConfig {
   double min_edge_taker = 0.05;
   double sigma_mult = 1.0;         // require edge >= sigma_mult * sigma_model
   double min_price = 0.05;         // do not trade outside [min_price, 1-min_price]
+  // How long a reviewed manual ticket stays valid, and therefore how long the queue keeps
+  // retrying one the book is refusing. 90s gave a blocked ticket almost no attempts.
+  long long manual_review_seconds = 180;
   int proposal_ttl_seconds = 300;
   // Per-order and per-day caps, enforced on every entry path. Turnover matters on its own: the
   // taker fee is 7% of p(1-p) each way, so churning a position is the reliable way to lose money
@@ -45,6 +48,9 @@ struct RiskConfig {
   // and the most cash one basket may use.
   double ladder_min_edge = 0.02;
   double ladder_max_cost = 20.0;
+  // New locked baskets proposed per cycle (M4). Each still needs the arbitrage budget, cash, and
+  // every leg under max_order_dollars.
+  int ladder_max_baskets_per_cycle = 2;
   // The fast lane. A proposal whose net edge reaches this goes in the cycle it appears, without
   // waiting for a click, whatever mode its strategy is in (off and research still never send).
   // 0 disables it. Every other guard still applies: AUTO must be armed, the kill switch, the
@@ -91,9 +97,38 @@ struct Config {
   // read this same number, so nothing is shown as tradable that the sender would call stale.
   // 0 = derive it from the cycle (3 polls + 10 s, which is 25 s at the default 5 s poll).
   int market_data_max_age_seconds = 0;
+  // Spacing between exchange REST calls (all threads). See KalshiClient::set_min_interval_ms.
+  int rest_min_interval_ms = 60;
+  // Series fetched concurrently in the market refresh. The calls are still paced by
+  // rest_min_interval_ms, so this bounds in-flight requests, not the rate.
+  int refresh_threads = 4;
+  // A cycle at or over this many seconds is logged with its five slowest steps. 8 s is the M0
+  // target: a cycle longer than that eats into the 25 s quote-freshness bar.
+  double cycle_report_seconds = 8.0;
+  // Consecutive failed cycles (an exception escaping every step) before the kill switch trips.
+  // The loop itself never exits on a failure; it backs off and tries again.
+  int max_consecutive_cycle_failures = 5;
+  // Raw commodity book events (every WebSocket delta on the 15-minute series, with the raw
+  // payload) grow about 12M rows and 4 GB a day: 15 GB of a 22 GB database after three days of
+  // capture, on a disk with 31 GB free. A full disk ends the desk with "disk I/O error".
+  // When set, the cycle DELETES rows older than this many days, without archiving them. Off (0)
+  // by default because that capture is research data: the safe route is
+  // scripts/archive_quotes.py --table commodity_book_events, which archives and verifies first.
+  // Set this only to cap the table on a machine where the history is not wanted.
+  int commodity_book_retain_days = 0;
   double bankroll_dollars = 100.0;
   RiskConfig risk;
   std::vector<std::string> watch_series;
+  // Series watched for locked baskets only (M4): refreshed every cycle and scanned by the ladder
+  // and dominance finders, but not priced by any model and not written to the quote history.
+  // Bracket ladders with hundreds of strikes (Nasdaq-100 hourly lists 1,000) would otherwise add
+  // millions of quote rows a day to a disk that is already short, and every weather city added
+  // to the model path adds forecast fetches to the cycle.
+  std::vector<std::string> basket_series;
+  // Each basket-only series is refreshed every this many cycles, staggered so a fraction of them
+  // goes each cycle. At 2 and a cycle near 8 s their quotes are at most ~16 s old, inside the
+  // freshness bar; 74 series every cycle measured 4.9 s of refresh against 2.0 s for the 32.
+  int basket_refresh_every = 2;
   std::map<std::string, std::string> strategy_modes;  // name -> off | research | manual | auto | bot
   nlohmann::json strategy_params;                      // free-form per-strategy params
   // Optional `"systematic": {...}` block. The algorithm's settings otherwise live only in a DB

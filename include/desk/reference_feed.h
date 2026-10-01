@@ -173,7 +173,7 @@ class ReferenceFeed {
   void note_schema(const nlohmann::json& msg, const std::string& text, long long received_ms);
   void keep_raw(const std::string& text, long long received_ms, const std::string& symbol,
                 long long seq, const char* why);
-  long long last_gap_seq_ = 0, seq_gaps_ = 0, last_seq_ = 0;
+  long long last_gap_seq_ = 0, seq_gaps_ = 0, last_seq_ = 0, seq_restarts_ = 0;
 };
 
 // The exchange's own quotes for the windows being priced, at the resolution the question needs.
@@ -192,8 +192,34 @@ class ReferenceFeed {
 // other. `ticker` says whether the QUOTED PRICE moved. `orderbook_delta` (with the snapshot that
 // seeds it, and a sequence number on every message) is what says whether a given quantity could
 // have been EXECUTED. A study that used ticker data to make a claim about fills would be
-// describing a price nobody could have taken, so the book events are recorded separately, with
-// their sequence numbers intact, and reconstructed offline where the reconstruction can be tested.
+// describing a price nobody could have taken, so the book events are recorded separately, as the
+// venue sent them, for a reconstruction done offline where it can be tested. No such
+// reconstruction exists yet (2026-09-24): nothing reads commodity_book_events but the retention
+// prune and the archive script, so nothing has yet refused a stretch for a gap.
+//
+// How to read commodity_book_events (checked against 500,465 recorded frames, 2026-09-23/24):
+//   - Replay in `id` order, which is receipt order. `seq` is numbered once per subscription (sid)
+//     across every market on it, not per market, and starts again at 1 on every connection while
+//     the sid stays the same, so ordering by the (ticker, sequence) index puts a later connection's
+//     stream before an earlier one's.
+//   - 'orderbook_snapshot' replaces that market's book. Its levels are only in raw_json
+//     (msg.yes_dollars_fp / msg.no_dollars_fp, pairs of [price_dollars, count_fp], either side may
+//     be absent), and side, price, delta and ts_exchange_ms are NULL: a snapshot carries none of
+//     them. One with no levels means the venue has no book for the market; in the sample every
+//     window close sent one, but a re-subscription 177 s after the 03:00 windows closed (ids
+//     50147884-50147888) got full books for all five, so use the market's close time, not an
+//     empty snapshot, to know a window is over.
+//   - 'orderbook_delta': price is msg.price_dollars in dollars, delta is msg.delta_fp in contracts
+//     (negative removes), side is 'yes' or 'no', ts_exchange_ms is msg.ts_ms.
+//   - 'ok', 'error', 'subscribed', 'unsubscribed' are the venue's replies to our commands, verbatim.
+//     A reply to update_subscription takes a number in the sid's sequence, so without these rows
+//     every window roll looks like a lost message.
+//   - 'connect' and 'dropped' are written by this desk, not the venue: a new connection (no book
+//     survives it without its next snapshot; raw_json lists what was subscribed), and rows this
+//     desk's own queue had to drop (a different fact from the venue losing them).
+// Rows written before 2026-09-24 differ: price and delta are 0 on every delta and snapshots hold
+// 0/'' instead of NULL (the parser asked for keys the venue does not send), and replies and
+// connections were not recorded. raw_json is intact on all of them; see the backfill notes.
 class MarketQuoteFeed {
  public:
   struct Settings {
@@ -204,6 +230,14 @@ class MarketQuoteFeed {
     int ping_interval_seconds = 10;
     size_t max_pending_rows = 50000;
     std::string name = "kalshi-ticker";
+    // Book events stop being recorded while the database's disk has less than this many GB free,
+    // and start again 2 GB above it (params.commodity.quotes.min_free_gb; 0 turns the floor off).
+    // The book stream is by far the largest writer on the desk; see Engine's quotes step.
+    double min_free_gb = 10.0;
+    // A delta whose every field is held by the columns is stored without its raw frame (about 265
+    // of its 414 bytes). Set this to keep every frame whole
+    // (params.commodity.quotes.keep_delta_raw).
+    bool keep_delta_raw = false;
   };
 
   MarketQuoteFeed(Store& store, Settings settings, std::shared_ptr<Signer> signer);
@@ -216,13 +250,31 @@ class MarketQuoteFeed {
   // The markets to follow now. Sends only the difference from what is already subscribed.
   void watch(const std::vector<std::string>& tickers);
   int flush(long long now);
+  // The disk is under the floor (true) or back above it (false). While it is, book frames are
+  // followed (sequence and counts) but not kept; on the way back a 'paused_low_disk' row records
+  // the stretch, so a replay reads it as missing rather than as a quiet book. The small streams
+  // (replies to our commands, connects, ticker rows) are kept throughout.
+  void set_disk_low(bool low, long long now_ms);
   nlohmann::json status() const;
   void on_message_for_tests(const std::string& text, long long received_ms) { on_text(text, received_ms); }
+  // Exposed for tests: what the socket's connect handler does, without a socket.
+  std::vector<std::string> on_connect_for_tests(long long now_ms) { return connect_frames(now_ms); }
+  // Exposed for tests: the frames watch() would send on a connected socket.
+  std::vector<std::string> watch_for_tests(const std::vector<std::string>& tickers) {
+    std::lock_guard<std::mutex> lk(mu_);
+    return watch_frames(tickers, true);
+  }
   std::vector<std::string> watching() const;
 
  private:
   void on_text(const std::string& text, long long received_ms);
-  void send_delta(const std::vector<std::string>& add, const std::vector<std::string>& remove);
+  // Called under mu_.
+  std::vector<std::string> watch_frames(const std::vector<std::string>& tickers, bool has_socket);
+  std::vector<std::string> connect_frames(long long now_ms);
+  // Called under mu_.
+  void queue_book(nlohmann::json row);
+  void note_sequence(long long sid, long long seq, bool book_frame);
+  void note_missing(const std::string& kind, const char* key);
 
   Store& store_;
   Settings s_;
@@ -232,15 +284,42 @@ class MarketQuoteFeed {
   std::set<std::string> watching_;
   std::vector<nlohmann::json> pending_, pending_book_;
   long long messages_ = 0, recorded_ = 0, dropped_rows_ = 0, unparsed_ = 0, command_id_ = 100;
-  long long book_messages_ = 0, book_recorded_ = 0, snapshots_ = 0;
+  long long book_messages_ = 0, book_recorded_ = 0, snapshots_ = 0, empty_snapshots_ = 0;
+  long long unwatched_ = 0, connects_ = 0, control_frames_ = 0, errors_ = 0;
   // The venue assigns a subscription id per channel, and `update_subscription` needs it. Taken
   // from the acknowledgements rather than assumed, because assuming it works until the day the
   // venue numbers them differently and the desk quietly stops following the live windows.
   std::map<std::string, long long> sids_;
-  // Sequence continuity per ticker. A book reconstructed across a gap is a book that never
-  // existed, so the gaps are counted here and the replay refuses those stretches.
-  std::map<std::string, long long> last_seq_;
-  long long sequence_gaps_ = 0;
+  // Whether a subscribe has gone out on this connection. Until one has, there is no subscription
+  // for update_subscription to change: the venue refuses it ("Unknown subscription ID").
+  bool subscribed_ = false;
+  // From this connection's connect handler until the socket reports it gone. The socket accepts
+  // frames a moment before its connect handler runs, and a watch() in that moment would decide
+  // against the old connection's state.
+  bool conn_ready_ = false;
+  long long forced_reconnects_ = 0, last_forced_reconnect_ms_ = 0;
+  bool reconnect_due_ = false;          // a refusal came inside the minute; reconnect when it ends
+  std::set<long long> add_ids_;         // this connection's add_markets commands
+  // Called under mu_: drop the connection so the next one subscribes afresh.
+  void force_reconnect(long long now_ms);
+  // Sequence continuity per subscription id, because that is how the venue numbers it: one `seq`
+  // per sid, shared by every market on it. Kept per market, as it was until 2026-09-24, every
+  // switch from one market to the next looked like a gap, about 30% of all book messages on a
+  // stream that had lost none. A gap here makes every book on the sid unreliable until its next
+  // snapshot, since the lost message could have been for any of them.
+  std::map<long long, long long> last_seq_by_sid_;
+  long long sid_gaps_ = 0, seqs_missing_ = 0, seq_restarts_ = 0;
+  // Book rows the queue could not hold, and the open stretch not yet written down as a marker.
+  long long book_dropped_rows_ = 0, drop_rows_ = 0, drop_first_ms_ = 0, drop_first_seq_ = 0,
+            drop_last_seq_ = 0;
+  // Documented fields that did not arrive, by "kind.key". A column the parser could not fill is
+  // NULL and counted here, never 0: a silent 0 is how every delta's price and size went unrecorded.
+  std::map<std::string, long long> schema_misses_;
+  long long raw_trimmed_ = 0;   // deltas stored without raw_json (Settings::keep_delta_raw)
+  // The disk floor, and the stretch of book frames not kept under it.
+  bool disk_low_ = false;
+  long long pause_rows_ = 0, pause_first_ms_ = 0, pause_last_ms_ = 0, pause_first_seq_ = 0,
+            pause_last_seq_ = 0, paused_total_ = 0;
 };
 
 MarketQuoteFeed::Settings market_quote_settings(const nlohmann::json& params, const std::string& env);

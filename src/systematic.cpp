@@ -1,4 +1,5 @@
 #include "desk/systematic.h"
+#include "desk/lanes.h"
 #include "desk/decision_router.h"
 
 #include <algorithm>
@@ -144,6 +145,8 @@ json systematic_defaults() {
           {"model_routes", {{"weather_nws_v1", "manual"}, {"crypto_lognormal_v1", "manual"}, {"sports_live_v1", "manual"},
                             {"sports_inplay_v1", "research"}, {"sports_totals_v1", "research"}, {"xvenue_v1", "manual"},
                             {"manual_fair_v1", "manual"}, {"ladder_arb", "auto"},
+                            // M5: priced and offered; its lane (paper) keeps it from the algorithm.
+                            {"sportsbook_line_v1", "manual"},
                             // Session 16. The terminal-price commodity models are new and unmeasured:
                             // they are priced and offered, and they are not the algorithm's to send.
                             {"commodity_terminal_gold_v1", "manual"}, {"commodity_terminal_silver_v1", "manual"},
@@ -168,7 +171,22 @@ json systematic_defaults() {
           // is hours, so the flat floor above is the smaller of the two and still binds.
           {"min_life_fraction_to_close", 0.2},
           // execution and size
-          {"entry_style", "auto"}, {"entry_ttl_seconds", 180.0}, {"per_trade_dollars", 6.0}, {"sports_per_trade_dollars",2.0},
+          {"entry_style", "auto"},
+          // What to do with a qualified same-side addition to an event you already hold.
+          // "offer" puts it on the manual board for review; "hide" keeps it off the board
+          // entirely while leaving it available to the algorithm. A game you have already traded
+          // reappearing as a manual row every cycle is noise, not an opportunity.
+          {"manual_additions", "offer"},
+          // Brackets of one event that reach the board, per route. 1 is the desk choosing for
+          // you; raise it when you are choosing and want to see the alternatives.
+          {"rows_per_event", 1.0},
+          // How far the edge may have drifted between a row being offered and the operator
+          // clicking it, before the hand-order path refuses it. Manual submits only.
+          {"manual_submit_tolerance", .03},
+          // Cancel a hand order that has rested this long without filling, freeing the collateral
+          // it reserves. 0 is off, and off is the default: the desk does not cancel what it did
+          // not place unless told to.
+          {"manual_order_ttl_seconds", 0.0}, {"entry_ttl_seconds", 180.0}, {"per_trade_dollars", 6.0}, {"sports_per_trade_dollars",2.0},
           {"kelly_fraction", .25}, {"max_open_dollars", 15.0}, {"max_positions", 5},
           {"max_entries_per_cycle", 1}, {"capital_budget_dollars", 40.0}, {"daily_budget_dollars", 40.0}, {"daily_loss_stop_dollars", 6.0}, {"daily_loss_stop_enabled",true},
           {"ladder_ticks", 3},
@@ -176,7 +194,50 @@ json systematic_defaults() {
           {"take_profit", .06}, {"stop_loss", .10}, {"stop_grace_seconds", 90.0}, {"stop_persist_seconds", 30.0},
           {"stop_loss_mode", "price"}, {"stop_loss_fraction", .70}, {"model_value_exit", true}, {"thesis_stop_enabled", true},
           {"exit_ttl_seconds", 240.0}, {"max_hold_minutes", 360.0}, {"cooldown_minutes", 30.0},
-          {"stop_at_day_end", false}, {"paper_slippage", .01}};
+          {"stop_at_day_end", false}, {"paper_slippage", .01},
+          // ---- lanes (M2, 2026-09-23) --------------------------------------------------------
+          // A model listed here is a lane: its stage, not graduated_models, decides whether the
+          // algorithm sends its AUTO decisions, and its stake is set by its own settled live
+          // results (include/desk/lanes.h). Models not listed keep the routes above unchanged.
+          // sports_live (ESPN in-game win probability) is a lane, at RESEARCH. The plan put it at
+          // live_candidate on day one on the premise that its reading was not negative; the
+          // study it asked for (reports/espn_leadlag.md, 2026-09-23) says it is: the plan's trigger
+          // (ESPN 8c+ over the ask, cheap side) lost $1.23 a trade over 106 recorded trades (t -1.83),
+          // every trigger tried lost on average, and an approximation of this router's own filter
+          // lost $0.98 a trade over 34 (t -0.46: negative, not conclusive).
+          // Promote it on the Systematic tab (Lanes) to trade it anyway at $5; this default only
+          // applies to a settings row that has never had the lane.
+          {"lanes", {{"sports_live", {{"stage", "research"}, {"stake", 5.0}, {"evaluated_trades", 0},
+                                      {"negative_windows", 0}, {"since_ts", 0}, {"halted_day", ""},
+                                      {"windows", json::array()}, {"asymmetric", true}}},
+                     // M5: the pregame sportsbook line. No settled evidence at all, so paper. It
+                     // buys toward the line, favourites included, so the cheap-side filter is off
+                     // for this lane.
+                     {"sportsbook_line", {{"stage", "paper"}, {"stake", 5.0}, {"evaluated_trades", 0},
+                                          {"negative_windows", 0}, {"since_ts", 0}, {"halted_day", ""},
+                                          {"windows", json::array()}, {"asymmetric", false}}}}},
+          {"lane_sizing_enabled", true}, {"lane_base_stake", 5.0}, {"lane_max_stake", 40.0},
+          {"lane_window_trades", 30.0},
+          // z of the lower band a window's mean must clear (two-sided 80%: 1.2816).
+          {"lane_band_z", 1.2816}, {"lane_negative_windows_to_research", 3.0},
+          // Per lane, per trading day: a loss past this fraction of bankroll_dollars (realized
+          // today plus the mark on what is open) puts the lane back to research ("research") or
+          // stops its entries until the day rolls ("halt_day").
+          {"lane_daily_loss_stop_frac", .08}, {"lane_loss_stop_action", "research"},
+          // Dollars of stake a lane may put on per trading day. The account-wide turnover cap
+          // (risk.max_turnover_dollars_per_day) still applies on top.
+          {"lane_daily_volume_dollars", 50.0},
+          // The cheap side only, for lane models: the side bought must cost at most
+          // asymmetric_max_price unless the edge after the buffer exceeds asymmetric_override_edge.
+          // Winners then pay 1.2x-5x the stake. Replaces the min_win_probability floor for lanes,
+          // which would otherwise refuse every such trade.
+          {"asymmetric_filter", true}, {"asymmetric_max_price", .45}, {"asymmetric_override_edge", .10},
+          // Lane trades are held to settlement: no take-profit, no "market pays more than it is
+          // worth" exit, no time stop. The thesis stop and the price stop still apply.
+          {"hold_to_settlement", true},
+          // Locked baskets (M4): their own daily stake and open-cost caps, separate from the model
+          // lanes' budgets above.
+          {"arbitrage_daily_dollars", 60.0}, {"arbitrage_max_open_dollars", 40.0}};
 }
 
 json validate_systematic_settings(const json& patch, const json& previous) {
@@ -201,6 +262,27 @@ json validate_systematic_settings(const json& patch, const json& previous) {
         for (auto it = r.begin(); it != r.end(); ++it) routes[it.key()] = it.value();
       }
     out["model_routes"] = routes;
+  }
+  // Lanes merge entry by entry like the routes, and each lane is completed from the defaults.
+  {
+    const double base = patch.contains("lane_base_stake") && patch["lane_base_stake"].is_number()
+                            ? patch["lane_base_stake"].get<double>()
+                            : previous.contains("lane_base_stake") && previous["lane_base_stake"].is_number()
+                                  ? previous["lane_base_stake"].get<double>() : 5.0;
+    json lanes = defaults["lanes"];
+    for (const json* src : {&previous, &patch})
+      if (src->contains("lanes")) {
+        const json& r = (*src)["lanes"];
+        if (!r.is_object()) throw std::invalid_argument("lanes must be an object of model -> lane");
+        for (auto it = r.begin(); it != r.end(); ++it) {
+          if (!it.value().is_object()) throw std::invalid_argument("lane " + it.key() + " must be an object");
+          json merged = lanes.contains(it.key()) ? lanes[it.key()] : json::object();
+          for (auto f = it.value().begin(); f != it.value().end(); ++f) merged[f.key()] = f.value();
+          lanes[it.key()] = merged;
+        }
+      }
+    for (auto it = lanes.begin(); it != lanes.end(); ++it) it.value() = lane_object(it.value(), base);
+    out["lanes"] = lanes;
   }
   // The nine category switches used to be booleans. A settings row written before this change
   // still holds them that way, and rejecting it would lock the desk out of its own saved state,
@@ -266,13 +348,45 @@ json validate_systematic_settings(const json& patch, const json& previous) {
     }
     out["graduated_models"] = grads;
   }
+  for (auto it = out["lanes"].begin(); it != out["lanes"].end(); ++it) {
+    if (!model_key_ok(it.key())) throw std::invalid_argument("lane key \"" + it.key() + "\" is not a model name");
+    const json& l = it.value();
+    if (!l["stage"].is_string() || !valid_lane_stage(l["stage"].get<std::string>()))
+      throw std::invalid_argument("lane " + it.key() + ": stage must be research, paper, live_candidate or live");
+    if (!l["stake"].is_number() || l["stake"].get<double>() < .5 || l["stake"].get<double>() > 10000)
+      throw std::invalid_argument("lane " + it.key() + ": stake must be a number in [0.5, 10000]");
+    for (const char* k : {"evaluated_trades", "negative_windows", "since_ts"})
+      if (!l[k].is_number() || l[k].get<double>() < 0) throw std::invalid_argument(std::string("lane ") + it.key() + ": " + k + " must be >= 0");
+    if (!l["asymmetric"].is_boolean()) throw std::invalid_argument("lane " + it.key() + ": asymmetric must be true or false");
+    if (!l["halted_day"].is_string() || !l["windows"].is_array())
+      throw std::invalid_argument("lane " + it.key() + ": halted_day must be a string and windows a list");
+  }
+  {
+    const std::string a = out["lane_loss_stop_action"].get<std::string>();
+    if (a != "research" && a != "halt_day") throw std::invalid_argument("lane_loss_stop_action must be research or halt_day");
+  }
+  range("lane_base_stake", .5, 1000); range("lane_max_stake", .5, 10000); range("lane_window_trades", 5, 1000);
+  range("lane_band_z", 0, 5); range("lane_negative_windows_to_research", 1, 20); range("lane_daily_loss_stop_frac", .005, 1);
+  range("lane_daily_volume_dollars", .5, 100000);
+  range("arbitrage_daily_dollars", 0, 100000); range("arbitrage_max_open_dollars", 0, 100000); range("asymmetric_max_price", .01, .99); range("asymmetric_override_edge", 0, 1);
+  whole("lane_window_trades"); whole("lane_negative_windows_to_research");
+  if (number(out, "lane_base_stake") > number(out, "lane_max_stake"))
+    throw std::invalid_argument("lane_base_stake must not exceed lane_max_stake");
   std::string style = out["entry_style"].get<std::string>();
   if (style != "auto" && style != "maker" && style != "taker")
     throw std::invalid_argument("entry_style must be auto, maker or taker");
+  {
+    const std::string ma = out["manual_additions"].get<std::string>();
+    if (ma != "offer" && ma != "hide")
+      throw std::invalid_argument("manual_additions must be offer or hide");
+  }
   if (str(out,"stop_loss_mode") != "price" && str(out,"stop_loss_mode") != "fraction")
     throw std::invalid_argument("stop_loss_mode must be price or fraction");
   if (!std::set<std::string>{"UTC","America/Chicago","America/New_York","America/Los_Angeles","America/Denver"}.count(str(out,"settlement_day_tz")))
     throw std::invalid_argument("unsupported settlement day timezone");
+  range("rows_per_event", 1, 20);
+  range("manual_submit_tolerance", 0, .10);
+  range("manual_order_ttl_seconds", 0, 86400);
   range("min_win_probability", .01, .99); range("min_edge", 0, .5); range("max_edge", .01, 1.0);
   range("manual_min_edge", 0, .5);
   range("uncertainty_buffer", 0, 5); range("max_spread", .01, .5); range("max_model_gap", .01, 1.0);
@@ -374,8 +488,14 @@ std::string systematic_entry_cancel_reason(const json& t, const json& m, const j
     if (mr != RouteMode::Auto)
       return "model " + q.model_key() + " is routed to " + route_name(mr) + (known ? "" : " (no route set)") +
              ": it is not the algorithm's to send";
-    if (!model_graduated(s, q.model_name, q.model_version))
+    // Mirror the router (decision_router.cpp): a lane is gated by its stage, not by graduation.
+    // Without this every resting lane entry was cancelled the cycle after it was posted.
+    if (lane_managed(s, q.model_name)) {
+      if (!lane_trades_live(s, q.model_name))
+        return "lane " + q.model_name + " is at stage " + lane_stage(s, q.model_name) + ": the algorithm does not send it";
+    } else if (!model_graduated(s, q.model_name, q.model_version)) {
       return "model " + q.model_key() + " has not graduated to unattended execution";
+    }
     if (!q.settlement_verified) return "settlement of this contract is not verified for " + q.model_key();
     if (q.research_only) return "model is no longer eligible for automatic execution: research estimate";
     if (std::isfinite(q.sigma) && q.sigma > number(s, "auto_max_sigma", .10) + 1e-9)
@@ -400,7 +520,13 @@ std::string systematic_entry_cancel_reason(const json& t, const json& m, const j
   const EdgeCandidate at = candidate_at(q, book, held_side,
                                         str(t, "entry_style") == "taker" ? "taker" : "maker", number(t, "entry_price"),
                                         fee_model(m), es);
-  if (!(at.fair_probability >= number(s, "min_win_probability") - 1e-9)) return "win probability fell below the entry floor";
+  // The cheap-side filter replaces the win-probability floor for lanes, as in the router.
+  const bool asymmetric = lane_asymmetric(s, q.model_name);
+  if (!asymmetric && !(at.fair_probability >= number(s, "min_win_probability") - 1e-9))
+    return "win probability fell below the entry floor";
+  if (asymmetric && at.entry_price > number(s, "asymmetric_max_price", .45) + 1e-9 &&
+      at.executable_edge <= number(s, "asymmetric_override_edge", .10) + 1e-9)
+    return "the resting price is above the lane's cheap-side ceiling and the edge is under the override";
   if (!at.executable || at.executable_edge < number(s, "min_edge") - 1e-9) return "edge vanished at the resting order price";
   if (at.net_edge > number(s, "max_edge") + 1e-9) return "edge exceeds the automatic entry cap";
   return "";
@@ -578,7 +704,7 @@ void SystematicTrader::upsert_trade(json& t) {
   auto n = [&](const char* k) { return SqlValue(number(t, k)); };
   auto i = [&](const char* k) { return SqlValue(integer(t, k)); };
   if (integer(t, "id") == 0) {
-    store_.exec(
+    const long long new_id = store_.insert(
         "INSERT INTO systematic_trades(ticker,event_ticker,series_ticker,title,side,state,mode,opened_ts,filled_ts,closed_ts,"
         "day,entry_proposal_id,entry_order_id,entry_style,entry_price,count,filled,entry_cost,entry_fee,exit_proposal_id,"
         "exit_order_id,exit_price,exit_proceeds,exit_fee,exit_reason,realized_pnl,p_win,edge,kelly,settings_version,note,"
@@ -589,8 +715,7 @@ void SystematicTrader::upsert_trade(json& t) {
          n("exit_price"), n("exit_proceeds"), n("exit_fee"), s("exit_reason"), n("realized_pnl"), n("p_win"), n("edge"),
          n("kelly"), i("settings_version"), s("note"), n("mark_price"), i("mark_ts"), n("unrealized"), i("exit_attempt_ts"),
          s("fair_strategy")});
-    json row = store_.query("SELECT last_insert_rowid() AS id");
-    t["id"] = row.empty() ? 0 : row[0].value("id", 0LL);
+    t["id"] = new_id;
     return;
   }
   store_.exec(
@@ -639,6 +764,13 @@ void SystematicTrader::roll_day(long long now) {
   if (str(state_, "day") == day) return;
   bool first = str(state_, "day").empty();
   state_["day"] = day;
+  // Stakes move at the day roll, never mid-day (and at startup, which catches up the windows that
+  // completed while the desk was down). A failure here must not skip the rest of the roll.
+  try {
+    evaluate_lanes(now);
+  } catch (const std::exception& e) {
+    log("error", std::string("lane evaluation at the day roll: ") + e.what());
+  }
   if (first) return;
   state_["loss_stop_base"] = 0.0;
   if (yes(state_, "halted") && str(state_, "halt_reason").find("loss stop") != std::string::npos) {
@@ -656,9 +788,135 @@ void SystematicTrader::roll_day(long long now) {
   }
 }
 
+// ---- lanes ---------------------------------------------------------------------------------------
+
+void SystematicTrader::evaluate_lanes(long long now) {
+  json& settings = state_["settings"];
+  if (!settings.contains("lanes") || !settings["lanes"].is_object()) return;
+  bool changed = false;
+  for (auto it = settings["lanes"].begin(); it != settings["lanes"].end(); ++it) {
+    const std::string model = it.key();
+    std::vector<double> pnl, fees;
+    for (const auto& r : store_.query(
+             "SELECT realized_pnl, entry_fee, exit_fee FROM systematic_trades WHERE mode='live' AND state='closed' "
+             "AND fair_strategy=? AND closed_ts>=? ORDER BY closed_ts, id",
+             {model, static_cast<long long>(number(it.value(), "since_ts"))})) {
+      pnl.push_back(number(r, "realized_pnl"));
+      fees.push_back(number(r, "entry_fee") + number(r, "exit_fee"));
+    }
+    std::vector<std::string> notes;
+    json updated = apply_lane_windows(it.value(), model, pnl, fees, settings, &notes);
+    if (updated != it.value()) { it.value() = updated; changed = true; }
+    for (const auto& n : notes) log(n.find("back to research") != std::string::npos ? "warn" : "info", "lane " + n);
+  }
+  if (changed) state_["settings_version"] = integer(state_, "settings_version") + 1;
+  (void)now;
+}
+
+// Per lane, for the current trading day and mode: stake put on (volume), realized, and the mark.
+json SystematicTrader::lane_today(const std::string& mode, long long now) {
+  json out = json::object();
+  const long long since = day_start_epoch(str(state_, "day"), cfg_.risk.day_tz, now);
+  for (const auto& r : store_.query(
+           "SELECT fair_strategy AS m, "
+           "SUM(CASE WHEN opened_ts>=? AND state NOT IN ('canceled','failed') THEN "
+           "  CASE WHEN state='entering' THEN count*entry_price ELSE entry_cost END ELSE 0 END) AS volume, "
+           "SUM(CASE WHEN state='closed' AND closed_ts>=? THEN realized_pnl ELSE 0 END) AS realized, "
+           "SUM(CASE WHEN state IN ('open','exiting','settling') THEN unrealized ELSE 0 END) AS unrealized "
+           "FROM systematic_trades WHERE mode=? GROUP BY fair_strategy",
+           {since, since, mode})) {
+    const double realized = number(r, "realized"), unrealized = number(r, "unrealized");
+    out[str(r, "m")] = {{"volume", round4(number(r, "volume"))}, {"realized", round4(realized)},
+                        {"unrealized", round4(unrealized)}, {"pnl", round4(realized + unrealized)}};
+  }
+  return out;
+}
+
+void SystematicTrader::check_lane_loss_stops(long long now) {
+  json& settings = state_["settings"];
+  if (!settings.contains("lanes") || !settings["lanes"].is_object()) return;
+  const double limit = number(settings, "lane_daily_loss_stop_frac") * cfg_.bankroll_dollars;
+  if (limit <= 0) return;
+  // A lane's stage is about live trading: paper losses must not demote or stop it.
+  if (str(state_, "mode") != "live") return;
+  const json today = lane_today(str(state_, "mode"), now);
+  const std::string day = str(state_, "day");
+  bool changed = false;
+  for (auto it = settings["lanes"].begin(); it != settings["lanes"].end(); ++it) {
+    if (!lane_trades_live(settings, it.key(), day) || !today.contains(it.key())) continue;
+    const double pnl = number(today[it.key()], "pnl");
+    if (pnl > -limit) continue;
+    const std::string why = "lane " + it.key() + ": today " + fmt2(pnl) + " is past the daily loss stop of -" +
+                            fmt2(limit) + " (" + fmt2(100 * number(settings, "lane_daily_loss_stop_frac")) + "% of bankroll)";
+    if (str(settings, "lane_loss_stop_action") == "halt_day") {
+      it.value()["halted_day"] = day;
+      log("warn", why + ": no new entries in this lane until the day rolls; open trades keep their exits");
+    } else {
+      it.value()["stage"] = "research";
+      log("warn", why + ": back to research (promote by hand to trade it again); open trades keep their exits");
+    }
+    changed = true;
+  }
+  if (changed) state_["settings_version"] = integer(state_, "settings_version") + 1;
+}
+
+// Attribution: every model the algorithm has traded (and every lane, traded or not), live mode.
+json SystematicTrader::lanes_view(long long now) {
+  const json& settings = state_["settings"];
+  const json today = lane_today("live", now);
+  std::map<std::string, json> rows;
+  for (const auto& r : store_.query(
+           "SELECT fair_strategy AS m, COUNT(*) AS trades, "
+           "SUM(CASE WHEN state='closed' THEN 1 ELSE 0 END) AS settled, "
+           "SUM(CASE WHEN state='closed' AND realized_pnl>0 THEN 1 ELSE 0 END) AS wins, "
+           "SUM(CASE WHEN state='closed' THEN realized_pnl ELSE 0 END) AS realized, "
+           "SUM(CASE WHEN state='closed' THEN COALESCE(entry_fee,0)+COALESCE(exit_fee,0) ELSE 0 END) AS fees, "
+           "SUM(CASE WHEN state IN ('open','exiting','settling') THEN 1 ELSE 0 END) AS open_n, "
+           "SUM(CASE WHEN state IN ('open','exiting','settling') THEN entry_cost ELSE 0 END) AS open_cost "
+           "FROM systematic_trades WHERE mode='live' GROUP BY fair_strategy")) {
+    const std::string m = str(r, "m").empty() ? "(unknown)" : str(r, "m");
+    const double settled = number(r, "settled");
+    rows[m] = {{"model", m}, {"trades", integer(r, "trades")}, {"settled", integer(r, "settled")},
+               {"wins", integer(r, "wins")}, {"realized", round4(number(r, "realized"))}, {"fees", round4(number(r, "fees"))},
+               {"pnl_per_trade", settled > 0 ? json(round4(number(r, "realized") / settled)) : json(nullptr)},
+               {"open", integer(r, "open_n")}, {"open_cost", round4(number(r, "open_cost"))}};
+  }
+  if (settings.contains("lanes") && settings["lanes"].is_object())
+    for (auto it = settings["lanes"].begin(); it != settings["lanes"].end(); ++it)
+      if (!rows.count(it.key())) rows[it.key()] = {{"model", it.key()}, {"trades", 0}, {"settled", 0}, {"wins", 0},
+                                                   {"realized", 0.0}, {"fees", 0.0}, {"pnl_per_trade", nullptr},
+                                                   {"open", 0}, {"open_cost", 0.0}};
+  const int window = static_cast<int>(number(settings, "lane_window_trades", 30));
+  const double volume_cap = number(settings, "lane_daily_volume_dollars");
+  json out = json::array();
+  for (auto& [m, row] : rows) {
+    const json t = today.contains(m) ? today[m] : json::object();
+    row["today"] = {{"volume", number(t, "volume")}, {"pnl", number(t, "pnl")}, {"realized", number(t, "realized")},
+                    {"unrealized", number(t, "unrealized")}};
+    if (lane_managed(settings, m)) {
+      const json& l = settings["lanes"][m];
+      long long counted = 0;
+      for (const auto& r : store_.query("SELECT COUNT(*) AS n FROM systematic_trades WHERE mode='live' AND state='closed' "
+                                        "AND fair_strategy=? AND closed_ts>=?", {m, integer(l, "since_ts")}))
+        counted = integer(r, "n");
+      row["lane"] = {{"stage", str(l, "stage")}, {"stake", number(l, "stake")}, {"negative_windows", integer(l, "negative_windows")},
+                     {"evaluated_trades", integer(l, "evaluated_trades")}, {"halted_today", str(l, "halted_day") == str(state_, "day")},
+                     {"trades_to_next_window", std::max<long long>(0, integer(l, "evaluated_trades") + window - counted)},
+                     {"volume_left_today", round4(std::max(0.0, volume_cap - number(t, "volume")))},
+                     {"windows", l.contains("windows") ? l["windows"] : json::array()}};
+    } else {
+      row["lane"] = nullptr;   // traded before lanes, or routed by graduated_models: attribution only
+    }
+    out.push_back(row);
+  }
+  return out;
+}
+
 json systematic_capital(Store& store, const json& settings, const std::string& mode) {
   double committed=0, realized=0, transferred=std::atof(store.kv_get("systematic_transferred:"+mode).value_or("0").c_str());
-  for (const auto& t : store.query("SELECT state,entry_cost,count,entry_price,entry_fee,realized_pnl FROM systematic_trades WHERE mode=?",{mode})) {
+  // The model lanes' allocation. Basket legs are accounted separately (arbitrage_* settings).
+  for (const auto& t : store.query("SELECT state,entry_cost,count,entry_price,entry_fee,realized_pnl FROM systematic_trades "
+                                   "WHERE mode=? AND COALESCE(fair_strategy,'')!='ladder_arb'",{mode})) {
     const auto state = str(t,"state");
     realized += number(t,"realized_pnl");
     if (state=="released") transferred += number(t,"entry_cost");
@@ -717,6 +975,11 @@ SystematicTrader::ExitPlan SystematicTrader::plan_exit(json& t, const json& m, d
     e.style = "maker"; e.price = maker_px; return e;
   };
   auto best = [&](const std::string& why) { return (deep && !hole) ? taker(why) : maker(why); };
+  // Lane trades are held to settlement (M2): every early exit in a binary costs a 2-4c round
+  // trip and the mid barely moves inside an hour. Only the thesis stop and the price stop below
+  // take one off early.
+  const bool hold_settle = yes(s, "hold_to_settlement") && lane_managed(s, str(t, "fair_strategy"));
+  if (hold_settle) { tp = 0; hold = 0; }
   if (tp > 0 && gain >= tp - 1e-9) return taker("take profit: bid " + fmt2(bid) + " nets " + fmt2(gain) + " over entry " + fmt2(entry));
   // Hold value against executable sale: the position is worth p(win) a contract at settlement;
   // if the bid, net of the fee to hit it, pays more than that, the market is paying more than the
@@ -726,7 +989,7 @@ SystematicTrader::ExitPlan SystematicTrader::plan_exit(json& t, const json& m, d
   if (fair_ok) {
     double p_yes = number(m, "p_model");
     win = str(t, "side") == "yes" ? p_yes : 1 - p_yes;
-    if (yes(s,"model_value_exit") && win + .005 <= bid - fm.fee(bid, 1, true))
+    if (!hold_settle && yes(s,"model_value_exit") && win + .005 <= bid - fm.fee(bid, 1, true))
       return taker("market pays more than the position is worth: bid " + fmt2(bid) + " net vs p(win) " + fmt2(win));
     // The thesis stop: the model itself now values the contract sl under what was paid. The
     // estimate that put the trade on has moved against it by more than the whole edge; the
@@ -1334,8 +1597,11 @@ void SystematicTrader::live_enter(const json& board, const json& screen, long lo
   std::set<std::string> held;
   double open_cost = 0;
   int open_n = 0;
+  // Basket legs have their own budget (live_arbitrage) and do not count against the model lanes'
+  // open cost or position count: a full basket book must not block every lane entry.
   for (const auto& t : store_.query("SELECT event_ticker, entry_cost, count, entry_price, state FROM systematic_trades "
-                                     "WHERE mode='live' AND state IN ('entering','open','exiting','settling')")) {
+                                     "WHERE mode='live' AND state IN ('entering','open','exiting','settling') "
+                                     "AND COALESCE(fair_strategy,'')!='ladder_arb'")) {
     ++open_n;
     open_cost += t.value("state", "") == "entering" ? t.value("count", 0.0) * t.value("entry_price", 0.0) : t.value("entry_cost", 0.0);
   }
@@ -1351,9 +1617,32 @@ void SystematicTrader::live_enter(const json& board, const json& screen, long lo
                                number(systematic_capital(store_,s,"live"),"available"));
   double bankroll = std::min(cfg_.bankroll_dollars,number(s,"capital_budget_dollars"));
   if (auto a = store_.last_account()) bankroll = std::min(bankroll, std::max(0.0, a->balance + a->portfolio_value));
+  // Lanes (M2): a lane's stake replaces the per-trade dollars and the Kelly scaling, and the lane's
+  // own daily volume budget caps it. Models that are not lanes size exactly as before.
+  const json lanes_today = lane_today("live", now);
+  std::map<std::string, double> lane_left;
+  // A lane row: its stage and daily volume budget always apply; its stake only with lane sizing on.
+  auto lane_of_row = [&](const json& r) {
+    const std::string m = str(r, "model", str(r, "fair_strategy"));
+    return lane_managed(s, m) ? m : std::string();
+  };
+  auto lane_volume_left = [&](const std::string& m) -> double& {
+    auto it = lane_left.find(m);
+    if (it == lane_left.end())
+      it = lane_left.emplace(m, number(s, "lane_daily_volume_dollars") -
+                                    (lanes_today.contains(m) ? number(lanes_today[m], "volume") : 0.0)).first;
+    return it->second;
+  };
   // One sizing rule for a first send and for a re-priced one.
   auto dollars_for = [&](const json& r, double cost_per) {
+    const std::string lane = lane_of_row(r);
+    // Capped by the desk's per-order limit too: risk refuses an order over it outright, so a stake
+    // that has doubled past it is sent at the limit rather than refused every time.
+    if (!lane.empty() && yes(s, "lane_sizing_enabled"))
+      return std::min({lane_stake(s, lane), cfg_.risk.max_order_dollars, lane_volume_left(lane), budget_left,
+                       number(s, "max_open_dollars") - open_cost});
     double dollars = number(s, str(r,"category")=="sports"?"sports_per_trade_dollars":"per_trade_dollars");
+    if (!lane.empty()) dollars = std::min(dollars, lane_volume_left(lane));
     if (number(s, "kelly_fraction") > 0)
       dollars = std::min(dollars, std::max(cost_per, number(s, "kelly_fraction") * number(r, "kelly") * bankroll));
     return std::min({dollars, budget_left, number(s, "max_open_dollars") - open_cost});
@@ -1383,11 +1672,14 @@ void SystematicTrader::live_enter(const json& board, const json& screen, long lo
     const std::string ticker = str(row, "ticker"), event = str(row, "event_ticker");
     if (held.count(event)) continue;
     if (auto cd = cooldowns.find(event); cd != cooldowns.end() && cd->second > now) continue;
+    // A lane stopped for the day (its loss stop) or demoted since the screen ran sends nothing.
+    const std::string row_lane = lane_of_row(row);
+    if (!row_lane.empty() && !lane_trades_live(s, row_lane, str(state_, "day"))) continue;
+    if (!row_lane.empty() && lane_volume_left(row_lane) < number(row, "price") + number(row, "fee")) continue;
     auto ru = refused_until_.find(ticker);
     if (ru != refused_until_.end() && ru->second > now) continue;
     double cost_per = number(row, "price") + number(row, "fee");
     if (cost_per <= 0) continue;
-    double dollars = dollars_for(row, cost_per);
     double count = count_for(row, cost_per);
     if (count < 1) {
       if (budget_left < cost_per) { log("info", "daily budget used up ($" + fmt2(spent_today()) + " of $" + fmt2(number(s, "daily_budget_dollars")) + ")"); break; }
@@ -1416,6 +1708,11 @@ void SystematicTrader::live_enter(const json& board, const json& screen, long lo
         if (taker) px = ask;
         const EdgeCandidate c = decision_edge_at(row, taker ? "taker" : "maker", px, s);
         if (!c.executable || c.executable_edge + 1e-9 < number(s, "min_edge")) break;   // the ladder stops at the edge floor
+        // ...and, for a cheap-side lane, at the price ceiling the router applied to the first post.
+        if (lane_asymmetric(s, str(row, "model", str(row, "fair_strategy"))) &&
+            c.entry_price > number(s, "asymmetric_max_price", .45) + 1e-9 &&
+            c.executable_edge <= number(s, "asymmetric_override_edge", .10) + 1e-9)
+          break;
         best = c;
         improved = true;
         if (taker) break;
@@ -1433,7 +1730,7 @@ void SystematicTrader::live_enter(const json& board, const json& screen, long lo
         send_row["kelly"] = round4(best.kelly);
         const double best_price = best.entry_price;
         cost_per = best_price + fee;
-        count = std::floor(std::min({dollars, budget_left, number(s, "max_open_dollars") - open_cost}) / cost_per);
+        count = std::floor(dollars_for(send_row, cost_per) / cost_per);
         if (taker) count = std::min(count, std::floor(number(row, "ask_size")));
         if (count < 1) continue;
         log("info", ticker + ": ladder step " + std::to_string(improve) + ", " + (taker ? "taking the offer at " : "posting at ") + fmt2(best_price) +
@@ -1494,6 +1791,7 @@ void SystematicTrader::live_enter(const json& board, const json& screen, long lo
       held.insert(event);
       open_cost += count * cost_per;
       budget_left -= count * cost_per;
+      if (!row_lane.empty()) lane_volume_left(row_lane) -= count * cost_per;
     } else if (!yes(state_, "running")) {
       break;   // stopped itself on a rejection
     }
@@ -1515,13 +1813,27 @@ void SystematicTrader::live_arbitrage(long long now) {
     std::string key = b == std::string::npos ? p.event_ticker : p.note.substr(b, p.note.find('|', b) - b);
     baskets[key].push_back(p);
   }
-  const json capital=systematic_capital(store_,s,"live");
-  double budget_left=std::min({number(s,"daily_budget_dollars")-spent_today(),number(capital,"available"),
-                             number(s,"max_open_dollars")-number(capital,"committed")});
+  // Baskets are their own lane with their own budget (M4): a locked basket and a model's opinion
+  // should not compete for the same dollars, and the plan scales baskets to their cap while the
+  // model lanes stay small. Account cash, the per-order cap and the turnover cap still apply in
+  // the executor.
+  double arb_today = 0, arb_open = 0;
+  for (const auto& r : store_.query(
+           "SELECT COALESCE(SUM(CASE WHEN opened_ts>=? AND state NOT IN ('canceled','failed') THEN "
+           "  CASE WHEN state='entering' THEN count*entry_price ELSE entry_cost END ELSE 0 END),0) AS today, "
+           "COALESCE(SUM(CASE WHEN state IN ('entering','open','exiting','settling') THEN "
+           "  CASE WHEN state='entering' THEN count*entry_price ELSE entry_cost END ELSE 0 END),0) AS open_cost "
+           "FROM systematic_trades WHERE mode='live' AND fair_strategy='ladder_arb'",
+           {day_start_epoch(str(state_, "day"), cfg_.risk.day_tz, now)})) {
+    arb_today = number(r, "today");
+    arb_open = number(r, "open_cost");
+  }
+  double budget_left = std::min(number(s, "arbitrage_daily_dollars") - arb_today,
+                                number(s, "arbitrage_max_open_dollars") - arb_open);
   for (auto& [key, legs] : baskets) {
     double cost = 0, edge = 0;
     for (const auto& l : legs) { cost += l.count * (l.price + l.fee_per); edge += l.count * l.net_edge; }
-    if (cost > budget_left + 1e-9) { log("info", "basket " + key + " needs $" + fmt2(cost) + ", over the remaining daily budget"); continue; }
+    if (cost > budget_left + 1e-9) { log("info", "basket " + key + " needs $" + fmt2(cost) + ", over the arbitrage budget left ($" + fmt2(std::max(0.0, budget_left)) + ")"); continue; }
     int ok = 0;
     double committed = 0;
     for (auto l : legs) {
@@ -1544,7 +1856,7 @@ void SystematicTrader::live_arbitrage(long long now) {
       }
       catch (const std::exception& e) { log("warn", "basket leg " + l.ticker + " " + l.outcome_side + " not sent: " + e.what()); }
     }
-    if (ok > 0) { add_spent(committed); budget_left-=committed; hooks_.request_reconcile(); }
+    if (ok > 0) { budget_left -= committed; hooks_.request_reconcile(); }
     log(ok == static_cast<int>(legs.size()) ? "trade" : "warn",
         "locked basket " + key + ": " + std::to_string(ok) + "/" + std::to_string(legs.size()) + " legs sent, cash $" +
             fmt2(cost) + ", locked $" + fmt2(edge) + (ok == static_cast<int>(legs.size()) ? "" : " - PARTIAL: a directional position may be left"));
@@ -1620,7 +1932,12 @@ void SystematicTrader::paper_enter(const json& screen, long long now) {
     double price = std::min(0.99, number(row, "ask") + slip);
     FeeModel fm = fee_model(row);
     double cost_per = price + fm.fee(price, 1, true);
-    double dollars = std::min({number(s,str(row,"category")=="sports"?"sports_per_trade_dollars":"per_trade_dollars"), budget_left, number(s, "max_open_dollars") - open_cost});
+    const std::string model = str(row, "model", str(row, "fair_strategy"));
+    const bool lane = lane_managed(s, model);   // the stage gates a lane whether or not it sizes by stake
+    if (lane && !lane_trades_live(s, model, str(state_, "day"))) continue;
+    double dollars = std::min({lane && yes(s, "lane_sizing_enabled") ? std::min(lane_stake(s, model), cfg_.risk.max_order_dollars)
+                                    : number(s,str(row,"category")=="sports"?"sports_per_trade_dollars":"per_trade_dollars"),
+                               budget_left, number(s, "max_open_dollars") - open_cost});
     double count = std::floor(std::min(dollars / cost_per, number(row, "ask_size")));
     if (count < 1) continue;
     double fee = fm.fee(price, count, true), cost = count * price + fee;
@@ -1681,6 +1998,11 @@ void SystematicTrader::step(const json& board, const json& screen, long long now
     state_["halt_reason"] = "daily loss stop: today " + fmt2(today) + (base < 0 ? " (from " + fmt2(base) + ")" : "") +
                             " <= -" + fmt2(stop) + " (no new entries until the day rolls or you clear it; exits keep running)";
     log("warn", state_["halt_reason"].get<std::string>());
+  }
+  try {
+    check_lane_loss_stops(now);
+  } catch (const std::exception& e) {
+    log("error", std::string("lane loss stops: ") + e.what());
   }
   if (yes(state_, "running") && !yes(state_, "halted") && !hooks_.killed()) {
     try {
@@ -1807,6 +2129,7 @@ json SystematicTrader::view_unlocked() {
   out["performance"] = performance(now);
   out["execution_stats"] = execution_stats();
   out["capital"] = systematic_capital(store_,state_["settings"],str(state_,"mode"));
+  out["lanes"] = lanes_view(now);
   out["spent_today"] = spent_today();
   out["live_possible"] = exec_ != nullptr && exec_->armed();
   out["killed"] = hooks_.killed();
@@ -1887,6 +2210,35 @@ json SystematicTrader::configure(const json& body) {
   long long now = now_s();
   if (body.contains("settings")) {
     json settings = validate_systematic_settings(body["settings"], state_["settings"]);
+    // Promoting a lane by hand (research or paper -> live_candidate or live) starts its evidence
+    // afresh: the streak that demoted it does not demote it again on the next window.
+    for (auto it = settings["lanes"].begin(); it != settings["lanes"].end(); ++it) {
+      const std::string was = lane_stage(state_["settings"], it.key());
+      const std::string now_stage = str(it.value(), "stage");
+      const bool was_live = was == "live_candidate" || was == "live";
+      const bool is_live = now_stage == "live_candidate" || now_stage == "live";
+      // A lane that did not exist before and arrives at a live stage starts its evidence now too:
+      // with since_ts 0 it would inherit every trade the model ever made.
+      if (is_live && !was_live) {
+        it.value()["negative_windows"] = 0;
+        it.value()["evaluated_trades"] = 0;
+        it.value()["since_ts"] = now;
+        it.value()["halted_day"] = "";
+        // And the stake it was demoted at is not the stake it comes back at: base, unless this
+        // same patch sets one explicitly.
+        const bool stake_in_patch = body["settings"].contains("lanes") && body["settings"]["lanes"].contains(it.key()) &&
+                                    body["settings"]["lanes"][it.key()].contains("stake");
+        if (!stake_in_patch) it.value()["stake"] = number(settings, "lane_base_stake", 5.0);
+      } else if (was == "live" && now_stage == "live_candidate") {
+        // live_candidate means "at the base stake" (lanes.h). Moved back by hand, the stake follows.
+        const bool stake_in_patch = body["settings"].contains("lanes") && body["settings"]["lanes"].contains(it.key()) &&
+                                    body["settings"]["lanes"][it.key()].contains("stake");
+        if (!stake_in_patch) it.value()["stake"] = number(settings, "lane_base_stake", 5.0);
+        log("warn", "lane " + it.key() + " set back to live_candidate by hand: stake to the base");
+        log("warn", "lane " + it.key() + " promoted by hand to " + now_stage + " at $" + fmt2(number(it.value(), "stake")) +
+                        "; its results are counted from now");
+      }
+    }
     if (settings != state_["settings"]) {
       state_["settings"] = settings;
       state_["settings_version"] = integer(state_, "settings_version") + 1;

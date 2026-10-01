@@ -170,6 +170,7 @@ PerpsConfig perps_config(const nlohmann::json& p) {
   PerpsConfig c;
   if (!p.is_object()) return c;
   c.enabled = p.value("enabled", c.enabled);
+  c.retired = p.value("retired", c.retired);
   c.max_order_notional = p.value("max_order_notional", c.max_order_notional);
   c.max_total_notional = p.value("max_total_notional", c.max_total_notional);
   c.max_leverage = p.value("max_leverage", c.max_leverage);
@@ -256,8 +257,18 @@ PerpsDesk::PerpsDesk(const Config& cfg, Store& store, KalshiClient& client)
     algo_state_["running"] = false;
     algo_log("warn", "perps rule stopped: live mode needs an API key");
   }
+  if (pc_.retired && algo_state_.value("running", false) && !algo_state_.value("paper", true)) {
+    algo_state_["running"] = false;
+    algo_log("warn", "perps rule stopped: perps are retired from live trading (params.perps.retired); "
+                     "open rule trades keep their exit rules");
+  }
   if (algo_state_.value("running", false)) algo_log("info", "perps rule resumed after a restart");
   algo_persist();
+}
+
+bool PerpsDesk::live_rule_running() {
+  Lock lk(mu_);
+  return algo_state_.value("running", false) && !algo_state_.value("paper", true);
 }
 
 void PerpsDesk::algo_persist() { store_.kv_set(kAlgoKey, algo_state_.dump()); }
@@ -662,7 +673,16 @@ json PerpsDesk::configure_algo(const json& body) {
   }
   if (body.contains("paper")) {
     if (!body["paper"].is_boolean()) throw std::invalid_argument("paper must be boolean");
+    // The rule manages only the trades of its current mode. Switching to paper with live rule trades
+    // open would leave them without exit management, and a retired rule cannot switch back.
+    if (body["paper"].get<bool>() && !st.value("paper", true) &&
+        !store_.query("SELECT id FROM perp_algo_trades WHERE mode='live' AND state IN ('entering','open') LIMIT 1").empty())
+      throw std::invalid_argument("live rule trades are still open; they keep their exit rules in live mode. "
+                                  "Close them (Perps tab) or let them exit before switching to paper");
     if (!body["paper"].get<bool>() && !armed()) throw std::invalid_argument("live needs an API key");
+    if (!body["paper"].get<bool>() && pc_.retired)
+      throw std::invalid_argument("perps are retired from live trading (params.perps.retired in config/desk.json); "
+                                  "the rule may run in paper only");
     if (st["paper"] != body["paper"]) { st["paper"] = body["paper"]; algo_log("warn", std::string("perps rule mode -> ") + (body["paper"].get<bool>() ? "paper" : "LIVE")); }
   }
   if (body.contains("clear_halt") && body["clear_halt"].is_boolean() && body["clear_halt"].get<bool>()) {
@@ -674,6 +694,9 @@ json PerpsDesk::configure_algo(const json& body) {
     if (!body["running"].is_boolean()) throw std::invalid_argument("running must be boolean");
     bool want = body["running"].get<bool>();
     if (want && !st.value("paper", true) && !armed()) throw std::invalid_argument("live needs an API key");
+    if (want && !st.value("paper", true) && pc_.retired)
+      throw std::invalid_argument("perps are retired from live trading (params.perps.retired in config/desk.json); "
+                                  "switch the rule to paper to run it as research");
     if (want != st.value("running", false)) {
       st["running"] = want;
       algo_log("warn", want ? std::string("perps rule STARTED (") + (st.value("paper", true) ? "paper" : "LIVE") + "): entry " +
@@ -720,7 +743,11 @@ void PerpsDesk::step(long long now) {
     const char* key = taker ? "taker_fee_rates" : "maker_fee_rates";
     if (fee_tiers_.is_object() && fee_tiers_.contains(key) && fee_tiers_[key].is_object() && fee_tiers_[key].contains(t))
       return fee_tiers_[key][t].get<double>() * 1e4;
-    return taker ? 12.0 : 5.0;
+    // Fallback only, for the window before /margin/fee_tier_rates has answered. Maker was 5.0
+    // here, taken from the CFTC filing ladder; the account's own schedule says 2.0 at tier 0 and
+    // the filing is a different ladder entirely. At 5.0 the hurdle below reads 22 bps instead of
+    // the true 19, and entries that clear their real costs get refused.
+    return taker ? 12.0 : 2.0;
   };
 
   // 1. Manage what the rule holds.
@@ -852,12 +879,22 @@ void PerpsDesk::step(long long now) {
       if (last_pull.count(ticker) && now - last_pull[ticker] < static_cast<long long>(ttl)) continue;
       auto m = market(ticker);
       if (!m || !m->is_open || m->bid <= 0 || m->ask <= 0 || m->reference <= 0) continue;
-      if (now * 1000 - m->reference_ts_ms > 120000) continue;   // a stale index is not a basis
+      // Read a millisecond clock here rather than scaling `now`. `now` is whole seconds, captured
+      // by the engine BEFORE the market refresh in the same pass (engine.cpp calls refresh_public,
+      // refresh_account, then step, each with its own now_s()), so `now * 1000` can sit up to a
+      // second behind a book stamped moments ago. That made a book fetched in this very pass
+      // measure as a NEGATIVE age, which the branch below reported as "unstamped" -- and every
+      // entry in every market was refused on a book that was in fact as fresh as it gets.
+      const long long tnow_ms = now_ms();
+      if (tnow_ms - m->reference_ts_ms > 120000) continue;   // a stale index is not a basis
       // A stale BOOK is not a basis either, and it is the half that decides whether a post-only
       // price crosses. Only the index was gated here, so an old bid/ask could both fabricate a
       // basis that had already closed and price an order the exchange then refused. Said once per
       // market per run, like the unsized warning, so a quiet feed cannot flood the log.
-      const long long book_age_ms = m->quote_received_ts_ms > 0 ? now * 1000 - m->quote_received_ts_ms : -1;
+      // Floored at zero: a stamp a few milliseconds ahead of this clock read is the freshest book
+      // there is, not a broken one. After the floor, negative means one thing only -- never stamped.
+      const long long book_age_ms =
+          m->quote_received_ts_ms > 0 ? std::max(0LL, tnow_ms - m->quote_received_ts_ms) : -1;
       if (book_age_ms < 0 || book_age_ms > book_max_age_ms) {
         if (stale_book_.insert(ticker).second)
           algo_log("warn", ticker + ": book snapshot is " +
@@ -940,7 +977,7 @@ json PerpsDesk::summary() {
     auto m = market(p.ticker);
     notional += std::fabs(p.position) * (m ? (m->mark > 0 ? m->mark : m->mid()) : p.entry_price);
   }
-  return json{{"enabled", pc_.enabled}, {"armed", armed()}, {"equity", balance_cache_.equity}, {"settled_funds", balance_cache_.settled_funds},
+  return json{{"enabled", pc_.enabled}, {"retired", pc_.retired}, {"armed", armed()}, {"equity", balance_cache_.equity}, {"settled_funds", balance_cache_.settled_funds},
               {"unrealized", unreal}, {"positions", positions_cache_.size()}, {"notional", notional},
               {"maintenance_margin", balance_cache_.maintenance_margin}, {"available", balance_cache_.available},
               {"account_ts", balance_cache_.updated_ts}, {"public_ts", public_ts_}, {"last_error", last_error_},
@@ -986,6 +1023,7 @@ json PerpsDesk::pnl() {
 json PerpsDesk::view() {
   Lock lk(mu_);
   long long now = now_s();
+  const long long tnow_ms = now_ms();   // same reason as in step(): seconds cannot time a book
   json markets = json::array();
   for (const auto& [t, m] : markets_cache_) {
     auto f = funding_cache_.find(t);
@@ -996,8 +1034,8 @@ json PerpsDesk::view() {
                        {"volume_24h", m.volume_24h}, {"open_interest", m.open_interest}, {"fractional", m.fractional},
                        {"funding_rate", f == funding_cache_.end() ? json(nullptr) : json(f->second.rate)},
                        {"next_funding", f == funding_cache_.end() ? "" : f->second.next_funding_time},
-                       {"reference_age_s", m.reference_ts_ms > 0 ? (now * 1000 - m.reference_ts_ms) / 1000 : -1},
-                       {"book_age_ms", m.quote_received_ts_ms > 0 ? now * 1000 - m.quote_received_ts_ms : -1}});
+                       {"reference_age_s", m.reference_ts_ms > 0 ? std::max(0LL, tnow_ms - m.reference_ts_ms) / 1000 : -1},
+                       {"book_age_ms", m.quote_received_ts_ms > 0 ? std::max(0LL, tnow_ms - m.quote_received_ts_ms) : -1}});
   }
   json positions = json::array();
   double total_notional = 0, total_unreal = 0;

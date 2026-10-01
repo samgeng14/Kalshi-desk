@@ -1,4 +1,8 @@
 #include "desk/engine.h"
+#include <chrono>
+#include <filesystem>
+#include <system_error>
+#include <thread>
 #include "desk/decision_log.h"
 
 #include <algorithm>
@@ -97,6 +101,10 @@ Engine::Engine(Config cfg, Store& store, KalshiClient& client, Executor& exec)
       for (const auto& s : j) watch_.insert(s.get<std::string>());
     }
   }
+  // Basket-only series (M4), after the saved watch list: that list replaces the set wholesale and
+  // would otherwise drop them. A series also on the model watch list keeps its full treatment.
+  for (const auto& s : cfg_.basket_series)
+    if (!watch_.count(s)) { watch_.insert(s); basket_only_.insert(s); }
   for (auto& st : strategies_) {
     if (auto m = store_.kv_get("mode:" + st->name())) cfg_.strategy_modes[st->name()] = *m;
   }
@@ -106,6 +114,7 @@ Engine::Engine(Config cfg, Store& store, KalshiClient& client, Executor& exec)
   }
   // A request from the Trades board names the decision it was reviewed on: check it is still on
   // the board before accepting it (the full revalidation runs again just before it is sent).
+  manual_orders_.set_review_seconds(cfg_.risk.manual_review_seconds);
   manual_orders_.set_precheck([this](const json& request) { precheck_manual_decision(request); });
   publish_snapshot();
 }
@@ -133,43 +142,122 @@ void Engine::refresh_series() {
 }
 
 void Engine::refresh_markets() {
-  long long now = now_s();
-  int seen = 0;
-  for (const auto& st : watch_) {
-    std::vector<Market> ms;
-    try {
-      ms = client_.get_markets(st, "open");
-    } catch (const std::exception& e) {
-      LOG_WARN("markets %s: %s", st.c_str(), e.what());
-      last_error_ = e.what();
-      {
-        std::lock_guard<std::mutex> lk(snap_mu_);
-        if (!market_feeds_.contains(st)) market_feeds_[st] = {{"last_success_ts", 0}, {"open_count", 0}};
-        market_feeds_[st]["last_error"] = e.what();
+  const long long now = now_s();
+  // Fetch every watched series concurrently, then write on this thread. The fetches were
+  // sequential and each paid the pacing delay plus a round trip, so the refresh alone took about
+  // six seconds a cycle with 39 series. The calls are still paced by the client; the threads only
+  // stop one slow series from holding up the rest. The store is written from one thread, in one
+  // transaction, in the same order as before.
+  struct Fetched { std::string series; std::vector<Market> markets; std::string error; bool complete = true; };
+  // Basket-only series are staggered across cycles (Config::basket_refresh_every); the rest go
+  // every cycle.
+  std::vector<std::string> series;
+  {
+    const long long every = std::max(1, cfg_.basket_refresh_every);
+    long long k = 0;
+    for (const auto& st : watch_) {
+      if (basket_only_.count(st) && (k++ + cycle_count_) % every != 0) continue;
+      series.push_back(st);
+    }
+  }
+  std::vector<Fetched> got(series.size());
+  std::atomic<size_t> next{0};
+  auto worker = [&] {
+    for (size_t i = next++; i < series.size(); i = next++) {
+      got[i].series = series[i];
+      try {
+        // max_pages 5 x 1000: a series that fills every page may have more, so it is not a
+        // complete listing and nothing is retired from it below.
+        got[i].markets = client_.get_markets(series[i], "open");
+        got[i].complete = got[i].markets.size() < 5000;
+      } catch (const std::exception& e) {
+        got[i].error = e.what();
       }
-      continue;
     }
-    {
-      std::lock_guard<std::mutex> lk(snap_mu_);
-      market_feeds_[st] = {{"last_success_ts", now}, {"open_count", ms.size()}, {"last_error", ""}};
-    }
-    for (auto& m : ms) {
-      if (m.series_ticker.empty()) m.series_ticker = st;
-      store_.upsert_market(m);
-      ++seen;
-      // Research history: log the top of book when it changes, or at least every 60 s.
-      auto lq = last_quote_.find(m.ticker);
-      bool changed = lq == last_quote_.end() || lq->second.first != m.yes_bid || lq->second.second != m.yes_ask;
-      long long last = last_quote_log_.count(m.ticker) ? last_quote_log_[m.ticker] : 0;
-      if ((changed && now - last >= 5) || now - last >= 60) {
-        store_.insert_quote(now, m);
-        last_quote_log_[m.ticker] = now;
-        last_quote_[m.ticker] = {m.yes_bid, m.yes_ask};
+  };
+  const int n_threads = std::max(1, std::min<int>(cfg_.refresh_threads, static_cast<int>(series.size())));
+  std::vector<std::thread> pool;
+  // A thread that cannot be started means fewer threads, not an exception: unwinding past threads
+  // already running would destroy joinable std::threads, which is std::terminate.
+  try {
+    for (int i = 1; i < n_threads; ++i) pool.emplace_back(worker);
+  } catch (const std::system_error& e) {
+    LOG_WARN("refresh: started %zu of %d threads (%s); the rest of the series go on those", pool.size() + 1,
+             n_threads, e.what());
+  }
+  worker();
+  for (auto& t : pool) t.join();
+
+  int seen = 0;
+  std::vector<std::string> unlisted;   // stored as open, absent from a complete open listing
+  // The feed status goes to the dashboard snapshot BEFORE the transaction, never inside it: the
+  // transaction holds the store's lock, and the dashboard takes snap_mu_ and then the store's lock
+  // (board_view). Taking snap_mu_ inside the transaction deadlocked the desk in a dry run on
+  // 2026-09-23 (main: store -> snap_mu_; an HTTP thread: snap_mu_ -> store).
+  {
+    std::lock_guard<std::mutex> lk(snap_mu_);
+    for (const auto& f : got) {
+      if (!f.error.empty()) {
+        if (!market_feeds_.contains(f.series)) market_feeds_[f.series] = {{"last_success_ts", 0}, {"open_count", 0}};
+        market_feeds_[f.series]["last_error"] = f.error;
+      } else {
+        market_feeds_[f.series] = {{"last_success_ts", now}, {"open_count", f.markets.size()}, {"last_error", ""}};
       }
     }
   }
+  store_.transaction([&] {
+    for (auto& f : got) {
+      const std::string& st = f.series;
+      if (!f.error.empty()) {
+        LOG_WARN("markets %s: %s", st.c_str(), f.error.c_str());
+        last_error_ = f.error;
+        continue;
+      }
+      std::set<std::string> listed;
+      for (auto& m : f.markets) {
+        if (m.series_ticker.empty()) m.series_ticker = st;
+        listed.insert(m.ticker);
+        store_.upsert_market(m);
+        ++seen;
+        // Research history: log the top of book when it changes, or at least every 60 s.
+        auto lq = last_quote_.find(m.ticker);
+        bool changed = lq == last_quote_.end() || lq->second.first != m.yes_bid || lq->second.second != m.yes_ask;
+        long long last = last_quote_log_.count(m.ticker) ? last_quote_log_[m.ticker] : 0;
+        if (!basket_only_.count(st) && ((changed && now - last >= 5) || now - last >= 60)) {
+          store_.insert_quote(now, m);
+          last_quote_log_[m.ticker] = now;
+          last_quote_[m.ticker] = {m.yes_bid, m.yes_ask};
+        }
+      }
+      // An empty listing proves nothing (a glitch looks the same as a series with nothing open),
+      // so it never triggers a status check. Each market is asked about at most every 10 minutes.
+      if (f.complete && !f.markets.empty())
+        for (const auto& m : store_.open_markets(st))
+          if (!listed.count(m.ticker) && now - unlisted_asked_[m.ticker] >= 600) unlisted.push_back(m.ticker);
+    }
+  });
   markets_seen_ = seen;
-  // Markets that left the open set (settled/closed) get their status refreshed lazily by reconcile.
+  // A market the exchange no longer lists as open but the store still calls open. A finished
+  // game is the usual case: it leaves the open listing when it is decided, days before its
+  // close_time, and nothing refreshed its status because reconcile only looks at markets we hold.
+  // Its quote then never updates, so it was skipped as stale every cycle for as long as it lived
+  // (98 of them on 2026-09-17: 80 MLB and 18 La Liga games), and it read as a freshness problem.
+  // Ask the exchange for its real status, in batches of 100, a bounded number per cycle.
+  if (!unlisted.empty()) {
+    if (unlisted.size() > 300) unlisted.resize(300);
+    for (const auto& t : unlisted) unlisted_asked_[t] = now;
+    try {
+      // Only the exchange's own answer about a market changes its status here. A ticker the
+      // lookup does not return is left as it was: absence is not evidence.
+      auto fresh = client_.get_markets_by_tickers(unlisted);
+      store_.transaction([&] {
+        for (auto& m : fresh) store_.upsert_market(m);
+      });
+      LOG_INFO("status refreshed for %zu of %zu markets that left the open listing", fresh.size(), unlisted.size());
+    } catch (const std::exception& e) {
+      LOG_WARN("status of %zu unlisted markets: %s", unlisted.size(), e.what());
+    }
+  }
 }
 
 // ---- proposals ---------------------------------------------------------------------
@@ -230,6 +318,7 @@ void Engine::run_strategies() {
     };
     prune(last_fair_log_, now - 6 * 3600);
     prune(last_quote_log_, now - 6 * 3600);
+    prune(unlisted_asked_, now - 6 * 3600);
     for (auto it = latest_fair_ts_.begin(); it != latest_fair_ts_.end();) {
       if (now - it->second > 6 * 3600) {
         latest_fair_.erase(it->first);
@@ -241,6 +330,12 @@ void Engine::run_strategies() {
     for (auto it = last_quote_.begin(); it != last_quote_.end();)
       it = last_quote_log_.count(it->first) ? std::next(it) : last_quote_.erase(it);
   }
+  // Basket-only series go to the ladder finders and nowhere else: no model prices them.
+  const std::vector<Market> ladder_markets = markets;
+  if (!basket_only_.empty())
+    markets.erase(std::remove_if(markets.begin(), markets.end(),
+                                 [&](const Market& m) { return basket_only_.count(m.series_ticker) > 0; }),
+                  markets.end());
   for (auto& st : strategies_) {
     if (mode_for(st->name()) == "off") continue;  // "research" still collects: prepare() + fair logs
     try {
@@ -420,7 +515,7 @@ void Engine::run_strategies() {
       break;  // first strategy that covers the market wins
     }
   }
-  run_ladder_arb(markets);
+  run_ladder_arb(ladder_markets);
   int expired = store_.expire_proposals(now - cfg_.risk.proposal_ttl_seconds);
   if (expired > 0) LOG_INFO("expired %d stale proposals", expired);
 }
@@ -440,9 +535,20 @@ void Engine::run_ladder_arb(const std::vector<Market>& markets) {
   if (auto a = store_.last_account()) cash = std::max(0.0, a->balance - committed_exposure(store_).resting);
   double budget = std::min({cfg_.risk.ladder_max_cost, cash, cfg_.risk.max_open_frac * bankroll});
   int baskets = 0;
+  const long long horizon = static_cast<long long>(std::max(0.0, cfg_.risk.max_entry_horizon_hours) * 3600.0);
   for (const auto& [ev, ms] : by_event) {
-    if (baskets >= 2) break;                       // two live baskets at a time is plenty
-    if (ms.size() < 2 || budget < 1) break;
+    if (baskets >= std::max(1, cfg_.risk.ladder_max_baskets_per_cycle)) break;
+    if (budget < 1) break;
+    // An event with one open market has no basket. This used to `break`, which ended the scan for
+    // every event sorting after it: one lone market early in the alphabet hid every ladder behind it.
+    if (ms.size() < 2) continue;
+    // The executor refuses an entry settling past the T+2 horizon (risk.max_entry_horizon_hours);
+    // do not propose a basket every leg of which will be refused. Monthly and annual ladders stay
+    // out until their last two days.
+    if (horizon > 0) {
+      const long long settle = expected_settlement_ts(*ms.front());
+      if (settle <= now || settle - now > horizon) continue;
+    }
     // Already working this event by hand or with another strategy: leave it alone.
     if (!store_.query("SELECT ticker FROM positions WHERE position!=0 AND ticker IN "
                       "(SELECT ticker FROM markets WHERE event_ticker=?)", {ev}).empty()) continue;
@@ -457,6 +563,23 @@ void Engine::run_ladder_arb(const std::vector<Market>& markets) {
       continue;
     }
     if (!arb) continue;
+    // Every leg is one order, and risk refuses an order over max_order_dollars outright. A basket
+    // whose dearest leg would cross it would go out with that leg refused and the others filled:
+    // a directional position, not a lock. Size the basket so every leg fits.
+    {
+      double dearest = 0;
+      for (const auto& leg : arb->legs) dearest = std::max(dearest, leg.price + leg.fee_per);
+      if (dearest > 0 && cfg_.risk.max_order_dollars > 0) {
+        const double fit = std::floor(cfg_.risk.max_order_dollars / dearest + 1e-9);
+        if (fit < 1) continue;
+        if (arb->count > fit) {
+          const double scale = fit / arb->count;
+          arb->count = fit;
+          arb->total_cost *= scale;
+          arb->total_edge *= scale;
+        }
+      }
+    }
     // One basket per event at a time: if its legs are already queued, refresh nothing and move on.
     std::string basket = "basket " + ev + "@" + std::to_string(now / 60);
     bool already = false;
@@ -570,8 +693,42 @@ json Engine::auto_rule_json(const std::string& strategy) const {
 // reduce-only order working at (our side's fair + min_edge). If the other side of the book is
 // already paying more than that, take it. Exit proposals carry the strategy's mode: auto/bot
 // send them alone, manual queues them next to the entries.
+// A hand-placed maker order rests until it fills or you cancel it, by design: the desk does not
+// touch what it did not place. That is right in principle and was costing money in practice.
+// Twelve orders resting unfilled on 2026-09-13 held collateral the whole time - available cash on
+// a shard is balance minus what resting orders reserve - and the operator was then refused for
+// collateral on shard 0 while his own stale orders were the reason it was short. An order whose
+// price the book left behind is not working; it is a lien.
+//
+// Opt-in, and off by default, because cancelling an order somebody placed on purpose is not a
+// decision to make for them silently. Set manual_order_ttl_seconds to turn it on.
+void Engine::expire_stale_manual_orders(long long now) {
+  const double ttl = jnum(systematic_.settings_copy(), "manual_order_ttl_seconds", 0.0);
+  if (ttl <= 0) return;
+  for (const auto& o : store_.orders("resting")) {
+    // Only hand orders: the strategies already manage their own, with their own rules.
+    if (store_.kv_get("manual_order:" + o.order_id).value_or("0") != "1") continue;
+    if (o.fill_count > 0) continue;          // partially filled is a position, not a stale quote
+    const long long placed = parse_iso(o.created_time);
+    if (placed <= 0 || now - placed < static_cast<long long>(ttl)) continue;
+    try {
+      exec_.cancel(o.order_id);
+      const double px = o.outcome_side == "yes" ? o.yes_price : o.no_price;
+      LOG_INFO("expired hand order %s %s %.0f @ %.2f after %llds unfilled; collateral released",
+               o.ticker.c_str(), o.outcome_side.c_str(), o.remaining_count, px,
+               static_cast<long long>(now - placed));
+      store_.log_event("info", "expired your resting " + o.outcome_side + " order on " + o.ticker +
+                                   " after " + std::to_string(now - placed) + "s unfilled "
+                                   "(manual_order_ttl_seconds); the collateral it held is free again");
+    } catch (const std::exception& e) {
+      LOG_WARN("expire hand order %s: %s", o.order_id.c_str(), e.what());
+    }
+  }
+}
+
 void Engine::run_exits() {
   long long now = now_s();
+  expire_stale_manual_orders(now);
   auto positions = store_.positions();
   std::map<std::string, std::vector<Order>> resting;
   for (const auto& o : store_.orders("resting")) resting[o.ticker].push_back(o);
@@ -754,21 +911,34 @@ void Engine::refresh_results() {
   // Closed for at least an hour, no result yet, and a fair was logged: settle them, oldest first.
   // Markets that keep coming back without a result (settlement pending) are retried later via
   // updated_ts, so one slow settlement does not block the rest.
+  // EXISTS against idx_model_fairs(ticker, ...) rather than IN (SELECT DISTINCT ticker FROM
+  // model_fairs ...): the DISTINCT walked the whole 250 MB index on every other cycle, which was the
+  // 3.5 s "results" step in the live cycle report on 2026-09-23. Same rows, indexed probes.
   json rows = store_.query(
-      "SELECT ticker FROM markets WHERE (result IS NULL OR result='') AND close_time!='' AND close_time<? "
-      "AND updated_ts<? AND ticker IN (SELECT DISTINCT ticker FROM model_fairs UNION SELECT DISTINCT ticker FROM positions "
-      "UNION SELECT DISTINCT home_ticker FROM ext_wp) ORDER BY updated_ts LIMIT 10",
+      "SELECT m.ticker FROM markets m WHERE (m.result IS NULL OR m.result='') AND m.close_time!='' AND m.close_time<? "
+      "AND m.updated_ts<? AND (EXISTS (SELECT 1 FROM model_fairs f WHERE f.ticker=m.ticker) "
+      "OR EXISTS (SELECT 1 FROM positions p WHERE p.ticker=m.ticker) "
+      "OR m.ticker IN (SELECT home_ticker FROM ext_wp)) ORDER BY m.updated_ts LIMIT 10",
       {iso_of(now - 3600), now - 6 * 3600});
-  for (const auto& r : rows) {
-    std::string t = r.value("ticker", "");
-    try {
-      Market m = client_.get_market(t);
+  // One batched request for all of them. It was one request per ticker, ten a cycle, and when
+  // the network dropped each one retried on its own: "results" took five to seven seconds of a
+  // cycle on 2026-09-17 and wrote ten warnings a cycle to the log.
+  std::vector<std::string> tickers;
+  for (const auto& r : rows) tickers.push_back(r.value("ticker", ""));
+  if (tickers.empty()) return;
+  try {
+    auto got = client_.get_markets_by_tickers(tickers);
+    std::set<std::string> answered;
+    for (const auto& m : got) {
+      answered.insert(m.ticker);
       store_.upsert_market(m);  // stamps updated_ts = now
       if (!m.result.empty()) results_settled_++;
-    } catch (const std::exception& e) {
-      LOG_WARN("result %s: %s", t.c_str(), e.what());
-      store_.exec("UPDATE markets SET updated_ts=? WHERE ticker=?", {now, t});
     }
+    for (const auto& t : tickers)
+      if (!answered.count(t)) store_.exec("UPDATE markets SET updated_ts=? WHERE ticker=?", {now, t});
+  } catch (const std::exception& e) {
+    LOG_WARN("results for %zu markets: %s", tickers.size(), e.what());
+    for (const auto& t : tickers) store_.exec("UPDATE markets SET updated_ts=? WHERE ticker=?", {now, t});
   }
 }
 
@@ -950,6 +1120,12 @@ void Engine::auto_submit() {
     if (!reduces && std::any_of(strategies_.begin(), strategies_.end(),
                                 [&](const std::unique_ptr<Strategy>& st) { return st->name() == p.strategy; }))
       continue;
+    // Locked-basket legs are never sent one at a time from here. This loop checks each proposal on
+    // its own against the auto budgets and per-cycle caps, so it could send one leg of a basket and
+    // hold the other: a directional position the finder presented as a lock. Baskets go out whole
+    // through the algorithm (SystematicTrader::live_arbitrage, all legs or none, within its own
+    // budget) or by your hand from Signals; legs nobody sends expire with the proposal TTL.
+    if (p.strategy == "ladder_arb") continue;
     // The market just refused (or would have refused) an entry on this ticker: give entries a
     // breather. Exits, targets and stops on the same ticker are never held back by it.
     if (!reduces && soft_backoff_.count(p.ticker)) continue;
@@ -1125,6 +1301,10 @@ void Engine::publish_snapshot() {
               {"polymarket", poly_.summary()}};
   // The settlement reference, named in the header like any other data source: a commodity model
   // priced off a socket that died twenty minutes ago is the failure this line exists to show.
+  // The cycle's own health, for the supervisor and the header: how long the last one took and
+  // how many cycles in a row have hit a storage error.
+  status["cycle_seconds"] = last_cycle_seconds_;
+  status["storage_failures"] = consecutive_storage_failures_;
   if (reference_feed_) status["reference"] = reference_feed_->status();
   if (quote_feed_) status["commodity_quotes"] = quote_feed_->status();
   // Where each commodity model stands economically, from what has actually been recorded. Nothing
@@ -1146,6 +1326,10 @@ void Engine::publish_snapshot() {
   snap_watch_ = watch_;
   snap_strategies_ = strategies;
   snap_status_ = status;
+  {
+    std::lock_guard<std::mutex> sl(status_mu_);
+    status_copy_ = status;
+  }
 }
 
 void Engine::process_manual_orders() {
@@ -1243,17 +1427,51 @@ void Engine::step_pair_models() {
 void Engine::cycle() {
   std::lock_guard<std::mutex> lk(mu_);
   ++cycle_count_;
-  apply_kill_sweep();
-  process_manual_orders();
+  // The thread that runs the cycle is the store's writer: its reads stay on the writer connection
+  // and every other thread's reads go to the read-only pool (Store::set_writer_thread).
+  store_.set_writer_thread();
   bool ok = true;
-  auto step = [&](const char* name, auto&& fn) {
+  bool storage_failed = false;
+  // Where the cycle's time goes, because the cycle's LENGTH is now a trading constraint and not
+  // just a comfort one: every market has to be re-quoted inside market_data_max_age_seconds or
+  // the router refuses it, and on 2026-09-12 2,294 of 4,738 decisions were blocked as
+  // "quote missing or stale". A step is named here or it is invisible, and the slow one has been
+  // guessed at three times without being measured once.
+  const auto cycle_began = std::chrono::steady_clock::now();
+  std::vector<std::pair<const char*, double>> timings;
+  // Nothing in a cycle may end the process. Every call runs through this guard, including the
+  // manual-order drain between steps: that drain used to sit outside the try, and on 2026-09-07,
+  // -12 and -13 a storage error thrown from it (or from the kill sweep and snapshot around the
+  // steps) escaped the cycle and terminated the desk seven times while it held positions.
+  auto guard = [&](const char* name, auto&& fn) {
     try { fn(); } catch (const std::exception& e) {
       LOG_ERR("cycle %s: %s", name, e.what());
       last_error_ = std::string(name) + ": " + e.what();
       ok = false;
+      // Storage failure = the database itself failing (I/O, corruption, full, locked), which a fresh
+      // connection or a restart can cure. A plain SQL error is a bug in a query: restarting would not
+      // fix it, only loop, so it is logged like any other step error.
+      const std::string what = e.what();
+      if (what.rfind("sqlite step: ", 0) == 0 &&
+          (what.find("disk I/O") != std::string::npos || what.find("malformed") != std::string::npos ||
+           what.find("not a database") != std::string::npos || what.find("full") != std::string::npos ||
+           what.find("locked") != std::string::npos || what.find("busy") != std::string::npos ||
+           what.find("unable to open") != std::string::npos))
+        storage_failed = true;
+    } catch (...) {
+      LOG_ERR("cycle %s: unknown exception", name);
+      last_error_ = std::string(name) + ": unknown exception";
+      ok = false;
     }
-    process_manual_orders();
   };
+  auto step = [&](const char* name, auto&& fn) {
+    const auto t0 = std::chrono::steady_clock::now();
+    guard(name, fn);
+    guard("manual orders", [&] { process_manual_orders(); });
+    timings.emplace_back(name, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+  };
+  guard("kill sweep", [&] { apply_kill_sweep(); });
+  guard("manual orders", [&] { process_manual_orders(); });
   // The reference socket collects on its own thread and never touches the store; this is the
   // only writer. First in the cycle so a slow cycle does not let the pending queue grow.
   if (reference_feed_) step("reference", [&] { reference_feed_->flush(now_s()); });
@@ -1266,10 +1484,42 @@ void Engine::cycle() {
       for (const auto& ser : u.series) series.insert(ser);
     std::vector<std::string> tickers;
     const long long t = now_s();
+    // Disk floor. The book stream is a few hundred events a second, 8-17 GB a day with every frame
+    // kept, while the desk runs around the clock (measured 2026-09-24), and nothing else here
+    // writes near that. With no floor a full disk fails every write the desk makes, trading
+    // included, until someone notices. Under the floor the book stops being kept, so the desk's own
+    // tables and the machine keep their room; it resumes 2 GB above. Checked once a minute.
+    const double floor_gb = quote_feed_->settings().min_free_gb;
+    if (floor_gb > 0 && t - last_disk_check_ts_ >= 60) {
+      last_disk_check_ts_ = t;
+      std::error_code ec;
+      const auto dir = std::filesystem::absolute(cfg_.db_path, ec).parent_path();
+      const auto sp = std::filesystem::space(dir, ec);
+      if (!ec) {
+        const double free_gb = static_cast<double>(sp.available) / 1e9;
+        const bool low = disk_low_ ? free_gb < floor_gb + 2.0 : free_gb < floor_gb;
+        if (low != disk_low_) {
+          disk_low_ = low;
+          quote_feed_->set_disk_low(low, t * 1000);
+          if (low) {
+            LOG_WARN("disk: %.1f GB free, under the %.0f GB floor; commodity book events are not kept "
+                     "until %.0f GB is free (params.commodity.quotes.min_free_gb)",
+                     free_gb, floor_gb, floor_gb + 2.0);
+            store_.log_event("warn", "disk under " + fmt2(floor_gb) + " GB free: book events not kept");
+          } else {
+            LOG_INFO("disk: %.1f GB free; commodity book events are kept again", free_gb);
+            store_.log_event("info", "disk above the floor again: book events kept");
+          }
+        }
+      }
+    }
     for (const auto& m : store_.open_markets("")) {
       if (!series.count(m.series_ticker) || !m.tradable()) continue;
       const long long close = parse_iso(m.close_time);
-      if (close > 0 && close <= t) continue;
+      // Two seconds early: `t` is whole seconds, and a subscribe reaches the venue a few hundred
+      // milliseconds after this. One naming only windows closed by then would be the whole
+      // exchange; with none listed, watch() keeps what it has until the next windows are known.
+      if (close > 0 && close <= t + 2) continue;
       tickers.push_back(m.ticker);
     }
     quote_feed_->watch(tickers);
@@ -1281,10 +1531,20 @@ void Engine::cycle() {
     step("reconcile", [&] { exec_.reconcile(cycle_count_ == 1); update_daily_stop(); });
   // The margined instance: marks and the index every few seconds, the account on its own cadence
   // (and right after anything was sent there), then the basis rule.
-  step("perps", [&] { perps_.refresh_public(now_s()); perps_.refresh_account(now_s()); perps_.step(now_s()); });
+  // Retired perps (M1) are read once a minute rather than every cycle: enough to show positions
+  // and manage any rule trade still open, without spending cycle time on a lane that does not
+  // trade. The dashboard's sync button still refreshes on demand.
+  if (!perps_.retired() || perps_.live_rule_running() || now_s() - last_perps_step_ts_ >= 60)
+    step("perps", [&] {
+      last_perps_step_ts_ = now_s();
+      perps_.refresh_public(now_s()); perps_.refresh_account(now_s()); perps_.step(now_s());
+    });
   // Polymarket: the league universe on its own slow clock, quotes for matched markets every few
   // seconds, the account, then the Kalshi<->Polymarket pairs the strategies read this cycle.
-  step("polymarket", [&] { poly_.refresh_universe(now_s()); poly_.match(now_s()); poly_.refresh_quotes(now_s()); poly_.refresh_account(now_s()); });
+  // On its own thread when the desk is serving (PolyDesk::start_background); inline only for
+  // `once` and the tests, which never start it.
+  if (!poly_.background_running())
+    step("polymarket", [&] { poly_.refresh_universe(now_s()); poly_.match(now_s()); poly_.refresh_quotes(now_s()); poly_.refresh_account(now_s()); });
   step("strategies", [&] { run_strategies(); });
   // Strategies first: research-only NBA/weather fairs can nominate liquid books for capture in
   // this same cycle. Previously only held or already-proposed contracts had depth history.
@@ -1296,7 +1556,7 @@ void Engine::cycle() {
   // The systematic trader reads the published snapshot (fairs, books), so publish this cycle's
   // numbers before it runs, and let it send before the queue is worked so a locked basket it
   // owns is not sent twice.
-  publish_snapshot();
+  guard("snapshot", [&] { publish_snapshot(); });
   // One decision set a cycle: quotes -> edges -> routes. The same rows go to the Trades board
   // (MANUAL, and AUTO marked), to the research record (RESEARCH) and to the algorithm (AUTO).
   step("systematic", [&] {
@@ -1329,10 +1589,71 @@ void Engine::cycle() {
   step("pairs", [&] { poly_.step(now_s()); });
   step("pair model lab", [&] { step_pair_models(); });
   step("auto", [&] { auto_submit(); });
-  apply_kill_sweep();
+  step("retention", [&] { prune_retention(); });
+  guard("kill sweep", [&] { apply_kill_sweep(); });
   if (ok) last_error_.clear();
+  consecutive_storage_failures_ = storage_failed ? consecutive_storage_failures_ + 1 : 0;
   last_cycle_ts_ = now_s();
-  publish_snapshot();
+  // Report the cycle when it ran long enough to threaten the freshness bar, and name the steps
+  // that spent the time. Silent under normal load; the moment quotes start going stale this says
+  // which step to look at instead of leaving it to be guessed.
+  {
+    const double total = std::chrono::duration<double>(std::chrono::steady_clock::now() - cycle_began).count();
+    // Over the target: said at most once a minute, unless the cycle is past the freshness bar,
+    // which is said every time.
+    const long long tnow = now_s();
+    const bool over_bar = total >= cfg_.data_max_age();
+    if (total >= cfg_.cycle_report_seconds && (over_bar || tnow - last_cycle_report_ts_ >= 60)) {
+      last_cycle_report_ts_ = tnow;
+      std::sort(timings.begin(), timings.end(),
+                [](const auto& a, const auto& b) { return a.second > b.second; });
+      std::string worst;
+      for (size_t i = 0; i < timings.size() && i < 5; ++i) {
+        if (timings[i].second < 0.05) break;
+        worst += (worst.empty() ? "" : ", ") + std::string(timings[i].first) + " " + fmt2(timings[i].second) + "s";
+      }
+      // data_max_age(), not the raw setting: the setting is 0 when derived, and the line read
+      // "quotes go stale past 0s" for five days.
+      LOG_WARN("cycle %lld took %.1fs (quotes go stale past %ds): %s",
+               static_cast<long long>(cycle_count_), total, cfg_.data_max_age(), worst.c_str());
+    }
+    last_cycle_seconds_ = total;
+  }
+  guard("snapshot", [&] { publish_snapshot(); });
+}
+
+// Raw WebSocket book deltas for the 15-minute commodity series are the one table that grows
+// without bound: 38.6 million rows and 13.5 GB (with its index 15 GB) of a 22 GB database after
+// three days, on a disk with 31 GB free. When commodity_book_retain_days is set (off by default:
+// see Config), delete the oldest past the window, oldest first by rowid, in small batches under
+// a time budget so the cycle never stalls on it. Freed pages are reused by new rows, so the file
+// stops growing rather than shrinking. The archive script is the route that keeps the history.
+void Engine::prune_retention() {
+  const int days = cfg_.commodity_book_retain_days;
+  if (days <= 0) return;
+  if (!retention_checked_) {
+    retention_checked_ = true;
+    retention_table_ = !store_.query("SELECT 1 AS x FROM sqlite_master WHERE type='table' AND "
+                                     "name='commodity_book_events'").empty();
+  }
+  if (!retention_table_) return;
+  const long long cutoff_ms = (now_s() - static_cast<long long>(days) * 86400) * 1000;
+  const auto t0 = std::chrono::steady_clock::now();
+  long long removed = 0;
+  while (std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(300)) {
+    long long n = 0;
+    store_.transaction([&] {
+      store_.exec("DELETE FROM commodity_book_events WHERE id IN (SELECT id FROM commodity_book_events "
+                  "ORDER BY id LIMIT 2000) AND ts_received_ms < ?", {cutoff_ms});
+      n = store_.changes();
+    });
+    removed += n;
+    if (n < 2000) break;
+  }
+  retention_removed_ += removed;
+  if (removed > 0 && (retention_removed_ / 500000) != ((retention_removed_ - removed) / 500000))
+    LOG_INFO("retention: %lld commodity book events older than %d days removed so far",
+             retention_removed_, days);
 }
 
 // ---- operations --------------------------------------------------------------------
@@ -1353,11 +1674,21 @@ void Engine::request_kill(const std::string& reason) {
 
 void Engine::apply_kill_sweep() {
   if (!kill_pending_.exchange(false)) return;
-  for (const auto& o : store_.orders("resting")) {
+  // The sweep is retried until it has run clean: a storage error reading the orders, or a cancel
+  // the exchange did not take, re-arms it for the next cycle instead of dropping it.
+  std::vector<Order> resting;
+  try {
+    resting = store_.orders("resting");
+  } catch (...) {
+    kill_pending_ = true;
+    throw;
+  }
+  for (const auto& o : resting) {
     try {
       exec_.cancel(o.order_id);
     } catch (const std::exception& e) {
       LOG_WARN("cancel %s: %s", o.order_id.c_str(), e.what());
+      kill_pending_ = true;
     }
   }
   store_.exec("UPDATE proposals SET status='expired',note='kill' WHERE status='pending'");
@@ -1574,14 +1905,15 @@ std::vector<std::string> Engine::book_capture_plan() {
   for (const auto& pos : store_.positions())
     if (pos.position != 0) add(pos.ticker);
   for (const auto& p : store_.proposals("pending", 100)) add(p.ticker);
-  // The algorithm's positions and routes. A view that cannot be built must not take book capture
-  // down with it (it did, for a NULL column): fall back to the defaults and the account's positions.
-  json lab = json::object();
-  try { lab = systematic_.view(); } catch (const std::exception& e) { LOG_WARN("book plan: systematic view: %s", e.what()); }
-  if (lab.contains("positions") && lab["positions"].is_array())
-    for (const auto& pos : lab["positions"])
-      if (pos.is_object() && pos.contains("ticker") && pos["ticker"].is_string()) add(pos["ticker"].get<std::string>());
-  json settings = lab.contains("settings") ? lab["settings"] : json();
+  // The algorithm's positions and routes, read directly: the full systematic view (performance,
+  // history, lanes) is built under the trader's lock, which the Systematic tab also holds while
+  // it builds its own, so asking for it here made every cycle queue behind the dashboard (the
+  // books step went from ~5 s to 70 s under load in a dry run on 2026-09-23). This needs only the
+  // open tickers and the settings.
+  for (const auto& r : store_.query("SELECT DISTINCT ticker FROM systematic_trades "
+                                    "WHERE state IN ('entering','open','exiting','settling')"))
+    if (r.contains("ticker") && r["ticker"].is_string()) add(r["ticker"].get<std::string>());
+  json settings = systematic_.settings_copy();
   if (!settings.is_object()) settings = systematic_defaults();
   auto num = [&](const char* key, double dflt) {
     return settings.contains(key) && settings[key].is_number() ? settings[key].get<double>() : dflt;
@@ -1632,8 +1964,11 @@ std::vector<std::string> Engine::book_capture_plan() {
 // Reads one book, keeps it as the research depth for that ticker and records it as an
 // observation (on change, plus a one-minute heartbeat). Returns the depth fields the board merges.
 json Engine::capture_book(const std::string& t) {
+  return record_book(t, client_.get_orderbook(t, 10));
+}
+
+json Engine::record_book(const std::string& t, const Orderbook& b) {
   const long long now = now_s();
-  Orderbook b = client_.get_orderbook(t, 10);
   json row = {{"quote_ts", now_s()}, {"yes_bid", b.best_yes_bid()}, {"yes_ask", b.best_yes_ask()},
               {"no_bid", b.best_no_bid()}, {"no_ask", b.best_no_ask()},
               {"yes_bid_size", b.yes_bids.empty() ? 0.0 : b.yes_bids.back().qty},
@@ -1661,17 +1996,42 @@ json Engine::capture_book(const std::string& t) {
 
 void Engine::record_books() {
   static constexpr int kMaxBooksPerCycle = 20;
-  int n = 0;
+  std::vector<std::string> want;
   for (const auto& t : book_capture_plan()) {
-    if (n >= kMaxBooksPerCycle) break;
+    if (static_cast<int>(want.size()) >= kMaxBooksPerCycle) break;
     // A market that has stopped trading has no book to learn from. A position in one still shows
     // here until settlement clears, and without this the desk spends a request a cycle fetching
     // the same empty book (KXNCAAFGAME-26SEP06WISND-WIS, determined 03:09, fifteen times over).
     auto m = store_.get_market(t);
     if (m && !m->tradable()) continue;
+    want.push_back(t);
+  }
+  if (want.empty()) return;
+  // One request for up to 100 books (GET /markets/orderbooks, authenticated) instead of twenty
+  // paced single requests, which were three seconds of every cycle. The single-book path stays as
+  // the fallback: without keys, or if the batch call fails, the books are still recorded.
+  if (client_.authenticated() && !batch_books_failed_) {
+    try {
+      auto books = client_.get_orderbooks(want);
+      for (const auto& b : books) record_book(b.ticker, b);
+      return;
+    } catch (const std::exception& e) {
+      // A 4xx says the endpoint does not work for this account; stop trying it this run. A
+      // network error is transient and the next cycle tries the batch again.
+      // 429 (rate limited) and 408 are transient like a 5xx; 401/403/404 and the rest of 4xx are not.
+      if (const auto* api = dynamic_cast<const ApiError*>(&e);
+          api && api->status >= 400 && api->status < 500 && api->status != 429 && api->status != 408) {
+        batch_books_failed_ = true;
+        LOG_WARN("batch orderbooks refused (%s); using one request per book for this run", e.what());
+      } else {
+        LOG_WARN("batch orderbooks: %s", e.what());
+        return;
+      }
+    }
+  }
+  for (const auto& t : want) {
     try {
       capture_book(t);
-      ++n;
     } catch (const std::exception& e) {
       LOG_WARN("book %s: %s", t.c_str(), e.what());
     }
@@ -1724,7 +2084,9 @@ void Engine::refresh_event_meta() {
            "SELECT DISTINCT event_ticker, series_ticker FROM markets WHERE status IN ('active','open') "
            "ORDER BY event_ticker", {}))
     if (watch_.count(r.value("series_ticker", ""))) add(r.value("event_ticker", ""));
-  int budget = 3;
+  // The range-ladder finder needs each event's mutually_exclusive flag, and the hourly series open
+  // new events every hour; three lookups a cycle fell behind once basket-only series were added.
+  int budget = 8;
   for (const auto& ev : want) {
     if (budget-- <= 0) break;
     event_meta_ts_[ev] = now;
@@ -2172,7 +2534,9 @@ json Engine::board_view(int limit) {
   std::map<std::string, double> held;
   for (const auto& pos : store_.positions()) if (pos.position != 0) held[pos.ticker] = pos.position;
   for (const auto& m : store_.open_markets()) {
-    if (!snap_watch_.count(m.series_ticker)) continue;
+    // Basket-only series have no model and no row on the board; the ladder finders read them
+    // directly. basket_only_ is fixed at construction, so reading it here needs no lock.
+    if (!snap_watch_.count(m.series_ticker) || basket_only_.count(m.series_ticker)) continue;
     double edge = -9;
     json j = board_row_locked(m, now, stale_after, manage_after, &edge, &held);
     rows.push_back({std::move(j), edge});
@@ -2397,13 +2761,13 @@ json Engine::book_configure(const json& body) {
 }
 
 json Engine::status() {
-  std::lock_guard<std::mutex> lk(snap_mu_);
-  return snap_status_.is_null() ? json{{"env", cfg_.env}, {"cycle", 0}, {"watch", json::array()},
+  std::lock_guard<std::mutex> lk(status_mu_);
+  return status_copy_.is_null() ? json{{"env", cfg_.env}, {"cycle", 0}, {"watch", json::array()},
                                        {"strategies", json::array()}, {"kill", kill_.load()}, {"armed", exec_.armed()},
                                        {"markets_seen", 0}, {"bankroll", cfg_.bankroll_dollars},
                                        {"balance", 0.0}, {"portfolio_value", 0.0}, {"last_cycle_ts", 0},
                                        {"last_error", ""}, {"kill_reason", ""}, {"account_ts", 0}}
-                                : snap_status_;
+                                : status_copy_;
 }
 
 // ---- the decision pipeline (session 15) -------------------------------------------------------
@@ -2524,18 +2888,24 @@ json Engine::decisions_view(bool include_research, int limit) {
   // One row per event and route: the best one. An event is one entry decision (the others are
   // blocked the moment one is taken), and a single event's brackets would otherwise fill the
   // board. `event_rows` says how many rows the event had on that route.
-  auto one_per_event = [](std::vector<json>& rows) {
-    std::map<std::string, size_t> first;
+  // How many of an event's brackets reach the board. One is right when the desk is choosing for
+  // you: taking any bracket blocks the rest, so the others are noise. It is wrong when you are
+  // choosing, because then the alternatives ARE the decision - the board said MANUAL 20 while
+  // showing 3 rows, and the missing 17 were the other brackets of those same three events.
+  const int per_event = std::max(1, static_cast<int>(
+      jnum(systematic_.settings_copy(), "rows_per_event", 1)));
+  auto one_per_event = [per_event](std::vector<json>& rows) {
+    std::map<std::string, std::vector<size_t>> seen;
     std::vector<json> out;
     for (auto& r : rows) {
       const std::string key = jstr(r, "event_ticker") + "|" + jstr(r, "route");
-      auto it = first.find(key);
-      if (it != first.end()) {
-        out[it->second]["event_rows"] = out[it->second].value("event_rows", 1) + 1;
-        continue;
-      }
-      first[key] = out.size();
-      r["event_rows"] = 1;
+      auto& idx = seen[key];
+      // Every row of the event still reports the event's true row count, so the board can say
+      // "3 of 12" rather than implying the twelve were never there.
+      for (size_t i : idx) out[i]["event_rows"] = out[i].value("event_rows", 1) + 1;
+      if (static_cast<int>(idx.size()) >= per_event) continue;
+      r["event_rows"] = static_cast<int>(idx.size()) + 1;
+      idx.push_back(out.size());
       out.push_back(std::move(r));
     }
     rows = std::move(out);
@@ -2690,7 +3060,22 @@ json Engine::revalidate_manual_decision(const json& b, const std::string& reques
   RouterContext ctx = router_context(now, false);   // this request's own queue reservation is not a conflict
   ctx.max_age = cfg_.data_max_age();
   const json settings = validate_systematic_settings(json::object(), systematic_.settings_copy());
-  const TradeDecision d = decide(row, side_from(side), settings, ctx);
+  // A row is offered, you click it, and between those two moments the book ticks. Rechecking
+  // against the SAME floor that displayed it then refuses your order over a fraction of a cent
+  // that appeared while you were reading - the edge was 0.00 on screen and -0.01 by the time it
+  // was re-read. That is not the desk protecting you from anything; the trade you reviewed is
+  // the trade you asked for. Relax the floors by manual_submit_tolerance for THIS check only.
+  //
+  // Deliberately scoped: it applies to a hand-approved order on the manual path and nowhere
+  // else. The algorithm's own floors are untouched, and every other gate - settlement, risk
+  // band, caps, the kill switch, shard cash - is checked exactly as before.
+  json submit_settings = settings;
+  const double tol = std::max(0.0, settings.value("manual_submit_tolerance", 0.01));
+  if (tol > 0) {
+    submit_settings["min_edge"] = std::max(0.0, settings.value("min_edge", 0.03) - tol);
+    submit_settings["manual_min_edge"] = std::max(0.0, settings.value("manual_min_edge", 0.05) - tol);
+  }
+  const TradeDecision d = decide(row, side_from(side), submit_settings, ctx);
   json fresh = decision_to_row(d);
   if (fresh.value("model_key", std::string()) != shown.value("model_key", std::string()))
     refuse("the model behind this row changed (" + shown.value("model_key", std::string()) + " -> " +

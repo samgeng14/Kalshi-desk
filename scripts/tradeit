@@ -50,6 +50,25 @@ def alive(pid):
     except ProcessLookupError:
         return False
 
+SUPERVISOR = ROOT / 'scripts/desk_supervise.sh'
+SUP_PID = ROOT / 'data/desk_supervisor.pid'
+STOPFILE = ROOT / 'data/desk.stop'
+
+def supervisor_pid():
+    """The supervisor's pid, only if that process really is desk_supervise.sh: a stale pidfile can
+    name a pid the system has since given to something else."""
+    try:
+        pid = int(SUP_PID.read_text().strip())
+    except (OSError, ValueError):
+        return None
+    if not alive(pid):
+        return None
+    try:
+        command = subprocess.check_output(['/bin/ps', '-p', str(pid), '-o', 'command='], text=True)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return pid if 'desk_supervise' in command else None
+
 def show(data, url):
     if data is None:
         print('Desk is stopped. Start it with: tradeit up')
@@ -60,7 +79,10 @@ def show(data, url):
         print(f"Balance ${data['balance']:.2f} | {len(data.get('orders', []))} open orders | {len(data.get('positions', []))} positions")
     else:
         print('Account sync pending.')
-    print(f"Markets {data.get('markets_seen', 0)} | cycle {data['cycle']} | age {str(age) + 's' if age is not None else 'starting'}")
+    print(f"Markets {data.get('markets_seen', 0)} | cycle {data['cycle']} | age {str(age) + 's' if age is not None else 'starting'}"
+          + (f" | last cycle {data['cycle_seconds']:.1f}s" if data.get('cycle_seconds') else ''))
+    sup = supervisor_pid()
+    print(f'Supervisor: running (pid {sup})' if sup else 'Supervisor: NOT running - a crash will not be restarted (tradeit down && tradeit up)')
     print('Modes: ' + ', '.join(f'{k}={v}' for k, v in data['config']['strategies'].items() if v != 'off'))
     if data.get('last_error'):
         print('Last error: ' + data['last_error'])
@@ -93,6 +115,15 @@ def main():
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         pids = listeners(port)
         if action == 'down':
+            # Stop the supervisor first, or it restarts the desk this is about to stop.
+            STOPFILE.touch()
+            sup = supervisor_pid()
+            if sup:
+                os.kill(sup, signal.SIGTERM)
+                deadline = time.monotonic() + 130   # the supervisor gives the desk 120 s
+                while alive(sup) and time.monotonic() < deadline:
+                    time.sleep(.5)
+            pids = listeners(port)
             stopping = set(pids)
             for pid in pids:
                 os.kill(pid, signal.SIGTERM)
@@ -114,13 +145,18 @@ def main():
         if not data:
             if not BINARY.is_file():
                 raise RuntimeError('Build is missing. Build kalshi-desk before launching.')
-            with log.open('ab', buffering=0) as output:
-                process = subprocess.Popen([str(BINARY), '--config', str(CONFIG), 'serve'], cwd=ROOT,
+            if supervisor_pid():
+                raise RuntimeError('The supervisor is running but the desk is not answering yet. '
+                                   'See data/supervisor.log and tradeit logs.')
+            # The desk runs under the supervisor, which restarts it after a crash or a stall.
+            STOPFILE.unlink(missing_ok=True)
+            with (ROOT / 'data/supervisor.log').open('ab', buffering=0) as output:
+                process = subprocess.Popen([str(SUPERVISOR)], cwd=ROOT,
                     stdin=subprocess.DEVNULL, stdout=output, stderr=output, start_new_session=True)
             deadline = time.monotonic() + 45
             while not data:
                 if process.poll() is not None:
-                    raise RuntimeError(f'Desk exited. See {log}')
+                    raise RuntimeError('Supervisor exited. See data/supervisor.log')
                 if time.monotonic() > deadline:
                     raise RuntimeError(f'Dashboard not ready yet. See {log}')
                 time.sleep(.5)

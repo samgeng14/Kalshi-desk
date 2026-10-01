@@ -69,6 +69,22 @@ class KalshiClient {
   // Translates an outcome-side request into the V2 bid/ask body. Exposed for tests.
   static json order_body(const OrderRequest& req);
 
+  // Minimum spacing between exchange calls from this process, all threads together. Kalshi's
+  // Basic tier allows 200 read tokens a second and most requests cost 10, so 20 reads a second
+  // is the ceiling; the default sits under it. The old fixed 150 ms (~6/s) was the largest
+  // single cost in a cycle: 32 watched series alone took 4.8 s of pure waiting.
+  //
+  // The spacing actually used adapts: a 429 doubles it (up to a second) and every successful
+  // call shrinks it 5% back toward this floor, so a limit lower than expected (the public, keyless
+  // limit is stricter than the tier's) costs a few slow calls instead of a storm of retries.
+  void set_min_interval_ms(int ms) {
+    std::lock_guard<std::mutex> lk(mu_);
+    min_interval_ms_ = ms < 0 ? 0 : ms;
+    interval_ms_ = min_interval_ms_;
+  }
+  int min_interval_ms() const { return min_interval_ms_; }
+  int current_interval_ms() const { return interval_ms_; }
+
   // Generic call; path is relative to the base, e.g. "/markets".
   json call(const std::string& method, const std::string& path,
             const std::map<std::string, std::string>& query = {}, const json* body = nullptr);
@@ -78,8 +94,12 @@ class KalshiClient {
   std::string prefix_;  // /trade-api/v2
   std::shared_ptr<Signer> signer_;
   Http http_;
+  void pace();                     // wait for this process's turn at the exchange
+  void note_status(long status);   // adapt the spacing to what the exchange said
   std::mutex mu_;
   long long last_call_ms_ = 0;
+  int min_interval_ms_ = 60;
+  int interval_ms_ = 60;   // adaptive, >= min_interval_ms_; guarded by mu_
 };
 
 }  // namespace desk

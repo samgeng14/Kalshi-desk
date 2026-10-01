@@ -146,6 +146,16 @@ class Engine {
   const Config& config() const { return cfg_; }
   Config& config() { return cfg_; }
   std::mutex& mutex() { return mu_; }
+  long long last_cycle_report_ts_ = 0;
+  long long last_perps_step_ts_ = 0;   // see Config::cycle_report_seconds
+  // Cycles in a row in which a storage (SQLite) error was caught. The serve loop acts on it:
+  // it trips the kill switch, and later restarts the process for a fresh connection.
+  int consecutive_storage_failures() const { return consecutive_storage_failures_; }
+  double last_cycle_seconds() const { return last_cycle_seconds_; }
+  // Starts the feeds that run beside the cycle (Polymarket). `serve` calls it; `once` and the
+  // tests do not, so there the cycle does that work inline.
+  void start_background() { poly_.start_background(); }
+  void stop_background() { poly_.stop_background(); }
 
   // Exposed for tests.
   void add_strategy(std::unique_ptr<Strategy> s) { strategies_.insert(strategies_.begin(), std::move(s)); }
@@ -160,7 +170,9 @@ class Engine {
   void run_strategies();
   void run_ladder_arb(const std::vector<Market>& markets);  // locked baskets in exclusive events
   void run_auto_hedge();   // covers the configured share of any event's excess worst case
-  void run_exits();   // reduce-only exit proposals for positions whose fair we know
+  void run_exits();
+  // Cancel hand-placed maker orders that have rested unfilled past manual_order_ttl_seconds.
+  void expire_stale_manual_orders(long long now);   // reduce-only exit proposals for positions whose fair we know
   void run_brackets();  // take-profit / stop-loss / trailing stop per position (dashboard-set)
   void refresh_results();  // settle sweep: results for closed markets we logged a fair on (Brier sample)
   void apply_kill_sweep();  // cancel every resting order, expire pending proposals
@@ -246,9 +258,27 @@ class Engine {
   std::set<std::string> snap_watch_;
   json snap_strategies_ = json::array();
   json snap_status_;
+  // /api/state reads its own copy under its own lock. It used to wait on snap_mu_, which the
+  // board holds while it builds every row; with the dashboard open that made /api/state miss the
+  // supervisor's 5 s probe three times running, and on 2026-09-23 the supervisor restarted a desk
+  // that was cycling normally.
+  mutable std::mutex status_mu_;
+  json status_copy_;
   json research_board();
   // Reads one orderbook now: research depth for the ticker plus an observation. Under mu_.
   json capture_book(const std::string& ticker);
+  // Records a book already fetched (the batch path). Under mu_.
+  json record_book(const std::string& ticker, const Orderbook& book);
+  std::set<std::string> basket_only_;   // Config::basket_series not also in watch_series
+  std::map<std::string, long long> unlisted_asked_;   // ticker -> last status lookup (refresh_markets)
+  bool batch_books_failed_ = false;   // the batch orderbook endpoint refused this run
+  void prune_retention();
+  bool retention_checked_ = false, retention_table_ = false;
+  long long retention_removed_ = 0;
+  long long last_disk_check_ts_ = 0;   // quotes step: the book feed's disk floor
+  bool disk_low_ = false;
+  int consecutive_storage_failures_ = 0;
+  double last_cycle_seconds_ = 0;
   std::map<std::string, json> research_books_, snap_research_books_;
   // The strategy modes as the router reads them. cfg_.strategy_modes is written by set_mode under
   // mu_; the router's context is also built on HTTP threads (the Systematic tab), which read this

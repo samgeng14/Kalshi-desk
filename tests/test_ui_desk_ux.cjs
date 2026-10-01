@@ -258,5 +258,28 @@ check(/if \(!pmLive\) continue;/.test(html), 'an unreachable second leg removes 
 check(/whose trade button can only fail/.test(html),
       'the gate documents why an unplaceable row must not be listed');
 
+// A variable removed from renderTrades but still referenced throws at render time: the chips
+// update (they are assigned earlier) and the table body never does, so the board shows
+// "FOR ME 36" above an empty table. That happened twice - routeCounts, then n - and both times
+// it looked like "no trades are showing" rather than a crash. Check the function body only
+// mentions names it actually has.
+{
+  // renderDetail is defined BEFORE renderTrades, so slicing between them gave an empty string
+  // and this guard silently checked nothing - it passed with the bug deliberately put back.
+  // Bound the body by the next function declaration instead, and assert it is non-empty.
+  const _s = html.indexOf('function renderTrades');
+  const _rest = html.slice(_s + 10);
+  const _next = _rest.search(/\n  (async )?function /);
+  const body = _rest.slice(0, _next > 0 ? _next : 9000);
+  check(body.length > 500 && body.includes("#trades tbody"),
+        'renderTrades body located for the undefined-reference check');
+  for (const name of ['n', 'minWin', 'researchShown']) {
+    const used = new RegExp('[^A-Za-z0-9_$.\'"`]' + name + '[^A-Za-z0-9_$]').test(
+      body.replace(/\/\/[^\n]*/g, ''));
+    const bound = new RegExp('(const|let|var|function)\\s+' + name + '\\b').test(body);
+    check(!used || bound, `renderTrades references ${name} without declaring it`);
+  }
+  }
+
 console.log(`${checks} checks, ${fails} failures`);
 process.exit(fails ? 1 : 0);

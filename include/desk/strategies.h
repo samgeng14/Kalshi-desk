@@ -279,6 +279,60 @@ class SportsInplay : public Strategy {
 //    spread alone before tip-off. Logs every live state to ext_wp. Hypothesis SPORT-4: a public
 //    live win probability quoted as a maker in wide-spread game markets, with reduce-only exits,
 //    earns the spread without being picked off more often than it is paid.
+// Pregame US team sports against the de-vigged sportsbook moneyline (M5, lane C of the volume
+// plan). The closing line at a sharp book is the best public pregame probability there is, and
+// this model is nothing but that number: it reports somebody else's price, so its market weight
+// is 0 and its settlement is the same official result the sportsbook's moneyline settles on.
+//
+// Data: The Odds API (v4), one call per league per `refresh_minutes` for regions us,eu (eu carries
+// Pinnacle), h2h only: 2 credits a call. The key is read from `api_key_path` (a file, mode 0600)
+// or the environment variable named by `api_key_env`; without one the model is inert and says so
+// once. The key rides in the query string, so every error this model logs is redacted.
+//
+// A market is priced only before kickoff (commence_time - 60 s) and only from a line fetched within
+// two refresh intervals. In-game it returns nothing and sports_live takes the market.
+class SportsbookLine : public Strategy {
+ public:
+  explicit SportsbookLine(const json& params, const std::string& user_agent);
+  std::string name() const override { return "sportsbook_line"; }
+  std::string category() const override { return "Sports"; }
+  bool covers(const Market& m, const Series& s) const override;
+  void prepare(const std::vector<Market>& markets, Store& store) override;
+  std::optional<Fair> fair(const Market& m, const Series& s, Store& store) override;
+  std::string describe() const override;
+  std::optional<bool> settlement_verified(const Market&) const override { return true; }
+  double default_market_weight() const override { return 0.0; }
+
+  struct Line {
+    std::string id, home, away, source;   // source: the sharp book used, or "median of N books"
+    long long commence_ts = 0, fetched_ts = 0;
+    double p_home = -1, p_away = -1;
+    int books = 0;
+  };
+  // Exposed for tests. Multiplicative de-vig of one book's decimal prices.
+  static std::vector<double> devig(const std::vector<double>& decimal_odds);
+  // One event from the feed -> the line, or nullopt when too few books quote it. A book listed in
+  // `sharp` (in preference order) is used alone; otherwise the median of the de-vigged books.
+  static std::optional<Line> consensus(const json& event, const std::vector<std::string>& sharp, int min_books,
+                                       long long fetched_ts);
+  static std::string redact(const std::string& text, const std::string& secret);
+  void set_lines_for_test(const std::string& sport, std::vector<Line> lines) { lines_[sport] = std::move(lines); }
+  void set_key_for_test(const std::string& key) { key_ = key; }
+
+ private:
+  void fetch(const std::string& sport, long long now);
+  const Line* match(const Market& m, const std::string& sport, bool* market_is_home) const;
+  Http http_;
+  std::string key_, base_url_, regions_;
+  std::map<std::string, std::string> leagues_;   // Kalshi series -> Odds API sport key
+  std::vector<std::string> sharp_;
+  int min_books_ = 2, refresh_seconds_ = 3600;
+  double sigma_ = 0.03, nfl_tie_ = 0.003;
+  std::map<std::string, std::vector<Line>> lines_;   // sport -> lines from the last fetch
+  std::map<std::string, long long> fetched_ts_;
+  bool said_no_key_ = false;
+};
+
 class SportsLive : public Strategy {
  public:
   explicit SportsLive(const json& params, const std::string& user_agent);
@@ -288,6 +342,24 @@ class SportsLive : public Strategy {
   void prepare(const std::vector<Market>& markets, Store& store) override;
   std::optional<Fair> fair(const Market& m, const Series& s, Store& store) override;
   std::string describe() const override;
+
+  // Matching a Kalshi game to an ESPN game, exposed for tests. (s1, s2): the evidence that
+  // ticker a is the AWAY team (s1) or the HOME team (s2). Codes are the ticker suffixes, names the
+  // team each ticker pays on (market_team). The desk takes an orientation only when one side beats
+  // the other by at least 1.0.
+  static std::pair<double, double> orientation_scores(const std::string& code_a, const std::string& code_b,
+                                                      const std::string& name_a, const std::string& name_b,
+                                                      const std::string& away_abbr, const std::string& home_abbr,
+                                                      const std::string& away_name, const std::string& home_name);
+  // The team a market pays on: its YES subtitle, else "If <team> wins the" from its rules.
+  static std::string market_team(const Market& m);
+  // Evidence that one Kalshi team is one ESPN team: 2 for the ticker code equal to ESPN's
+  // abbreviation, plus the share of name tokens in common (team_names.h); a match needs 0.75. A match needs evidence for BOTH teams in
+  // the chosen orientation, not just a high total: on 2026-09-23 a total of 3.0 from one team alone
+  // matched Texas at Minnesota to the Mets at Texas, and Boston at Washington (Sep 25) to Boston vs
+  // Philadelphia (Sep 24), because the right game was not on the scoreboards fetched yet.
+  static double team_evidence(const std::string& code, const std::string& name, const std::string& abbr,
+                              const std::string& full_name);
 
   struct League {
     std::string sport, league;   // ESPN path pieces
@@ -313,6 +385,7 @@ class SportsLive : public Strategy {
     std::string event_ticker, series, date, code_a, code_b, name_a, name_b;
     std::string ticker_a, ticker_b;  // markets: "-<code>"
     std::string espn_id;             // matched game
+    int start_min = -1;              // Eastern start from the ticker (MLB), -1 when it has none
     bool home_is_a = false;          // which Kalshi market is the ESPN home team
     double mu_home = 0;              // pre-game expected margin used when ESPN has no spread
     bool mu_from_market = false;
@@ -335,8 +408,11 @@ class SportsLive : public Strategy {
   std::map<std::string, GameState> games_;               // espn_id -> live state
   std::map<std::string, long long> sb_ts_;               // league|date -> last scoreboard fetch
   std::map<std::string, long long> last_log_;
+  std::set<std::string> ambiguous_logged_;   // event|espn id matched both ways round (said once)
   int sb_refresh_seconds_ = 20, wp_refresh_seconds_ = 30, log_seconds_ = 30;
   double sigma_wp_ = 0.04, sigma_leadtime_ = 0.07, sigma_pregame_ = 0.10;
+  // Trade the lead/time fallback when ESPN publishes no win probability. See sports_live.cpp.
+  bool allow_approximation_ = false;
 };
 
 class EconNowcast : public Strategy {

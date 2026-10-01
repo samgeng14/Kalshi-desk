@@ -145,7 +145,25 @@ WsClient::~WsClient() { stop(); }
 void WsClient::start() {
   if (running_.exchange(true)) return;
   stopping_ = false;
-  thread_ = std::thread([this] { run(); });
+  // run() returns only when stopping. A callback that throws must not end the process (an
+  // exception leaving a thread is std::terminate): log it, drop the socket, and go round again.
+  thread_ = std::thread([this] {
+    while (!stopping_.load()) {
+      try {
+        run();
+      } catch (const std::exception& e) {
+        LOG_ERR("%s: feed thread error: %s; reconnecting", opt_.name.c_str(), e.what());
+      } catch (...) {
+        LOG_ERR("%s: feed thread error (unknown); reconnecting", opt_.name.c_str());
+      }
+      if (stopping_.load()) break;
+      try { close_socket(); } catch (...) {}
+      // The connection is gone as surely as after any other failure, and a caller that tracks
+      // connections has to hear it before the next one opens.
+      try { if (on_event_) on_event_("disconnected", "feed thread error"); } catch (...) {}
+      std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
+  });
 }
 
 void WsClient::stop() {
@@ -161,6 +179,13 @@ void WsClient::stop() {
   }
   if (thread_.joinable()) thread_.join();
   running_ = false;
+}
+
+void WsClient::reconnect() {
+  // Reads end (the loop sees the connection closed and reconnects); writes still reach the peer,
+  // so a pong or a queued frame after this is harmless.
+  std::lock_guard<std::mutex> lk(mu_);
+  if (fd_ >= 0) ::shutdown(fd_, SHUT_RD);
 }
 
 bool WsClient::send(const std::string& text) {
@@ -299,6 +324,12 @@ bool WsClient::connect_once(std::string* why) {
   }
   int one = 1;
   ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+#ifdef SO_NOSIGPIPE
+  // A write to a socket the peer (or reconnect()) has closed must fail, not kill the process. The
+  // plain path passes MSG_NOSIGNAL, but TLS writes go through OpenSSL's own write(2), and SIGPIPE's
+  // default action ends the whole desk: a forced reconnect followed by a pong did, in a probe.
+  ::setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
+#endif
   {
     std::lock_guard<std::mutex> lk(mu_);
     fd_ = fd;

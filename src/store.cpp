@@ -1,4 +1,5 @@
 #include "desk/store.h"
+#include <cctype>
 #include "desk/timeutil.h"
 
 #include <sqlite3.h>
@@ -184,15 +185,66 @@ long long ll(const json& r, const char* k) { return static_cast<long long>(num(r
 
 }  // namespace
 
+namespace {
+// Transactions this thread has open on a writer connection (BEGIN ... COMMIT/ROLLBACK through
+// exec). While one is open, this thread's queries stay on the writer so they see its own rows.
+thread_local int tl_open_transactions = 0;
+
+bool starts_with_word(const std::string& sql, const char* word) {
+  size_t i = 0;
+  while (i < sql.size() && std::isspace(static_cast<unsigned char>(sql[i]))) ++i;
+  for (size_t k = 0; word[k]; ++k, ++i)
+    if (i >= sql.size() || std::toupper(static_cast<unsigned char>(sql[i])) != word[k]) return false;
+  return true;
+}
+}  // namespace
+
 Store::Store(const std::string& path) {
   if (sqlite3_open(path.c_str(), &db_) != SQLITE_OK)
     throw std::runtime_error("cannot open db " + path + ": " + sqlite3_errmsg(db_));
   sqlite3_busy_timeout(db_, 5000);
   migrate();
+  // Read-only connections for the other threads. Only for a real file: ":memory:" (and the
+  // file::memory: URI form) would give each connection its own empty database.
+  if (!path.empty() && path != ":memory:" && path.rfind("file::memory:", 0) != 0) {
+    for (int i = 0; i < 3; ++i) {
+      sqlite3* r = nullptr;
+      if (sqlite3_open_v2(path.c_str(), &r, SQLITE_OPEN_READONLY, nullptr) != SQLITE_OK) {
+        if (r) sqlite3_close(r);
+        break;   // fewer readers (or none) just means more waiting on the writer, never wrong answers
+      }
+      sqlite3_busy_timeout(r, 5000);
+      auto rd = std::make_unique<Reader>();
+      rd->db = r;
+      readers_.push_back(std::move(rd));
+    }
+  }
 }
 
 Store::~Store() {
+  for (auto& r : readers_)
+    if (r->db) sqlite3_close(r->db);
   if (db_) sqlite3_close(db_);
+}
+
+void Store::set_writer_thread() { writer_.store(std::this_thread::get_id()); }
+
+long long Store::insert(const std::string& sql, const std::vector<SqlValue>& params) {
+  std::lock_guard<std::recursive_mutex> lk(mu_);
+  exec(sql, params);
+  return static_cast<long long>(sqlite3_last_insert_rowid(db_));
+}
+
+bool Store::use_reader() const {
+  if (readers_.empty() || tl_open_transactions > 0) return false;
+  // No other thread's write can be sitting uncommitted inside someone else's transaction: every
+  // multi-statement transaction goes through transaction() (or holds mu_ itself, as
+  // replace_risk_snapshot does), which keeps the lock from BEGIN to COMMIT. A bare exec("BEGIN")
+  // that released mu_ between statements would break that, which is why none is left outside this
+  // file (review 2026-09-23: a manual order's read-back returned null while the cycle's book-event
+  // flush held such a transaction open).
+  const std::thread::id w = writer_.load();
+  return w != std::thread::id() && w != std::this_thread::get_id();
 }
 
 void Store::migrate() {
@@ -223,6 +275,22 @@ void Store::migrate() {
 }
 
 json Store::query(const std::string& sql, const std::vector<SqlValue>& params) {
+  if (use_reader()) {
+    // A free reader if there is one, else wait on the next in turn. Never the writer's lock.
+    const size_t n = readers_.size(), start = next_reader_++ % n;
+    Reader* r = nullptr;
+    std::unique_lock<std::mutex> lk;
+    for (size_t k = 0; k < n && !r; ++k) {
+      std::unique_lock<std::mutex> t(readers_[(start + k) % n]->mu, std::try_to_lock);
+      if (t.owns_lock()) { r = readers_[(start + k) % n].get(); lk = std::move(t); }
+    }
+    if (!r) { r = readers_[start].get(); lk = std::unique_lock<std::mutex>(r->mu); }
+    Stmt s(r->db, sql);
+    s.bind(params);
+    json rows = json::array();
+    while (s.step()) rows.push_back(s.row());
+    return rows;
+  }
   std::lock_guard<std::recursive_mutex> lk(mu_);
   Stmt s(db_, sql);
   s.bind(params);
@@ -236,6 +304,28 @@ void Store::exec(const std::string& sql, const std::vector<SqlValue>& params) {
   Stmt s(db_, sql);
   s.bind(params);
   s.step();
+  // Only after the statement succeeded: a BEGIN that threw opened nothing.
+  if (starts_with_word(sql, "BEGIN")) ++tl_open_transactions;
+  else if ((starts_with_word(sql, "COMMIT") || starts_with_word(sql, "END") || starts_with_word(sql, "ROLLBACK")) &&
+           tl_open_transactions > 0)
+    --tl_open_transactions;
+}
+
+void Store::transaction(const std::function<void()>& fn) {
+  std::lock_guard<std::recursive_mutex> lk(mu_);
+  exec("BEGIN IMMEDIATE");
+  try {
+    fn();
+    exec("COMMIT");
+  } catch (...) {
+    try { exec("ROLLBACK"); } catch (...) {}
+    throw;
+  }
+}
+
+long long Store::changes() {
+  std::lock_guard<std::recursive_mutex> lk(mu_);
+  return sqlite3_changes(db_);
 }
 
 // ---- reference data -------------------------------------------------------------

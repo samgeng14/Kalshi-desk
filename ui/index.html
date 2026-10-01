@@ -417,7 +417,7 @@
         <input id="tr_q" placeholder="filter" size="12">
         <label>p(win) ≥ <input id="tr_minwin" type="number" min="0" max="99" value="0" style="width:48px">%</label>
         <label title="valid estimates nobody is offered yet (a research-only model, or settlement not verified): recorded, never sent"><input type="checkbox" id="tr_research"> show RESEARCH</label>
-        <select id="tr_n"><option value="15">top 15</option><option value="20" selected>top 20</option><option value="40">top 40</option></select>
+        <select id="tr_n" title="rows per category tab; ALL shows this many across everything, ranked by net edge"><option value="10" selected>top 10</option><option value="20">top 20</option><option value="40">top 40</option><option value="60">top 60</option><option value="100">top 100</option><option value="0">no cap</option></select>
         <label title="rows the algorithm sends itself: shown and marked, not offered to you"><input type="checkbox" id="tr_algo" checked> show AUTO</label>
       </span>
     </h2>
@@ -593,6 +593,13 @@
     </tr></thead><tbody></tbody></table>
   </div>
   <button id="sys_more" class="hidden mini">show more</button>
+  <h3>Lanes <span class="mini" id="sys_lanes_note">stake set by each model's own settled live trades; no Brier gate</span></h3>
+  <div class="scroll" style="max-height:26vh"><table id="sys_lanes"><thead><tr>
+    <th class="l">model</th><th class="l">stage</th><th>stake</th><th title="closed live trades / all live trades">settled</th><th>wins</th>
+    <th title="realized P&L per settled trade, after fees">P&amp;L / trade</th><th>realized</th><th>today</th>
+    <th title="stake put on today / what the lane may still put on">volume today</th><th title="settled trades until the next window is evaluated (at the day roll)">next window</th>
+    <th class="l">last window</th>
+  </tr></thead><tbody></tbody></table></div>
   <h3>Open positions <span class="mini" id="sys_pos_count"></span></h3>
   <div class="scroll" style="max-height:34vh"><table id="sys_positions"><thead><tr>
     <th class="l">market</th><th>side</th><th>n</th><th>entry</th><th title="best bid for the side held">bid</th><th title="what selling into the bid returns now, net of the fee, against cost">unrealized</th>
@@ -839,6 +846,12 @@
   // manual order was refused with "an order request is still pending" - for hours, with no way
   // out. A hung request must fail, not wedge the desk.
   const API_TIMEOUT_MS = 15000;
+  // How long a published decision set stays on the board. Past DECISION_STALE_S the rows are
+  // marked; past DECISION_MAX_AGE_S they are dropped.
+  const DECISION_STALE_S = 30, DECISION_MAX_AGE_S = 240;
+  // Row caps. ALL is a ranked queue of the best edges across everything; a category tab is the
+  // top of that category. Without a cap the board is 1,297 rows and unusable as a work list.
+  const TOP_ALL = 100, TOP_CAT = 10;
   async function api(path, opts) {
     const o = Object.assign({headers:{'Content-Type':'application/json', 'X-Desk': '1'}}, opts||{});
     if (!o.signal) o.signal = AbortSignal.timeout(API_TIMEOUT_MS);
@@ -1710,10 +1723,32 @@
     const cats = SYS_CATEGORIES.filter(k => routeOf(set[k]) === 'auto').join(', ') || 'nothing';
     // A description of the saved configuration, not a route: the rows' routes are the desk's.
     const graduatedAuto = Object.entries(set.model_routes || {}).filter(([k,v]) => routeOf(v) === 'auto' && (set.graduated_models || []).includes(k)).map(([k]) => k);
-    $('#sys_line').innerHTML = `The algorithm sends, by itself: <b>${esc(cats)}</b>${routeOf(set.arbitrage)==='auto'?' plus <b>locked baskets</b>':''}, and only on a model routed auto <b>and</b> graduated (${graduatedAuto.length ? '<b>' + esc(graduatedAuto.join(', ')) + '</b>' : '<b>none yet</b>'}), where p(win) ≥ <b>${fmt(set.min_win_probability,2)}</b>, edge is between <b>${money(set.min_edge)}</b> and <b>${money(set.max_edge)}</b> after the fee, ${money(set.slippage_estimate||0)} taker slippage and ${fmt(set.uncertainty_buffer,1)}×σ, σ ≤ ${fmt(set.auto_max_sigma??.10,2)}, the book is fresh and no wider than ${money(set.max_spread)}, the raw model is within ${fmt(set.max_model_gap,2)} of the mid, and settlement is inside ${fmt(set.max_horizon_hours,0)}h. Research-only estimates, unverified settlement and models routed to research are recorded and offered to nobody. Ranked by Kelly fraction, so a small edge on a likely winner beats a big edge on a coin flip.<br>Left to you (the Trades board): every model not routed auto and graduated, edges above ${money(set.max_edge)}, large model/market gaps, wide books, high σ, markets settling later than ${fmt(set.max_horizon_hours,0)}h, additions to events already held, hedges.`;
+    const liveLanes = Object.entries(set.lanes || {}).filter(([k,l]) => l && (l.stage === 'live_candidate' || l.stage === 'live'))
+      .map(([k,l]) => `${k} $${fmt(l.stake,0)}${set.asymmetric_filter !== false && l.asymmetric !== false ? ', cheap side only' : ', any price, p(win) floor applies'}`);
+    $('#sys_line').innerHTML = `The algorithm sends, by itself: <b>${esc(cats)}</b>${routeOf(set.arbitrage)==='auto'?' plus <b>locked baskets</b>':''}, and only on a model routed auto <b>and</b> graduated (${graduatedAuto.length ? '<b>' + esc(graduatedAuto.join(', ')) + '</b>' : '<b>none yet</b>'}) or a lane at live_candidate/live (${liveLanes.length ? '<b>' + esc(liveLanes.join('; ')) + '</b>' : '<b>none</b>'}; a cheap-side lane buys at or under ${fmt(set.asymmetric_max_price??.45,2)} unless the edge exceeds ${money(set.asymmetric_override_edge??.10)}${set.hold_to_settlement === false ? '' : ', and lane trades hold to settlement'}), where p(win) ≥ <b>${fmt(set.min_win_probability,2)}</b> except on cheap-side lanes, edge is between <b>${money(set.min_edge)}</b> and <b>${money(set.max_edge)}</b> after the fee, ${money(set.slippage_estimate||0)} taker slippage and ${fmt(set.uncertainty_buffer,1)}×σ, σ ≤ ${fmt(set.auto_max_sigma??.10,2)}, the book is fresh and no wider than ${money(set.max_spread)}, the raw model is within ${fmt(set.max_model_gap,2)} of the mid, and settlement is inside ${fmt(set.max_horizon_hours,0)}h. Research-only estimates, unverified settlement and models routed to research are recorded and offered to nobody. Ranked by Kelly fraction, so a small edge on a likely winner beats a big edge on a coin flip.<br>Left to you (the Trades board): every model not routed auto and graduated, edges above ${money(set.max_edge)}, large model/market gaps, wide books, high σ, markets settling later than ${fmt(set.max_horizon_hours,0)}h, additions to events already held, hedges.`;
     researchRows = s.screen?.rows || [];
     $('#sys_line').insertAdjacentHTML('beforeend', `<br><b>Ownership:</b> this algorithm manages only its own entries. Manually submitted orders use your manual brackets and are excluded from algorithm exits. Capital allocation: <b>${money(set.capital_budget_dollars)}</b>. Stop mode: <b>${set.stop_loss_mode==='fraction'?fmt((set.stop_loss_fraction??.70)*100,0)+'% loss of entry cost including fees':money(set.stop_loss)+' fixed price loss per contract'}</b>.${set.near_day_categories_only?` Economics, finance, and technology/science are limited to today or tomorrow (${esc(set.settlement_day_tz||'America/Chicago')}).`:''}`);
     renderSystematicScreen();
+    // Lanes: attribution per model, and the live-sizing state of every model that is a lane. Not
+    // rebuilt while one of its stage selects is open, which would swallow the choice.
+    const lanesBody = $('#sys_lanes tbody');
+    if (!lanesBody.contains(document.activeElement)) lanesBody.innerHTML = (s.lanes || []).map(l => {
+      const lane = l.lane, last = lane && lane.windows && lane.windows.length ? lane.windows[lane.windows.length - 1] : null;
+      const stage = lane ? (lane.halted_today ? lane.stage + ' · stopped today' : lane.stage) : 'not a lane';
+      const stageCls = !lane ? '' : lane.halted_today ? 'warn' : (lane.stage === 'live' || lane.stage === 'live_candidate') ? 'up' : 'dn';
+      const stageCell = lane
+        ? `<select data-lanestage="${esc(l.model)}" title="research/paper: priced for you, never sent. live_candidate/live: the algorithm sends it at the lane's stake.">` +
+          ['research','paper','live_candidate','live'].map(k => `<option value="${k}" ${lane.stage===k?'selected':''}>${k}</option>`).join('') +
+          `</select>${lane.halted_today ? ' stopped today' : ''}`
+        : esc(stage);
+      return `<tr><td class="l">${esc(l.model)}</td><td class="l ${stageCls}">${stageCell}</td>` +
+        `<td>${lane ? money(lane.stake) : '-'}</td><td>${l.settled} / ${l.trades}</td><td>${l.wins}</td>` +
+        `<td class="${c(l.pnl_per_trade)}">${l.pnl_per_trade === null || l.pnl_per_trade === undefined ? '-' : money(l.pnl_per_trade)}</td>` +
+        `<td class="${c(l.realized)}">${money(l.realized)}</td><td class="${c(l.today?.pnl)}">${money(l.today?.pnl)}</td>` +
+        `<td>${money(l.today?.volume)}${lane ? ' / ' + money(lane.volume_left_today) + ' left' : ''}</td>` +
+        `<td>${lane ? lane.trades_to_next_window + ' trades' : '-'}</td>` +
+        `<td class="l">${last ? esc(`${last.verdict}: mean ${money(last.mean)}, lower ${money(last.lower)} vs fee ${money(last.fee)}, ${money(last.stake_before)} → ${money(last.stake_after)}`) : '-'}</td></tr>`;
+    }).join('') || '<tr><td class="l" colspan="11">no lanes and no algorithm trades yet</td></tr>';
     const positions = s.positions || [];
     $('#sys_pos_count').textContent = positions.length ? `${positions.length}` : '';
     $('#sys_positions tbody').innerHTML = positions.map(t => {
@@ -2120,6 +2155,32 @@
       $('#sys_toggle').disabled = true;
     } finally { systematicLoading = false; }
   }
+  // A lane's stage, from the Lanes table. Promoting to live_candidate/live makes the algorithm send
+  // that model's AUTO decisions with real money (when it is running live), so it asks first.
+  document.addEventListener('change', async (ev) => {
+    const el = ev.target;
+    if (!el || !el.dataset || !el.dataset.lanestage) return;
+    const model = el.dataset.lanestage, stage = el.value;
+    const lane = (systematic?.settings?.lanes || {})[model] || {};
+    const was = lane.stage || 'research';
+    const isLive = st => st === 'live_candidate' || st === 'live';
+    const base = systematic?.settings?.lane_base_stake ?? 5;
+    // Say what the server will actually do (SystematicTrader::configure).
+    const note = !isLive(stage)
+      ? `Move ${model} to ${stage}? The algorithm stops sending it; open positions keep their exits.`
+      : !isLive(was)
+        ? `Promote ${model} to ${stage}? When the algorithm runs live, it sends this model's AUTO decisions at $${fmt(base, 2)} a trade. Its results are counted afresh from now.`
+        : stage === 'live_candidate'
+          ? `Set ${model} back to live_candidate? Its stake returns to $${fmt(base, 2)}; its results so far still count.`
+          : `Set ${model} to live? The stake stays at $${fmt(lane.stake ?? base, 2)} until the next window moves it.`;
+    if (systematicSaving) { toast('A settings save is in progress; try the lane change again in a moment.', true); renderSystematic(); return; }
+    if (!confirm(note)) { renderSystematic(); return; }   // put the select back to the saved stage
+    // Posted on its own, not through saveSystematic: that marks the settings form clean and would
+    // discard edits you have not applied yet.
+    try { await post('/api/systematic', {settings: {lanes: {[model]: {stage}}}}); toast(`${model}: ${stage}`); }
+    catch (e) { toast(e.message, true); }
+    finally { await refreshSystematic(); }
+  });
   async function saveSystematic(body, msg) {
     if (systematicSaving) return;
     systematicSaving = true; $('#sys_toggle').disabled = true; $('#sys_apply').disabled = true;
@@ -2293,8 +2354,14 @@
     const inflight = new Set();
     for (const [,request] of unacknowledged) inflight.add(eventKey(request));
     for (const [key,until] of submittedEvents) { if(until>Date.now())inflight.add(key);else submittedEvents.delete(key); }
-    const decisionsFresh = decisions?.generated_ts > 0 && now-decisions.generated_ts <= 30;
-    if (decisionsFresh) for (const r of decisionRows) {
+    const decisionAge = decisions?.generated_ts > 0 ? now - decisions.generated_ts : -1;
+    const decisionsFresh = decisionAge >= 0 && decisionAge <= 30;
+    // Rows stay on the board well past "fresh". The cycle routinely takes 17-25s and sometimes
+    // far longer, so a 30-second all-or-nothing cutoff blanked a board that had 13 manual rows on
+    // it - the operator saw MANUAL 13 in the funnel and an empty table. Show them, say how old
+    // they are, and only drop them when they are old enough to be misleading.
+    const decisionsUsable = decisionAge >= 0 && decisionAge <= DECISION_MAX_AGE_S;
+    if (decisionsUsable) for (const r of decisionRows) {
       const route = r.route;
       if (route !== 'manual' && route !== 'auto' && route !== 'research') continue;   // the desk lists only these
       if ((route === 'auto' && !showAuto) || (route === 'research' && !showResearch)) continue;
@@ -2380,10 +2447,27 @@
     if (!cats.includes(tradesCat)) tradesCat = 'all';
     // Same predicate the row renderer uses for `tradable`, so this can never disagree with it.
     const isTradable = r => r.kind !== 'kalshi' || r.route === 'manual';
-    if (!tradesCatPinned && tradesCat !== 'all' && rows.some(isTradable)
-        && !rows.some(r => r.cat === tradesCat && isTradable(r))) tradesCat = 'all';
-    const out = rows.filter(r => (tradesCat === 'all' || r.cat === tradesCat) && (!q || (r.ticker + ' ' + (r.title||'') + ' ' + (r.sub||'') + ' ' + (r.model||'')).toLowerCase().includes(q)));
-    return {rows: out, counts, cats, total: rows.length, decisionsFresh, routeCounts};
+    // A category you clicked stays clicked. This used to bounce you back to ALL whenever the
+    // chosen category briefly had no tradable row - which on a board that repopulates every few
+    // seconds meant the tab you selected kept vanishing under you. An empty category now shows as
+    // empty, which is information, rather than silently moving you somewhere else.
+    let out = rows.filter(r => (tradesCat === 'all' || r.cat === tradesCat) && (!q || (r.ticker + ' ' + (r.title||'') + ' ' + (r.sub||'') + ' ' + (r.model||'')).toLowerCase().includes(q)));
+    // Rank by executable net edge, best first, then cap. The desk's own ordering is kept as the
+    // tie-break so rows with no edge number do not jump the queue.
+    // The rows carry `net` (executable edge, or a pair's locked profit) and `raw`; there is no
+    // net_edge or edge on them, so the old lookup made every row -Infinity and nothing was ranked.
+    const edgeOf = r => [r.net, r.net_edge, r.raw, r.edge].map(Number).find(Number.isFinite) ?? -Infinity;
+    const shown = out.length;
+    out = out.slice().sort((a,b) => edgeOf(b) - edgeOf(a) || band(a) - band(b));
+    // The visible selector is the cap for a category tab. ALL is the ranked queue across
+    // everything, so it gets the larger of the selector and TOP_ALL unless the cap is off.
+    const pick = parseInt(($('#tr_n')||{}).value, 10);
+    const sel = Number.isFinite(pick) ? pick : TOP_CAT;
+    const cap = sel === 0 ? Infinity : (tradesCat === 'all' ? Math.max(sel, TOP_ALL) : sel);
+    const capped = out.length > cap;
+    if (capped) out = out.slice(0, cap);
+    return {rows: out, counts, cats, total: rows.length, decisionsFresh, decisionAge,
+            decisionsUsable, routeCounts, capped, shown, cap};
   }
   // An empty board is the normal resting state of a working router, so it has to account for
   // itself. Every number here comes from the server's own decision counts and reason histogram;
@@ -2524,8 +2608,11 @@
 
   function renderTrades() {
     if (!decisions) return;
-    const {rows, counts, cats, total, decisionsFresh, routeCounts} = tradesModel();
-    const n = parseInt($('#tr_n').value, 10) || 20;
+    const {rows, counts, cats, total, decisionsFresh, decisionAge, decisionsUsable,
+           routeCounts, capped, shown, cap} = tradesModel();
+    // NOTE: no second slice here. tradesModel() ranks by net edge and applies the cap; this
+    // used to also do rows.slice(0, n), so a lane holding 27 rows rendered 10 of them and the
+    // other 17 were unreachable - there was nothing to scroll to.
     const alg = decisions.algorithm || {};
     // `running` is the switch the operator set; `halted` is what the engine is actually doing.
     // Reading only the switch is how this line said "algorithm LIVE" while nothing was being sent.
@@ -2550,9 +2637,9 @@
     ).join('') + `<span class="ar">→</span><span class="st" data-trfunnel="auto">AUTO <b>${fn['auto']??0}</b></span>`
       + `<span class="st" data-trfunnel="me">MANUAL <b>${fn['manual']??0}</b></span>`;
     $('#tr_cats').innerHTML = cats.map(k => `<span class="chip ${k===tradesCat?'on':''}" data-trcat="${k}">${k}<span class="n">${counts[k]||0}</span></span>`).join('');
-    $('#trades_count').textContent = `${Math.min(n, rows.length)} of ${total} actionable · ${algo} · decisions ${sysAge(decisions.generated_ts)}`;
+    $('#trades_count').textContent = `${rows.length} of ${total} actionable · ${algo} · decisions ${sysAge(decisions.generated_ts)}`;
     const num = (x, d = 3, sign = false) => x === null || x === undefined || !Number.isFinite(Number(x)) ? '-' : (sign && x > 0 ? '+' : '') + fmt(x, d);
-    $('#trades tbody').innerHTML = rows.slice(0, n).map(r => {
+    $('#trades tbody').innerHTML = rows.map(r => {
       // These windows settle a second after they close; the exchange's expected_expiration_time
       // for them is hours later and is not the window (docs/commodity-settlement.md). Where the
       // model gave us the real clock, show that instead of a number that is wrong by hours.
@@ -2572,7 +2659,7 @@
         <td class="l">${ROUTE_PILL[r.route] || esc(r.route||'')}</td>
         <td class="dim">${settles}</td>
         <td>${tradable?`<button data-tradebtn="${esc(r.key)}" class="ok">trade</button>`:''}</td></tr>`;
-    }).join('') || `<tr><td class="l" colspan="11">${emptyBoardExplanation(decisionsFresh)}</td></tr>`;
+    }).join('') || `<tr><td class="l" colspan="11">${emptyBoardExplanation(decisionsUsable)}</td></tr>`;
     // The selection is re-applied after the rows are replaced, because innerHTML destroyed the
     // previous element. Falling back to the top row means the panel is useful the moment the
     // board has anything in it, without the operator having to click first.
@@ -2590,7 +2677,10 @@
     // folds away: it was costing a third of the board's height on a 900px display.
     $('#trades_note').innerHTML =
       `${alg.halted?`<div class="warn">The algorithm is HALTED and is sending nothing${alg.halt_reason?': '+esc(alg.halt_reason):''}. Clear the halt on the Systematic tab. Manual orders are unaffected.</div>`:''}`
-      + `${decisionsFresh?'':'<span class="warn">The desk\'s decisions are stale; event rows are hidden until a new cycle publishes them.</span> '}`
+      + `${decisionsFresh ? '' : decisionsUsable
+            ? `<span class="warn">These rows are ${Math.round(decisionAge)}s old. The desk publishes on its cycle; they are shown because a board with nothing on it is worse than one that says how old it is. The desk rechecks every price before anything is sent.</span> `
+            : `<span class="warn">No decision set newer than ${DECISION_MAX_AGE_S}s. The desk is not publishing - check that a cycle is completing.</span> `}`
+      + `${capped ? `<span class="dim">Showing the top ${cap} of ${shown} by net edge${tradesCat==='all'?'':' in '+esc(tradesCat)}. Category tabs show their own top ${cap}.</span> ` : ''}`
       + `<details><summary>what the routes mean</summary><span class="dim">Routes are the desk\'s decision router; this page does not recompute them. `
       + `MANUAL: yours to review, and the desk rechecks it before anything is sent. AUTO: the algorithm sends it itself and it is not offered to you. `
       + `RESEARCH: recorded, offered to nobody. One row per event and route; events you hold, work or have queued are not listed. `
@@ -3069,7 +3159,14 @@
   // covers them wherever they are rendered.
   $('#tradespanel').addEventListener('click', (ev) => {
     const f = ev.target.closest('[data-trfunnel]');
-    if (f) { ev.preventDefault(); setTradesRoute(f.dataset.trfunnel); }
+    if (f) {
+      ev.preventDefault();
+      // A button labelled SHOW ALL DECISIONS has to actually show all of them. The ALL lane
+      // filters research out unless this box is ticked, so on an empty board - where research is
+      // usually the only thing there is - the button appeared to do nothing at all.
+      if (f.dataset.trfunnel === 'all') $('#tr_research').checked = true;
+      setTradesRoute(f.dataset.trfunnel);
+    }
   });
   $('#tr_q').addEventListener('input', renderTrades);
   $('#tr_n').addEventListener('change', renderTrades);
@@ -3552,6 +3649,17 @@
     } catch (e) { toast(e.message, true); }
   }
 
+  // A reload should mean everything is current, not "current as of whenever the desk last
+  // published". Cmd+R now does what pressing y then waiting for a cycle used to: it asks the desk
+  // to reconcile the account first, so the account snapshot is fresh and the entry check that
+  // refuses on a 118s-old snapshot passes, then pulls every panel. Failures are ignored on
+  // purpose - a reload must never end up showing nothing because one endpoint was busy.
+  (async () => {
+    try { await post('/api/reconcile', {}, {signal: AbortSignal.timeout(20000)}); } catch (e) {}
+    for (const t of _tasks) t.last = 0;
+    refreshState(); refreshRiskPnl(); refreshBoard(); refreshLadder(); refreshBlotter();
+    refreshManualQueue(); refreshTrades(); refreshBook();
+  })();
   refreshState(); refreshRiskPnl(); refreshBoard(); refreshLadder(); refreshBlotter();
   // One clock for all of it. The ladder only runs when a market is selected, and the per-tab
   // panels only when their tab is on screen, so a hidden tab costs nothing instead of a request

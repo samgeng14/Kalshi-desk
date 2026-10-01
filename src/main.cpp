@@ -2,6 +2,7 @@
 #include <sys/file.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <csignal>
 #include <cstring>
 #include <cmath>
@@ -86,6 +87,7 @@ int main(int argc, char** argv) {
   Store store(cfg.db_path);
   seed_hypotheses(store);
   KalshiClient client(cfg.rest_base(), signer, cfg.user_agent);
+  client.set_min_interval_ms(cfg.rest_min_interval_ms);
   Executor exec(cfg, store, client);
 
   if (cmd == "research") return run_research(rest, cfg, store, client);
@@ -159,21 +161,73 @@ int main(int argc, char** argv) {
 
   std::signal(SIGINT, on_signal);
   std::signal(SIGTERM, on_signal);
+  // A write to a closed socket is an error to handle, never a reason to end the desk: TLS writes
+  // go through OpenSSL's write(2), which raises SIGPIPE, and its default action is to terminate.
+  std::signal(SIGPIPE, SIG_IGN);
   HttpServer server(engine, store, client, exec, cfg.http_port);
   server.start();
-  LOG_INFO("desk up: env=%s poll=%ds bankroll=%.2f watch=%zu", cfg.env.c_str(), cfg.poll_seconds,
-           cfg.bankroll_dollars, engine.watch().size());
+  engine.start_background();
+  LOG_INFO("desk up: env=%s poll=%ds bankroll=%.2f watch=%zu rest_interval=%dms", cfg.env.c_str(),
+           cfg.poll_seconds, cfg.bankroll_dollars, engine.watch().size(), client.min_interval_ms());
+  // The loop never exits on a failure. A cycle that throws anyway (the cycle guards every step,
+  // so this is the last line of defence) is logged and retried with a growing pause. Repeated
+  // storage failures escalate: first the kill switch, which cancels resting orders and stops
+  // every send; then, if they still persist, a clean exit with code 75 so the supervisor
+  // (scripts/desk_supervise.sh) starts a fresh process with a fresh SQLite connection. Before
+  // this, each of the seven storage errors in the log ended the process on the spot.
+  const int limit = std::max(1, cfg.max_consecutive_cycle_failures);
+  // Heartbeat for the supervisor: the loop's own clock, in a file, written after every pass. The
+  // supervisor used to judge liveness by asking /api/state, and a desk whose request threads were
+  // all busy with the dashboard looked dead and was restarted while it was cycling normally.
+  const std::string heartbeat = cfg.db_path + ".heartbeat";
+  auto beat = [&heartbeat] {
+    const std::string tmp = heartbeat + ".tmp";
+    if (FILE* f = std::fopen(tmp.c_str(), "w")) {
+      std::fprintf(f, "%lld\n", static_cast<long long>(now_s()));
+      std::fclose(f);
+      std::rename(tmp.c_str(), heartbeat.c_str());
+    }
+  };
+  int thrown = 0;
+  int exit_code = 0;
+  bool killed_for_storage = false;
   while (!g_stop) {
     long long t0 = now_ms();
-    engine.cycle();
+    try {
+      engine.cycle();
+      thrown = 0;
+    } catch (const std::exception& e) {
+      ++thrown;
+      LOG_ERR("cycle escaped its guards (%d in a row): %s", thrown, e.what());
+    } catch (...) {
+      ++thrown;
+      LOG_ERR("cycle escaped its guards (%d in a row): unknown exception", thrown);
+    }
+    beat();
+    const int failures = std::max(thrown, engine.consecutive_storage_failures());
+    if (failures >= limit && !killed_for_storage) {
+      killed_for_storage = true;
+      LOG_ERR("%d failed cycles in a row: tripping the kill switch (re-arm on the dashboard)", failures);
+      try { engine.request_kill("storage failing: " + std::to_string(failures) + " cycles in a row"); }
+      catch (const std::exception& e) { LOG_ERR("kill request: %s", e.what()); }
+    }
+    if (failures == 0) killed_for_storage = false;
+    if (failures >= 3 * limit) {
+      LOG_ERR("%d failed cycles in a row: exiting so the supervisor restarts with a fresh connection", failures);
+      exit_code = 75;
+      break;
+    }
     long long spent = now_ms() - t0;
-    long long wait = cfg.poll_seconds * 1000LL - spent;
+    // Back off while failing: 1x, 2x, 4x the poll, capped at a minute.
+    long long pause = cfg.poll_seconds * 1000LL * (failures > 0 ? std::min(12, 1 << std::min(failures - 1, 4)) : 1);
+    long long wait = std::min<long long>(pause, 60000) - spent;
     while (wait > 0 && !g_stop) {
       std::this_thread::sleep_for(std::chrono::milliseconds(std::min<long long>(wait, 250)));
       wait -= 250;
     }
   }
   LOG_INFO("shutting down");
+  engine.stop_background();
   server.stop();
-  return 0;
+  return exit_code;
 }

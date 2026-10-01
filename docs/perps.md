@@ -89,7 +89,7 @@ posts against the drift and takes the position off when it closes:
 - `daily_loss_stop` on the rule's own realized plus unrealized for the local day: halts new
   entries until cleared or the day turns.
 - paper mode simulates the same thing: a maker entry fills when the touch trades through it,
-  exits at the touch, fees at the account's rates (defaults 5/12 bps when unknown).
+  exits at the touch, fees at the account's rates (defaults 2/12 bps maker/taker when unknown).
 
 Settings live on the tab (`entry_bps` 25, `exit_bps` 5, `stop_bps` 60, `max_hold_minutes` 120,
 `contracts` 1, `daily_loss_stop` $3, `entry_ttl_seconds` 90, `cooldown_minutes` 30, `markets`

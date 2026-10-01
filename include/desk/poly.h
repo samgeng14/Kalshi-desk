@@ -1,4 +1,6 @@
 #pragma once
+#include <thread>
+#include <atomic>
 // Polymarket US: the CFTC-regulated exchange (api.polymarket.us for trading, gateway.polymarket.us
 // for public data), Ed25519-signed requests, the same binary contracts as Kalshi with a different
 // fee schedule (taker 0.06 p(1-p) a contract, makers are PAID 0.0125 p(1-p)) and a 0.005 tick on
@@ -169,7 +171,18 @@ class PolyDesk {
   // `exec` may be null: the pair rule then cannot go live (paper only) and pairs cannot be sent.
   PolyDesk(const Config& cfg, Store& store, std::shared_ptr<PolyClient> client, Executor* exec, Hooks hooks = {});
 
-  // Cycle hooks, in this order, under the engine lock. Exceptions are logged, never thrown.
+  ~PolyDesk();
+  // Runs refresh_universe, match, refresh_quotes and refresh_account on a thread of their own,
+  // every second, each on its own cadence. They are network calls (four HTTP round trips for the
+  // account alone, thirteen leagues for the universe) and they used to run inside the engine
+  // cycle under the engine lock: "polymarket" was 15-16 s of a 30-36 s cycle on 2026-09-17, and
+  // for those seconds no Kalshi quote was refreshed and the dashboard could not take the lock.
+  // Once started, the engine skips its own calls to them (see background_running()).
+  void start_background();
+  void stop_background();
+  bool background_running() const { return bg_running_.load(); }
+
+  // Cycle hooks, in this order. Exceptions are logged, never thrown.
   void refresh_universe(long long now);   // league events -> game-winner markets
   void refresh_quotes(long long now);     // bid/ask for matched and held markets
   void refresh_account(long long now, bool force = false);
@@ -228,9 +241,16 @@ class PolyDesk {
   json algo_state_;
   std::map<std::string, long long> pair_backoff_;   // kalshi ticker -> no new pair before this
   long long universe_ts_ = 0, quotes_ts_ = 0, account_ts_ = 0, match_ts_ = 0;
+  // Consecutive 401/403s on the account call. A refused credential is refused next cycle
+  // too, so it backs off instead of spending four HTTP round trips per cycle forever.
+  int account_auth_failures_ = 0;
   std::string last_error_;
   std::recursive_mutex mu_;
   using Lock = std::lock_guard<std::recursive_mutex>;
+  std::thread bg_;
+  std::atomic<bool> bg_running_{false};
+  std::atomic<bool> bg_stop_{false};
+  std::atomic<long long> order_gen_{0};   // bumped by every order write; see refresh_account
 };
 
 }  // namespace desk

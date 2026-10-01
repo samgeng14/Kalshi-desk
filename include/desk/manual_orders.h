@@ -10,6 +10,11 @@ struct RetryManualOrder : std::runtime_error { using std::runtime_error::runtime
 class ManualOrders {
  public:
   explicit ManualOrders(Store& store);
+  // How long a reviewed ticket stays valid: the enqueue guard and the queue's own deadline.
+  // It is also the retry budget - a request that keeps being put back stops when this runs out -
+  // so 90s meant a blocked ticket got very few attempts. risk.manual_review_seconds.
+  void set_review_seconds(long long s) { review_seconds_ = s > 0 ? s : 90; }
+
   json enqueue(const json& payload, long long now);
   json view();
   json cancel(const std::string& id, long long now);
@@ -23,6 +28,7 @@ class ManualOrders {
  private:
   Precheck precheck_;
   Store& store_;
+  long long review_seconds_ = 90;
   std::mutex mu_;
   std::mutex worker_mu_;
   void finish(const std::string& id,const std::string& status,const json& result,const std::string& error,long long now);

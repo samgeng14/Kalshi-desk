@@ -480,6 +480,7 @@ void PolyDesk::algo_log(const std::string& level, const std::string& msg) {
 }
 
 std::optional<PolyMarket> PolyDesk::market(const std::string& slug) {
+  Lock lk(mu_);   // the background thread inserts and erases markets_ under this lock
   auto it = markets_.find(slug);
   if (it == markets_.end()) return std::nullopt;
   return it->second;
@@ -507,12 +508,53 @@ std::optional<PolyDesk::Quote> PolyDesk::quote_for(const std::string& kalshi_tic
 
 // ---- refreshes ------------------------------------------------------------------------------------------
 
+PolyDesk::~PolyDesk() { stop_background(); }
+
+void PolyDesk::start_background() {
+  if (!pc_.enabled || !client_ || bg_running_.load()) return;
+  bg_stop_ = false;
+  bg_running_ = true;
+  bg_ = std::thread([this] {
+    LOG_INFO("polymarket: refreshing on its own thread");
+    while (!bg_stop_.load()) {
+      // Each call checks its own cadence and returns at once when it is not due. None of them may
+      // end the thread: a failure is logged and the next pass tries again.
+      auto guard = [&](const char* what, auto&& fn) {
+        try { fn(); } catch (const std::exception& e) {
+          LOG_WARN("polymarket %s: %s", what, e.what());
+          Lock lk(mu_);
+          last_error_ = std::string(what) + ": " + e.what();
+        } catch (...) {
+          LOG_WARN("polymarket %s: unknown exception", what);
+        }
+      };
+      // Each call gets the time it actually runs at: the universe refresh alone can take seconds,
+      // and quote rows stamped with the pass's start would read older than they are.
+      guard("universe", [&] { refresh_universe(now_s()); });
+      guard("match", [&] { match(now_s()); });
+      guard("quotes", [&] { refresh_quotes(now_s()); });
+      guard("account", [&] { refresh_account(now_s()); });
+      for (int i = 0; i < 10 && !bg_stop_.load(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+  });
+}
+
+void PolyDesk::stop_background() {
+  bg_stop_ = true;
+  if (bg_.joinable()) bg_.join();
+  bg_running_ = false;
+}
+
 void PolyDesk::refresh_universe(long long now) {
   if (!pc_.enabled || !client_) return;
-  if (now - universe_ts_ < pc_.universe_refresh_seconds) return;
-  universe_ts_ = now;
+  {
+    Lock lk(mu_);   // the background thread and the dashboard's sync can both get here
+    if (now - universe_ts_ < pc_.universe_refresh_seconds) return;
+    universe_ts_ = now;
+  }
   std::vector<PolyMarket> found;
   std::string err;
+  std::set<std::string> failed_leagues;   // their markets are kept, not treated as over
   for (const auto& lg : pc_.leagues) {
     for (int page = 0; page < 3; ++page) {
       json j;
@@ -520,6 +562,7 @@ void PolyDesk::refresh_universe(long long now) {
         j = client_->call("GET", "/v2/leagues/" + lg + "/events", {{"limit", "200"}, {"offset", std::to_string(page * 200)}});
       } catch (const std::exception& e) {
         err = std::string(lg) + ": " + e.what();
+        failed_leagues.insert(lg);
         LOG_WARN("poly league %s: %s", lg.c_str(), e.what());
         break;
       }
@@ -563,7 +606,10 @@ void PolyDesk::refresh_universe(long long now) {
   std::set<std::string> keep;
   for (const auto& p : positions_) keep.insert(p.slug);
   for (auto it = markets_.begin(); it != markets_.end();) {
-    if (!seen.count(it->first) && !keep.count(it->first) && !found.empty()) {
+    // Not listed because its league's fetch failed is not the same as over: an open pair may still
+    // need that market to hedge.
+    if (!seen.count(it->first) && !keep.count(it->first) && !found.empty() &&
+        !failed_leagues.count(it->second.league)) {
       store_.exec("UPDATE poly_markets SET closed=1, updated_ts=? WHERE slug=?", {now, it->first});
       it = markets_.erase(it);
     } else ++it;
@@ -573,8 +619,11 @@ void PolyDesk::refresh_universe(long long now) {
 
 void PolyDesk::refresh_quotes(long long now) {
   if (!pc_.enabled || !client_) return;
-  if (now - quotes_ts_ < pc_.refresh_seconds) return;
-  quotes_ts_ = now;
+  {
+    Lock lk(mu_);
+    if (now - quotes_ts_ < pc_.refresh_seconds) return;
+    quotes_ts_ = now;
+  }
   std::vector<std::string> slugs;
   {
     Lock lk(mu_);
@@ -639,11 +688,21 @@ void PolyDesk::refresh_quotes(long long now) {
   }
 }
 
+// How long to stop asking after the credential is refused.
+static constexpr long long kPolyAuthBackoffSeconds = 900;
+
 void PolyDesk::refresh_account(long long now, bool force) {
   if (!pc_.enabled || !armed()) return;
-  if (!force && now - account_ts_ < pc_.account_refresh_seconds) return;
-  account_ts_ = now;
+  {
+    Lock lk(mu_);
+    if (!force && now - account_ts_ < pc_.account_refresh_seconds) return;
+    account_ts_ = now;
+  }
   json bj, pj, oj, aj;
+  // An order sent or cancelled while this snapshot is in flight makes it stale on arrival: it would
+  // mark the new order done and stamp pre-trade positions as fresh. Such a snapshot is dropped and
+  // fetched again on the next pass.
+  const long long gen_before = order_gen_.load();
   long long since = std::atoll(store_.kv_get("poly_trades_since").value_or("0").c_str());
   try {
     bj = client_->call("GET", "/v1/account/balances", {}, nullptr, true);
@@ -653,10 +712,32 @@ void PolyDesk::refresh_account(long long now, bool force) {
   } catch (const std::exception& e) {
     Lock lk(mu_);
     last_error_ = e.what();
-    LOG_WARN("poly account: %s", e.what());
+    // A credential that is wrong is wrong on the next cycle too. Retrying it every cycle cost
+    // four HTTP round trips inside the engine lock, every cycle, for hours - 234 consecutive
+    // 401s on 2026-09-12 - while the cycle was already overrunning the quote freshness bar.
+    // Back off on an auth failure and say so once, rather than logging the same line forever.
+    const std::string what = e.what();
+    // By the status the venue returned, not by searching the message: the message carries the
+    // response body, and "401" or "API key" can appear in a body that is not an auth failure.
+    const auto* api = dynamic_cast<const ApiError*>(&e);
+    if (api ? (api->status == 401 || api->status == 403) : what.find("API key") != std::string::npos) {
+      if (++account_auth_failures_ == 1 || account_auth_failures_ % 60 == 0)
+        LOG_WARN("poly account: %s (auth failure %d; backing off to %ds - fix the key or disable "
+                 "polymarket in config)", what.c_str(), account_auth_failures_,
+                 static_cast<int>(kPolyAuthBackoffSeconds));
+      account_ts_ = now + kPolyAuthBackoffSeconds - pc_.account_refresh_seconds;
+      return;
+    }
+    account_auth_failures_ = 0;
+    LOG_WARN("poly account: %s", what.c_str());
     return;
   }
+  account_auth_failures_ = 0;
   Lock lk(mu_);
+  if (order_gen_.load() != gen_before) {
+    account_ts_ = 0;
+    return;
+  }
   balance_ = parse_poly_balance(bj);
   store_.exec("INSERT OR REPLACE INTO poly_account(ts,current_balance,buying_power,asset_notional,asset_available) VALUES(?,?,?,?,?)",
               {now, balance_.current_balance, balance_.buying_power, balance_.asset_notional, balance_.asset_available});
@@ -719,9 +800,9 @@ void PolyDesk::refresh_account(long long now, bool force) {
 
 void PolyDesk::match(long long now) {
   if (!pc_.enabled) return;
+  Lock lk(mu_);
   if (match_ts_ > 0 && now - match_ts_ < 120) return;
   match_ts_ = now;
-  Lock lk(mu_);
   // Polymarket events by league: slug -> markets of that event.
   std::map<std::string, std::vector<const PolyMarket*>> by_event;
   for (const auto& [slug, m] : markets_) by_event[m.league + "|" + m.event_slug].push_back(&m);
@@ -840,12 +921,16 @@ void PolyDesk::match(long long now) {
     }
   }
   pairs_ = found;
-  store_.exec("DELETE FROM poly_pairs");
-  for (const auto& [t, p] : pairs_)
-    store_.exec("INSERT INTO poly_pairs(kalshi_ticker,kalshi_event,kalshi_series,kalshi_team,slug,league,pm_team,pm_yes_is_kalshi_yes,score,matched_by,updated_ts) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                {p.kalshi_ticker, p.kalshi_event, p.kalshi_series, p.kalshi_team, p.slug, p.league, p.pm_team,
-                 static_cast<long long>(p.pm_yes_is_kalshi_yes ? 1 : 0), static_cast<long long>(p.score), p.matched_by, now});
+  // One transaction: this runs on the Polymarket thread now, and a reader (the xvenue model, the
+  // quote refresh) must never see the table emptied and half refilled.
+  store_.transaction([&] {
+    store_.exec("DELETE FROM poly_pairs");
+    for (const auto& [t, p] : pairs_)
+      store_.exec("INSERT INTO poly_pairs(kalshi_ticker,kalshi_event,kalshi_series,kalshi_team,slug,league,pm_team,pm_yes_is_kalshi_yes,score,matched_by,updated_ts) "
+                  "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                  {p.kalshi_ticker, p.kalshi_event, p.kalshi_series, p.kalshi_team, p.slug, p.league, p.pm_team,
+                   static_cast<long long>(p.pm_yes_is_kalshi_yes ? 1 : 0), static_cast<long long>(p.score), p.matched_by, now});
+  });
 }
 
 // ---- rails and orders --------------------------------------------------------------------------------------
@@ -899,6 +984,7 @@ json PolyDesk::preview(const PolyOrderRequest& req) {
 }
 
 json PolyDesk::ticket(const PolyOrderRequest& req_in, const std::string& note) {
+  ++order_gen_;
   Lock lk(mu_);
   auto m = market(req_in.slug);
   if (!m) throw std::runtime_error("unknown Polymarket market " + req_in.slug);
@@ -944,6 +1030,7 @@ json PolyDesk::ticket(const PolyOrderRequest& req_in, const std::string& note) {
 }
 
 json PolyDesk::cancel(const std::string& order_id, const std::string& slug) {
+  ++order_gen_;
   Lock lk(mu_);
   if (!armed()) throw std::runtime_error("no Polymarket API key configured");
   std::string s = slug;
@@ -960,6 +1047,7 @@ json PolyDesk::cancel(const std::string& order_id, const std::string& slug) {
 }
 
 int PolyDesk::cancel_all(const std::string& why) {
+  ++order_gen_;
   Lock lk(mu_);
   if (!pc_.enabled || !armed()) return 0;
   json open = store_.query("SELECT id, slug FROM poly_orders WHERE state IN ('new','partially_filled','pending_new')");
@@ -1120,7 +1208,7 @@ void PolyDesk::upsert_xtrade(json& t) {
   auto n = [&](const char* k) { return SqlValue(t.value(k, 0.0)); };
   auto i = [&](const char* k) { return SqlValue(t.value(k, 0LL)); };
   if (t.value("id", 0LL) == 0) {
-    store_.exec("INSERT INTO xvenue_trades(kalshi_ticker,kalshi_event,slug,league,route,mode,state,contracts,kalshi_side,kalshi_style,kalshi_price,"
+    const long long new_id = store_.insert("INSERT INTO xvenue_trades(kalshi_ticker,kalshi_event,slug,league,route,mode,state,contracts,kalshi_side,kalshi_style,kalshi_price,"
                 "kalshi_filled,kalshi_cost,kalshi_fee,kalshi_order_id,kalshi_proposal_id,pm_action,pm_style,pm_price,pm_filled,pm_cost,pm_fee,pm_order_id,"
                 "locked,expected_profit,realized_pnl,opened_ts,kalshi_filled_ts,pm_filled_ts,closed_ts,reason,note,day,pm_yes_is_kalshi_yes,pm_mid_yes) "
                 "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -1129,8 +1217,7 @@ void PolyDesk::upsert_xtrade(json& t) {
                  s("pm_action"), s("pm_style"), n("pm_price"), n("pm_filled"), n("pm_cost"), n("pm_fee"), s("pm_order_id"), n("locked"), n("expected_profit"),
                  n("realized_pnl"), i("opened_ts"), i("kalshi_filled_ts"), i("pm_filled_ts"), i("closed_ts"), s("reason"), s("note"), s("day"),
                  SqlValue(static_cast<long long>(t.value("pm_yes_is_kalshi_yes", true) ? 1 : 0)), n("pm_mid_yes")});
-    json row = store_.query("SELECT last_insert_rowid() AS id");
-    t["id"] = row.empty() ? 0 : row[0].value("id", 0LL);
+    t["id"] = new_id;
     return;
   }
   store_.exec("UPDATE xvenue_trades SET state=?,contracts=?,kalshi_price=?,kalshi_filled=?,kalshi_cost=?,kalshi_fee=?,kalshi_order_id=?,kalshi_proposal_id=?,"
@@ -1295,15 +1382,15 @@ bool PolyDesk::send_pm_leg(json& t, long long now, std::string* why) {
       if (t.value("pm_filled_ts", 0LL) == 0) t["pm_filled_ts"] = now;
     }
     const double actual_px = res.value("average_fill_price", 0.0) > 0 ? res.value("average_fill_price", 0.0) : r.price;
-    store_.exec("BEGIN IMMEDIATE");
-    try {
+    // One transaction holding the store lock throughout (Store::transaction), so no other thread's
+    // statement can land inside it.
+    store_.transaction([&] {
       store_.kv_set("poly_pair_accounted:" + t.value("pm_order_id", ""),
                     json{{"cum", fc}, {"cost", fc * (r.action == "BUY" ? actual_px : 1 - actual_px)},
                          {"fee", res.value("fee", 0.0)}}.dump());
       upsert_xtrade(t);
       store_.kv_set(pending_key, "");
-      store_.exec("COMMIT");
-    } catch (...) { store_.exec("ROLLBACK"); throw; }
+    });
     return true;
   } catch (const ApiError& e) {
     if (e.status >= 400 && e.status < 500 && e.status != 408) store_.kv_set(pending_key, "");
@@ -1338,15 +1425,13 @@ bool PolyDesk::reconcile_pm_leg(json& t, long long now, bool cancel_working, std
     t["pm_cost"] = round4(t.value("pm_cost", 0.0) + cost - accounted.value("cost", 0.0));
     t["pm_fee"] = round4(t.value("pm_fee", 0.0) + o.commission - accounted.value("fee", 0.0));
     if (o.cum > 0 && t.value("pm_filled_ts", 0LL) == 0) t["pm_filled_ts"] = now;
-    store_.exec("BEGIN IMMEDIATE");
-    try {
+    store_.transaction([&] {
       store_.exec("UPDATE poly_orders SET state=?,cum=?,leaves=?,avg_px=?,commission=?,updated_ts=? WHERE id=?",
                   {o.state, o.cum, o.leaves, o.avg_px, o.commission, now, id});
       store_.kv_set(key, json{{"cum", o.cum}, {"cost", cost}, {"fee", o.commission}}.dump());
       upsert_xtrade(t);
-      store_.exec("COMMIT");
-      checkpoint = t;
-    } catch (...) { store_.exec("ROLLBACK"); throw; }
+    });
+    checkpoint = t;
     bool terminal = o.state == "filled" || o.state == "canceled" || o.state == "cancelled" || o.state == "rejected" || o.state == "expired";
     if (terminal && o.leaves <= 1e-9) return true;
     if (cancel_working) {
