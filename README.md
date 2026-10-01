@@ -54,6 +54,16 @@ For unattended running use `scripts/tradeit up` / `tradeit down` / `tradeit stat
 `scripts/desk_supervise.sh`, which restarts the desk if it exits or stops cycling (three stale
 readings of `last_cycle_ts`, 180 s) and logs to `data/supervisor.log`.
 
+A reboot is the one thing the supervisor cannot survive. To start it at login, install the agent
+(`scripts/desk_autostart.sh` stays down after `tradeit down`, which leaves `data/desk.stop`):
+
+```bash
+cp scripts/com.kalshi-desk.supervisor.plist ~/Library/LaunchAgents/
+```
+
+It loads at the next login. Remove it with `launchctl bootout gui/$(id -u)/com.kalshi-desk.supervisor`
+and delete the plist.
+
 Without keys the desk still runs: market data, quotes history, model fairs and proposals all
 work; only submit/cancel/close are disabled.
 
