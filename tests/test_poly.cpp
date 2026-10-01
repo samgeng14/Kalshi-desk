@@ -3,6 +3,7 @@
 // pair rule in paper and live mode through mock exchanges on both sides.
 // Built and run with `ninja -C build-ci && ./build-ci/poly-tests`.
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -921,6 +922,84 @@ static void test_quote_writes() {
   }
 }
 
+// The dashboard's sync runs refresh_quotes on an HTTP thread beside the Polymarket thread's
+// universe refresh. A universe refresh that closes a market while a quote batch is between its
+// collection and its commit must find the market closed afterwards, and its poll time gone: the
+// batch's UPDATE (closed=0, from before) may not land after the close.
+static void test_quote_batch_against_universe_close() {
+  MockPoly x;
+  seed_poly(x);
+  Store st(":memory:");
+  seed_kalshi(st);
+  Config cfg = poly_cfg();
+  auto client = std::make_shared<PolyClient>(x.base(), x.base(), nullptr, "tests");
+  const std::string slug = "aec-nfl-ne-sea-2026-09-09";
+  const long long now = now_s();
+  PolyDesk desk(cfg, st, client, nullptr);
+  desk.refresh_universe(now);
+  desk.match(now);
+  x.quote(slug, 0.40, 0.405);
+  desk.refresh_quotes(now);
+  {
+    std::lock_guard<std::mutex> lk(x.mu);   // NE-SEA leaves the league feed; DAL-NYG stays
+    json keep = json::array();
+    for (const auto& ev : x.events)
+      if (ev.value("slug", "") != "nfl-ne-sea-2026-09-09") keep.push_back(ev);
+    x.events = keep;
+  }
+  x.quote(slug, 0.41, 0.415);                 // a moved book: the batch writes the row
+  std::thread universe;
+  std::atomic<bool> universe_done{false};
+  desk.set_quote_batch_hook_for_tests([&] {
+    universe = std::thread([&] { desk.refresh_universe(now + 100); universe_done = true; });
+    // Up to a second for the universe refresh to run here, where it could before 2026-10-01's fix.
+    for (int i = 0; i < 100 && !universe_done; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  });
+  desk.refresh_quotes(now + 10);
+  desk.set_quote_batch_hook_for_tests(nullptr);
+  universe.join();
+  CHECK(st.query("SELECT closed FROM poly_markets WHERE slug=?", {slug})[0]["closed"] == 1);
+  CHECK(!desk.quote_poll_times().count(slug));
+}
+
+// A market that leaves the feeds is forgotten whole, its last history time included: if it comes
+// back, that time is read from the table again, as the old per-pass SELECT MAX(ts) did.
+static void test_quote_log_time_forgotten_with_market() {
+  MockPoly x;
+  seed_poly(x);
+  Store st(":memory:");
+  seed_kalshi(st);
+  Config cfg = poly_cfg();
+  auto client = std::make_shared<PolyClient>(x.base(), x.base(), nullptr, "tests");
+  const std::string slug = "aec-nfl-ne-sea-2026-09-09";
+  auto history = [&] { return st.query("SELECT COUNT(*) AS n FROM poly_quotes WHERE slug=?", {slug})[0]["n"].get<long long>(); };
+  const long long now = now_s();
+  PolyDesk desk(cfg, st, client, nullptr);
+  desk.refresh_universe(now);
+  desk.match(now);
+  x.quote(slug, 0.38, 0.385);                 // the listing's own book, so a return is no change
+  desk.refresh_quotes(now);
+  CHECK(history() == 1);
+  json events;
+  {
+    std::lock_guard<std::mutex> lk(x.mu);
+    events = x.events;
+    json keep = json::array();
+    for (const auto& ev : x.events)
+      if (ev.value("slug", "") != "nfl-ne-sea-2026-09-09") keep.push_back(ev);
+    x.events = keep;
+  }
+  desk.refresh_universe(now + 10);            // gone from the feed: closed and forgotten
+  st.exec("DELETE FROM poly_quotes WHERE slug=?", {slug});
+  {
+    std::lock_guard<std::mutex> lk(x.mu);
+    x.events = events;
+  }
+  desk.refresh_universe(now + 20);            // listed again
+  desk.refresh_quotes(now + 30);              // unchanged, and no history row in the table: logged
+  CHECK(history() == 1);
+}
+
 int main(int argc, char** argv) {
   if (argc == 2 && std::string(argv[1]) == "--hedge-lifecycle") {
     test_pm_hedge_ownership_and_reconciliation();
@@ -930,6 +1009,8 @@ int main(int argc, char** argv) {
   test_parsers_and_math();
   test_matching_quotes_and_locks();
   test_quote_writes();
+  test_quote_batch_against_universe_close();
+  test_quote_log_time_forgotten_with_market();
   test_matching_daily_league();
   test_account_rails_and_orders();
   test_pair_rule_paper();

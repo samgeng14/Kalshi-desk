@@ -207,6 +207,12 @@ Store::Store(const std::string& path) {
     throw std::runtime_error("cannot open db " + path + ": " + sqlite3_errmsg(db_));
   sqlite3_busy_timeout(db_, 5000);
   migrate();
+  // The baseline for noticing another connection's commits (upsert_market's change detector): read
+  // now, so a commit before the first skip is caught too.
+  {
+    std::lock_guard<std::recursive_mutex> lk(mu_);
+    foreign_commit_since_last_look();
+  }
   // Read-only connections for the other threads. Only for a real file: ":memory:" (and the
   // file::memory: URI form) would give each connection its own empty database.
   if (!path.empty() && path != ":memory:" && path.rfind("file::memory:", 0) != 0) {
@@ -234,6 +240,7 @@ Store::~Store() {
   attempt("buffered quote rows", [this] { flush_quotes(now_s(), true); });
   attempt("market poll times", [this] { persist_market_poll_times(); });
   if (shadow_stmt_) sqlite3_finalize(shadow_stmt_);
+  if (data_version_stmt_) sqlite3_finalize(data_version_stmt_);
   for (auto& r : readers_)
     if (r->db) sqlite3_close(r->db);
   if (db_) sqlite3_close(db_);
@@ -514,9 +521,28 @@ void Store::upsert_market(const Market& m) {
   // The change detector: what this process last wrote for the ticker (this transaction's own write
   // first). Nothing known (a first sight, or after a restart) is a write.
   MarketWritten v = MarketWritten::of(m);
-  const MarketWritten* prev = nullptr;
-  if (auto s = staged_written_.find(m.ticker); s != staged_written_.end()) prev = &s->second;
-  else if (auto c = market_written_.find(m.ticker); c != market_written_.end()) prev = &c->second;
+  auto last_written = [&]() -> const MarketWritten* {
+    if (auto s = staged_written_.find(m.ticker); s != staged_written_.end()) return &s->second;
+    if (auto c = market_written_.find(m.ticker); c != market_written_.end()) return &c->second;
+    return nullptr;
+  };
+  const MarketWritten* prev = last_written();
+  // What the detector remembers is only what the row holds while nothing else writes the file.
+  // `kalshi-desk close-all` does (Executor::refresh_account upserts every held market, in write
+  // mode, without the desk lock): reproduced 2026-10-01 with two Stores on one file, the desk then
+  // skipped the next poll that matched its own last write and left the other book in the row. So
+  // before a skip, any other connection's commit since the last look makes it forget everything
+  // committed, and this row and every other one is written at its next poll. This transaction's
+  // staged writes stand: no other commit can land inside it. Measured on 11,000 unchanged rows: the
+  // check keeps a skipped refresh at 7-10 ms, and a foreign commit costs one full rewrite (129 ms,
+  // as in write mode), after which skipping resumes. Only manual commands commit beside the desk.
+  if (prev && prev->same_values(v) && foreign_commit_since_last_look()) {
+    const long long n = ++foreign_commits_;
+    if (n <= 20 || n % 100 == 0)
+      LOG_INFO("markets: another connection wrote the database (%lld so far); every market row is written at its next poll", n);
+    market_written_.clear();
+    prev = last_written();
+  }
   const bool changed = !prev || !prev->same_values(v);
   const bool heartbeat = !changed && now - prev->written_ts >= kMarketHeartbeatSeconds;
   const bool write = changed || heartbeat;
@@ -548,7 +574,31 @@ void Store::upsert_market(const Market& m) {
   }
   // The row now carries `now` if it was written (always, in shadow), else the last write's ts.
   const long long row_ts = mode == MarketsWriteMode::Shadow || write ? now : v.written_ts;
-  stage_market(m.ticker, &v, PollTime{now, row_ts});
+  stage_market(m.ticker, &v, next_poll_time(m.ticker, now, row_ts));
+}
+
+Store::PollTime Store::next_poll_time(const std::string& ticker, long long poll, long long row_ts) const {
+  std::lock_guard<std::mutex> pl(poll_mu_);
+  auto it = market_poll_ts_.find(ticker);
+  if (it == market_poll_ts_.end()) return PollTime{poll, row_ts};
+  const PollTime& c = it->second;
+  if (c.row == row_ts) return PollTime{poll, row_ts, c.prev_poll, c.prev_row};   // the same version
+  return PollTime{poll, row_ts, c.poll, c.row};                                   // a new one
+}
+
+bool Store::foreign_commit_since_last_look() {
+  if (!data_version_stmt_ && sqlite3_prepare_v2(db_, "PRAGMA data_version", -1, &data_version_stmt_, nullptr) != SQLITE_OK) {
+    data_version_stmt_ = nullptr;
+    return true;   // cannot tell: assume another writer, which costs only a write
+  }
+  sqlite3_reset(data_version_stmt_);
+  const bool ok = sqlite3_step(data_version_stmt_) == SQLITE_ROW;
+  const long long v = ok ? sqlite3_column_int64(data_version_stmt_, 0) : -1;
+  sqlite3_reset(data_version_stmt_);   // at once: a statement left open would hold a read snapshot
+  if (!ok) return true;
+  const bool changed = data_version_ == -1 || v != data_version_;
+  data_version_ = v;
+  return changed;
 }
 
 bool Store::stored_market_matches(const Market& m, std::string* differs) {
@@ -613,7 +663,8 @@ json Store::markets_write_stats() const {
               {"overlay_mismatches", overlay_mismatches_.load()},
               {"written", markets_written_.load()},
               {"skipped", markets_skipped_.load()},
-              {"heartbeats", market_heartbeats_.load()}};
+              {"heartbeats", market_heartbeats_.load()},
+              {"foreign_commits", foreign_commits_.load()}};
 }
 
 void Store::touch_market(const std::string& ticker, long long ts) {
@@ -628,9 +679,9 @@ void Store::touch_market(const std::string& ticker, long long ts) {
   if (prev) {
     MarketWritten v = *prev;
     v.written_ts = ts;
-    stage_market(ticker, &v, PollTime{ts, ts});
+    stage_market(ticker, &v, next_poll_time(ticker, ts, ts));
   } else {
-    stage_market(ticker, nullptr, PollTime{ts, ts});
+    stage_market(ticker, nullptr, next_poll_time(ticker, ts, ts));
   }
 }
 
@@ -658,7 +709,12 @@ int Store::persist_market_poll_times() {
   std::lock_guard<std::mutex> pl(poll_mu_);
   for (const auto& [t, ts] : todo) {
     if (auto w = market_written_.find(t); w != market_written_.end()) w->second.written_ts = ts;
-    if (auto p = market_poll_ts_.find(t); p != market_poll_ts_.end() && p->second.poll == ts) p->second.row = ts;
+    if (auto p = market_poll_ts_.find(t); p != market_poll_ts_.end() && p->second.poll == ts && p->second.row != ts) {
+      // The version the row held before keeps the poll that confirmed it (this one).
+      p->second.prev_row = p->second.row;
+      p->second.prev_poll = ts;
+      p->second.row = ts;
+    }
   }
   return static_cast<int>(todo.size());
 }
@@ -897,17 +953,23 @@ size_t Store::buffered_quotes() const {
 }
 
 json Store::recent_quotes(const std::string& ticker, long long limit) {
-  json stored = query("SELECT ts,yes_bid,yes_ask,last,volume FROM quotes WHERE ticker=? ORDER BY ts DESC LIMIT ?",
-                      {ticker, limit});
+  // The buffer first, then the table (2026-10-01 review): a flush commits its rows and only then
+  // erases them, so a row missing from this copy was committed before the query starts, and the
+  // query sees it. Table first, a query whose snapshot predated the commit followed by a copy taken
+  // after the erase found a whole flush in neither (2 of 6,656 dashboard reads in a probe, each 5
+  // minutes of a ticker's history).
   std::vector<QuoteRow> mine;
   {
     std::lock_guard<std::mutex> lk(quotes_mu_);
     for (const auto& q : quote_buffer_)
       if (q.ticker == ticker) mine.push_back(q);
   }
+  if (recent_quotes_hook_) recent_quotes_hook_();
+  json stored = query("SELECT ts,yes_bid,yes_ask,last,volume FROM quotes WHERE ticker=? ORDER BY ts DESC LIMIT ?",
+                      {ticker, limit});
   if (mine.empty()) return stored;
-  // A flush can commit a row a moment before it leaves the buffer: one ticker's rows are at least
-  // 5 s apart, so its ts is the row's identity.
+  // A row can be in both, copied before its flush erased it and committed before the query: one
+  // ticker's rows are at least 5 s apart, so its ts is the row's identity.
   std::set<long long> have;
   for (const auto& r : stored) have.insert(r.value("ts", 0LL));
   json out = json::array();
@@ -962,8 +1024,15 @@ void Store::insert_model_fair(long long ts, const std::string& ticker, const std
 void Store::queue_model_fair(long long ts, const std::string& ticker, const std::string& strategy, double p,
                              double sigma, double yes_bid, double yes_ask) {
   std::lock_guard<std::mutex> lk(fairs_mu_);
-  // A cycle queues a few hundred and flushes them; this many means the flush keeps failing.
-  if (fair_queue_.size() >= 200000) return;
+  // A cycle queues a few hundred and flushes them; this many means the flush keeps failing (a plain
+  // SQL error there is not a storage failure, so the desk keeps running). Counted and said, as the
+  // quote buffer does: the Brier and WX1 samples it drops are not queued again until their next
+  // 5-minute heartbeat.
+  if (fair_queue_.size() >= kModelFairQueueCap) {
+    if (fairs_dropped_++ % 10000 == 0)
+      LOG_WARN("model_fairs queue full (%zu rows): dropping rows (%lld so far)", fair_queue_.size(), fairs_dropped_);
+    return;
+  }
   fair_queue_.push_back({ts, ticker, strategy, p, sigma, yes_bid, yes_ask});
 }
 
@@ -991,6 +1060,11 @@ int Store::flush_model_fairs() {
 size_t Store::queued_model_fairs() const {
   std::lock_guard<std::mutex> lk(fairs_mu_);
   return fair_queue_.size();
+}
+
+long long Store::dropped_model_fairs() const {
+  std::lock_guard<std::mutex> lk(fairs_mu_);
+  return fairs_dropped_;
 }
 
 // ---- proposals -------------------------------------------------------------------

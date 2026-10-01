@@ -214,6 +214,8 @@ class PolyDesk {
   // slug -> the quote_ts the poly_markets row would hold if every refresh still wrote it (see
   // refresh_quotes). The xvenue strategy reads poly_markets and takes the later of the two.
   std::map<std::string, long long> quote_poll_times();
+  // Tests: runs in refresh_quotes after a batch's writes are collected and before they commit.
+  void set_quote_batch_hook_for_tests(std::function<void()> f) { quote_batch_hook_ = std::move(f); }
 
  private:
   void rails(const PolyOrderRequest& r, const PolyMarket& m, double* cost_out);
@@ -263,6 +265,7 @@ class PolyDesk {
   std::map<std::string, long long> quote_poll_ts_, quote_logged_ts_;
   // At stop: quote_ts into every row whose stored value is behind its last refresh.
   void persist_quote_times();
+  std::function<void()> quote_batch_hook_;
 };
 
 }  // namespace desk

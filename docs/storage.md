@@ -97,20 +97,33 @@ later or are written less often:
 
 - `quotes`: the same rows with the same `ts`, held in memory and written every 5 minutes (and at
   shutdown). Rowids still increase with `ts`, so `archive_quotes.py`'s day boundary is unchanged.
-  `/api/quotes/<ticker>` merges what is still in memory.
+  `/api/quotes/<ticker>` merges what is still in memory. A crash or SIGKILL (including the
+  supervisor's SIGKILL of a stalled desk, `desk_supervise.sh`) loses the rows not yet flushed: up
+  to 5 minutes, at most 100,000 rows while writes succeed.
 - `markets.updated_ts`: with `markets_write_mode` "skip", the time the row last changed or a
   heartbeat at most 10 minutes old, not the last poll. Every reader inside the desk sees the poll
-  time (`Market::quote_ts`); a script reading the column directly is up to 10 minutes behind.
-  "shadow" (the default) and "write" still write every listed row every cycle.
+  time (`Market::quote_ts`); a script reading the column directly is up to 10 minutes behind, and
+  after a crash the column stays that far behind until the market is polled again (a clean stop
+  writes the poll times in). "shadow" (the default) and "write" still write every listed row every
+  cycle. A row another process wrote (`kalshi-desk close-all`) reads at its own `updated_ts`, and
+  the desk's next poll of it writes the row.
 - `model_fairs`: the cycle's rows are written in one transaction after the strategy loop.
   `weather_wx1` is logged when its row would differ (estimate, sigma, or the book it is scored
   against) or every 5 minutes, the Brier sample's rule, instead of every cycle. Consecutive rows
   were identical but for `ts`, so an as-of read (the latest row at or before a moment, as
   `research/wx_score.py` does) gets the same values; counting rows, or reading `ts` as the time of
-  the last estimate, no longer works. No study in the repo assumed one row per cycle.
+  the last estimate, no longer works. One study did assume a row per cycle:
+  `scripts/score_models.py --pick median` takes the middle row by index as "a mid-life fair", so for
+  `weather_wx1` it now lands where the estimate or book changed most (in the review's 600-cycle
+  replay of 4 brackets the market Brier moved on 3 of them), and its `fairs` column counts logged
+  rows (600 -> 58-80 a market). `--pick last`, the default, is unchanged. The cycle's queued rows are
+  lost if the desk crashes before the strategy loop's flush.
 - `contract_universe.refreshed_ts`: when the row was first written or last changed. Nothing reads
   it.
 - `poly_markets.quote_ts`: written at most every 60 s unless the book or state changed, and at
-  stop. The xvenue strategy adds the in-memory refresh time, so it reads what it read before.
+  stop; after a crash it stays up to 60 s behind the last refresh. The xvenue strategy adds the
+  in-memory refresh time, so it reads what it read before. `research/settlement_gate_census.py`
+  cannot: its `pair_valid` now allows 90 + 60 s against the stored time, an approximation that
+  counts every pair the desk saw fresh and may count a few whose last poll was up to 60 s older.
 - `observations` (book captures), `kv`: one transaction per cycle; an unchanged `kv` value is
   not rewritten.

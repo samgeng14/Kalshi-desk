@@ -180,4 +180,8 @@ if(PYTHON3_EXE)
            COMMAND ${PYTHON3_EXE} ${CMAKE_SOURCE_DIR}/research/impulse_target_audit.py --self-test)
   add_test(NAME impulse-prepare
            COMMAND ${PYTHON3_EXE} ${CMAKE_SOURCE_DIR}/research/impulse_prepare.py --self-test)
+  # The settlement-gate census still counts every Polymarket pair the xvenue strategy saw fresh,
+  # although poly_markets.quote_ts is written at most every 60 s since 2026-10-01.
+  add_test(NAME settlement-census
+           COMMAND ${PYTHON3_EXE} ${CMAKE_SOURCE_DIR}/research/settlement_gate_census.py --self-test)
 endif()

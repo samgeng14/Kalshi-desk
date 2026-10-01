@@ -130,7 +130,7 @@ class Store {
   void set_markets_write_mode(MarketsWriteMode m);
   MarketsWriteMode markets_write_mode() const { return markets_mode_.load(); }
   // Counters for the engine status: mode, shadow_rows, would_skip, detector_mismatches,
-  // overlay_mismatches, written, skipped, heartbeats.
+  // overlay_mismatches, written, skipped, heartbeats, foreign_commits.
   json markets_write_stats() const;
   // refresh_results' retry stamp (UPDATE markets SET updated_ts). It still writes the row, and in
   // shadow and skip modes it also moves the poll time, so the overlay and the row agree.
@@ -159,6 +159,10 @@ class Store {
   // ~5 rows share one leaf write. The rows and their ts are exactly the ones insert_quote would have
   // written, inserted in the order it would have run, so rowids still increase with ts, which
   // scripts/archive_quotes.py's day boundary search relies on. recent_quotes() merges the buffer.
+  // A crash or SIGKILL (the supervisor's SIGKILL of a stalled desk included, desk_supervise.sh)
+  // loses the rows not yet flushed: up to kQuoteFlushSeconds of history, at most kQuoteBufferSoftCap
+  // rows while flushes succeed (kQuoteBufferHardCap while they fail). Only a clean stop (the engine's
+  // flush_on_stop, or the destructor) writes them.
   void buffer_quotes(std::vector<QuoteRow> rows);
   // Writes everything buffered when kQuoteFlushSeconds have passed since the last flush, when the
   // buffer is past its soft cap, or when `force` (shutdown). One transaction. A failed write leaves
@@ -167,6 +171,8 @@ class Store {
   // The dashboard's history endpoint: newest first, `limit` rows, the database merged with what is
   // still buffered.
   json recent_quotes(const std::string& ticker, long long limit);
+  // Tests: runs between recent_quotes' two reads (the buffer, then the table), where a flush can commit.
+  void set_recent_quotes_hook_for_tests(std::function<void()> f) { recent_quotes_hook_ = std::move(f); }
   size_t buffered_quotes() const;
   static constexpr long long kQuoteFlushSeconds = 300;
   static constexpr size_t kQuoteBufferSoftCap = 100000;   // flush at once past this
@@ -187,6 +193,10 @@ class Store {
                         double sigma, double yes_bid, double yes_ask);
   int flush_model_fairs();
   size_t queued_model_fairs() const;
+  // Rows refused because kModelFairQueueCap were already queued: only a flush that keeps failing
+  // gets there (a cycle queues a few hundred). Counted and logged, never silent.
+  long long dropped_model_fairs() const;
+  static constexpr size_t kModelFairQueueCap = 200000;
 
   // proposals
   long long insert_proposal(Proposal& p);
@@ -261,13 +271,31 @@ class Store {
   // True when the stored row equals `m` in every column the upsert sets but updated_ts (shadow).
   bool stored_market_matches(const Market& m, std::string* differs);
   // A poll time, and the updated_ts of the row version it vouches for. The poll says "the exchange
-  // gave us exactly what the row with updated_ts == row holds"; a reader holding an older version of
-  // the row (it read just before a write committed) gets that row's own updated_ts instead, so a poll
-  // time is never put on a book it did not see.
-  struct PollTime { long long poll = 0, row = 0; };
+  // gave us exactly what the row with updated_ts == row holds". Only that exact version gets it: a
+  // row another connection wrote carries an updated_ts this Store never wrote, and a reader holding
+  // it reads that row's own time, so a poll time is never put on a book it did not see (2026-10-01
+  // review: with `>=` here, a row `kalshi-desk close-all` wrote read as freshly polled for up to ten
+  // minutes once the book went back to what the desk last wrote). The previous version keeps the
+  // last poll that confirmed it: a dashboard read whose snapshot predates a write's commit holds that
+  // version, and read its updated_ts, one cycle old, when every poll wrote the row; with only its own
+  // write time it read up to kMarketHeartbeatSeconds old and the board marked it stale.
+  // The one other writer of markets rows beside a running desk is `kalshi-desk close-all`
+  // (Executor::refresh_account, write mode, no desk lock). Skip mode does not rely on that: after
+  // any other connection's commit (foreign_commit_since_last_look) upsert_market writes each row at
+  // its next poll, whatever the change detector remembers.
+  struct PollTime { long long poll = 0, row = 0, prev_poll = 0, prev_row = -1; };
   long long quote_ts_for(const PollTime& p, long long stored_ts) const {
-    return stored_ts >= p.row ? std::max(stored_ts, p.poll) : stored_ts;
+    if (stored_ts == p.row) return std::max(stored_ts, p.poll);
+    if (stored_ts == p.prev_row) return std::max(stored_ts, p.prev_poll);
+    return stored_ts;
   }
+  // The entry a poll at `poll` of the row version `row_ts` leaves. Its previous version is the
+  // committed one, the only other version a reader can hold (staged rows are seen only by the
+  // transaction that wrote them). Under mu_; takes poll_mu_.
+  PollTime next_poll_time(const std::string& ticker, long long poll, long long row_ts) const;
+  // True when another connection committed to the database since the last call (PRAGMA
+  // data_version, which ignores this connection's own commits; our readers are read-only). Under mu_.
+  bool foreign_commit_since_last_look();
   void stage_market(const std::string& ticker, const MarketWritten* written, PollTime poll);
   void commit_staged_markets();   // after COMMIT (or an autocommit write)
   void discard_staged_markets();  // after ROLLBACK
@@ -282,8 +310,10 @@ class Store {
   mutable std::mutex poll_mu_;
   std::unordered_map<std::string, PollTime> market_poll_ts_;
   std::atomic<long long> shadow_rows_{0}, would_skip_{0}, detector_mismatches_{0}, overlay_mismatches_{0},
-      markets_written_{0}, markets_skipped_{0}, market_heartbeats_{0};
+      markets_written_{0}, markets_skipped_{0}, market_heartbeats_{0}, foreign_commits_{0};
   sqlite3_stmt* shadow_stmt_ = nullptr;   // the shadow check's row read, prepared once (under mu_)
+  sqlite3_stmt* data_version_stmt_ = nullptr;   // PRAGMA data_version, prepared once (under mu_)
+  long long data_version_ = -1;                 // its last value (under mu_); -1: not read yet
 
   // ---- quote history buffer (see buffer_quotes). A leaf lock: never held while taking mu_. ----
   mutable std::mutex quotes_mu_;
@@ -291,10 +321,12 @@ class Store {
   long long quotes_flushed_ts_ = 0;      // the last flush (0: none yet; the first buffer starts the clock)
   long long quotes_dropped_ = 0;
   bool quotes_flushing_ = false;         // one flush at a time: two would write the same rows
+  std::function<void()> recent_quotes_hook_;
 
   // ---- model_fairs queue (see queue_model_fair). A leaf lock as well. ----
   mutable std::mutex fairs_mu_;
   std::vector<std::vector<SqlValue>> fair_queue_;
+  long long fairs_dropped_ = 0;
 };
 
 }  // namespace desk

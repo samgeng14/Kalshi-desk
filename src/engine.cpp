@@ -1361,7 +1361,8 @@ void Engine::publish_snapshot() {
   status["storage_failures"] = consecutive_storage_failures_;
   // How market rows were written, and the shadow checks behind switching to skip (2026-10-01).
   status["markets_write"] = store_.markets_write_stats();
-  status["write_buffers"] = {{"quotes", store_.buffered_quotes()}, {"model_fairs", store_.queued_model_fairs()}};
+  status["write_buffers"] = {{"quotes", store_.buffered_quotes()}, {"model_fairs", store_.queued_model_fairs()},
+                             {"model_fairs_dropped", store_.dropped_model_fairs()}};
   if (reference_feed_) status["reference"] = reference_feed_->status();
   if (quote_feed_) status["commodity_quotes"] = quote_feed_->status();
   // Where each commodity model stands economically, from what has actually been recorded. Nothing
@@ -2056,6 +2057,10 @@ json Engine::record_book(const std::string& t, const Orderbook& b) {
 // a cycle, each its own autocommit with two random-key indexes, about 2% of the 09-28 write samples.
 // The rows are the same; they reach the table a few hundred milliseconds later. A book read outside
 // this step (the systematic trader's own refresh) is still written as it is read.
+// A failed write of them is logged and the step goes on, as before, when read_books' own handlers
+// caught it per book ("book %s: ...") or per batch: letting it out failed the step, and a storage
+// error there (a corrupt observations index, say) counted toward the storage-failure kill switch
+// and the exit-75 restart, which research history never did (2026-10-01 review).
 void Engine::record_books() {
   pending_observations_.clear();
   buffer_observations_ = true;
@@ -2068,8 +2073,12 @@ void Engine::record_books() {
   buffer_observations_ = false;
   std::vector<Observation> rows;
   rows.swap(pending_observations_);
-  record_observations(store_, rows);
-  if (failed) std::rethrow_exception(failed);
+  try {
+    record_observations(store_, rows);
+  } catch (const std::exception& e) {
+    LOG_WARN("book observations: %zu not written: %s", rows.size(), e.what());
+  }
+  if (failed) std::rethrow_exception(failed);   // read_books' own exceptions, which it let out before too
 }
 
 void Engine::read_books() {

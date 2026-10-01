@@ -555,8 +555,10 @@ std::optional<Fair> WeatherNws::fair(const Market& m, const Series&, Store& stor
       // 4.4% of the desk's write-weighted stack samples on 09-28 by itself. Consecutive rows were
       // identical but for ts, so a study that takes the latest row at or before a moment (as
       // research/wx_score.py does) reads the same values; one that counts rows, or reads ts as the
-      // time of the last estimate, no longer can. The row is queued and written with the cycle's
-      // other model_fairs rows in one transaction.
+      // time of the last estimate, no longer can. scripts/score_models.py did: `--pick median` takes
+      // the middle row by index as a mid-life fair, and its `fairs` column counts rows (see its
+      // docstring and docs/storage.md). The row is queued and written with the cycle's other
+      // model_fairs rows in one transaction.
       Wx1Logged& logged = wx1_logged_[m.ticker];
       if (logged.ts == 0 || q != logged.p || qsig != logged.sigma || m.yes_bid != logged.yes_bid ||
           m.yes_ask != logged.yes_ask || now - logged.ts >= 300) {

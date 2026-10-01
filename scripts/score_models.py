@@ -7,10 +7,17 @@ and nothing else.
 
 Two things it is careful about, because both were wrong before:
 
-  One sample per MARKET. `model_fairs` holds a row per cycle, so a contract quoted all day
+  One sample per MARKET. `model_fairs` holds many rows per contract, so a contract quoted all day
   contributes a hundred rows that share a single outcome. Averaging over rows inflates the sample
   count and over-weights whatever was quoted longest: 107 settled weather markets were being
   reported as 11,390 independent samples.
+
+  Rows are not one per cycle. The engine's Brier sample is at most one per 5 minutes, and since
+  2026-10-01 `weather_wx1` is too (logged when its estimate or book changes, else every 5 minutes;
+  before, every cycle). So `--pick median`, the middle row by index, is not the middle of a
+  contract's life: for weather_wx1 it now falls where the estimate or book changed most, and markets
+  logged before and after that date are picked differently. `--pick last` is unaffected. The
+  `fairs` column counts logged rows, not cycles.
 
   An interval, not a point. "No worse than the market" on a point estimate is a null result
   wearing a hat. A model is promoted only when the whole 95% interval on the paired difference

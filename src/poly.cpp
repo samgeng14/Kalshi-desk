@@ -648,6 +648,9 @@ void PolyDesk::refresh_universe(long long now) {
       store_.exec("UPDATE poly_markets SET closed=1, updated_ts=? WHERE slug=?", {now, it->first});
       stored_quote_.erase(it->first);
       quote_poll_ts_.erase(it->first);
+      // Its history clock too, or the map keeps every slug ever quoted; a slug that returns reads
+      // MAX(ts) from the table again.
+      quote_logged_ts_.erase(it->first);
       it = markets_.erase(it);
     } else ++it;
   }
@@ -686,20 +689,25 @@ void PolyDesk::refresh_quotes(long long now) {
       LOG_WARN("poly quotes: %s", e.what());
       return;
     }
-    // The batch's writes are collected under mu_ and run after it, in one transaction (2026-10-01).
-    // They were one autocommit each, ~3 per slug every 10 s, and the poly_markets UPDATE ran for
-    // every slug on every pass because quote_ts always changed: 4.5% of the desk's write-weighted
-    // stack samples on 09-28. Now the UPDATE runs when bid, ask, active or closed differ from what
-    // the row holds, or its quote_ts is 60 s behind (quote_ts lives in markets_, and quote_poll_ts_
-    // keeps what the row would have held, for the xvenue strategy); the per-slug SELECT MAX(ts)
-    // probe is a map, read from the table once per slug. The transaction never spans the HTTP call
-    // and takes no lock of ours (Store::transaction), and our maps move only once it has committed,
-    // as the rows they describe did.
+    // The batch's writes are collected and then run in one transaction (2026-10-01). They were one
+    // autocommit each, ~3 per slug every 10 s, and the poly_markets UPDATE ran for every slug on
+    // every pass because quote_ts always changed: 4.5% of the desk's write-weighted stack samples on
+    // 09-28. Now the UPDATE runs when bid, ask, active or closed differ from what the row holds, or
+    // its quote_ts is 60 s behind (quote_ts lives in markets_, and quote_poll_ts_ keeps what the row
+    // would have held, for the xvenue strategy); the per-slug SELECT MAX(ts) probe is a map, read
+    // from the table once per slug.
+    // mu_ is held from the collection to the maps' update, taken before the transaction as match()
+    // does, and released before the next batch's HTTP call; nothing is locked inside the transaction
+    // (Store::transaction's rule). Released between collection and commit (the first version of this
+    // change), a universe refresh could close a market in between and the batch's UPDATE (closed=0,
+    // from before) reopened it until a restart, and two passes (the dashboard's sync beside the
+    // Polymarket thread) could log the same history row twice or commit out of order (2026-10-01
+    // review). The old per-statement writes all ran under mu_ too.
     std::vector<std::pair<const char*, std::vector<SqlValue>>> writes;
     std::map<std::string, long long> logged, polled;
     std::map<std::string, StoredQuote> stored;
+    Lock lk(mu_);
     {
-      Lock lk(mu_);
       for (const auto& mj : j.value("markets", json::array())) {
         std::string slug = sval(mj, "slug");
         auto it = markets_.find(slug);
@@ -748,11 +756,11 @@ void PolyDesk::refresh_quotes(long long now) {
         polled[slug] = now;
       }
     }
+    if (quote_batch_hook_) quote_batch_hook_();
     if (!writes.empty())
       store_.transaction([&] {
         for (const auto& [sql, params] : writes) store_.exec(sql, params);
       });
-    Lock lk(mu_);
     for (const auto& [slug, ts] : logged) quote_logged_ts_[slug] = ts;
     for (const auto& [slug, q] : stored) stored_quote_[slug] = q;
     for (const auto& [slug, ts] : polled) quote_poll_ts_[slug] = ts;

@@ -43,6 +43,32 @@ def default_db(root):
         "in that second - no exception, no log line. Take a snapshot with the desk stopped, or\n"
         "natively on the Mac outside the bridge mount, then re-run." % snap)
 
+# ---- xvenue's quote freshness, as far as the file can show it ------------------------------------
+# XVenue::fair (src/strategies/xvenue.cpp) calls a Polymarket quote fresh when it is at most 90 s old.
+XVENUE_FRESH_SECONDS = 90
+# 2026-10-01: poly_markets.quote_ts is written at most every 60 s unless the book or state changed;
+# the desk's own freshness test adds the in-memory poll time, which is not on disk. A replay of the
+# Polymarket thread read the stored time up to 59 s behind the last poll (23.6% of reads over 30 s).
+# So the census allows the persistence interval on top of the desk's bar: every pair the desk saw
+# fresh is counted, and a pair whose last poll was up to 60 s past the bar may be counted too.
+POLY_QUOTE_PERSIST_SECONDS = 60
+
+
+def pair_quote_fresh(cycle, quote_ts):
+    return quote_ts > 0 and cycle - quote_ts <= XVENUE_FRESH_SECONDS + POLY_QUOTE_PERSIST_SECONDS
+
+
+def self_test():
+    cycle = 1_790_000_000
+    # Polled 85 s before the cycle (fresh to the desk), row last written 55 s before that poll.
+    assert pair_quote_fresh(cycle, cycle - 85 - 55), "a fresh pair whose row trails its poll is counted"
+    assert pair_quote_fresh(cycle, cycle - 90), "the desk's own bar still counts"
+    assert not pair_quote_fresh(cycle, cycle - 151), "past bar plus persistence interval is stale"
+    assert not pair_quote_fresh(cycle, 0), "no quote is never fresh"
+    print("self-test OK: the census counts every pair xvenue saw fresh despite the 60 s quote_ts write")
+    return 0
+
+
 # ---- settlement_specs(), transcribed from src/universe.cpp -------------------------------------
 # product "" means nobody has read that series' rules; the gate treats that as unverified.
 SPECS = {
@@ -187,7 +213,7 @@ def main():
             " JOIN poly_markets q ON q.slug=p.slug WHERE q.closed=0"):
             pairs.add(r["t"])
             two = r["b"] > 0 and r["k"] > 0 and r["k"] > r["b"] and r["k"] < 1
-            if two and r["qt"] > 0 and cycle - r["qt"] <= 90: pair_valid.add(r["t"])
+            if two and pair_quote_fresh(cycle, r["qt"]): pair_valid.add(r["t"])
     except sqlite3.Error:
         pass
     mfs = set()
@@ -356,4 +382,6 @@ def main():
 
 
 if __name__ == "__main__":
+    if "--self-test" in sys.argv[1:]:
+        sys.exit(self_test())   # before argparse: the --db default refuses to run without a snapshot
     main()
