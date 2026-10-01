@@ -133,7 +133,9 @@ struct Config {
   //   "write"   every listed row every cycle, updated_ts = now: the behaviour before this setting.
   //   "shadow"  the same writes, plus checks on what "skip" would do, counted in the engine status
   //             (markets_write: would_skip, detector_mismatches, overlay_mismatches). The default:
-  //             run it, see both mismatch counts stay at zero, then switch.
+  //             run it, see both mismatch counts stay at zero, then switch. foreign_rows (rows no
+  //             poll of this desk wrote, such as close-all's) is not a reason to wait: skip mode
+  //             reads those rows' own, older time, which can only refuse more.
   //   "skip"    a row is written only when a stored field changed or as a 10-minute heartbeat, and
   //             the poll time is kept in memory as quote_ts. Rewriting unchanged rows was the
   //             largest single cause of the 2.96 MB/s macOS measured the desk dirtying while awake.

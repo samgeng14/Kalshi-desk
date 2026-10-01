@@ -14,6 +14,58 @@ Working agreement for every session in this programme:
   geolocation check rejects it, so autonomous execution has to run on the Mac. This constrains
   session 8 and is not negotiable by design choices made earlier.
 
+## Session 25 - three days down, and 137 GB of writes (2026-10-01)
+
+**Down from 2026-09-28 21:02Z to 10-01.** The laptop restarted with no clean shutdown (`last`
+shows no shutdown record; it was on battery earlier; no panic report) and nothing started the
+supervisor again. The run before it lasted 3.7 days with 0 storage failures and no crash. After
+the restart `PRAGMA quick_check` was ok and the last book row matched the last heartbeat.
+`scripts/desk_autostart.sh` and a LaunchAgent (`scripts/com.kalshi-desk.supervisor.plist`,
+installed in ~/Library/LaunchAgents) now start the supervisor at login, unless `tradeit down`
+left `data/desk.stop`.
+
+**The desk wrote 137 GB in 12.9 awake hours** (macOS 'disk writes' report, 2.96 MB/s while
+awake; about 49 GB a day at this laptop's awake share, 256 GB if never asleep) while the database
+grew about 2 GB a day. The report's own write-weighted stacks attributed it: the refresh
+transaction 37% (every market row rewritten each cycle only for updated_ts, plus one random
+quote-history index leaf per row), a sorter temp file from the per-series market query 23% (it
+grows with "zombie" rows: closed markets in series no model prices stay 'active' forever),
+contract_universe autocommits 15%, model_fairs 8%, the dashboard scorecard's full-table sort 5%
+(93% of the 09-24 report, with the tab open), Polymarket 4.5%. Fixed, measured on scratch
+databases:
+
+| | before | after |
+|---|---|---|
+| per-series query | 10 MB temp a call | 0 |
+| contract_universe refresh | 137 MB | 1.8 MB |
+| scorecard | up to 257 MB a call, every 3 s | 0, cached 5 min |
+| quote history | 8.4 MB a cycle | 2.2 MB |
+| model_fairs | 3.3 MB a cycle | 1.4 MB |
+| Polymarket refresh | 9.6 MB | 5.0 MB |
+| market rows, skip mode | 30.6 MB a cycle | 2-8.6 MB |
+
+**Market rows ship behind `markets_write_mode`, default "shadow"** (config.h has the three
+modes). Shadow writes exactly what the old code wrote and counts, in the status under
+`markets_write`, what skip would do. Switch to `"skip"` in config/desk.json once
+`detector_mismatches` and `overlay_mismatches` stay 0 over a day while `would_skip` climbs;
+`foreign_rows` (rows close-all wrote) is not a reason to wait. `tests/test_invariance.cpp`
+(markets-invariance) is the evidence that skip reads what write reads: 1.84M differential
+checks, threaded reader connections, a backward clock step, all 0 differences.
+
+Reviewed three ways and verified twice; the reviews found and fixed: skip mode putting the desk's
+poll time on a row close-all wrote, reader connections holding the previous row version, a
+history read racing a flush, the Polymarket batch committing outside its lock, and on the last
+pass a backward clock step reading as the future and two books in one second sharing a poll.
+
+**What is lost on a crash or SIGKILL:** up to 5 minutes of quote-history rows (buffered), the
+cycle's queued model_fairs; in skip mode a market not yet re-polled reads up to 10 minutes old
+(refuses more, never less).
+
+**Open:** the zombie rows (count them on a lock-checked extract; retiring them changes stored
+status values and needs a reader audit); the WAL checkpoint window (1000 pages; 10k would halve
+the checkpoint copies at the cost of longer stalls); `scripts/score_models.py --pick median` for
+weather_wx1 now samples on change, not per cycle.
+
 ## Session 24 - M0 stabilize and M1 retire perps (2026-09-23)
 
 The operator's plan (volume, live-sizing, maker-first) orders M0 first: the desk had been down

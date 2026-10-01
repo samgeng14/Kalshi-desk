@@ -130,7 +130,7 @@ class Store {
   void set_markets_write_mode(MarketsWriteMode m);
   MarketsWriteMode markets_write_mode() const { return markets_mode_.load(); }
   // Counters for the engine status: mode, shadow_rows, would_skip, detector_mismatches,
-  // overlay_mismatches, written, skipped, heartbeats, foreign_commits.
+  // overlay_mismatches, foreign_rows, written, skipped, heartbeats, foreign_commits.
   json markets_write_stats() const;
   // refresh_results' retry stamp (UPDATE markets SET updated_ts). It still writes the row, and in
   // shadow and skip modes it also moves the poll time, so the overlay and the row agree.
@@ -284,9 +284,13 @@ class Store {
   // any other connection's commit (foreign_commit_since_last_look) upsert_market writes each row at
   // its next poll, whatever the change detector remembers.
   struct PollTime { long long poll = 0, row = 0, prev_poll = 0, prev_row = -1; };
+  // The poll itself, not the larger of poll and row: write mode stamps every poll with the clock it
+  // reads, so after a backward clock step its quote_ts is the new, earlier time. A max kept the
+  // pre-step write time, a few seconds in the future, and every fresh() test (ts <= now) refused the
+  // market until the clock caught up.
   long long quote_ts_for(const PollTime& p, long long stored_ts) const {
-    if (stored_ts == p.row) return std::max(stored_ts, p.poll);
-    if (stored_ts == p.prev_row) return std::max(stored_ts, p.prev_poll);
+    if (stored_ts == p.row) return p.poll;
+    if (stored_ts == p.prev_row) return p.prev_poll;
     return stored_ts;
   }
   // The entry a poll at `poll` of the row version `row_ts` leaves. Its previous version is the
@@ -309,6 +313,7 @@ class Store {
   // is a leaf: nothing is ever locked while it is held.
   mutable std::mutex poll_mu_;
   std::unordered_map<std::string, PollTime> market_poll_ts_;
+  std::atomic<long long> foreign_rows_{0};   // shadow reads of a row another connection wrote
   std::atomic<long long> shadow_rows_{0}, would_skip_{0}, detector_mismatches_{0}, overlay_mismatches_{0},
       markets_written_{0}, markets_skipped_{0}, market_heartbeats_{0}, foreign_commits_{0};
   sqlite3_stmt* shadow_stmt_ = nullptr;   // the shadow check's row read, prepared once (under mu_)

@@ -547,6 +547,10 @@ void Store::upsert_market(const Market& m) {
   const bool heartbeat = !changed && now - prev->written_ts >= kMarketHeartbeatSeconds;
   const bool write = changed || heartbeat;
   v.written_ts = write ? now : prev->written_ts;
+  // A different book written in the same second as the last write shares its updated_ts, so a later
+  // skipped poll would vouch for either version, and a reader holding the earlier one would read a
+  // poll of the later book. Make the next poll a heartbeat, so it writes a second of its own.
+  if (write && changed && prev && prev->written_ts == now) v.written_ts = now - kMarketHeartbeatSeconds;
   if (mode == MarketsWriteMode::Shadow) {
     // Every row is still written, exactly as in write mode. What skip mode WOULD skip is checked
     // against the row as it stands: if any stored column differs, skipping would have lost a change.
@@ -661,6 +665,7 @@ json Store::markets_write_stats() const {
               {"would_skip", would_skip_.load()},
               {"detector_mismatches", detector_mismatches_.load()},
               {"overlay_mismatches", overlay_mismatches_.load()},
+              {"foreign_rows", foreign_rows_.load()},
               {"written", markets_written_.load()},
               {"skipped", markets_skipped_.load()},
               {"heartbeats", market_heartbeats_.load()},
@@ -695,19 +700,24 @@ long long Store::effective_quote_ts(const std::string& ticker, long long stored_
 int Store::persist_market_poll_times() {
   if (markets_mode_.load() != MarketsWriteMode::Skip) return 0;
   std::lock_guard<std::recursive_mutex> lk(mu_);
-  std::vector<std::pair<std::string, long long>> todo;
+  // Only onto the row version the poll saw (updated_ts = p.row): a row another connection wrote
+  // since is not a book this desk polled, and stamping our poll on it would outlive the restart.
+  struct Todo { std::string ticker; long long poll, row; };
+  std::vector<Todo> todo;
   {
     std::lock_guard<std::mutex> pl(poll_mu_);
     for (const auto& [t, p] : market_poll_ts_)
-      if (p.row < p.poll) todo.emplace_back(t, p.poll);
+      if (p.row != p.poll) todo.push_back({t, p.poll, p.row});
   }
   if (todo.empty()) return 0;
   std::vector<std::vector<SqlValue>> rows;
   rows.reserve(todo.size());
-  for (const auto& [t, ts] : todo) rows.push_back({ts, t, ts});
-  transaction([&] { exec_rows("UPDATE markets SET updated_ts=? WHERE ticker=? AND updated_ts<?", rows); });
+  for (const auto& x : todo) rows.push_back({x.poll, x.ticker, x.row});
+  transaction([&] { exec_rows("UPDATE markets SET updated_ts=? WHERE ticker=? AND updated_ts=?", rows); });
   std::lock_guard<std::mutex> pl(poll_mu_);
-  for (const auto& [t, ts] : todo) {
+  for (const auto& x : todo) {
+    const std::string& t = x.ticker;
+    const long long ts = x.poll;
     if (auto w = market_written_.find(t); w != market_written_.end()) w->second.written_ts = ts;
     if (auto p = market_poll_ts_.find(t); p != market_poll_ts_.end() && p->second.poll == ts && p->second.row != ts) {
       // The version the row held before keeps the poll that confirmed it (this one).
@@ -729,11 +739,11 @@ void Store::retire_market_poll_times(long long older_than) {
     for (const auto& [t, p] : market_poll_ts_)
       if (p.poll < older_than) {
         gone.emplace_back(t, p.poll);
-        if (p.row < p.poll) rows.push_back({p.poll, t, p.poll});
+        if (p.row != p.poll) rows.push_back({p.poll, t, p.row});   // the version the poll saw only
       }
   }
   if (markets_mode_.load() == MarketsWriteMode::Skip && !rows.empty())
-    transaction([&] { exec_rows("UPDATE markets SET updated_ts=? WHERE ticker=? AND updated_ts<?", rows); });
+    transaction([&] { exec_rows("UPDATE markets SET updated_ts=? WHERE ticker=? AND updated_ts=?", rows); });
   // A detector entry is only ever made together with a poll time, so this removes both.
   std::lock_guard<std::mutex> pl(poll_mu_);
   for (const auto& [t, ts] : gone) {
@@ -796,7 +806,13 @@ Market Store::market_from_row(const json& r, bool on_writer) {
   } else if (on_writer && poll.poll != m.quote_ts) {
     // Shadow: the row was written with the poll time, so the two must agree. Only on the writer
     // connection, where the caller holds mu_ from the read to here, so no write lands in between: a
-    // reader connection can see a commit a moment before the poll times move with it.
+    // reader connection can see a commit a moment before the poll times move with it. A row another
+    // connection wrote (close-all) is no version of ours, and skip mode reads its own time too, so it
+    // is counted apart: a manual command must not spoil the evidence for switching to skip.
+    if (m.quote_ts != poll.row && m.quote_ts != poll.prev_row) {
+      ++foreign_rows_;
+      return m;
+    }
     const long long n = ++overlay_mismatches_;
     if (n <= 20 || n % 1000 == 0)
       LOG_WARN("markets shadow: overlay mismatch %lld: %s poll time %lld, stored updated_ts %lld", n,

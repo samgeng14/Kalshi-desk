@@ -12,7 +12,9 @@ void XVenue::prepare(const std::vector<Market>&, Store& store) {
   for (const auto& r : store.query("SELECT slug, bid, ask, quote_ts FROM poly_markets WHERE closed=0")) {
     const std::string slug = r.value("slug", "");
     long long ts = r.value("quote_ts", 0LL);
-    if (auto p = polled.find(slug); p != polled.end()) ts = std::max(ts, p->second);
+    // The poll time itself: it is never behind the stored quote_ts of a slug the map holds, and a
+    // max would keep a pre-step time after a backward clock step (read as the future, so stale).
+    if (auto p = polled.find(slug); p != polled.end()) ts = p->second;
     quotes[slug] = {{r.value("bid", 0.0), r.value("ask", 0.0)}, ts};
   }
   for (const auto& r : store.query("SELECT kalshi_ticker, slug, pm_yes_is_kalshi_yes FROM poly_pairs")) {

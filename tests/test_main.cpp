@@ -4514,10 +4514,13 @@ static void test_markets_write_modes() {
     st.upsert_market(ms[1]);
     CHECK(st.markets_write_stats()["detector_mismatches"] == 1);
     CHECK(st.get_market("KXT-W-B1")->yes_bid == ms[1].yes_bid);    // shadow still wrote it
-    // And a stored updated_ts the poll time does not explain.
+    // And a stored updated_ts the poll time does not explain (a write outside this Store's own
+    // statements). No poll of this desk vouches for that version, and skip mode reads the row's own,
+    // older time too, which can only refuse more: counted as a foreign row, not a mismatch.
     st.exec("UPDATE markets SET updated_ts=updated_ts-50 WHERE ticker='KXT-W-B1'");
     CHECK(st.get_market("KXT-W-B1")->quote_ts == t0 + 50);         // shadow reads the row, as before
-    CHECK(st.markets_write_stats()["overlay_mismatches"] == 1);
+    CHECK(st.markets_write_stats()["overlay_mismatches"] == 0);
+    CHECK(st.markets_write_stats()["foreign_rows"] == 1);
   }
   // Write (Store's own default): the old statements, no checks.
   {
@@ -4618,10 +4621,14 @@ static void test_markets_foreign_writer() {
       close_all.set_clock_for_tests(t0 + 12);
       close_all.upsert_market(flicker);
     }
+    // A read before the desk's next poll sees close-all's row, which no poll of this desk vouches
+    // for. Skip mode reads that row's own time too, so it is not a mismatch; it is counted apart.
+    desk.get_market(m.ticker);
     desk.set_clock_for_tests(t0 + 18);
     desk.upsert_market(m);
     json s = desk.markets_write_stats();
     CHECK(s["would_skip"] == 1 && s["detector_mismatches"] == 0);
+    CHECK(s["overlay_mismatches"] == 0 && s["foreign_rows"] == 1);
   }
   for (const char* sfx : {"", "-wal", "-shm"}) std::remove((path + sfx).c_str());
 }

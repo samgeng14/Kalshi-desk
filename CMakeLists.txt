@@ -110,6 +110,10 @@ add_test(NAME unit COMMAND desk-tests)
 add_executable(systematic-tests tests/test_systematic.cpp)
 target_link_libraries(systematic-tests PRIVATE desk)
 add_test(NAME systematic COMMAND systematic-tests)
+# markets_write_mode: skip mode must read exactly what write mode reads (see the test's header).
+add_executable(invariance-tests tests/test_invariance.cpp)
+target_link_libraries(invariance-tests PRIVATE desk)
+add_test(NAME markets-invariance COMMAND invariance-tests)
 
 add_executable(perps-tests tests/test_perps.cpp)
 target_link_libraries(perps-tests PRIVATE desk)
