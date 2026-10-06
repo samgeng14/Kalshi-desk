@@ -333,6 +333,8 @@ function manOrders(P, key) { const a = []; P.D.store.orders.forEach(o => { if (o
     check(ci.reserve === 0 && ci.pos === 6 && ci.maxl === 30000, 'a reducing sell ties up no cash; max loss of what stays', ci);
     ci = L.costInfo(mk, { pos: 3, avg: 5000 }, 'SELL', 6000, 5, 'M');
     check(ci.reserve === 2 * 4000 && ci.pos === -2 && ci.maxl === 2 * 4000, 'a sell through flat: NO cost on the excess', ci);
+    ci = L.costInfo(mk, { pos: 12, avg: 5000 }, 'SELL', 6000, 10, 'T', [{ side: 'SELL', px: 5900, left: 10 }]);
+    check(ci.reserve === 8 * 4000, 'a sell next to a working sell: the +12 long covers 10 + 2, the other 8 reserve 1 - px (the gateway\'s rule)', ci);
     ci = L.costInfo(mk, null, 'BUY', 5800, 70, 'M');
     check(ci.fee === 0 && ci.cost === 406000 && ci.need === 406000 + D.fees.estimate('K', QUAD, 'BUY', 5800, 70, 'T'), 'a post: no maker fee, but the cash check (need) holds the taker fee as the gateway does', ci);
     eq(L.c2(175), '1.75', 'fee per contract in cents');
@@ -382,6 +384,15 @@ function manOrders(P, key) { const a = []; P.D.store.orders.forEach(o => { if (o
   eq(D.focus.key, natKey, 'the focused market is ladder A\'s');
   await run(300);
   eq(st.book(natKey).depth, 'FULL', 'the ladders\' books stream at full depth');
+  {
+    // a snapshot whose subs differ from the ladders on screen makes the page subscribe again
+    const want = Desk => Desk.layout.ladders().map(sl => Desk.focus.ladders[sl]).filter(Boolean).length;
+    eq(D.subs.check(JSON.parse(JSON.stringify(P.sim().state.subs))), false, 'subs that match the ladders on screen send nothing');
+    P.sim().state.subs = { ladders: [], tops: 'ALL' };          // the backend lost them (a restart, a sid reset)
+    eq(D.subs.check({ ladders: [], tops: 'ALL' }), true, 'a snapshot without them is noticed');
+    await run(300);
+    eq(P.sim().state.subs.ladders.length, want(D), 'and the subscription is sent again');
+  }
   // freeze natural gas: bids 0.63 x120, 0.62 x85, 0.61 x40 / asks 0.64 x80, 0.65 x210, 0.67 x12
   const nat = st.market(natKey);
   P.sim().freeze(natKey, { bids: [[6300, 120], [6200, 85], [6100, 40]], asks: [[6400, 80], [6500, 210], [6700, 12]] });
@@ -465,11 +476,36 @@ function manOrders(P, key) { const a = []; P.D.store.orders.forEach(o => { if (o
   P.frame();
   check(/\barm\b/.test(ladCell(P, 'A', 6700, 'bq').className), 'the refused cell stays armed (amber) for a second click');
   check(/PRICE_BAND/.test(P.$('sb-alert').textContent), 'status bar shows the guard');
+  click(ladCell(P, 'A', 6700, 'bq'), { detail: 2 });
+  eq(st.orders.size, n0, 'a double-click\'s second click never confirms the guard');
+  await run(100);
   click(ladCell(P, 'A', 6700, 'bq'));
-  eq(st.orders.size, n0 + 1, 'the second click on the armed cell sends it (override)');
+  eq(st.orders.size, n0, 'nor does a separate click under 0.35 s after the arming one');
+  await run(300);
+  click(ladCell(P, 'A', 6700, 'bq'));
+  eq(st.orders.size, n0 + 1, 'a separate second click on the armed cell sends it (override)');
   o = newest(P, x => x.own === 'MAN');
   await run(250);
   check(st.orders.get(o.cid).st !== 'REJ', 'the override was accepted by the venue', st.orders.get(o.cid).why);
+  // the backend's touch is not ours: its PRICE_BAND refusal arms the cell for a second click
+  {
+    const lb = st.book(natKey), ba0 = lb.ba;
+    lb.ba = 6600;                                   // our book says 0.66 (stale); the venue's ask is 0.64
+    n0 = st.orders.size;
+    click(ladCell(P, 'A', 6700, 'bq'));
+    lb.ba = ba0;
+    eq(st.orders.size, n0 + 1, 'a buy 1 tick through our (stale) ask passes our guard and is sent');
+    const cb = newest(P, x => x.own === 'MAN');
+    await run(250);
+    check(st.orders.get(cb.cid).st === 'REJ' && st.orders.get(cb.cid).why === 'PRICE_BAND', 'the venue refuses it PRICE_BAND', st.orders.get(cb.cid).why);
+    P.frame();
+    check(/\barm\b/.test(ladCell(P, 'A', 6700, 'bq').className), 'the refusal arms the cell (amber)');
+    await run(400);
+    click(ladCell(P, 'A', 6700, 'bq'));
+    const ov = newest(P, x => x.own === 'MAN');
+    await run(250);
+    check(ov.cid !== cb.cid && st.orders.get(ov.cid).st !== 'REJ', 'the next separate click sends it with override', st.orders.get(ov.cid) && st.orders.get(ov.cid).why);
+  }
   n0 = st.orders.size;
   click(ladCell(P, 'A', 6700, 'bq'), { shiftKey: true });
   eq(st.orders.size, n0 + 1, 'Shift+click overrides at once');
@@ -497,9 +533,36 @@ function manOrders(P, key) { const a = []; P.D.store.orders.forEach(o => { if (o
   check(/drag/.test(ladCell(P, 'A', 6000, 'wb').className), 'the drag target is outlined');
   n0 = st.orders.size;
   fire(ladCell(P, 'A', 6000, 'wb'), 'mouseup', { button: 0 });
+  check(st.orders.get(cidDrag).local.cxlPend && st.orders.size === n0, 'drag: the cancel goes first; nothing new until it is confirmed');
+  await run(250);
   const nRe = newest(P, x => x.own === 'MAN');
-  check(st.orders.get(cidDrag).local.cxlPend && st.orders.size === n0 + 1 && nRe.px === 6000 && nRe.tif === 'POST', 'drag re-prices as cancel + new post-only', { px: nRe.px, tif: nRe.tif });
+  check(st.orders.get(cidDrag).st === 'CXL' && st.orders.size === n0 + 1 && nRe.px === 6000 && nRe.tif === 'POST' && nRe.qty === st.orders.get(cidDrag).qty - st.orders.get(cidDrag).filled,
+    'then a new post-only order for what the cancel took off', { px: nRe.px, tif: nRe.tif, qty: nRe.qty });
   check(/queue place lost/.test(st.alerts[0].msg), 'the status bar says queue place is lost');
+  // a fill that races the cancel is not sent again
+  {
+    click(ladCell(P, 'A', 6100, 'bq'));
+    const cr = newest(P, x => x.own === 'MAN').cid;
+    await run(250);
+    fire(ladCell(P, 'A', 6100, 'wb'), 'mousedown', { button: 0 });
+    fire(ladCell(P, 'A', 5900, 'wb'), 'mousemove', { button: 0 });
+    const n1 = st.orders.size;
+    fire(ladCell(P, 'A', 5900, 'wb'), 'mouseup', { button: 0 });
+    // the market trades our 0.61 bid before the cancel lands at the venue
+    P.sim().freeze(natKey, { bids: [[6000, 50]], asks: [[6400, 80]] });
+    P.sim().trade(natKey, 'SELL', 5);
+    await run(300);
+    check(st.orders.get(cr).st === 'FILL' && st.orders.size === n1, 'the order filled before its cancel: no re-price is sent', { st: st.orders.get(cr).st, n: st.orders.size - n1 });
+    P.sim().freeze(natKey, { bids: [[6300, 120], [6200, 85], [6100, 40]], asks: [[6400, 80], [6500, 210], [6700, 12]] });
+    await run(300);
+    const ext = JSON.parse(JSON.stringify(D.contract.examples.ord));
+    ext.cid = 'X-drag-ext1'; ext.tk = nat.tk; ext.v = 'K'; ext.own = 'EXT'; ext.st = 'WORK'; ext.filled = 0; ext.left = 2; ext.qty = 2; ext.px = '0.5800'; ext.exp_ms = null; ext.rev = 1;
+    st._handlers.ord(ext); P.frame();
+    fire(ladCell(P, 'A', 5800, 'wb'), 'mousedown', { button: 0 });
+    check(!A.drag, 'an EXT order (placed outside the desk) cannot be dragged');
+    fire(ladCell(P, 'A', 5800, 'wb'), 'mouseup', { button: 0 });
+    ext.st = 'CXL'; ext.left = 0; ext.why = 'USER'; ext.rev = 2; st._handlers.ord(ext);
+  }
   await run(250);
   // PRICE copies to the ticket, never an order
   n0 = st.orders.size;
@@ -632,14 +695,23 @@ function manOrders(P, key) { const a = []; P.D.store.orders.forEach(o => { if (o
   }
   check(wtb.children.some(r => r.getAttribute('data-mkt') && r.children[4].textContent !== ''), 'ESPN shows on live games');
   check(wtb.children.some(r => r.getAttribute('data-mkt') && /\b(fair|warn)\b/.test(r.children[3].className) && r.children[3].textContent !== ''), 'model fair shows in the watchlist');
-  // amber rule: |mid - fair| beyond the taker break-even
+  // amber rule: a taker at the touch beats the model after the fee (never the mid)
+  let amberN = 0;
   const amberOk = wtb.children.filter(r => r.getAttribute('data-mkt')).every(r => {
     const k = r.getAttribute('data-mkt'), b = st.book(k), m = st.market(k);
-    if (!b || b.ref.fair === null || b.mid === null) return true;
-    const want = Math.abs(b.mid - b.ref.fair) > D.fees.takerPer(m.v, m.fee, b.mid);
+    if (!b || b.ref.fair === null) return true;
+    const f = b.ref.fair, buy = b.ba !== null ? f - b.ba - D.fees.takerPer(m.v, m.fee, b.ba) : -1, sell = b.bb !== null ? b.bb - f - D.fees.takerPer(m.v, m.fee, b.bb) : -1;
+    const want = buy > 0 || sell > 0;
+    if (want) amberN++;
     return /\bwarn\b/.test(r.children[3].className) === want;
   });
-  check(amberOk, 'Fair is amber exactly when |mid - fair| beats the taker break-even');
+  check(amberOk, 'Fair is amber exactly when a take at the touch clears the taker fee', amberN);
+  {
+    const L2 = D.manual.logic, QUAD = { type: 'QUAD', mult: 1 };
+    eq(L2.takeEdge('K', QUAD, 6100, 6100, 6700) && L2.takeEdge('K', QUAD, 6100, 6100, 6700).e < 0, true, 'ILST-like: bid 0.61 / ask 0.67, fair 0.61: no take clears the fee (not amber)');
+    const te = L2.takeEdge('K', QUAD, 7000, 6100, 6700);
+    check(te.side === 'BUY' && te.e > 0, 'fair 0.70 over an ask of 0.67: buying at the ask clears the fee', te);
+  }
   // click loads into the focused ladder, Shift+click into the other
   const wxRow = wtb.children.find(r => r.getAttribute('data-mkt') && st.market(r.getAttribute('data-mkt')).kind === 'WEATHER');
   const wxKey = wxRow.getAttribute('data-mkt');
@@ -743,8 +815,11 @@ function manOrders(P, key) { const a = []; P.D.store.orders.forEach(o => { if (o
   n0 = st.orders.size;
   click(E.buy); P.frame();
   check(st.orders.size === n0 && /^OVERRIDE BUY/.test(E.buy.textContent) && /confirm/.test(E.buy.className), 'the guard turns the button into OVERRIDE (no dialog)', E.buy.textContent);
+  click(E.buy, { detail: 2 });
+  eq(st.orders.size, n0, 'a double-click does not confirm OVERRIDE');
+  await run(400);
   click(E.buy);
-  eq(st.orders.size, n0 + 1, 'the second click sends it');
+  eq(st.orders.size, n0 + 1, 'the second, separate click sends it');
   await run(3500);
   check(!/OVERRIDE/.test(E.buy.textContent), 'OVERRIDE lapses');
   // price stepping and the fill buttons
@@ -780,6 +855,10 @@ function manOrders(P, key) { const a = []; P.D.store.orders.forEach(o => { if (o
   check(live.length >= 1, 'something is working');
   const r0 = wtb2.children.find(r => r.getAttribute('data-k') === live[0].cid);
   check(r0 && r0.children[9].textContent === 'WORK' && /^\d+s$/.test(r0.children[7].textContent) && r0.getAttribute('data-mkt') === live[0].key, 'WORKING: state, seconds to expiry, linked market', r0 && r0.children.map(c => c.textContent));
+  click(r0.children[1]);
+  P.frame();
+  check(/\bsel\b/.test(r0.className) && wtb2.children.filter(r => r !== r0 && r.getAttribute('data-mkt') === r0.getAttribute('data-mkt')).every(r => /\bfmk\b/.test(r.className) && !/\bsel\b/.test(r.className)),
+    'the clicked row carries the selection bar; the market\'s other rows only a tint', r0.className);
   click(r0.children[10]);
   check(st.orders.get(live[0].cid).local.cxlPend, 'x cancels the row');
   check(D.focus.key === natKey, 'the x does not re-focus the market');
@@ -900,7 +979,11 @@ function manOrders(P, key) { const a = []; P.D.store.orders.forEach(o => { if (o
   const cidK = newest(P, x => x.own === 'MAN').cid;
   await run(300);
   D.act.kill();
+  P.frame();
+  check(P.$('kill').textContent === 'KILL ...' && st.canTrade('K') === 'KILLED' && st.orders.get(cidK).local.cxlPend,
+    'KILL paints pending at once: the button, new orders refused, working orders struck through', P.$('kill').textContent);
   await run(300);
+  check(/^KILLED \d+s$/.test(P.$('kill').textContent), 'KILLED with the lockout once the backend confirms', P.$('kill').textContent);
   check(E.buy.disabled && E.blk.textContent === 'KILLED', 'KILL: the ticket is locked');
   eq(st.orders.get(cidK).st, 'CXL', 'KILL cancelled the working order');
   n0 = st.orders.size;
@@ -972,30 +1055,48 @@ function manOrders(P, key) { const a = []; P.D.store.orders.forEach(o => { if (o
     D.focus.set(dk.key, { ladder: 'B', other: true });
     await run(500);
     const zb = P.$('m-lad-b-head').children[0].children[8];
-    check(!/\boff\b/.test(zb.className) && zb.textContent === 'x1', 'a 0.1c ladder offers zoom');
+    check(!/\boff\b/.test(zb.className) && zb.textContent === 'x10', 'a 0.1c ladder offers zoom and opens at x10 (whole-cent rows)', zb.textContent);
+    let px5 = rowsOf(B.tb).map(r => +r.getAttribute('data-k'));
+    check(px5.every(p => p % 100 === 0) && px5[0] - px5[1] === 100, 'x10 rows are whole cents');
+    click(zb); await run(300);
+    eq(zb.textContent, 'x1', 'zoom x1: every 0.1c level');
+    px5 = rowsOf(B.tb).map(r => +r.getAttribute('data-k'));
+    check(px5[0] - px5[1] === 10, 'x1 rows are tenths of a cent', px5.slice(0, 3));
     click(zb); await run(300);
     eq(zb.textContent, 'x5', 'zoom x5');
-    let px5 = rowsOf(B.tb).map(r => +r.getAttribute('data-k'));
-    check(px5.length === 38 && px5.every(p => p % 50 === 0) && px5[0] - px5[1] === 50, 'x5 rows are half cents', px5.slice(0, 3));
-    click(zb); await run(300);
     px5 = rowsOf(B.tb).map(r => +r.getAttribute('data-k'));
-    check(px5.every(p => p % 100 === 0) && px5[0] - px5[1] === 100, 'x10 rows are whole cents');
-    const shownBid = rowsOf(B.tb).reduce((t, r) => t + (+r.children[1].textContent || 0), 0);
+    check(px5.length === 38 && px5.every(p => p % 50 === 0) && px5[0] - px5[1] === 50, 'x5 rows are half cents', px5.slice(0, 3));
+    // the choice belongs to the market, not the ladder slot
+    D.focus.set(dk.key, { ladder: 'A' }); await run(300);
+    eq(P.$('m-lad-a-head').children[0].children[8].textContent, 'x5', 'the same market in another ladder keeps its zoom');
+    D.focus.set(natKey, { ladder: 'A' }); await run(300);
+    click(zb); await run(300);
+    eq(zb.textContent, 'x10', 'x10 again');
+    px5 = rowsOf(B.tb).map(r => +r.getAttribute('data-k'));
+    const shownBid = rowsOf(B.tb).reduce((t, r) => t + (+(r.children[1].getAttribute('title') || 0)), 0);
+    check(rowsOf(B.tb).every(r => /^(\d+|<1|)$/.test(r.children[1].textContent)), 'ladder sizes read as whole contracts (the exact size on the title)');
     const b3 = st.book(dk.key), lo = Math.min.apply(null, px5), inWin = b3.bids.filter(l => l[0] >= lo).reduce((t, l) => t + l[1], 0);
     check(Math.abs(shownBid - inWin) < 0.05, 'zoomed rows add up the book\'s sizes', { shownBid, inWin });
     const bbRowEl = rowsOf(B.tb).find(r => /\bbb\b/.test(r.children[3].className));
     check(bbRowEl && +bbRowEl.getAttribute('data-k') === Math.floor(b3.bb / 100) * 100, 'the best bid marks its floor row', bbRowEl && bbRowEl.getAttribute('data-k'));
-    click(zb); await run(300);
-    eq(zb.textContent, 'x1', 'zoom cycles back to x1');
   }
 
   // ---- the 15-minute roll ---------------------------------------------------------------------
   D.focus.set(natKey, { ladder: 'A' });
   await run(300);
   const closeAt = st.market(natKey).close_ms;
-  await run(closeAt - P.clock.t + 3000, 1000);
-  const nk = D.focus.ladders.A;
+  await run(closeAt - P.clock.t - 200, 1000);
+  let nk = D.focus.ladders.A;
+  for (let i = 0; i < 80 && nk === natKey; i++) { await run(50, 50); nk = D.focus.ladders.A; }
   check(nk !== natKey && st.market(nk) && st.market(nk).status === 'OPEN' && D.manual.logic.series(st.market(nk).tk) === 'KXNATGAS15M', 'ladder A rolls to the next natural gas window', nk);
+  {
+    // the row under the pointer is now another market's: clicks wait half a second
+    P.frame();
+    const row = rowsOf(A.tb)[5], n1 = st.orders.size;
+    click(row.children[1]);
+    check(st.orders.size === n1 && /^ROLLED/.test(st.alerts[0].msg), 'a click just after the roll is refused (ROLLED)', st.alerts[0].msg);
+    await run(600);
+  }
   await run(500);
   eq(A.shownKey, nk, 'and shows it');
 

@@ -35,7 +35,7 @@
   <div class="hc" id="hc-pm"><span class="hl">PM</span><span class="hv" id="h-pm"></span><span class="hs" id="h-pm-free"></span><span class="tag warn ro" id="h-pm-ro">RO</span></div>
   <div class="hc" id="hc-day"><span class="hl">DAY</span><span class="hv" id="h-day"></span><span class="hs" id="h-day-split"></span></div>
   <div class="hc" id="hc-risk"><span class="hl">RISK</span><span class="hv" id="h-risk"></span></div>
-  <div class="hc" id="hc-stop"><span class="hl">STOP</span><span class="hv" id="h-stop"></span></div>
+  <div class="hc" id="hc-stop"><span class="hl">LOSS</span><span class="hv" id="h-stop"></span></div>
   <div class="hc" id="hc-sys"><span class="hl">SYS</span><span class="hv" id="h-sys"></span></div>
   <div class="hgap"></div>
   <div class="hh" id="h-kx">KX -</div>
@@ -50,7 +50,7 @@
 
 <main id="tabs">
 
-  <!-- SYSTEMATIC: strip 36 / lanes 164 / lower (working 250 + fills | risk 330 + markouts) -->
+  <!-- SYSTEMATIC: strip 36 / lanes 164 / lower (working 250 + fills | risk 330 + markouts | LOG from 2400 px) -->
   <div class="tabroot" id="tab-systematic" tabindex="-1">
     <section class="panel strip" id="s-ctl">
       <div class="pbody" id="s-ctl-body"></div>
@@ -81,6 +81,10 @@
           <div class="pbody" id="s-mo-body"></div>
         </section>
       </div>
+      <section class="panel" id="s-log">
+        <div class="ptitle"><span class="pname">LOG</span></div>
+        <div class="pbody" id="s-log-body"></div>
+      </section>
     </div>
   </div>
 
@@ -143,12 +147,22 @@
   <span class="sbc dim" id="sb-hk">HOTKEYS OFF</span>
   <span class="sbc" id="sb-ui">UI -</span>
   <span class="sbc" id="sb-ack">ACK -</span>
+  <button class="sbc" id="sb-set" type="button">SET</button>
   <button class="sbc" id="sb-keys" type="button">? keys</button>
 </footer>
 
 <div id="logdrawer" class="panel">
   <div class="ptitle"><span class="pname">LOG</span><span class="ptools"><button id="log-close" type="button">x</button></span></div>
   <div class="pbody" id="log-body"></div>
+</div>
+
+<div id="setdrawer" class="panel">
+  <div class="ptitle"><span class="pname">SETTINGS</span><span class="ptools"><button id="set-close" type="button">x</button></span></div>
+  <div class="pbody set-body">
+    <div class="set-col" id="set-lanes"></div>
+    <div class="set-col" id="set-fees"></div>
+    <div class="set-col" id="set-limits"></div>
+  </div>
 </div>
 
 <div id="keysheet">

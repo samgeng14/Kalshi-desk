@@ -7,13 +7,14 @@
  *                   amount is an integer in u = $0.0001 ("0.6400" -> 6400, "$142.31" -> 1423100).
  *   Desk.grid       price grids (Kalshi price_ranges): levels, snapping, stepping by ticks
  *   Desk.fees       Kalshi and Polymarket US fee formulas, with the venues' rounding
+ *   Desk.risk       the cash a working order ties up (the gateway's reservation rule, one copy)
  *   Desk.fmt        display strings: prices, sizes, money, P&L with U+2212, cents, times
  *   Desk.dom        setText/setHTML/setClass/setAttr, keyedRows (keyed row diffing), flash
  *   Desk.render     the requestAnimationFrame scheduler: mark(topic) -> one frame -> renderers
  *   Desk.tick       one 250 ms clock for countdowns and the stale check (no other timers)
  *   Desk.focus      the global focused market, the ladder slots, and panel linking ([data-mkt])
  *   Desk.keys       key bindings with scopes, the typing guard, HOTKEYS ON/OFF, the ? key sheet
- *   Desk.lat        click-to-paint and click-to-ack meters
+ *   Desk.lat        click-to-paint and click-to-ack meters, the display's frame interval
  *   Desk.layout     wide (>= 1920 px) / narrow (< 1400 px) flags
  *   Desk.ui         density and colour-blind toggles
  *
@@ -26,8 +27,6 @@
   var perf = (typeof performance !== 'undefined' && performance.now) ? performance : { now: function () { return Date.now(); } };
   var MINUS = '\u2212';
   Desk.MINUS = MINUS;
-  Desk.now = function () { return Date.now(); };
-  Desk.pnow = function () { return perf.now(); };
 
   // ---------------------------------------------------------------------------------------------
   // Storage. Browser storage is a convenience, never a dependency: it throws in a private window
@@ -79,6 +78,13 @@
     while (f.length < 4) f = '0' + f;
     return (neg ? '-' : '') + w + '.' + f;
   }
+  // standard normal CDF (Abramowitz and Stegun 26.2.17, |error| < 7.5e-8)
+  function ncdf(x) {
+    var t = 1 / (1 + 0.2316419 * Math.abs(x));
+    var y = 0.3989422804014327 * Math.exp(-x * x / 2) *
+      t * (0.319381530 + t * (-0.356563782 + t * (1.781477937 + t * (-1.821255978 + t * 1.330274429))));
+    return x >= 0 ? 1 - y : y;
+  }
   Desk.num = {
     U: U,
     px: parseU,                 // "0.6400" -> 6400
@@ -86,7 +92,8 @@
     money: parseU,              // "-3.2100" -> -32100
     moneyStr: strU,             // -32100 -> "-3.2100"
     r2: function (x) { return Math.round(x * 100) / 100; },   // sizes: 2 decimals
-    clamp: function (x, lo, hi) { return x < lo ? lo : (x > hi ? hi : x); }
+    clamp: function (x, lo, hi) { return x < lo ? lo : (x > hi ? hi : x); },
+    ncdf: ncdf
   };
 
   // ---------------------------------------------------------------------------------------------
@@ -108,14 +115,17 @@
     var minStep = Math.min.apply(null, rs.map(function (r) { return r.st; }));
     return { ranges: rs, levels: lv, minStep: minStep, dp: minStep % 100 === 0 ? 2 : (minStep % 10 === 0 ? 3 : 4) };
   }
-  // index of the highest level <= u (or -1)
-  function floorIdx(g, u) {
-    var lv = g.levels, lo = 0, hi = lv.length - 1, ans = -1;
-    while (lo <= hi) { var mid = (lo + hi) >> 1; if (lv[mid] <= u) { ans = mid; lo = mid + 1; } else hi = mid - 1; }
+  // index of the highest element <= u in an ascending array (or -1)
+  function bisect(a, u) {
+    var lo = 0, hi = a.length - 1, ans = -1;
+    while (lo <= hi) { var mid = (lo + hi) >> 1; if (a[mid] <= u) { ans = mid; lo = mid + 1; } else hi = mid - 1; }
     return ans;
   }
+  // index of the highest level <= u (or -1)
+  function floorIdx(g, u) { return bisect(g.levels, u); }
   Desk.grid = {
     make: makeGrid,
+    bisect: bisect,
     floorIdx: floorIdx,
     onGrid: function (g, u) { var i = floorIdx(g, u); return i >= 0 && g.levels[i] === u; },
     // dir -1: highest level <= u; +1: lowest level >= u; 0: nearest
@@ -147,7 +157,8 @@
   // ---------------------------------------------------------------------------------------------
   // Fees. All results in u (float allowed; the money string rounds to 4 dp).
   //  Kalshi:  model fee = rate * mult * C * p * (1-p) dollars; taker rate 0.07; maker rate 0.0175
-  //           on QUAD_MAKER series, 0 on QUAD, everything 0 on FREE (the LIP 15-minute series).
+  //           on QUAD_MAKER series, 0 on QUAD (the LIP 15-minute series, weather, FCS games:
+  //           takers pay, makers free), everything 0 on FREE (a fee multiplier of 0).
   //           Rounding per Kalshi's "Fee Rounding" page for a non-direct (FCM) member: the trade
   //           fee is rounded up to $0.000001, the balance change is floored to the cent, the
   //           difference is a rounding fee kept in a per-order accumulator and rebated in whole
@@ -217,6 +228,41 @@
   };
 
   // ---------------------------------------------------------------------------------------------
+  // Reservations: the cash a working order ties up, the gateway's rule (contract SEMANTICS). A BUY
+  // reserves px per contract, a SELL (a buy of NO) 1 - px, except the part that reduces an open
+  // position, which reserves nothing. Several orders on one side share the position's reducing
+  // room, best price first (buys highest first, sells lowest first), so two sells against one long
+  // cannot both count as reducing. Taker fees are not held: the order check adds the order's own
+  // taker fee once, when it is placed. The sim, the risk book and the ticket all use this.
+  //   Desk.risk.one(side, px, qty, room)        u for one order given the reducing room left
+  //   Desk.risk.market(orders, pos)             u for one market's orders [{side, px, left}]
+  //   Desk.risk.byMarket(orders, posOf)         Map key -> u over orders [{key, side, px, left}]
+  // ---------------------------------------------------------------------------------------------
+  function riskOne(side, px, qty, room) { var q = Math.max(0, qty - Math.max(0, room || 0)); return side === 'BUY' ? q * px : q * (U - px); }
+  function riskMarket(orders, pos) {
+    pos = pos || 0;
+    var room = { BUY: Math.max(0, -pos), SELL: Math.max(0, pos) }, tot = 0;
+    orders.slice().sort(function (a, b) { return a.side === b.side ? (a.side === 'BUY' ? b.px - a.px : a.px - b.px) : 0; })
+      .forEach(function (o) {
+        if (!(o.left > 0)) return;
+        var red = Math.min(room[o.side], o.left);
+        room[o.side] -= red;
+        tot += riskOne(o.side, o.px, o.left - red, 0);
+      });
+    return tot;
+  }
+  Desk.risk = {
+    one: riskOne,
+    market: riskMarket,
+    byMarket: function (orders, posOf) {
+      var by = new Map(), out = new Map();
+      orders.forEach(function (o) { var a = by.get(o.key); if (!a) { a = []; by.set(o.key, a); } a.push(o); });
+      by.forEach(function (a, key) { out.set(key, riskMarket(a, posOf(key))); });
+      return out;
+    }
+  };
+
+  // ---------------------------------------------------------------------------------------------
   // Formatting. No $ inside cells; units go in column headers. Negatives use U+2212.
   // ---------------------------------------------------------------------------------------------
   function pad2(n) { return n < 10 ? '0' + n : '' + n; }
@@ -254,10 +300,22 @@
       var s = Math.abs(r) % 1 === 0 ? String(Math.abs(r)) : String(Math.abs(r).toFixed(2)).replace(/0$/, '');
       return (r < 0 ? MINUS : '') + s;
     },
+    // whole contracts for a size column read at a glance (ladder depth, queue): '<1' under one
+    whole: function (n) {
+      if (n === null || n === undefined || isNaN(n)) return '';
+      if (n > 0 && n < 1) return '<1';
+      return String(Math.round(n));
+    },
     ssize: function (n) {
       if (n === null || n === undefined || isNaN(n)) return '';
       var s = fmt.size(n);
       return n > 0 ? '+' + s : s;
+    },
+    // a signed position in at most 6 characters for a position column: '+18.22', '−123' (whole
+    // from 100 up); the exact one goes on the title
+    pos6: function (n) {
+      if (n === null || n === undefined || isNaN(n)) return '';
+      return Math.abs(n) >= 100 ? fmt.ssize(Math.round(n)) : fmt.ssize(n);
     },
     int: function (n) { return (n === null || n === undefined || isNaN(n)) ? '' : (n < 0 ? MINUS + Math.abs(Math.round(n)) : String(Math.round(n))); },
     pct: function (x) { return (x === null || x === undefined || isNaN(x)) ? '' : Math.round(x * 100) + '%'; },
@@ -397,7 +455,6 @@
     $: byId,
     setText: setText, setHTML: setHTML, setClass: setClass, setAttr: setAttr, setVar: setStyleVar,
     keyedRows: keyedRows, emptyRow: emptyRow, flash: flash,
-    esc: function (s) { return String(s === null || s === undefined ? '' : s).replace(/[&<>"]/g, function (ch) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[ch]; }); },
     // build a <table> with a <thead> from column specs [{h:'Px', w:44, cls:'n'}]; returns tbody
     table: function (host, cols, cls) {
       if (!host) return null;
@@ -406,7 +463,7 @@
       var th = document.createElement('thead'), tr = document.createElement('tr');
       cols.forEach(function (c) {
         var col = document.createElement('col'); if (c.w) col.style.width = c.w + 'px'; cg.appendChild(col);
-        var h = document.createElement('th'); h.textContent = c.h; if (c.cls) h.className = c.cls; if (c.title) h.title = c.title; tr.appendChild(h);
+        var h = document.createElement('th'); h.textContent = c.h; if (c.cls) h.className = c.cls; if (c.title) h.setAttribute('title', c.title); tr.appendChild(h);
       });
       th.appendChild(tr); t.appendChild(cg); t.appendChild(th);
       var tb = document.createElement('tbody'); t.appendChild(tb);
@@ -417,6 +474,14 @@
 
   // ---------------------------------------------------------------------------------------------
   // Latency meters. Rolling windows; p50 over the last N.
+  //   click-to-paint  from the input event until the frame that drew its pending state has been
+  //                   painted. The render pass runs inside requestAnimationFrame, before the
+  //                   browser's style, layout and paint, so the stamp is taken by a message posted
+  //                   from that pass: it runs as the next task, after the frame went to the screen.
+  //   frame interval  the display's refresh as the browser runs animation frames (Safari: 60 Hz on
+  //                   a ProMotion Mac, 30 Hz in Low Power Mode), from two chained frames after a
+  //                   click. A click is on time when it painted within one frame interval plus the
+  //                   frame's own work (lat.budget()); performance.now() is 1 ms coarse in Safari.
   // ---------------------------------------------------------------------------------------------
   function Roll(n) { this.n = n; this.v = []; this.last = null; }
   Roll.prototype.push = function (x) { this.last = x; this.v.push(x); if (this.v.length > this.n) this.v.shift(); };
@@ -429,13 +494,21 @@
   Roll.prototype.p90 = function () { return this.q(0.9); };
   Desk.Roll = Roll;
 
+  var rafLat = (hasDoc && root.requestAnimationFrame) ? function (f) { root.requestAnimationFrame(f); } : null;
+  var paintMc = null;
+  try {
+    if (hasDoc && typeof root.MessageChannel === 'function') {
+      paintMc = new root.MessageChannel();
+      paintMc.port1.onmessage = function () { lat.stamp(); };
+    }
+  } catch (e) { paintMc = null; }
   var lat = Desk.lat = {
     paint: new Roll(50),        // click -> pending painted (ms)
     ack: new Roll(20),          // click -> first acknowledged state received (ms)
-    ackV: { K: new Roll(20), P: new Roll(20) },
-    frame: new Roll(120),       // per-frame render time (ms)
-    _pending: new Map(),        // cid -> {t0, painted, acked, v}
+    fi: new Roll(20),           // the display's frame interval (ms)
+    _pending: new Map(),        // cid -> {t0, painted, acked}
     _waiting: [],               // cids waiting for their first paint
+    _batches: [],               // cids drawn by a frame, waiting for that frame's paint
     // t0 of an input event on the performance clock
     t0: function (ev) {
       var n = perf.now();
@@ -447,31 +520,41 @@
       var origin = perf.timeOrigin || (Date.now() - perf.now());
       return Math.round(origin + lat.t0(ev));
     },
-    click: function (cid, ev, v) {
-      var rec = { t0: lat.t0(ev), painted: false, acked: false, v: v || 'K' };
+    click: function (cid, ev) {
+      var rec = { t0: lat.t0(ev), painted: false, acked: false };
       lat._pending.set(cid, rec); lat._waiting.push(cid);
       if (lat._pending.size > 200) { var first = lat._pending.keys().next().value; lat._pending.delete(first); }
+      if (rafLat) rafLat(function (a) { rafLat(function (b) { var d = b - a; if (d > 4 && d < 100) lat.fi.push(d); }); });
       return rec;
     },
     // called by the scheduler at the end of each frame's render pass
     painted: function () {
       if (!lat._waiting.length) return;
+      lat._batches.push(lat._waiting); lat._waiting = [];
+      if (paintMc) { try { paintMc.port2.postMessage(0); return; } catch (e) { /* fall through */ } }
+      lat.stamp();
+    },
+    // the frame that drew these clicks has been painted
+    stamp: function () {
+      var batch = lat._batches.shift();
+      if (!batch) return;
       var n = perf.now();
-      lat._waiting.forEach(function (cid) {
+      batch.forEach(function (cid) {
         var r = lat._pending.get(cid); if (!r || r.painted) return;
         r.painted = true; lat.paint.push(n - r.t0);
       });
-      lat._waiting.length = 0;
+      if (R) R.mark('lat');
     },
     acked: function (cid) {
       var r = lat._pending.get(cid);
       if (!r || r.acked) return null;
       r.acked = true;
       var d = perf.now() - r.t0;
-      lat.ack.push(d); if (lat.ackV[r.v]) lat.ackV[r.v].push(d);
+      lat.ack.push(d);
       return d;
     },
-    has: function (cid) { return lat._pending.has(cid); }
+    // click-to-paint above this is late (amber): one frame interval plus the frame's own work
+    budget: function () { var f = lat.fi.p50(); return (f !== null && f > 4 ? f : 16.7) + 4; }
   };
 
   // ---------------------------------------------------------------------------------------------
@@ -507,7 +590,6 @@
     force: function (tab) { R.renderers.forEach(function (r) { if (!tab || r.tab === tab) r.missed = true; }); R.mark('force'); },
     frame: function () {
       R.scheduled = false;
-      var t0 = perf.now();
       var set = R.dirty; R.dirty = new Set();
       var snapAll = set.has('snapshot');
       var d = {
@@ -529,7 +611,6 @@
         }
       }
       lat.painted();
-      lat.frame.push(perf.now() - t0);
     },
     flush: function () { R.frame(); }
   };
@@ -553,9 +634,12 @@
   //   Desk.focus.key           the focused market key or null
   //   Desk.focus.ladder        'A' | 'B' | 'C' | 'D': the focused ladder
   //   Desk.focus.ladders       {A: key|null, B: key|null, C: key|null}
-  //   Desk.focus.set(key, {other: bool, ladder: 'B', from: 'm-watch'})
+  //   Desk.focus.set(key, {other: bool, ladder: 'B', from: 'm-watch', row: {panel, k}})
   //   Desk.focus.setLadder('B')
   //   Desk.focus.on(fn(key, info))
+  //   Desk.focus.rowCls(panelId, rowKey, mktKey)  'sel' for the one grid row that was clicked (the
+  //                            2 px bar), 'fmk' for the focused market's other rows (a tint, no
+  //                            bar), '' otherwise
   // ---------------------------------------------------------------------------------------------
   var focusFns = [];
   var F = Desk.focus = {
@@ -563,6 +647,7 @@
     ladder: 'A',
     ladders: { A: null, B: null, C: null, D: null },
     from: null,
+    row: null,                  // {panel, k}: the grid row whose click set the focus
     on: function (fn) { focusFns.push(fn); },
     load: function () {
       var s = Desk.storage.getJSON('ladders', null);
@@ -579,15 +664,19 @@
       opts = opts || {};
       var slot = opts.ladder || (opts.other ? F.otherLadder() : F.ladder);
       F.ladders[slot] = key;
-      if (!opts.other) F.key = key;
+      if (!opts.other) { F.key = key; F.row = opts.row || null; }
       F.from = opts.from || null;
       Desk.storage.setJSON('ladders', F.ladders);
       R.mark('focus');
       focusFns.forEach(function (fn) { try { fn(key, { ladder: slot, other: !!opts.other, from: F.from }); } catch (e) { if (root.console) console.error(e); } });
     },
+    rowCls: function (panelId, rowKey, mktKey) {
+      if (!mktKey || mktKey !== F.key) return '';
+      return F.row && F.row.panel === panelId && F.row.k === String(rowKey) ? 'sel' : 'fmk';
+    },
     setLadder: function (slot) {
       if (F.ladder === slot) return;
-      F.ladder = slot; F.key = F.ladders[slot];
+      F.ladder = slot; F.key = F.ladders[slot]; F.row = null;
       Desk.storage.set('ladder', slot);
       R.mark('focus');
       focusFns.forEach(function (fn) { try { fn(F.key, { ladder: slot, other: false, from: 'ladder' }); } catch (e) { if (root.console) console.error(e); } });
@@ -606,8 +695,8 @@
         if (!row) return;
         var ctl = t.closest('button, input, select, a, [data-nolink]');
         if (ctl && row.contains(ctl) && ctl !== row) return;
-        var panel = row.closest('.panel');
-        F.set(row.getAttribute('data-mkt'), { other: ev.shiftKey, from: panel ? panel.id : null });
+        var panel = row.closest('.panel'), pid = panel ? panel.id : null;
+        F.set(row.getAttribute('data-mkt'), { other: ev.shiftKey, from: pid, row: { panel: pid, k: row.getAttribute('data-k') } });
       });
     }
   };
@@ -622,7 +711,9 @@
   // focus, only bindings with typing:true fire (e.g. Enter in the ticket); Esc leaves the field.
   // order:true bindings fire only while HOTKEYS are ON (OFF at every page load; H toggles).
   // Key names: a letter or digit ('b', '1') matched by physical key so Alt/Option works on a
-  // Mac, with 'Shift+' / 'Alt+' prefixes; punctuation by character ('`', '?', '/', '+', '-');
+  // Mac (on Dvorak or AZERTY a letter is the key in that place on a US keyboard), with 'Shift+' /
+  // 'Alt+' prefixes; punctuation by character ('`', '?', '/', '+', '-'; ` and ~ also by physical
+  // key where the layout makes it a dead key);
   // named keys as KeyboardEvent.key ('Escape', 'Enter', 'Tab', 'F1', 'ArrowUp', 'PageDown'),
   // ' ' is 'Space'. Cmd/Ctrl combinations are never taken from the browser.
   //   Desk.keys.bind({key, scope, desc, fn(ev, ctx), order, typing, after: 'g'})
@@ -658,6 +749,7 @@
       if (/^Key[A-Z]$/.test(code)) { base = code.charAt(3).toLowerCase(); shiftCounts = true; }
       else if (/^Digit[0-9]$/.test(code)) { base = code.charAt(5); shiftCounts = true; }
       else if (ev.key === ' ' || code === 'Space') { base = 'Space'; shiftCounts = true; }
+      else if (code === 'Backquote' && ev.key === 'Dead') { base = ev.shiftKey ? '~' : '`'; shiftCounts = false; }   // a dead key (US International, most European layouts)
       else if (ev.key && ev.key.length > 1) { base = ev.key; shiftCounts = true; }
       else { base = ev.key || ''; shiftCounts = false; }
       // Option+key on a Mac produces a symbol; map by physical key above. Without a code

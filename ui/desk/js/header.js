@@ -1,13 +1,14 @@
 /* ui/desk/js/header.js
  *
- * The 28 px header, the 20 px status bar, the tab switch, KILL, the ? key sheet and the LOG
- * drawer. Also the global keys: ` (tab), g s / g m, h (hotkeys), l (log), ? (keys), y (resync),
- * d (density), c (colour-blind palette).
+ * The 28 px header, the 20 px status bar, the tab switch, KILL, the ? key sheet, the LOG drawer
+ * (and the always-open LOG panel of SYSTEMATIC from 2400 px), and the read-only settings drawer.
+ * Also the global keys: ` (tab), g s / g m, h (hotkeys), l (log), p (settings), ? (keys),
+ * y (resync), d (density), c (colour-blind palette).
  *
  *   Desk.tabs.cur                'manual' | 'systematic'
  *   Desk.tabs.set(name), .toggle()
  *   Desk.header.init()           called once by main.js
- *   Desk.header.openLog(on?), Desk.header.openKeys(on?)
+ *   Desk.header.openLog(on?), Desk.header.openKeys(on?), Desk.header.openSet(on?)
  */
 (function (root) {
   'use strict';
@@ -42,11 +43,16 @@
   // overlays
   // ---------------------------------------------------------------------------------------------
   var H = Desk.header = {
-    logOpen: false, keysOpen: false, rearmAt: 0, rearmPend: false,
+    logOpen: false, keysOpen: false, setOpen: false, rearmAt: 0, rearmPend: false,
     openLog: function (on) {
       H.logOpen = on === undefined ? !H.logOpen : !!on;
       D.setClass(document.body, 'log', H.logOpen);
       R.mark('alert');
+    },
+    openSet: function (on) {
+      H.setOpen = on === undefined ? !H.setOpen : !!on;
+      D.setClass(document.body, 'set', H.setOpen);
+      R.mark('set');
     },
     openKeys: function (on) {
       H.keysOpen = on === undefined ? !H.keysOpen : !!on;
@@ -59,6 +65,8 @@
   function buildSheet() {
     var host = $('keysheet-body'); if (!host) return;
     var rows = Desk.keys.sheetRows();
+    // letters match the physical key (the US-layout position) so Option+letter works on a Mac
+    rows.push({ key: 'A-Z', scope: 'note', desc: 'letters by key position (US layout)', order: false });
     var tb = D.table(host, [{ h: 'Key', w: 120 }, { h: 'Scope', w: 96 }, { h: 'Action' }, { h: 'HK', w: 36 }], 'keys');
     D.keyedRows(tb, rows, function (r) { return r.scope + ' ' + r.key; }, function (r) {
       return [{ t: r.key, cls: 'kk' }, { t: r.scope, cls: 'dim' }, r.desc, { t: r.order ? 'HK' : '', cls: 'warn' }];
@@ -70,16 +78,20 @@
   // 3 s), no dialog either. After the re-arm Systematic is STOPPED and START waits for the order
   // groups to reset (the GROUPS preflight row).
   // ---------------------------------------------------------------------------------------------
+  // KILLING (sent, not confirmed: 'KILL ...'), KILLFAIL (not confirmed, retrying; a click retries
+  // now), LOCKED (the 60 s lockout, server clock), REARM, CONFIRM, REARMING, ARMED
   function killState(now) {
-    var h = Desk.store.hdr;
+    var h = Desk.store.hdr, k = Desk.act.killing;
+    if (k) return { st: k.failed ? 'KILLFAIL' : 'KILLING' };
     if (!h || h.run.state !== 'KILLED') return { st: 'ARMED' };
-    if (h.run.rearm_ms && now < h.run.rearm_ms) return { st: 'LOCKED', left: h.run.rearm_ms - now };
+    var srv = now + (Desk.store.srvOffset || 0);
+    if (h.run.rearm_ms && srv < h.run.rearm_ms) return { st: 'LOCKED', left: h.run.rearm_ms - srv };
     if (H.rearmPend) return { st: 'REARMING' };
     return { st: now - H.rearmAt < REARM_MS ? 'CONFIRM' : 'REARM' };
   }
   function onKill(ev) {
     var now = Date.now(), k = killState(now);
-    if (k.st === 'ARMED') { Desk.act.kill(); R.mark('hdr'); return; }
+    if (k.st === 'ARMED' || k.st === 'KILLFAIL') { Desk.act.kill(); R.mark('hdr'); return; }
     if (k.st === 'REARM') { H.rearmAt = now; R.mark('hdr'); return; }
     if (k.st === 'CONFIRM') {
       H.rearmAt = 0; H.rearmPend = true; R.mark('hdr');
@@ -102,17 +114,20 @@
   function renderHeader(d) {
     var S = Desk.store, h = S.hdr, now = Date.now();
     if (d.has('hdr') || d.has('snapshot') || d.has('ord') || d.has('clock') || d.all) {
+      // the tab's run state: RUN, OFF (stopped: STOP is the button's word), KILL, HALT
       var run = h ? h.run.state : null;
-      cell('tab-sys-st', run === 'RUN' ? 'RUN' : run === 'KILLED' ? 'KILL' : run === 'HALTED' ? 'HALT' : run === 'STOP' ? 'STOP' : '', 'tst ' + (run === 'RUN' ? 'up' : run === 'KILLED' || run === 'HALTED' ? 'dn' : 'dim'));
+      cell('tab-sys-st', run === 'RUN' ? 'RUN' : run === 'KILLED' ? 'KILL' : run === 'HALTED' ? 'HALT' : run === 'STOP' ? 'OFF' : '', 'tst ' + (run === 'RUN' ? 'up' : run === 'KILLED' || run === 'HALTED' ? 'dn' : 'dim'));
       var mw = S.manWorking();
       cell('tab-man-n', String(mw), 'tst ' + (mw ? '' : 'dim'));
     }
     if (h && (d.has('hdr') || d.all || d.has('snapshot'))) {
       cell('h-kal', F.money(h.cash.K.total));
       cell('h-kal-free', 'free ' + F.money(h.cash.K.free));
+      D.setAttr($('hc-kal'), 'title', 'free ' + F.money(h.cash.K.free) + '  ' + h.cash.K.shards.map(function (x) { return x.id + ' ' + F.money(x.cash) + '/' + F.money(x.free); }).join(' '));
       cell('h-pm', F.money(h.cash.P.total));
       // PM has no shards: its free cash shows only while orders hold some of it
       cell('h-pm-free', h.cash.P.ro || Math.abs(h.cash.P.total - h.cash.P.free) < 100 ? '' : 'free ' + F.money(h.cash.P.free));
+      D.setAttr($('hc-pm'), 'title', h.cash.P.ro ? 'read-only: PM key failing' : 'free ' + F.money(h.cash.P.free));
       D.setClass($('h-pm-ro'), 'on', h.cash.P.ro);
       cell('h-day', F.pnl(h.day.total), 'hv ' + F.sign(h.day.total));
       cell('h-day-split', 'S ' + F.pnl(h.day.sys) + ' M ' + F.pnl(h.day.man));
@@ -158,9 +173,10 @@
       // KILL label
       var k = killState(now), kb = $('kill');
       if (kb) {
-        var label = k.st === 'ARMED' ? 'KILL' : k.st === 'LOCKED' ? 'KILLED ' + F.mmss(k.left) : k.st === 'CONFIRM' ? 'CONFIRM' : k.st === 'REARMING' ? 'RE-ARMING' : 'RE-ARM';
+        var label = k.st === 'ARMED' ? 'KILL' : k.st === 'KILLING' ? 'KILL ...' : k.st === 'KILLFAIL' ? 'KILL FAIL' :
+          k.st === 'LOCKED' ? 'KILLED ' + F.secs(k.left) : k.st === 'CONFIRM' ? 'CONFIRM' : k.st === 'REARMING' ? 'RE-ARMING' : 'RE-ARM';
         D.setText(kb, label);
-        var kc = k.st === 'ARMED' ? '' : k.st === 'LOCKED' ? 'locked' : k.st === 'CONFIRM' ? 'rearm confirm' : 'rearm';
+        var kc = k.st === 'ARMED' ? '' : k.st === 'KILLING' ? 'pend' : k.st === 'KILLFAIL' ? 'fail' : k.st === 'LOCKED' ? 'locked' : k.st === 'CONFIRM' ? 'rearm confirm' : 'rearm';
         if (kb.className !== kc) kb.className = kc;
       }
     }
@@ -189,8 +205,11 @@
       D.setAttr(document.body, 'data-hk', Desk.keys.hk ? '1' : '0');
     }
     if (d.has('lat') || d.has('clock') || d.all) {
-      var p = Desk.lat.paint.last, ak = Desk.lat.ack.p50();
-      cell('sb-ui', 'UI ' + (p === null ? '-' : (p < 10 ? p.toFixed(1) : Math.round(p)) + 'ms'), 'sbc' + (p !== null && p > 16.7 ? ' warn' : ''));
+      // click-to-paint in whole ms (Safari's clock is 1 ms coarse); amber past one frame interval
+      var p = Desk.lat.paint.last, ak = Desk.lat.ack.p50(), fi = Desk.lat.fi.p50();
+      cell('sb-ui', 'UI ' + (p === null ? '-' : Math.round(p) + 'ms'), 'sbc' + (p !== null && p > Desk.lat.budget() ? ' warn' : ''));
+      D.setAttr($('sb-ui'), 'title', 'click to paint, last; p50 ' + (Desk.lat.paint.p50() === null ? '-' : Math.round(Desk.lat.paint.p50()) + 'ms') +
+        '; frame ' + (fi === null ? '-' : fi.toFixed(1) + 'ms'));
       cell('sb-ack', 'ACK ' + (ak === null ? '-' : Math.round(ak) + 'ms'), 'sbc' + (ak !== null && ak > 250 ? ' warn' : ''));
       var errs = R.errors + S.invalid;
       cell('sb-err', errs ? 'ERR ' + errs : '', 'sbc' + (errs ? ' crit' : ' off'));
@@ -198,14 +217,76 @@
     }
   }
 
-  var logTb = null;
-  function renderLog() {
-    var host = $('log-body'); if (!host) return;
-    if (!logTb) logTb = D.table(host, [{ h: 'Time', w: 64 }, { h: 'Lvl', w: 40 }, { h: 'Source', w: 64 }, { h: 'Message' }], 'log');
-    var rows = Desk.store.alerts.slice(0, 300);
-    D.keyedRows(logTb, rows, function (a) { return a.id; }, function (a) {
+  // the LOG grid: the drawer (l) and SYSTEMATIC's own LOG panel from 2400 px share it
+  var logTbs = {};
+  function logInto(hostId, max) {
+    var host = $(hostId); if (!host) return;
+    var tb = logTbs[hostId];
+    if (!tb || !host.contains(tb)) tb = logTbs[hostId] = D.table(host, [{ h: 'Time', w: 74 }, { h: 'Lvl', w: 46 }, { h: 'Source', w: 64 }, { h: 'Message' }], 'log');
+    var rows = Desk.store.alerts.slice(0, max);
+    if (!rows.length) { D.emptyRow(tb, 4); return; }
+    D.keyedRows(tb, rows, function (a) { return a.id; }, function (a) {
       return [{ t: F.time(a.ts_ms), cls: 'n' }, { t: a.lvl, cls: a.lvl === 'CRIT' ? 'dn' : a.lvl === 'WARN' ? 'warn' : 'dim' }, a.src, { t: a.msg, title: a.msg }];
     });
+  }
+  function renderLog() { logInto('log-body', 300); }
+  // SYSTEMATIC's LOG panel: shown from 2400 px (not in SPLIT), where the width is there for it
+  function renderSysLog(d) {
+    var L = Desk.layout;
+    if (!L || !L.splitOK || L.split) return;
+    if (d.has('alert') || d.has('snapshot') || d.has('layout') || d.all) logInto('s-log-body', 200);
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // the settings drawer (p): read-only. What the lanes run with and what the fees are, from the
+  // snapshot; the limits from the header; the page's own constants. Nothing here edits anything.
+  // ---------------------------------------------------------------------------------------------
+  var setTbs = {};
+  function setGrid(id, cols) {
+    var host = $(id); if (!host) return null;
+    if (!setTbs[id] || !host.contains(setTbs[id])) setTbs[id] = D.table(host, cols, 'set');
+    return setTbs[id];
+  }
+  function renderSet(d) {
+    if (!H.setOpen || !(d.has('set') || d.has('lane') || d.has('hdr') || d.has('mkt') || d.has('snapshot') || d.all)) return;
+    var S = Desk.store, h = S.hdr, sc = Desk.systematic ? Desk.systematic.cfg : null, mc = Desk.manual && Desk.manual.state ? Desk.manual.state().cfg : null;
+    var tl = setGrid('set-lanes', [{ h: 'Lane', w: 40 }, { h: 'Name' }, { h: 'V', w: 28 }, { h: 'Style', w: 48 }, { h: 'Budget', w: 60, cls: 'n' }, { h: 'Thr\u00a2', w: 48, cls: 'n' }, { h: 'On', w: 36 }]);
+    var lanes = S.laneOrder.map(function (id) { return S.lanes.get(id); }).filter(Boolean);
+    if (tl) { if (!lanes.length) D.emptyRow(tl, 7); else D.keyedRows(tl, lanes, function (l) { return l.id; }, function (l) {
+      return [l.id, { t: l.name, cls: 't' }, { t: l.venue, cls: 'dim' }, { t: l.style, cls: 'dim' }, { t: F.money(l.budget), cls: 'n' },
+              { t: l.thr === null ? '' : (l.thr / 100).toFixed(1), cls: 'n' }, { t: l.on ? 'ON' : 'OFF', cls: l.on ? '' : 'dim' }];
+    }); }
+    // fees: one row per venue, kind and fee type, with the per-contract fee at 50c
+    var fees = new Map();
+    S.markets.forEach(function (m) {
+      if (m.status === 'SETTLED') return;
+      var k = m.v + '|' + m.kind + '|' + m.fee.type + '|' + m.fee.mult, r = fees.get(k);
+      if (!r) { r = { k: k, v: m.v, kind: m.kind, fee: m.fee, n: 0 }; fees.set(k, r); }
+      r.n++;
+    });
+    var tf = setGrid('set-fees', [{ h: 'V', w: 24 }, { h: 'Kind' }, { h: 'Fee', w: 112 }, { h: 'x', w: 32, cls: 'n' }, { h: 'T\u00a2@50', w: 58, cls: 'n' }, { h: 'M\u00a2@50', w: 58, cls: 'n' }, { h: 'Mkts', w: 40, cls: 'n' }]);
+    var fl = Array.from(fees.values()).sort(function (a, b) { return a.k < b.k ? -1 : 1; });
+    if (tf) { if (!fl.length) D.emptyRow(tf, 7); else D.keyedRows(tf, fl, function (r) { return r.k; }, function (r) {
+      var t = Desk.fees.takerPer(r.v, r.fee, 5000), mk = Desk.fees.exact(r.v, r.fee, 5000, 1, 'M') * 10000;
+      return [r.v, { t: r.kind, cls: 't' }, { t: r.fee.type, cls: 't' }, { t: String(r.fee.mult), cls: 'n' }, { t: (t / 100).toFixed(2), cls: 'n' },
+              { t: (mk < 0 ? Desk.MINUS : '') + Math.abs(mk / 100).toFixed(2), cls: 'n' }, { t: String(r.n), cls: 'n' }];
+    }); }
+    var rows = [];
+    var kv = function (k, v) { rows.push({ k: k, v: v }); };
+    if (h) {
+      kv('daily loss stop, Systematic', F.money(h.stop.limit));
+      kv('ceiling, Systematic', (sc ? Math.round(sc.ceilPct * 100) : 70) + '%  K ' + F.money(h.sys.K.ceiling) + '  P ' + F.money(h.sys.P.ceiling));
+      kv('daily cost budget, IOC lanes', F.money(h.cost.budget));
+    }
+    if (sc) { kv('equity floor, Systematic', F.money(sc.floorU)); kv('P(stop) daily sigma', F.money(sc.sigmaDayU)); kv('lane amber, Rlzd under Pred', (sc.edgeWarnU / 100).toFixed(1) + '\u00a2 at n ' + sc.edgeWarnN); }
+    kv('price guard, Manual', '2 ticks through the touch');
+    if (mc) kv('slippage cap, Manual', mc.cap + ' tick' + (mc.cap === 1 ? '' : 's'));
+    kv('ladder expiries', '5 15 60 s');
+    kv('ticket types', 'IOC FOK 5s 15s 60s 5m 30m START');
+    kv('KILL lockout', '60 s');
+    kv('contract', (Desk.contract ? Desk.contract.version : '') + ' ' + (Desk.transport.mode || ''));
+    var tk = setGrid('set-limits', [{ h: 'Limit' }, { h: 'Value' }]);
+    if (tk) D.keyedRows(tk, rows, function (r) { return r.k; }, function (r) { return [{ t: r.k, cls: 't lbl' }, { t: r.v, title: r.v }]; });
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -223,12 +304,15 @@
     $('kill').addEventListener('click', onKill);
     $('sb-alert').addEventListener('click', function () { H.openLog(); });
     $('sb-keys').addEventListener('click', function () { H.openKeys(); });
+    var sbSet = $('sb-set'); if (sbSet) sbSet.addEventListener('click', function () { H.openSet(); });
+    var setClose = $('set-close'); if (setClose) setClose.addEventListener('click', function () { H.openSet(false); });
     $('sb-hk').addEventListener('click', function () { Desk.keys.setHK(!Desk.keys.hk); });
     var closeBtn = $('keysheet-close'); if (closeBtn) closeBtn.addEventListener('click', function () { H.openKeys(false); });
     var logClose = $('log-close'); if (logClose) logClose.addEventListener('click', function () { H.openLog(false); });
 
     Desk.keys.overlays.push(function () { if (H.keysOpen) { H.openKeys(false); return true; } return false; });
     Desk.keys.overlays.push(function () { if (H.logOpen) { H.openLog(false); return true; } return false; });
+    Desk.keys.overlays.push(function () { if (H.setOpen) { H.openSet(false); return true; } return false; });
 
     var K = Desk.keys;
     K.bind({ key: '`', desc: 'switch SYSTEMATIC / MANUAL', fn: function () { tabs.toggle(); } });
@@ -237,6 +321,7 @@
     K.bind({ key: 'm', after: 'g', desc: 'go to MANUAL', fn: function () { tabs.set('manual'); } });
     K.bind({ key: 'h', desc: 'hotkeys on/off (order keys need ON)', fn: function () { K.setHK(!K.hk); } });
     K.bind({ key: 'l', desc: 'log drawer', fn: function () { H.openLog(); } });
+    K.bind({ key: 'p', desc: 'settings (read-only): lanes, fees, limits', fn: function () { H.openSet(); } });
     K.bind({ key: '?', desc: 'this sheet', fn: function () { H.openKeys(); } });
     K.bind({ key: 'y', desc: 'resync from snapshot', fn: function () { Desk.act.resync(); } });
     K.bind({ key: 'd', desc: 'density compact/normal', fn: function () { Desk.ui.cycleDensity(); } });
@@ -245,5 +330,7 @@
 
     R.add({ id: 'header', tab: null, fn: renderHeader });
     R.add({ id: 'status', tab: null, fn: renderStatus });
+    R.add({ id: 'set', tab: null, fn: renderSet });
+    R.add({ id: 's-log', tab: 'systematic', fn: renderSysLog });
   }
 })(typeof window !== 'undefined' ? window : globalThis);

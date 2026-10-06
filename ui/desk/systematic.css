@@ -48,7 +48,8 @@
 #tab-systematic #s-lanes table.grid td, #tab-systematic #s-lanes table.grid th { height: 20px; }
 #tab-systematic #s-lanes tbody tr[data-lane] { cursor: pointer; }
 #tab-systematic #s-lanes tbody tr.total { cursor: pointer; }
-#tab-systematic td.ls-ON { color: var(--up); }
+#tab-systematic td.ls-ON { color: var(--up); }               /* green only while the lane runs */
+#tab-systematic td.ls-IDLE { color: var(--tx1); }             /* on, Systematic not running */
 #tab-systematic td.ls-OFF { color: var(--tx2); }
 #tab-systematic td.ls-BLOCKED { color: var(--dn); font-weight: 700; }
 #tab-systematic td.ls-CAPPED { color: var(--warn); }
@@ -59,15 +60,18 @@
 /* a lane whose realized edge sits well under its predicted edge */
 #tab-systematic tr.lane-warn > td:first-child { box-shadow: inset 2px 0 0 var(--warn); }
 #tab-systematic tr.lane-warn > td.ln, #tab-systematic td.n.warn { color: var(--warn); }
-/* on/off toggle and the lane kill, drawn as cell buttons */
+/* on/off toggle and the lane kill, drawn as cell buttons. The toggle is neutral (white ON, grey
+   OFF): green belongs to State, for a lane that actually runs. The lane KILL is grey and turns
+   red only while the lane has live orders, or under the pointer. */
 #tab-systematic td.tg {
   text-align: center; cursor: pointer; font: 600 11px/1 var(--font-ui); letter-spacing: .04em;
   color: var(--tx2); box-shadow: inset 0 0 0 1px var(--line2); background: var(--bg2);
 }
-#tab-systematic td.tg.on { color: var(--up); }
+#tab-systematic td.tg.on { color: var(--tx0); }
 #tab-systematic td.tg.pend { color: var(--tx2); box-shadow: none; outline: 1px dotted var(--tx2); outline-offset: -2px; background: var(--bg3); }
 #tab-systematic table.grid tbody tr:hover > td.tg { background: var(--bg3); }
-#tab-systematic td.kl { text-align: center; cursor: pointer; font: 700 11px/1 var(--font-ui); letter-spacing: .04em; color: var(--dn); }
+#tab-systematic td.kl { text-align: center; cursor: pointer; font: 600 11px/1 var(--font-ui); letter-spacing: .04em; color: var(--tx2); }
+#tab-systematic td.kl.live { color: var(--dn); font-weight: 700; }
 #tab-systematic table.grid tbody tr:hover > td.kl:hover { background: var(--crit); color: #fff; }
 #tab-systematic td.kl.dis { color: var(--tx2); cursor: default; font-weight: 400; }
 #tab-systematic table.grid tbody tr:hover > td.kl.dis:hover { background: var(--bg3); color: var(--tx2); }
@@ -80,6 +84,7 @@
 #tab-systematic td.n.fair { color: var(--fair); }
 /* risk book: member rows indent under their outcome group; '?' while the PM key fails */
 #tab-systematic #s-risk td.mem { padding-left: 10px; }
+#tab-systematic #s-risk tr.solo > td:first-child { color: var(--tx0); }
 #tab-systematic #s-risk td.q { color: var(--warn); }
 #tab-systematic #s-risk tr.grp > td { cursor: pointer; }
 /* markouts: lane rows filter */

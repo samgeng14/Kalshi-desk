@@ -15,17 +15,21 @@
  *                           last {px, qty, side, ts_ms} | null, vol, prints [{px, qty, side, ts_ms, at}]
  *                           (last 10 s, 'at' = local receive time, for the LTQ column),
  *                           ref {fair, sd, espn, espn_ts_ms, game}, ex_ms, at (local receive ms)}
- *   st.orders   Map cid -> order (contract fields, prices/money in u) plus:
+ *   st.orders   Map cid -> order (contract fields, prices/money in u, rev) plus:
  *                           key, terminal (bool), doneAt (local ms it became terminal),
- *                           local {pend: true until the backend has echoed it, cxlPend, amendPend,
- *                                  tClick (perf ms), at (local ms created)}
+ *                           local {pend: true until the backend has echoed it, cxlPend,
+ *                                  prov: a REJ made here from a refusal with no ord (the backend
+ *                                  may still report the order; any record of it replaces this),
+ *                                  at (local ms created)}
  *   st.fills    Array newest first; each fill has mo {'1s','10s','60s','SETTLE'} -> u per contract
  *   st.pos      Map key -> position (money/prices in u)
  *   st.lanes    Map id -> lane (money in u), in the order first seen (st.laneOrder)
  *   st.risk     {groups [{id, name, worst, best, members: [key]}], shards [{v, id, cash, free}]}
  *   st.alerts   Array newest first (server alerts plus local ones with id 'L...')
  *   st.feeds    hb.feeds; st.lastHb local ms of the last hb; st.srvOffset server - local ms
- *   st.stale    true while the stream is down, gapped, resyncing or silent > 3 s
+ *   st.stale    true while the stream is down (EventSource error), silent > 3 s, gapped,
+ *               resyncing, or after a snapshot until a stream hb newer than it has been applied
+ *               (a snapshot alone never proves the stream is alive)
  *   st.staleWhy 'SYNC' | 'GAP' | 'SRV DOWN' | ''
  *   st.vstale   {K: '' | 'KX DOWN' | 'KX GAP', P: '' | 'PM DOWN' | 'PM GAP'}
  *   st.mode     'demo' | 'live'
@@ -33,19 +37,18 @@
  * SELECTORS
  *   st.key(v, tk), st.split(key) -> {v, tk}
  *   st.market(key), st.book(key), st.position(key)
- *   st.touch(key) -> {bb, ba, bbSz, baSz, mid} (nulls when empty)
  *   st.working(pred?)       non-terminal orders, newest first
  *   st.recent(ms, pred?)    terminal orders that ended within ms (the 3 s CXL/REJ display)
- *   st.workingAt(key)       {BUY: Map px -> {left, filled, n, pend, cxl, cids, exp}, SELL: Map}
  *   st.manWorking()         count of non-terminal MAN orders
  *   st.canTrade(v)          '' or the reason new orders are disabled (cancel and KILL stay live)
  *   st.priceGuard(key, side, px) -> '' or 'PRICE_BAND ...' (crossing more than 2 ticks)
- *   st.markouts(pred?)      {n, m1, m10, m60, mset, t60, adv, sprd} over fills (u per contract)
  *
  * WRITES (the transport and Desk.act call these; renderers never do)
  *   st.begin(), st.apply(env), st.applySnapshot(snap), st.resync(why), st.streamReset(why),
- *   st.onTransport(state), st.tick(now), st.pend(req), st.reply(cid, status, json),
+ *   st.onTransport(state, isReconnect), st.tick(now), st.pend(req), st.reply(cid, status, json),
  *   st.cxlPend(cids, on), st.localAlert(lvl, src, msg)
+ *   st.onSnapshot           optional fn(snap) after each applied snapshot (main.js: subscriptions)
+ *   st.killPend             true from the KILL click until the backend answers (Desk.act.kill)
  */
 (function (root) {
   'use strict';
@@ -55,6 +58,14 @@
   var TERM = { FILL: 1, CXL: 1, REJ: 1, EXP: 1 };
   var KEEP_TERMINAL_MS = 120000;
   var HB_TIMEOUT_MS = 3000;
+  var SETTLED_KEEP_MS = 30 * 60000;      // the snapshot's own rule: settled markets stay 30 min
+  var PRUNE_EVERY_MS = 10000;
+  // refusals the gateway makes before anything reaches a venue: with no ord in the reply the order
+  // was never sent, so the page may show it REJ (provisionally). Anything else (EXCHANGE, INTERNAL,
+  // a 5xx, a proxy page, no answer) leaves the order's fate unknown: it stays PEND and a snapshot
+  // decides.
+  var PRESEND = { BAD_REQUEST: 1, OFF_GRID: 1, BAD_QTY: 1, UNKNOWN_MARKET: 1, MARKET_CLOSED: 1, PRICE_BAND: 1, REDUCE: 1,
+                  FORBIDDEN: 1, KILLED: 1, STALE: 1, RO: 1, NO_CASH: 1, SHARD_CASH: 1, SYS_CEILING: 1, HALTED: 1, BAD_STATE: 1, RATE: 1 };
 
   function mark(t) { if (R) R.mark(t); }
   function nowMs() { return Date.now(); }
@@ -69,11 +80,12 @@
     risk: { groups: [], shards: [] },
     alerts: [], feeds: null, subs: null,
     stale: true, staleWhy: 'SYNC', vstale: { K: '', P: '' },
-    connected: false, resyncing: false, buffer: [], bufEpoch: null, inflight: false,
-    lastHb: 0, srvOffset: 0,
+    connected: false, resyncing: false, buffer: [], bufEpoch: null, inflight: false, needHb: false,
+    lastHb: 0, srvOffset: 0, snapFails: 0, lastPrune: 0, killPend: false,
     gaps: 0, resyncs: 0, applied: 0, invalid: 0, lastInvalid: null,
     validate: true,               // check every event against Desk.contract (cheap; catches backend drift)
     fetchSnapshot: null,          // set by main.js: () => Promise<snapshot>
+    onSnapshot: null,
     localN: 0,
 
     key: function (v, tk) { return v + '|' + tk; },
@@ -96,7 +108,7 @@
           return 'invalid';
         }
       }
-      if (env.type === 'hb') { st.lastHb = nowMs(); st.connected = true; }
+      if (env.type === 'hb') st.lastHb = nowMs();       // the socket talks (connected follows the EventSource)
       if (st.resyncing) {
         if (env.type === 'hb' && st.bufEpoch !== null && env.data.epoch !== st.bufEpoch) st.buffer = [];
         if (env.type === 'hb') st.bufEpoch = env.data.epoch;
@@ -140,65 +152,98 @@
       try { p = Promise.resolve(st.fetchSnapshot()); } catch (e) { p = Promise.reject(e); }
       p.then(function (snap) {
         st.inflight = false;
-        st.finishResync(snap);
-      }, function () {
+        try { st.finishResync(snap); } catch (e) { st.snapFailed('resync failed: ' + (e && e.message)); }
+      }, function (e) {
         st.inflight = false;
-        setTimeout(function () { if (st.resyncing) st.resync(st.resyncWhy); }, 5000);
+        st.snapFailed(null, e);
       });
+    },
+    // a snapshot that could not be fetched, was refused or failed to apply: stay STALE and ask
+    // again, backing off 1, 2, 4 ... 30 s (one CRIT line for the first few, not one per retry)
+    snapFailed: function (msg) {
+      st.snapFails++;
+      if (msg && st.snapFails <= 3) st.localAlert('CRIT', 'SYNC', msg);
+      var d = Math.min(30000, 1000 * Math.pow(2, Math.min(5, st.snapFails - 1)));
+      if (!st.resyncing) { st.resyncing = true; st.buffer = []; st.bufEpoch = null; }
+      st.recomputeStale(nowMs());
+      setTimeout(function () { if (st.resyncing) st.resync(st.resyncWhy || 'GAP'); }, d);
     },
     // the stream restarted (reconnect, new epoch): its seq starts over
     streamReset: function (why) { st.seq = null; st.buffer = []; st.bufEpoch = null; st.resyncing = false; st.resync(why); },
     finishResync: function (snap) {
-      if (!snap || typeof snap.seq !== 'number') { setTimeout(function () { st.resync(st.resyncWhy); }, 1000); return; }
-      if (st.validate && Desk.contract) {
+      var bad = (!snap || typeof snap.seq !== 'number') ? ['$: not a snapshot'] : null;
+      if (!bad && st.validate && Desk.contract) {
         var errs = Desk.contract.validate(Desk.contract.snapshot, snap);
-        if (errs.length) { st.invalid++; st.lastInvalid = 'snapshot ' + errs[0]; st.localAlert('CRIT', 'CONTRACT', 'snapshot: ' + errs[0]); }
+        if (errs.length) bad = errs;
       }
-      st.applySnapshot(snap);
+      // a snapshot that breaks the contract is never applied: the screen stays STALE
+      if (bad) { st.invalid++; st.lastInvalid = 'snapshot ' + bad[0]; st.snapFailed('snapshot refused (contract): ' + bad[0]); return; }
+      try { st.applySnapshot(snap); } catch (e) { st.snapFailed('snapshot failed: ' + (e && e.message)); return; }
+      st.snapFails = 0;
       var buf = st.buffer.slice().sort(function (a, b) { return a.seq - b.seq; });
       st.buffer = []; st.resyncing = false;
-      for (var i = 0; i < buf.length; i++) {
-        var env = buf[i];
-        if (env.type === 'hb' && env.data.epoch !== st.epoch) { st.seq = null; st.resyncing = true; st.buffer = buf.slice(i); st.resync('EPOCH', 250); return; }
-        if (env.seq <= st.seq) continue;
-        if (env.seq !== st.seq + 1) { st.gaps++; st.resyncing = true; st.buffer = buf.slice(i); st.resync('GAP', 250); return; }
-        st.seq = env.seq; st.dispatch(env);
+      try {
+        for (var i = 0; i < buf.length; i++) {
+          var env = buf[i];
+          if (env.type === 'hb' && env.data.epoch !== st.epoch) { st.seq = null; st.resyncing = true; st.buffer = buf.slice(i); st.resync('EPOCH', 250); return; }
+          if (env.seq <= st.seq) continue;
+          if (env.seq !== st.seq + 1) { st.gaps++; st.resyncing = true; st.buffer = buf.slice(i); st.resync('GAP', 250); return; }
+          st.seq = env.seq; st.dispatch(env);
+        }
+      } catch (e2) {
+        st.localAlert('CRIT', 'SYNC', 'replay failed: ' + (e2 && e2.message));
+        st.resyncing = true; st.buffer = []; st.resync('GAP', 1000);
+        return;
       }
       st.recomputeStale(nowMs());
       mark('snapshot');
+      if (st.onSnapshot) { try { st.onSnapshot(snap); } catch (e3) { if (root.console) console.error('[desk store] onSnapshot', e3); } }
     },
+    // Replace everything from a snapshot, all or nothing: the new maps are built in place and the
+    // old ones put back if any record fails. It does not touch the stream's liveness: the screen
+    // stays STALE (SYNC) until a stream hb newer than the snapshot is applied.
     applySnapshot: function (s) {
-      st.epoch = s.epoch; st.sid = s.sid; st.seq = s.seq;
-      st.srvOffset = s.srv_ms - nowMs();
-      st.lastHb = nowMs(); st.connected = true;
-      H.hdr(s.hdr);
-      st.markets = new Map(); s.markets.forEach(function (m) { H.mkt(m, null, true); });
-      st.books = new Map(); s.books.forEach(function (b) { H.book(b, null, true); });
-      // keep local orders the backend has not echoed yet (in flight)
-      var keep = [];
-      st.orders.forEach(function (o) { if (o.local && o.local.pend && nowMs() - o.local.at < 15000) keep.push(o); });
-      var old = st.orders;
-      st.orders = new Map();
-      s.orders.forEach(function (d) { H.ord(d, null, true, old.get(d.cid)); });
-      keep.forEach(function (o) { if (!st.orders.has(o.cid)) st.orders.set(o.cid, o); });
-      st.fills = []; st.fillIdx = new Map(); st.moPending = new Map();
-      s.fills.forEach(function (f) { H.fill(f, null, true); });
-      s.mos.forEach(function (m) { H.mo(m, null, true); });
-      st.pos = new Map(); s.pos.forEach(function (p) { H.pos(p, null, true); });
-      st.lanes = new Map(); st.laneOrder = []; s.lanes.forEach(function (l) { H.lane(l, null, true); });
-      H.risk(s.risk, null, true);
-      var locals = st.alerts.filter(function (a) { return a.local && nowMs() - a.at < 60000; });
-      st.alerts = [];
-      s.alerts.forEach(function (a) { H.alert(a, null, true); });
-      locals.forEach(function (a) { st.alerts.unshift(a); });
-      st.alerts.sort(function (a, b) { return b.ts_ms - a.ts_ms; });
-      st.feeds = s.feeds; st.subs = s.subs;
+      var KEYS = ['epoch', 'sid', 'seq', 'srvOffset', 'hdr', 'markets', 'books', 'orders', 'fills', 'fillIdx', 'moPending',
+                  'pos', 'lanes', 'laneOrder', 'risk', 'alerts', 'feeds', 'subs', 'needHb'];
+      var saved = {};
+      KEYS.forEach(function (k) { saved[k] = st[k]; });
+      try {
+        st.epoch = s.epoch; st.sid = s.sid; st.seq = s.seq;
+        st.srvOffset = s.srv_ms - nowMs();
+        H.hdr(s.hdr);
+        st.markets = new Map(); s.markets.forEach(function (m) { H.mkt(m, null, true, saved.markets); });
+        st.books = new Map(); s.books.forEach(function (b) { H.book(b, null, true); });
+        // keep local orders the backend has not echoed yet (in flight), and refusals made here
+        var keep = [], now = nowMs();
+        saved.orders.forEach(function (o) { if (o.local && (o.local.pend || o.local.prov) && now - o.local.at < 15000) keep.push(o); });
+        st.orders = new Map();
+        s.orders.forEach(function (d) { H.ord(d, null, true, saved.orders.get(d.cid), true); });
+        keep.forEach(function (o) { if (!st.orders.has(o.cid)) st.orders.set(o.cid, o); });
+        st.fills = []; st.fillIdx = new Map(); st.moPending = new Map();
+        s.fills.forEach(function (f) { H.fill(f, null, true); });
+        s.mos.forEach(function (m) { H.mo(m, null, true); });
+        st.pos = new Map(); s.pos.forEach(function (p) { H.pos(p, null, true); });
+        st.lanes = new Map(); st.laneOrder = []; s.lanes.forEach(function (l) { H.lane(l, null, true); });
+        H.risk(s.risk, null, true);
+        var locals = saved.alerts.filter(function (a) { return a.local && now - a.at < 60000; });
+        st.alerts = [];
+        s.alerts.forEach(function (a) { H.alert(a, null, true); });
+        locals.forEach(function (a) { st.alerts.unshift(a); });
+        st.alerts.sort(function (a, b) { return b.ts_ms - a.ts_ms; });
+        st.feeds = s.feeds; st.subs = s.subs;
+        st.needHb = true;
+      } catch (e) {
+        KEYS.forEach(function (k) { st[k] = saved[k]; });
+        throw e;
+      }
       mark('snapshot');
     },
+    // the EventSource opened (the first time, or again): a stream's seq starts over, so every open
+    // takes a fresh snapshot
     onTransport: function (state, reconnect) {
       if (state === 'open') {
         st.connected = true;
-        if (reconnect) st.streamReset('RECONNECT');
+        st.streamReset(reconnect ? 'RECONNECT' : 'BOOT');
       } else if (state === 'error' || state === 'closed') {
         st.connected = false;
       }
@@ -212,6 +257,7 @@
       var why = '';
       if (!st.connected || (st.lastHb && now - st.lastHb > HB_TIMEOUT_MS)) why = 'SRV DOWN';
       else if (st.resyncing) why = (st.resyncWhy === 'GAP' || st.resyncWhy === 'EPOCH' || st.resyncWhy === 'RECONNECT') ? 'GAP' : 'SYNC';
+      else if (st.needHb) why = 'SYNC';
       var f = st.feeds, vk = '', vp = '';
       if (f) {
         if (!f.KX.up || !f.KXP.up) vk = 'KX DOWN'; else if (f.KX.gap || f.KXP.gap) vk = 'KX GAP';
@@ -222,16 +268,32 @@
       if (changed) mark('stale');
       return changed;
     },
+    // A silent stream past the timeout greys the screen (SRV DOWN) and blocks new orders, nothing
+    // more: it is not resynced from here, because a snapshot cannot prove the stream alive. If it
+    // talks again with its seq in step nothing was lost; a gap, a new epoch or a reopened stream
+    // (the transport reopens one that stays silent) resyncs.
     tick: function (now) {
       st.recomputeStale(now);
-      // a silent stream past the timeout is a dead stream: resync when it talks again
-      if (st.lastHb && now - st.lastHb > HB_TIMEOUT_MS && !st.resyncing && st.seq !== null) st.resync('GAP');
       // forget terminal orders and old prints
       var cut = now - KEEP_TERMINAL_MS;
       st.orders.forEach(function (o, cid) { if (o.terminal && o.doneAt < cut) st.orders.delete(cid); });
       st.books.forEach(function (b) { if (b.prints.length && b.prints[0].at < now - 10000) { b.prints = b.prints.filter(function (p) { return p.at >= now - 10000; }); } });
+      if (now - st.lastPrune >= PRUNE_EVERY_MS) { st.lastPrune = now; st.prune(now); }
+    },
+    // forget markets settled more than 30 min ago, with their books, unless a position or a
+    // ladder holds them (the snapshot drops them by the same rule)
+    prune: function (now) {
+      var held = {}, n = 0;
+      if (Desk.focus && Desk.focus.ladders) Object.keys(Desk.focus.ladders).forEach(function (s2) { var k = Desk.focus.ladders[s2]; if (k) held[k] = 1; });
+      st.markets.forEach(function (m, key) {
+        if (m.status !== 'SETTLED' || !m.settledAt || now - m.settledAt < SETTLED_KEEP_MS || held[key] || st.pos.has(key)) return;
+        st.markets.delete(key); st.books.delete(key); n++;
+      });
+      if (n) mark('mkt');
+      return n;
     },
     canTrade: function (v) {
+      if (st.killPend) return 'KILLED';
       if (st.stale) return st.staleWhy;
       if (v && st.vstale[v]) return st.vstale[v];
       var h = st.hdr;
@@ -248,11 +310,6 @@
     market: function (key) { return st.markets.get(key) || null; },
     book: function (key) { return st.books.get(key) || null; },
     position: function (key) { return st.pos.get(key) || null; },
-    touch: function (key) {
-      var b = st.books.get(key);
-      if (!b) return { bb: null, ba: null, bbSz: null, baSz: null, mid: null };
-      return { bb: b.bb, ba: b.ba, bbSz: b.bbSz, baSz: b.baSz, mid: b.mid };
-    },
     working: function (pred) {
       var out = [];
       st.orders.forEach(function (o) { if (!o.terminal && (!pred || pred(o))) out.push(o); });
@@ -262,19 +319,6 @@
       var cut = nowMs() - ms, out = [];
       st.orders.forEach(function (o) { if (o.terminal && o.doneAt >= cut && (!pred || pred(o))) out.push(o); });
       return out.sort(byNewest);
-    },
-    workingAt: function (key) {
-      var r = { BUY: new Map(), SELL: new Map() };
-      st.orders.forEach(function (o) {
-        if (o.key !== key || o.terminal) return;
-        var m = r[o.side], e = m.get(o.px);
-        if (!e) { e = { left: 0, filled: 0, n: 0, pend: false, cxl: false, cids: [], exp: null, own: {} }; m.set(o.px, e); }
-        e.left += o.left; e.filled += o.filled; e.n++; e.cids.push(o.cid); e.own[o.own] = true;
-        if (o.st === 'PEND') e.pend = true;
-        if (o.local && o.local.cxlPend) e.cxl = true;
-        if (o.exp_ms && (e.exp === null || o.exp_ms < e.exp)) e.exp = o.exp_ms;
-      });
-      return r;
     },
     manWorking: function () { var n = 0; st.orders.forEach(function (o) { if (!o.terminal && o.own === 'MAN') n++; }); return n; },
     // a crossing order more than 2 ticks through the touch is refused unless overridden
@@ -291,62 +335,51 @@
       }
       return '';
     },
-    // markout statistics over fills (u per contract, + = in our favour)
-    markouts: function (pred) {
-      var acc = { n: 0, s1: [], s10: [], s60: [], sset: [], sprd: [] };
-      st.fills.forEach(function (f) {
-        if (pred && !pred(f)) return;
-        acc.n++;
-        if (f.mo['1s'] !== undefined) acc.s1.push(f.mo['1s']);
-        if (f.mo['10s'] !== undefined) acc.s10.push(f.mo['10s']);
-        if (f.mo['60s'] !== undefined) acc.s60.push(f.mo['60s']);
-        if (f.mo.SETTLE !== undefined) acc.sset.push(f.mo.SETTLE);
-        if (f.mid !== null) acc.sprd.push((f.px - f.mid) * (f.side === 'BUY' ? 1 : -1));
-      });
-      var mean = function (a) { if (!a.length) return null; var s = 0; a.forEach(function (x) { s += x; }); return s / a.length; };
-      var m60 = mean(acc.s60), t60 = null;
-      if (acc.s60.length > 1) {
-        var v = 0; acc.s60.forEach(function (x) { v += (x - m60) * (x - m60); }); v /= (acc.s60.length - 1);
-        t60 = v > 0 ? m60 / Math.sqrt(v / acc.s60.length) : null;
-      }
-      return { n: acc.n, n60: acc.s60.length, m1: mean(acc.s1), m10: mean(acc.s10), m60: m60, mset: mean(acc.sset), t60: t60,
-               adv: acc.s60.length ? acc.s60.filter(function (x) { return x < 0; }).length / acc.s60.length : null, sprd: mean(acc.sprd) };
-    },
-
     // ------------------------------------------------------------------------------------------
     // local writes (optimistic)
     // ------------------------------------------------------------------------------------------
-    // req: {cid, v, tk, side, px (u), qty, tif, ttl_s, exp_ms, touch (u|null), t_click_ms, tClick (perf)}
+    // req: {cid, v, tk, side, px (u), qty, tif, ttl_s, exp_ms, touch (u|null), t_click_ms}
     pend: function (req) {
       var now = nowMs(), key = req.v + '|' + req.tk;
       var o = {
         cid: req.cid, oid: null, v: req.v, tk: req.tk, key: key, side: req.side, px: req.px, qty: req.qty, filled: 0,
         left: req.qty, avg: null, tif: req.tif, exp_ms: req.tif === 'POST' && req.ttl_s ? now + req.ttl_s * 1000 : (req.tif === 'POST' && req.exp_ms ? req.exp_ms : null),
         st: 'PEND', why: '', own: 'MAN', lane: null, piq: null, fee: 0, touch: req.touch === undefined ? null : req.touch, edge: null,
-        t: { click: req.t_click_ms || null, recv: null, sent: null, ack: null, done: null },
+        t: { click: req.t_click_ms || null, recv: null, sent: null, ack: null, done: null }, rev: 0,
         terminal: false, doneAt: null,
-        local: { pend: true, cxlPend: false, amendPend: null, tClick: req.tClick || null, at: now, acked: false }
+        local: { pend: true, cxlPend: false, prov: false, at: now, acked: false }
       };
       st.orders.set(o.cid, o);
       mark('ord'); mark('ord:' + key);
       return o;
     },
-    // the HTTP answer to POST /api/order (or amend); status 0 = no answer at all
+    // the HTTP answer to POST /api/order; status 0 = no answer at all
+    //   ok, or a refusal carrying ord      the backend's record, applied by its rev
+    //   a pre-send refusal with no ord     never sent: REJ here, provisional (any backend record of
+    //                                      the cid replaces it); the line goes to the status bar
+    //   no answer, 5xx, EXCHANGE/INTERNAL   fate unknown: the order stays PEND and a snapshot
+    //   with no ord                        decides (the backend may have sent it to the venue)
+    // A refusal the backend reports with its ord also raises its own alert on the stream, so the
+    // page logs only the refusals the backend cannot have logged.
     reply: function (cid, status, json) {
-      var o = st.orders.get(cid);
-      if (json && json.ord) H.ord(json.ord, null, false);
-      if (status === 0) {
-        st.localAlert('CRIT', 'GW', 'no answer for ' + cid + ': order state unknown until the stream reports it');
-        return;
-      }
-      if (!(json && json.ok) && o && !(json && json.ord)) {
-        o.st = 'REJ'; o.why = (json && json.err && Desk.contract.enums.WHY.indexOf(json.err.code) >= 0) ? json.err.code : 'INTERNAL';
-        o.left = 0; o.terminal = true; o.doneAt = nowMs(); o.local.pend = false;
-        mark('ord'); mark('ord:' + o.key);
-      }
-      if (!(json && json.ok)) {
-        var e = (json && json.err) || { code: 'INTERNAL', msg: 'HTTP ' + status };
-        st.localAlert('WARN', 'GW', 'REJ ' + e.code + ' ' + (o ? o.side + ' ' + Desk.fmt.size(o.qty) + ' ' + o.tk + ' @ ' + Desk.fmt.px(o.px) : cid) + ': ' + e.msg);
+      var o = st.orders.get(cid), ok = !!(json && json.ok), hasOrd = !!(json && json.ord);
+      if (hasOrd) H.ord(json.ord, null, false);
+      var e = (json && json.err) || { code: 'INTERNAL', msg: 'HTTP ' + status };
+      var what = o ? o.side + ' ' + Desk.fmt.size(o.qty) + ' ' + o.tk + ' @ ' + Desk.fmt.px(o.px) : cid;
+      if (!ok && !hasOrd) {
+        if (status >= 400 && status < 500 && PRESEND[e.code]) {
+          if (o && !o.terminal) {
+            o.st = 'REJ'; o.why = Desk.contract && Desk.contract.enums.WHY.indexOf(e.code) >= 0 ? e.code : 'INTERNAL';
+            o.left = 0; o.terminal = true; o.doneAt = nowMs();
+            if (o.local) { o.local.pend = false; o.local.prov = true; }
+            mark('ord'); mark('ord:' + o.key);
+          }
+          st.localAlert('WARN', 'GW', 'REJ ' + e.code + ' ' + what + ': ' + e.msg);
+        } else {
+          st.localAlert('CRIT', 'GW', (status === 0 ? 'no answer' : e.code) + ' for ' + what + ': state unknown until the snapshot' + (status === 0 ? '' : ' (' + e.msg + ')'));
+          st.resync('GAP');
+          return;
+        }
       }
       st.acked(cid);
     },
@@ -360,7 +393,7 @@
       cids.forEach(function (cid) {
         var o = st.orders.get(cid);
         if (!o || o.terminal) return;
-        if (!o.local) o.local = { pend: false, cxlPend: false, amendPend: null, tClick: null, at: nowMs(), acked: true };
+        if (!o.local) o.local = { pend: false, cxlPend: false, prov: false, at: nowMs(), acked: true };
         o.local.cxlPend = on !== false;
         mark('ord:' + o.key);
       });
@@ -394,18 +427,19 @@
         cost: mapMoney(d.cost, ['used', 'budget']),
         run: { state: d.run.state, since_ms: d.run.since_ms, rearm_ms: d.run.rearm_ms, why: d.run.why },
         preflight: d.preflight.map(function (r) { return { id: r.id, ok: r.ok, why: r.why }; }),
-        man_working: d.man_working,
         lat: { kx_lag_ms: d.lat.kx_lag_ms, pm_lag_ms: d.lat.pm_lag_ms, gw_ack_ms: d.lat.gw_ack_ms, clk_off_ms: d.lat.clk_off_ms }
       };
       mark('hdr');
     },
-    mkt: function (d) {
-      var key = d.v + '|' + d.tk, old = st.markets.get(key);
+    // prev: the market map to carry the grid cache and the settle time from (a snapshot builds a new one)
+    mkt: function (d, env, fromSnap, prev) {
+      var key = d.v + '|' + d.tk, old = (prev || st.markets).get(key);
       var m = {
         v: d.v, tk: d.tk, key: key, ev: d.ev, title: d.title, short: d.short, grp: d.grp, kind: d.kind, og: d.og, oc: d.oc,
         open_ms: d.open_ms, close_ms: d.close_ms, status: d.status, result: d.result, grid: d.grid,
         g: old && JSON.stringify(old.grid) === JSON.stringify(d.grid) ? old.g : Desk.grid.make(d.grid),
-        fee: { type: d.fee.type, mult: d.fee.mult }, shard: d.shard, lip: d.lip, start_ms: d.start_ms, man: d.man
+        fee: { type: d.fee.type, mult: d.fee.mult }, shard: d.shard, lip: d.lip, start_ms: d.start_ms, man: d.man,
+        settledAt: d.status !== 'SETTLED' ? null : (old && old.settledAt ? old.settledAt : nowMs())   // local ms first seen SETTLED
       };
       st.markets.set(key, m);
       mark('mkt'); mark('mkt:' + key);
@@ -434,22 +468,28 @@
       st.books.set(key, b);
       mark('book'); mark('book:' + key);
     },
-    ord: function (d, env, quiet, prev) {
+    // An order record from the stream, an HTTP reply or a snapshot (fromSnap: authoritative, the
+    // backend's word as of the snapshot). The stream and the replies travel on different
+    // connections, so they can arrive out of order: rev (one more on every change of the order)
+    // decides, and an older record is dropped.
+    ord: function (d, env, quiet, prev, fromSnap) {
       var old = prev || st.orders.get(d.cid);
+      var prov = !!(old && old.local && old.local.prov);
+      if (!fromSnap && old && !prov && typeof old.rev === 'number' && d.rev < old.rev) return;
       var o = {
         cid: d.cid, oid: d.oid, v: d.v, tk: d.tk, key: d.v + '|' + d.tk, side: d.side, px: px(d.px), qty: d.qty,
         filled: d.filled, left: d.left, avg: px(d.avg), tif: d.tif, exp_ms: d.exp_ms, st: d.st, why: d.why, own: d.own,
         lane: d.lane, piq: d.piq, fee: money(d.fee), touch: px(d.touch), edge: money(d.edge),
-        t: { click: d.t.click, recv: d.t.recv, sent: d.t.sent, ack: d.t.ack, done: d.t.done },
+        t: { click: d.t.click, recv: d.t.recv, sent: d.t.sent, ack: d.t.ack, done: d.t.done }, rev: d.rev,
         terminal: !!TERM[d.st], doneAt: null, local: old && old.local ? old.local : null
       };
-      // a terminal order never changes again; a late non-terminal echo cannot resurrect it
-      if (old && old.terminal && !o.terminal) return;
+      // a terminal order never changes again; a late non-terminal echo cannot resurrect it (a
+      // provisional REJ made here is not the backend's word and gives way)
+      if (!fromSnap && old && old.terminal && !o.terminal && !prov) return;
       if (o.terminal) o.doneAt = old && old.terminal ? old.doneAt : nowMs();
       if (o.local) {
-        o.local.pend = false;
+        o.local.pend = false; o.local.prov = false;
         if (o.terminal) o.local.cxlPend = false;
-        if (o.local.amendPend !== null && o.local.amendPend !== undefined && (o.px === o.local.amendPend || o.terminal)) o.local.amendPend = null;
       }
       st.orders.set(o.cid, o);
       if (o.st !== 'PEND' && !quiet) st.acked(o.cid);
@@ -517,6 +557,7 @@
     },
     hb: function (d) {
       st.lastHb = nowMs();
+      st.needHb = false;                   // a stream hb newer than the snapshot: the stream is live
       st.srvOffset = d.srv_ms - nowMs();
       st.feeds = d.feeds;
       st.recomputeStale(nowMs());

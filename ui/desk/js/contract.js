@@ -36,6 +36,10 @@
  *   partly filled), and the terminal states FILL (fully filled), CXL (cancelled; filled may be
  *   > 0, e.g. an IOC that filled 6 of 10), REJ (rejected; filled is 0), EXP (exchange expiry
  *   reached; filled may be > 0). A terminal order never changes again.
+ * - ORDER REVISIONS: every order record carries rev, 1 when the order is created and one more on
+ *   every change of any of its fields. The stream and the HTTP replies travel on different
+ *   connections and may arrive in either order; the page keeps the record with the highest rev
+ *   and drops an older one. The same state always carries the same rev.
  * - OWNERS: "MAN" orders come from this screen, "SYS" from Systematic's lanes, "EXT" are orders
  *   on the account that this desk did not place (the venue's website, another tool), seen on the
  *   private feed. Client order ids: MAN start with M, SYS with S; an EXT order's cid is the
@@ -59,22 +63,82 @@
  * ---------------------------------------------------------------------------------------------
  * THE STREAM: GET /api/stream?sid=<sid>   (text/event-stream, one per browser tab)
  * ---------------------------------------------------------------------------------------------
- * The page makes a random stream id (sid) at boot and opens the stream with it. Each SSE
- * message is:
+ * The page makes a random stream id (sid) at boot and opens the stream with it.
+ * - LIFECYCLE: GET /api/stream creates the sid (or takes it over: a second stream with the same
+ *   sid closes the first). The sid's seq counter starts at the stream's first message, an hb with
+ *   seq 1. GET /api/snapshot and POST /api/subscribe for a sid with no open stream are refused
+ *   409 BAD_STATE, so the page takes its snapshot and sends its subscription only after the
+ *   stream opened, and again after every reopen. A sid's subscription survives a disconnect for
+ *   60 s (a reconnect inside that keeps it; the page re-sends it anyway); after 60 s the sid is
+ *   forgotten. The stream's first line is "retry: 2000" (EventSource reconnects 2 s after a
+ *   drop) and a comment line ": ka" follows any 15 s without a message (proxies).
+ * Each SSE message is:
  *     event: <type>
  *     id: <seq>
  *     data: {"type":<type>,"seq":<seq>,"ts_ms":<server send time>,"data":{...}}
  * - seq is per stream: 1 for the first message, then +1 for EVERY message of any type
  *   (hb included), so a gap is always detectable, even on a quiet book.
  * - The page resyncs (GET /api/snapshot, then applies only messages with seq > snapshot.seq)
- *   when: seq != last + 1, hb.epoch changes (backend restarted), the stream reconnects, or no
- *   hb arrives for 3 s. While resyncing every number on screen greys out (the STALE rule).
+ *   when: the stream opens or reopens, seq != last + 1, or hb.epoch changes (backend
+ *   restarted). While resyncing every number on screen greys out (the STALE rule), and it stays
+ *   grey after the snapshot until a stream hb with seq > snapshot.seq has been applied: a
+ *   snapshot never proves the stream alive.
  * - Staleness is socket liveness plus sequence continuity (hb.feeds), never the time since the
- *   last trade: a quiet book is not stale.
+ *   last trade: a quiet book is not stale. No hb for 3 s greys the screen (SRV DOWN) and blocks
+ *   new orders; after 5 s without any message the page closes and reopens the stream (which
+ *   resyncs), and while the stream is down it probes GET /api/health every 5 s, reopening the
+ *   stream as soon as the backend answers.
  * - Rates: hdr at most 4/s and only on change; book coalesced to at most 20/s per ticker;
  *   pos/risk at most 1/s on mark changes (immediately on fills); hb exactly 1/s.
  * - Event types: hdr, mkt, book, ord, fill, pos, lane, risk, mo, alert, hb (shapes below).
  *   "mkt" is the market universe (listings, rolls of the 15-minute windows, settlement).
+ *
+ * ---------------------------------------------------------------------------------------------
+ * SEMANTICS (what the numbers mean; the demo venues in sim.js compute exactly these)
+ * ---------------------------------------------------------------------------------------------
+ * Reservation (the cash a working order ties up; Desk.risk in core.js is the one copy):
+ *   a BUY reserves px x qty, a SELL (a buy of NO) (1 - px) x qty, except the part that reduces
+ *   an open position, which reserves nothing. Several orders on the same side of one market
+ *   share the position's reducing room, best price first (buys highest first, sells lowest
+ *   first), so two sells against one long cannot both count as reducing. Fees are not held:
+ *   the order check (NO_CASH, SHARD_CASH) asks for the order's reservation plus its own fee as a
+ *   taker, once, when it is placed; a resting order's fee is not subtracted from free.
+ * Cash: hdr.cash.K.shards[i].free = cash - the reservations of the working orders on markets of
+ *   that shard; cash.K.free = the sum over shards; cash.P.free likewise on Polymarket.
+ * Open worst case of a set of positions: per outcome group (mkt.og), the loss of the worst
+ *   real-world outcome (>= 0), summed over groups; a basket that always has one paying leg
+ *   risks its net cost, not the sum of its legs.
+ * hdr.risk = the open worst case of every position (both venues, both owners) + the
+ *   reservations of every working order.
+ * hdr.day: real = realized P&L net of fees of today's fills, credited to the owner of the fill
+ *   that closed (EXT fills count as MAN); unrl = open positions marked at the mid; a position
+ *   only Systematic traded counts in sys, any other (MAN or MIX) in man. day.sys includes
+ *   day.lip (the LIP reward accrued today); total = sys + man.
+ * hdr.stop: limit = the daily loss stop on Systematic; left = limit + min(0, day.sys) (LIP
+ *   included); hit = left <= 0, which HALTs Systematic (Manual is never blocked by it).
+ * hdr.sys, per venue: used = the open worst case of positions Systematic holds (by group) + the
+ *   reservations of its working orders; ceiling = 0.70 x (venue cash + the open worst case of
+ *   every position on that venue); eff = min(ceiling, used + venue free), 0 while the venue is
+ *   read-only. A Systematic order that would take used past eff is refused SYS_CEILING.
+ * hdr.cost: used = every fee Systematic was charged today, all lanes (a Polymarket maker rebate
+ *   does not count against it); budget caps only the IOC-style lanes (they turn CAPPED 'daily
+ *   cost budget'), so used can pass budget while the quoting lanes keep quoting.
+ * hdr.lat: kx_lag_ms / pm_lag_ms = feed lag p50 (now - the venue's send time); gw_ack_ms = p50
+ *   over the last 20 orders of venue ack - backend receive; clk_off_ms = our clock - the venue's.
+ * lane: used = the open worst case of the lane's positions + the reservations of its working
+ *   orders; open = the first part alone; cap_left = max(0, min(budget - used, the venue's
+ *   eff - used)); day = real + unrl + lip; thr = the net edge per contract (after fees) an IOC
+ *   lane needs to take. A lane that is on while Systematic is stopped or killed reads state OFF
+ *   with why = the run state ('STOP', 'KILLED', 'HALTED'); the page shows it IDLE.
+ * Self-trade: an incoming MAN order that would trade against a resting desk order (either owner)
+ *   cancels the resting one (why STP) and goes on matching; an incoming SYS order stops there:
+ *   its rest is cancelled (CXL, why STP). EXT orders are the venue's business.
+ * Polymarket US sides: as on Kalshi, a SELL with no long YES opens a short (a long NO at
+ *   1 - px, reserving 1 - px) and positions net to one signed number per market. reduce_only
+ *   applies on both venues (the backend cuts qty to the open position itself where the venue
+ *   has no such flag).
+ * Alerts: a refused order whose reply carries its ord also raises a WARN alert on the stream
+ *   (src GW); the page logs only the refusals that came back without an ord.
  *
  * Exported API (window.Desk.contract):
  *   .version, .types, .enums, .errors, .envelope, .events, .endpoints, .snapshot
@@ -162,9 +226,11 @@
     LVL: ['INFO', 'WARN', 'CRIT'],
     MO_H: ['1s', '10s', '60s', 'SETTLE'],
     // KEY venue keys sign; CASH free cash for the lanes; SHARD every shard Systematic uses has
-    // cash; CLK clock offset under 0.5 s; DISK recorder space; FEED market data up; PRIV Kalshi's
-    // private socket (orders, fills) up and reconciled; GROUPS every lane's order group (one per
-    // shard) reset and confirmed by the exchange (after KILL they stay triggered until re-arm).
+    // cash; CLK clock offset under 0.5 s; DISK recorder space (a warning: it never blocks START,
+    // the recorder is not needed to trade); FEED market data up; PRIV Kalshi's private socket
+    // (orders, fills) up and reconciled; GROUPS every lane's order group (one per shard) reset and
+    // confirmed by the exchange (after KILL they stay triggered until re-arm). Every other row
+    // that fails blocks START.
     PREFLIGHT: ['KEY', 'CASH', 'SHARD', 'CLK', 'DISK', 'FEED', 'PRIV', 'GROUPS'],
     FEED: ['KX', 'KXP', 'PM'],             // Kalshi market data, Kalshi private (orders/fills), Polymarket
     MODE: ['DEMO', 'LIVE'],
@@ -172,13 +238,14 @@
     WHY: ['', 'USER', 'KILL', 'STOP', 'HALT', 'PULL', 'IOC_REST', 'FOK', 'POST_CROSS', 'STP', 'TAKEOVER',
           'MARKET_CLOSED', 'EXPIRY', 'BAD_REQUEST', 'OFF_GRID', 'BAD_QTY', 'UNKNOWN_MARKET',
           'DUP_CID', 'PRICE_BAND', 'REDUCE', 'KILLED', 'STALE', 'RO', 'NO_CASH', 'SHARD_CASH', 'SYS_CEILING',
-          'HALTED', 'RATE', 'EXCHANGE', 'INTERNAL']
+          'HALTED', 'RATE', 'EXCHANGE', 'INTERNAL', 'LANE_OFF', 'FORBIDDEN', 'BAD_STATE']
   };
   var WHY_DOC = {
     '': 'live order, or fully filled',
     USER: 'cancelled by the operator (x, right-click, Esc, cancel endpoint)',
     KILL: 'cancelled by KILL',
     STOP: 'cancelled because Systematic was stopped',
+    LANE_OFF: 'cancelled because its lane was switched off (POST /api/lane/{id} with on false, or a lane KILL)',
     HALT: 'cancelled because the daily stop halted Systematic',
     PULL: 'a lane pulled its own quote (repricing, inventory, news, window end)',
     IOC_REST: 'IOC remainder killed after matching (filled may be > 0)',
@@ -187,7 +254,10 @@
     STP: 'self-trade prevention cancelled this order',
     TAKEOVER: 'a manual order took this market; Systematic orders there were cancelled',
     MARKET_CLOSED: 'the market closed or settled while the order rested',
-    EXPIRY: 'the exchange-side expiry was reached (st EXP)'
+    EXPIRY: 'the exchange-side expiry was reached (st EXP)',
+    // REJ reasons are the error codes of the same name (errors below)
+    FORBIDDEN: 'REJ: the POST lacked the current X-Desk token',
+    BAD_STATE: 'REJ: a Systematic order while Systematic is not running'
   };
 
   // ---------------------------------------------------------------------------------------------
@@ -213,8 +283,8 @@
     HALTED: { http: 409, doc: 'Systematic halted by the daily stop (start refused)' },
     PREFLIGHT: { http: 409, doc: 'start refused: a preflight check fails (see preflight in the reply)' },
     BAD_STATE: { http: 409, doc: 'the action does not apply now (e.g. rearm before rearm_ms)' },
-    RATE: { http: 429, doc: 'write token bucket empty; retry after the stated ms' },
-    EXCHANGE: { http: 502, doc: 'the venue rejected or did not answer; msg carries its text' },
+    RATE: { http: 429, doc: 'write token bucket empty; retry after the stated ms (orders, transfers; never cancels or KILL)' },
+    EXCHANGE: { http: 502, doc: 'the venue rejected the order (ord carries it REJ) or did not answer in time (ord carries it PEND; the private feed settles it); msg carries the venue\'s text' },
     INTERNAL: { http: 500, doc: 'backend bug; msg carries the text' }
   };
   var ERR_CODES = Object.keys(errors);
@@ -253,7 +323,6 @@
     cost: { used: 'money', budget: 'money' },
     run: RUN_OBJ,
     preflight: ['arr', PREFLIGHT_ROW],
-    man_working: 'count',
     lat: { kx_lag_ms: 'int?', pm_lag_ms: 'int?', gw_ack_ms: 'int?', clk_off_ms: 'int?' }
   };
   S.mkt = {
@@ -317,7 +386,8 @@
     fee: 'money',                          // net fees so far (negative = rebate)
     touch: 'price?',                       // the touch we crossed or joined, at click/signal time
     edge: 'money?',                        // per contract vs model fair at send, + = in our favour
-    t: { click: 'ms?', recv: 'ms', sent: 'ms?', ack: 'ms?', done: 'ms?' }
+    t: { click: 'ms?', recv: 'ms', sent: 'ms?', ack: 'ms?', done: 'ms?' },
+    rev: 'count'                           // 1 at creation, +1 on every change (see ORDER REVISIONS)
   };
   S.fill = {
     fid: 'id',
@@ -428,7 +498,6 @@
     preflight: [{ id: 'KEY', ok: true, why: '' }, { id: 'CASH', ok: true, why: '' }, { id: 'SHARD', ok: true, why: '' },
                 { id: 'CLK', ok: true, why: '' }, { id: 'DISK', ok: true, why: '' }, { id: 'FEED', ok: true, why: '' },
                 { id: 'PRIV', ok: true, why: '' }, { id: 'GROUPS', ok: true, why: '' }],
-    man_working: 3,
     lat: { kx_lag_ms: 34, pm_lag_ms: 210, gw_ack_ms: 52, clk_off_ms: 80 }
   };
   EX.mkt = {
@@ -460,7 +529,7 @@
     cid: 'Mk3f9x2-17', oid: 'b8a1c0de-0001', v: 'K', tk: 'KXNATGAS15M-26OCT061930-30', side: 'BUY',
     px: '0.6300', qty: 10, filled: 2, left: 8, avg: '0.6300', tif: 'POST', exp_ms: T0 + 1215000,
     st: 'PART', why: '', own: 'MAN', lane: null, piq: 40, fee: '0.0000', touch: '0.6300', edge: '0.0300',
-    t: { click: T0 + 1199950, recv: T0 + 1199952, sent: T0 + 1199953, ack: T0 + 1200001, done: null }
+    t: { click: T0 + 1199950, recv: T0 + 1199952, sent: T0 + 1199953, ack: T0 + 1200001, done: null }, rev: 4
   };
   EX.fill = {
     fid: 'K-F-000231', cid: 'Mk3f9x2-17', oid: 'b8a1c0de-0001', v: 'K', tk: 'KXNATGAS15M-26OCT061930-30',
@@ -528,8 +597,8 @@
     markets: ['arr', S.mkt],          // every OPEN market, plus those that closed or settled in the last 30 min
     books: ['arr', S.book],           // the stream's current subscriptions (FULL and TOP)
     orders: ['arr', S.ord],           // every non-terminal order, plus terminal ones from the last 2 min
-    fills: ['arr', S.fill],           // today's fills, oldest first
-    mos: ['arr', S.mo],               // markouts matured for those fills
+    fills: ['arr', S.fill],           // today's fills, the newest 5000 at most, oldest first
+    mos: ['arr', S.mo],               // markouts matured for those fills only
     pos: ['arr', S.pos],
     lanes: ['arr', S.lane],
     risk: S.risk,
@@ -548,28 +617,29 @@
 
   var endpoints = {
     'GET /api/stream': {
-      doc: 'Server-sent events, one per browser tab. Query sid=<random 8+ chars>. The first message is an hb. Messages: see events. On reconnect EventSource sends Last-Event-ID; the backend may resume after it or start a new seq at 1 with a new hb, and the page resyncs either way.',
+      doc: 'Server-sent events, one per browser tab. Query sid=<random 8+ chars>. Creates the sid (see LIFECYCLE). The response starts with "retry: 2000"; the first message is an hb with seq 1. Messages: see events. On reconnect EventSource sends Last-Event-ID; the backend may resume after it or start a new seq at 1 with a new hb, and the page resyncs either way.',
       query: { sid: 'str' }
     },
     'GET /api/snapshot': {
-      doc: 'Everything the screen shows, taken atomically against the sid\'s stream counter. Query sid=<sid>.',
+      doc: 'Everything the screen shows, taken atomically against the sid\'s stream counter (seq = the last message of that stream it includes). Query sid=<sid>. A sid with no open stream is refused 409 BAD_STATE.',
       query: { sid: 'str' },
-      response: SNAP
+      response: SNAP,
+      errors: ['BAD_STATE', 'FORBIDDEN', 'INTERNAL']
     },
     'GET /api/health': {
-      doc: 'Cheap liveness probe; the page uses it to choose live vs demo at boot and every 5 s while the stream is down.',
+      doc: 'Cheap liveness probe. The page probes it every 5 s while the stream is down and reopens the stream when it answers. It never decides live vs demo: a page the backend served (a non-empty desk-token) is live, demo runs only from file:// or with ?demo=1.',
       response: { ok: ['enum', true], epoch: 'id', srv_ms: 'ms' },
       example: { response: { ok: true, epoch: 'e-1791300000', srv_ms: T0 } }
     },
     'POST /api/subscribe': {
-      doc: 'Names the books the sid\'s stream carries: up to 4 ladders at FULL depth and the watchlist at TOP ("ALL" = every OPEN market). Replaces the previous subscription. The backend then pushes one book for every newly subscribed market.',
+      doc: 'Names the books the sid\'s stream carries: up to 4 ladders at FULL depth and the watchlist at TOP ("ALL" = every OPEN market). Replaces the previous subscription. The backend then pushes one book for every newly subscribed market. A sid with no open stream is refused 409 BAD_STATE (the page retries after the stream opens). The page sends it after every stream open and again whenever a snapshot\'s subs differ from the ladders on screen.',
       request: { sid: 'str', ladders: ['arr', MKT_REF], tops: ['or', ['enum', 'ALL'], ['arr', MKT_REF]] },
       response: { ok: ['enum', true], subs: SUBS },
       example: { request: { sid: 'k3f9x2ab', ladders: [{ v: 'K', tk: 'KXNATGAS15M-26OCT061930-30' }], tops: 'ALL' },
                  response: { ok: true, subs: { ladders: [{ v: 'K', tk: 'KXNATGAS15M-26OCT061930-30' }], tops: 'ALL' } } }
     },
     'POST /api/order': {
-      doc: 'Place one order. The reply comes after the venue\'s acknowledgement and carries the order\'s state then (WORK, PART, FILL or CXL; IOC/FOK fills are in it). A refusal returns the error and, when the cid was valid, the REJ order. The gateway checks risk in memory: no pre-check request is ever needed. The price guard refuses a crossing order more than 2 ticks through the touch unless override is true. A manual order in a market Systematic is quoting cancels those Systematic orders (why TAKEOVER) and keeps the market manual (mkt.man true) until POST /api/release. POST needs exactly one of ttl_s and exp_ms (a whole second, 5 s to 24 h ahead, e.g. a game\'s start_ms); IOC and FOK carry neither. reduce_only (IOC only, as Kalshi allows) never increases the position: qty is cut to the open position, and an order on a flat position or on the increasing side is refused REDUCE (FLAT sends it).',
+      doc: 'Place one order. The reply comes after the venue\'s acknowledgement and carries the order\'s state then (WORK, PART, FILL or CXL; IOC/FOK fills are in it), with its rev. A refusal returns the error and, when the cid was valid, the order: REJ when it never reached the venue or the venue rejected it, PEND when the venue did not answer in time (EXCHANGE; the private feed then settles it, on the stream). An error reply WITHOUT ord means the order was never sent to a venue (a 4xx check); a 5xx without ord means the page cannot know, so it keeps the order PEND and resyncs. The gateway checks risk in memory: no pre-check request is ever needed. The price guard refuses a crossing order more than 2 ticks through the touch unless override is true. A manual order in a market Systematic is quoting cancels those Systematic orders (why TAKEOVER) and keeps the market manual (mkt.man true) until POST /api/release. POST needs exactly one of ttl_s and exp_ms (a whole second, 5 s to 24 h ahead, e.g. a game\'s start_ms); IOC and FOK carry neither. reduce_only (IOC only, as Kalshi allows) never increases the position: qty is cut to the open position, and an order on a flat position or on the increasing side is refused REDUCE (FLAT sends it).',
       request: {
         cid: 'cid', v: ['enum'].concat(enums.VENUE), tk: 'tk', side: ['enum'].concat(enums.SIDE),
         px: 'price', qty: 'size', tif: ['enum'].concat(enums.TIF),
@@ -582,7 +652,7 @@
       },
       response: OK_ORD,
       errors: ['BAD_REQUEST', 'OFF_GRID', 'BAD_QTY', 'UNKNOWN_MARKET', 'DUP_CID', 'MARKET_CLOSED', 'PRICE_BAND', 'REDUCE',
-               'KILLED', 'STALE', 'RO', 'NO_CASH', 'SHARD_CASH', 'RATE', 'EXCHANGE', 'INTERNAL', 'FORBIDDEN'],
+               'KILLED', 'STALE', 'RO', 'NO_CASH', 'SHARD_CASH', 'RATE', 'EXCHANGE', 'INTERNAL'],
       example: {
         request: { cid: 'Mk3f9x2-17', v: 'K', tk: 'KXNATGAS15M-26OCT061930-30', side: 'BUY', px: '0.6300', qty: 10,
                    tif: 'POST', ttl_s: 15, override: false, touch: '0.6300', t_click_ms: T0 + 1199950 },
@@ -590,17 +660,17 @@
         error: { ok: false, err: { code: 'PRICE_BAND', msg: 'BUY 0.6900 is 5 ticks through ask 0.6400 (max 2)' },
                  ord: (function () { var o = JSON.parse(JSON.stringify(EX.ord)); o.st = 'REJ'; o.why = 'PRICE_BAND'; o.px = '0.6900';
                    o.tif = 'IOC'; o.exp_ms = null; o.filled = 0; o.left = 0; o.avg = null; o.oid = null; o.piq = null;
-                   o.t.sent = null; o.t.ack = null; o.t.done = T0 + 1199953; return o; })() }
+                   o.t.sent = null; o.t.ack = null; o.t.done = T0 + 1199953; o.rev = 1; return o; })() }
       }
     },
     'POST /api/cancel': {
-      doc: 'Cancel by cid list, or every order matching a market filter (side and px narrow it to one ladder level: right-click on WRK). n counts the orders asked to cancel; each then gets an ord event with st CXL (or FILL/EXP if that won the race).',
+      doc: 'Cancel by cid list, or every order matching a market filter (side and px narrow it to one ladder level: right-click on WRK). n counts the orders asked to cancel; each then gets an ord event with st CXL (or FILL/EXP if that won the race). Unknown or already finished cids are skipped (ok, not counted); a market filter naming an unknown market is NOT_FOUND.',
       request: ['or',
         { cids: ['arr', 'cid'] },
         { v: ['enum'].concat(enums.VENUE), tk: 'tk', own: ['enum', 'MAN', 'SYS', 'ANY'],
           side: ['enum?'].concat(enums.SIDE), px: 'price?' }],
       response: CANCEL_RESP,
-      errors: ['BAD_REQUEST', 'NOT_FOUND', 'EXCHANGE'],
+      errors: ['NOT_FOUND', 'EXCHANGE'],
       example: { request: { v: 'K', tk: 'KXNATGAS15M-26OCT061930-30', own: 'MAN', side: 'BUY', px: '0.6300' },
                  response: { ok: true, n: 1, cids: ['Mk3f9x2-17'] } }
     },
@@ -608,25 +678,25 @@
       doc: 'Cancel every working order of an owner, on one venue or both (v null). Shift+Esc sends {own:"MAN", v:null}.',
       request: { own: ['enum', 'MAN', 'SYS', 'ANY'], v: ['enum?'].concat(enums.VENUE) },
       response: CANCEL_RESP,
-      errors: ['BAD_REQUEST', 'EXCHANGE'],
+      errors: ['EXCHANGE'],
       example: { request: { own: 'MAN', v: null }, response: { ok: true, n: 3, cids: ['Mk3f9x2-17', 'Mk3f9x2-18', 'Mk3f9x2-19'] } }
     },
     'POST /api/amend': {
-      doc: 'Amend a resting (WORK/PART) order; BAD_STATE when it is PEND or terminal. A price change or a size increase loses queue place; a size decrease or a new ttl_s only (expiry refresh: the new expiry counts from now) keeps it. Fields left null are unchanged; qty is the new total quantity. A new price that would cross cancels the order (CXL POST_CROSS). The reply carries the order after the venue\'s acknowledgement.',
+      doc: 'Amend a resting (WORK/PART) order; BAD_STATE when it is PEND or terminal. A price change or a size increase loses queue place; a size decrease or a new ttl_s only (expiry refresh: the new expiry counts from now) keeps it. Fields left null are unchanged; qty is the new total quantity. A new price that would cross cancels the order (CXL POST_CROSS; there is no price guard on an amend, a resting order cannot cross). The reply carries the order after the venue\'s acknowledgement. (Used by the lanes inside the backend; the screen re-prices by cancel and a new order.)',
       request: { cid: 'cid', px: 'price?', qty: 'size?', ttl_s: ['enum?'].concat(enums.TTL_S) },
       response: OK_ORD,
-      errors: ['BAD_REQUEST', 'NOT_FOUND', 'BAD_STATE', 'OFF_GRID', 'BAD_QTY', 'PRICE_BAND', 'KILLED', 'STALE', 'EXCHANGE'],
+      errors: ['NOT_FOUND', 'BAD_STATE', 'OFF_GRID', 'BAD_QTY', 'KILLED', 'STALE', 'EXCHANGE'],
       example: { request: { cid: 'Mk3f9x2-17', px: '0.6200', qty: null, ttl_s: null }, response: { ok: true, ord: EX.ord } }
     },
     'POST /api/lane/{id}': {
-      doc: 'Turn one lane on or off. Off cancels that lane\'s working orders.',
+      doc: 'Turn one lane on or off. Off cancels that lane\'s working orders (why LANE_OFF).',
       request: { on: 'bool' },
       response: { ok: ['enum', true], lane: S.lane },
       errors: ['NOT_FOUND'],
       example: { request: { on: false }, response: { ok: true, lane: EX.lane } }
     },
     'POST /api/start': {
-      doc: 'Start Systematic. Refused with PREFLIGHT (and the preflight rows) while any check fails, KILLED during the lockout, HALTED after the daily stop.',
+      doc: 'Start Systematic. Refused with PREFLIGHT (and the preflight rows) while any check but DISK fails, KILLED during the lockout, HALTED after the daily stop. Starting while running is ok (n 0).',
       request: {},
       response: RUN_RESP,
       errors: ['PREFLIGHT', 'KILLED', 'HALTED', 'BAD_STATE'],
@@ -669,8 +739,17 @@
                  response: { ok: true, shards: [{ id: 'S1', cash: '24.8100', free: '24.8100' }, { id: 'S3', cash: '43.2000', free: '26.1900' }] } }
     }
   };
-  // Every endpoint shares the error shape.
-  Object.keys(endpoints).forEach(function (k) { if (endpoints[k].request !== undefined || k === 'GET /api/snapshot') endpoints[k].error = ERR_RESP; });
+  // Every endpoint shares the error shape. Every POST can also be refused FORBIDDEN (Host or
+  // token, before anything else) and BAD_REQUEST (the body breaks this contract), and can fail
+  // INTERNAL (a backend bug); the lists above name the rest. RATE applies only where listed:
+  // cancels and KILL are never rate-limited.
+  Object.keys(endpoints).forEach(function (k) {
+    var ep = endpoints[k];
+    if (ep.request !== undefined || k === 'GET /api/snapshot') ep.error = ERR_RESP;
+    if (k.indexOf('POST ') === 0) {
+      ep.errors = ['FORBIDDEN', 'BAD_REQUEST'].concat((ep.errors || []).filter(function (c) { return c !== 'FORBIDDEN' && c !== 'BAD_REQUEST' && c !== 'INTERNAL'; }), ['INTERNAL']);
+    }
+  });
 
   // ---------------------------------------------------------------------------------------------
   // Validator
@@ -763,10 +842,29 @@
     var k = String(method).toUpperCase() + ' ' + p;
     return endpoints[k] ? k : null;
   }
+  // the schema, then the rules that tie fields together (the backend refuses these BAD_REQUEST)
+  function inside(p) { return typeof p === 'string' && RE_PRICE.test(p) && +p > 0 && +p < 1; }
   function validateRequest(key, body) {
     var ep = endpoints[key];
     if (!ep || ep.request === undefined) return ['no request schema for ' + key];
-    return validate(ep.request, body, '$', []);
+    var errs = validate(ep.request, body, '$', []);
+    if (errs.length) return errs;
+    if (key === 'POST /api/order') {
+      var hasTtl = body.ttl_s !== null && body.ttl_s !== undefined, hasExp = body.exp_ms !== null && body.exp_ms !== undefined;
+      if (body.tif === 'POST' && hasTtl === hasExp) errs.push('$: a POST needs exactly one of ttl_s and exp_ms');
+      if (body.tif !== 'POST' && (hasTtl || hasExp)) errs.push('$: ' + body.tif + ' carries neither ttl_s nor exp_ms');
+      if (body.reduce_only !== undefined && body.reduce_only !== false && body.tif !== 'IOC') errs.push('$.reduce_only: IOC only');
+      if (!(body.qty > 0)) errs.push('$.qty: must be > 0');
+      if (!inside(body.px)) errs.push('$.px: an order price is strictly between 0 and 1');
+      if (hasExp && body.exp_ms % 1000 !== 0) errs.push('$.exp_ms: a whole second');
+    }
+    if (key === 'POST /api/amend') {
+      if (body.px !== null && !inside(body.px)) errs.push('$.px: an order price is strictly between 0 and 1');
+      if (body.qty !== null && !(body.qty > 0)) errs.push('$.qty: must be > 0');
+      if (body.px === null && body.qty === null && body.ttl_s === null) errs.push('$: nothing to amend');
+    }
+    if (key === 'POST /api/transfer' && !(+body.amt > 0)) errs.push('$.amt: must be > 0');
+    return errs;
   }
   function validateResponse(key, status, json) {
     var ep = endpoints[key];
@@ -779,7 +877,7 @@
   }
 
   Desk.contract = {
-    version: '1.1.0',
+    version: '1.2.0',
     TOKEN_META: 'desk-token',            // <meta name="desk-token" content="..."> in the served page
     hostOk: hostOk,
     types: types,
@@ -796,7 +894,6 @@
     validateEvent: validateEvent,
     validateRequest: validateRequest,
     validateResponse: validateResponse,
-    endpointFor: endpointFor,
-    terminal: function (st) { return st === 'FILL' || st === 'CXL' || st === 'REJ' || st === 'EXP'; }
+    endpointFor: endpointFor
   };
 })(typeof window !== 'undefined' ? window : globalThis);

@@ -182,6 +182,35 @@ const flushMicro = () => new Promise(r => setImmediate(r));
       check(!!C.endpoints[k], 'the contract defines ' + k);
     eq(C.enums.ST.join(','), 'PEND,WORK,PART,FILL,CXL,REJ,EXP', 'order states');
     eq(C.enums.TIF.join(','), 'IOC,FOK,POST', 'time in force');
+    // the rules that tie fields together are checked, not left to prose
+    const vr = b => C.validateRequest('POST /api/order', Object.assign({}, good, b));
+    check(vr({ exp_ms: 1791306015000 }).length > 0, 'a POST with both ttl_s and exp_ms is refused');
+    check(vr({ ttl_s: null }).length > 0, 'a POST with neither ttl_s nor exp_ms is refused');
+    check(!vr({ ttl_s: null, exp_ms: 1791306015000 }).length, 'a POST with exp_ms alone is fine');
+    check(vr({ tif: 'IOC' }).length > 0, 'an IOC carrying ttl_s is refused');
+    check(!vr({ tif: 'IOC', ttl_s: null }).length, 'an IOC with neither is fine');
+    check(vr({ reduce_only: true }).length > 0 && !vr({ tif: 'IOC', ttl_s: null, reduce_only: true }).length, 'reduce_only is IOC only');
+    check(vr({ qty: 0 }).length > 0, 'qty 0 is refused');
+    check(vr({ px: '0.0000' }).length > 0 && vr({ px: '1.0000' }).length > 0, 'an order price is strictly between 0 and 1');
+    check(vr({ ttl_s: null, exp_ms: 1791306015500 }).length > 0, 'exp_ms is a whole second');
+    check(C.enums.WHY.indexOf('LANE_OFF') >= 0 && C.enums.WHY.indexOf('FORBIDDEN') >= 0 && C.enums.WHY.indexOf('BAD_STATE') >= 0, 'WHY names a lane switched off, FORBIDDEN and BAD_STATE');
+    check(Object.keys(C.endpoints).filter(k => k.indexOf('POST ') === 0).every(k => ['FORBIDDEN', 'BAD_REQUEST', 'INTERNAL'].every(c => C.endpoints[k].errors.indexOf(c) >= 0)),
+      'every POST lists FORBIDDEN, BAD_REQUEST and INTERNAL');
+    check(C.endpoints['POST /api/kill'].errors.indexOf('RATE') < 0 && C.endpoints['POST /api/cancel'].errors.indexOf('RATE') < 0, 'KILL and cancels are never rate-limited');
+    check(C.endpoints['POST /api/amend'].errors.indexOf('PRICE_BAND') < 0, 'an amend has no price guard (a crossing amend is POST_CROSS)');
+    check(C.schemas.ord.rev === 'count' && C.examples.ord.rev === 4, 'an order record carries its revision');
+    check(C.schemas.hdr.man_working === undefined, 'hdr carries no field the page does not read');
+  }
+  // ---- 3b. grid colours: the meaning classes beat 'table.grid td' (a node check of the CSS) ----
+  {
+    const css = fs.readFileSync(path.join(JS, '..', 'desk.css'), 'utf8');
+    const at = sel => css.indexOf(sel);
+    const base = at('table.grid td {'), thin = at('table.grid td.thin');
+    for (const c of ['up', 'dn', 'dim', 'bid', 'ask']) {
+      const i = at('table.grid td.' + c + ' {');
+      check(i > base && i < thin, 'desk.css: table.grid td.' + c + ' comes after table.grid td and before td.thin (same specificity, so order decides)', { base, i, thin });
+    }
+    check(at('table.grid tr.o-CXL > td') > thin && at('body.stale #tabs td') > thin, 'row states and STALE come later and still win');
   }
 
   if (process.env.V) console.log('section 4');
@@ -202,10 +231,12 @@ const flushMicro = () => new Promise(r => setImmediate(r));
   st.resync('BOOT');
   await flushMicro();
   eq(st.seq, 100, 'snapshot sets the sequence');
-  check(!st.resyncing && !st.stale, 'snapshot ends the resync and the stale state', st.staleWhy);
+  check(!st.resyncing && st.stale && st.staleWhy === 'SYNC', 'a snapshot ends the resync but not the stale state: it proves nothing about the stream', st.staleWhy);
   let seq = 100;
   const env = (type, data) => ({ type, seq: ++seq, ts_ms: T0 + seq, data: JSON.parse(JSON.stringify(data)) });
   const ap = (type, data) => st.apply(env(type, data));
+  eq(ap('hb', EX.hb), 'ok', 'a stream hb newer than the snapshot applies');
+  check(!st.stale, 'and only that ends the stale state', st.staleWhy);
   eq(ap('hdr', EX.hdr), 'ok', 'hdr applies');
   eq(st.hdr.cash.K.total, 1423100, 'hdr money becomes integers in u');
   eq(st.hdr.day.man, 21100, 'hdr day split');
@@ -221,9 +252,14 @@ const flushMicro = () => new Promise(r => setImmediate(r));
   eq(st.book('K|KXNCAAFGAME-26OCT06SOUMISTROY-SOUMIS').ref.game.clock, '3:12', 'game clock rides on the book');
   eq(ap('ord', EX.ord), 'ok', 'ord applies');
   const o = st.orders.get('Mk3f9x2-17');
-  check(o.st === 'PART' && o.px === 6300 && o.left === 8 && o.edge === 300 && !o.terminal, 'ord fields', o);
-  eq(st.workingAt(KEY).BUY.get(6300).left, 8, 'workingAt aggregates our orders by level');
+  check(o.st === 'PART' && o.px === 6300 && o.left === 8 && o.edge === 300 && !o.terminal && o.rev === 4, 'ord fields', o);
   eq(st.working().length, 1, 'working lists non-terminal orders');
+  // the HTTP reply and the stream race: rev decides, an older record is dropped
+  {
+    const older = JSON.parse(JSON.stringify(EX.ord)); older.st = 'WORK'; older.filled = 0; older.left = 10; older.avg = null; older.rev = 3;
+    st._handlers.ord(older, null, false);
+    check(st.orders.get('Mk3f9x2-17').st === 'PART' && st.orders.get('Mk3f9x2-17').left === 8, 'a reply with an older rev (WORK, left 10) does not undo the stream\'s PART (left 8)');
+  }
   eq(ap('mo', { fid: 'K-F-000231', h: '1s', mo: '0.0020', mid: '0.6370' }), 'ok', 'a markout before its fill applies');
   eq(ap('fill', EX.fill), 'ok', 'fill applies');
   eq(st.fills[0].px, 6300, 'fill price in u');
@@ -243,16 +279,14 @@ const flushMicro = () => new Promise(r => setImmediate(r));
   eq(st.alerts[0].msg, 'PM key 401: positions unknown', 'the newest alert is first');
   eq(ap('hb', EX.hb), 'ok', 'hb applies');
   check(st.feeds.KX.lag_ms === 34 && !st.stale, 'hb feeds and liveness');
-  const m = st.markouts();
-  check(m.n === 1 && m.m10 === 50 && m.n60 === 0, 'markout stats over fills', m);
   eq(st.priceGuard(KEY, 'BUY', 6600), '', 'price guard: 2 ticks through the ask is allowed');
   check(/^PRICE_BAND/.test(st.priceGuard(KEY, 'BUY', 6700)), 'price guard: 3 ticks through the ask is refused');
   check(/^PRICE_BAND/.test(st.priceGuard(KEY, 'SELL', 6000)), 'price guard: 3 ticks through the bid is refused');
   eq(st.canTrade('K'), '', 'trading allowed while live');
   // terminal orders never change again
-  const term = JSON.parse(JSON.stringify(EX.ord)); term.st = 'CXL'; term.why = 'USER'; term.left = 0; term.t.done = T0 + 1300000;
+  const term = JSON.parse(JSON.stringify(EX.ord)); term.st = 'CXL'; term.why = 'USER'; term.left = 0; term.t.done = T0 + 1300000; term.rev = 5;
   ap('ord', term);
-  const back = JSON.parse(JSON.stringify(EX.ord));
+  const back = JSON.parse(JSON.stringify(EX.ord)); back.rev = 6;
   ap('ord', back);
   eq(st.orders.get('Mk3f9x2-17').st, 'CXL', 'a late non-terminal echo cannot resurrect a terminal order');
   eq(st.recent(3000).length, 1, 'recent terminal orders are listed for the 3 s display');
@@ -267,11 +301,31 @@ const flushMicro = () => new Promise(r => setImmediate(r));
   check(pend.st === 'PEND' && pend.local.pend, 'pend inserts a local PEND order');
   st.reply('Mtestabc-1', 409, { ok: false, err: { code: 'PRICE_BAND', msg: 'BUY 0.6700 is 3 ticks through ask 0.6400 (max 2)' } });
   const rj = st.orders.get('Mtestabc-1');
-  check(rj.st === 'REJ' && rj.why === 'PRICE_BAND' && rj.terminal, 'a refused order shows REJ with the reason', rj);
+  check(rj.st === 'REJ' && rj.why === 'PRICE_BAND' && rj.terminal && rj.local.prov, 'a pre-send refusal with no ord shows REJ with the reason, provisionally', rj);
   check(/^REJ PRICE_BAND/.test(st.alerts[0].msg), 'the reason goes to the status bar');
+  {
+    // the backend's own record of that cid replaces a provisional REJ (it was sent after all)
+    const real = JSON.parse(JSON.stringify(EX.ord)); real.cid = 'Mtestabc-1'; real.st = 'WORK'; real.filled = 0; real.left = 5; real.qty = 5; real.avg = null; real.rev = 2;
+    st._handlers.ord(real, null, false);
+    check(st.orders.get('Mtestabc-1').st === 'WORK' && !st.orders.get('Mtestabc-1').terminal, 'a stream record of the cid replaces the provisional REJ');
+    real.st = 'CXL'; real.why = 'USER'; real.left = 0; real.rev = 3; st._handlers.ord(real, null, false);
+  }
+  const calls0 = snapCalls;
   st.pend({ cid: 'Mtestabc-2', v: 'K', tk: EX.mkt.tk, side: 'BUY', px: 6300, qty: 1, tif: 'POST', ttl_s: 15, touch: 6300, t_click_ms: T0 });
   st.reply('Mtestabc-2', 0, { ok: false, err: { code: 'EXCHANGE', msg: 'desk unreachable' } });
   eq(st.orders.get('Mtestabc-2').st, 'PEND', 'no answer leaves the order PEND (state unknown), never REJ');
+  check(st.resyncing && snapCalls === calls0 + 1, 'and asks for a snapshot, which decides whether it exists', { calls: snapCalls - calls0 });
+  await flushMicro();
+  st.pend({ cid: 'Mtestabc-3', v: 'K', tk: EX.mkt.tk, side: 'BUY', px: 6300, qty: 1, tif: 'POST', ttl_s: 15, touch: 6300, t_click_ms: T0 });
+  st.reply('Mtestabc-3', 502, { ok: false, err: { code: 'EXCHANGE', msg: 'venue timeout' } });
+  check(st.orders.get('Mtestabc-3') && st.orders.get('Mtestabc-3').st === 'PEND', 'a 502 EXCHANGE with no ord is not a reject: the order may rest at the venue, so it stays PEND');
+  st.pend({ cid: 'Mtestabc-4', v: 'K', tk: EX.mkt.tk, side: 'BUY', px: 6300, qty: 1, tif: 'POST', ttl_s: 15, touch: 6300, t_click_ms: T0 });
+  st.reply('Mtestabc-4', 500, { ok: false, err: { code: 'INTERNAL', msg: 'HTTP 500 with no JSON body' } });
+  eq(st.orders.get('Mtestabc-4').st, 'PEND', 'a proxy 5xx leaves it PEND too');
+  await flushMicro();
+  // the snapshot does not list Mtestabc-3/4: they stay while young (in flight), then go
+  seq = st.seq;
+  ap('hb', EX.hb);
 
   if (process.env.V) console.log('section 5');
   // ---- 5. sequence gaps, epochs, silence ---------------------------------------------------
@@ -284,10 +338,11 @@ const flushMicro = () => new Promise(r => setImmediate(r));
     check(st.resyncing && st.stale && st.staleWhy === 'GAP', 'a gap greys the screen (STALE GAP)', st.staleWhy);
     eq(snapCalls, calls + 1, 'a gap requests one snapshot');
     eq(st.apply({ type: 'hb', seq: k + 3, ts_ms: T0, data: EX.hb }), 'buffered', 'messages during a resync are buffered');
-    eq(st.apply({ type: 'alert', seq: k + 4, ts_ms: T0, data: Object.assign({}, EX.alert, { id: 'a-913', msg: 'after the snapshot' }) }), 'buffered', 'and kept');
+    eq(st.apply({ type: 'hb', seq: k + 4, ts_ms: T0, data: EX.hb }), 'buffered', 'more buffered');
+    eq(st.apply({ type: 'alert', seq: k + 5, ts_ms: T0, data: Object.assign({}, EX.alert, { id: 'a-913', msg: 'after the snapshot' }) }), 'buffered', 'and kept');
     await flushMicro();
-    check(!st.resyncing && !st.stale, 'the snapshot ends the resync');
-    eq(st.seq, k + 4, 'buffered messages newer than the snapshot are replayed in order');
+    check(!st.resyncing && !st.stale, 'the snapshot plus a buffered hb newer than it end the resync and the stale state', st.staleWhy);
+    eq(st.seq, k + 5, 'buffered messages newer than the snapshot are replayed in order');
     eq(st.alerts[0].msg, 'after the snapshot', 'the replayed message is applied');
     eq(st.gaps, 1, 'one gap counted');
     // a new epoch (backend restart) resyncs even when seq looks fine
@@ -319,6 +374,64 @@ const flushMicro = () => new Promise(r => setImmediate(r));
     st.apply({ type: 'hb', seq: st.seq + 1, ts_ms: T0, data: down });
     check(!st.stale && st.vstale.K === 'KX DOWN' && st.canTrade('K') === 'KX DOWN' && st.vstale.P === '', 'Kalshi private socket down blocks Kalshi orders only', { stale: st.staleWhy, v: st.vstale });
     eq(st.canTrade('P'), 'RO', 'a read-only venue (PM key failing) blocks its new orders');
+  }
+
+  // ---- 5b. the STALE rule fails closed; a bad snapshot is never applied -------------------------
+  {
+    const c5 = makeCtx(), S5 = c5.Desk.store;
+    let calls5 = 0, snap5 = baseSnap();
+    S5.fetchSnapshot = () => { calls5++; return Promise.resolve(JSON.parse(JSON.stringify(snap5))); };
+    S5.begin(); S5.onTransport('open', false);
+    await flushMicro();
+    eq(calls5, 1, 'the first stream open takes the snapshot');
+    let q = S5.seq;
+    S5.apply({ type: 'hb', seq: ++q, ts_ms: T0, data: EX.hb });
+    check(!S5.stale && S5.canTrade('K') === '', 'live after the snapshot and a fresh hb');
+    // the stream goes silent while GET /api/snapshot still answers: never live again from a snapshot
+    const base = Date.now();
+    S5.lastHb = base - 3100;
+    let allowed = 0;
+    for (let i = 0; i < 40; i++) { S5.tick(base + i * 250); await flushMicro(); if (S5.canTrade('K') === '') allowed++; }
+    check(allowed === 0 && calls5 === 1, 'a silent stream (snapshots still answering) blocks new orders on every tick and asks for no snapshot', { allowed, calls: calls5 - 1 });
+    S5.resync('USER'); await flushMicro();
+    check(S5.stale && S5.canTrade('K') !== '', 'a snapshot taken during the silence does not make it live', S5.staleWhy);
+    // the socket in error: snapshots cannot make it live either
+    S5.onTransport('error'); S5.lastHb = Date.now();
+    S5.resync('USER'); await flushMicro();
+    check(S5.stale && S5.staleWhy === 'SRV DOWN' && S5.canTrade('K') === 'SRV DOWN', 'with the EventSource in error the page stays SRV DOWN through a snapshot', S5.staleWhy);
+    // it reopens: snapshot, then the first hb newer than it
+    const c0 = calls5;
+    S5.onTransport('open', true); await flushMicro();
+    check(calls5 === c0 + 1 && S5.stale && S5.staleWhy === 'SYNC', 'a reopen resyncs and waits for a stream hb', { calls: calls5 - c0, why: S5.staleWhy });
+    q = S5.seq; S5.apply({ type: 'hb', seq: ++q, ts_ms: T0, data: EX.hb });
+    check(!S5.stale, 'the hb after the snapshot makes it live');
+    // a snapshot that breaks the contract is refused, not applied; the store retries with back-off
+    const hdr0 = S5.hdr, inv0 = S5.invalid;
+    snap5 = JSON.parse(JSON.stringify(baseSnap())); delete snap5.hdr.lat; snap5.seq = 500;
+    S5.resync('USER'); await flushMicro();
+    check(S5.resyncing && S5.stale && S5.hdr === hdr0 && S5.seq !== 500 && S5.invalid === inv0 + 1 && /snapshot refused/.test(S5.alerts[0].msg),
+      'a snapshot missing hdr.lat is refused: nothing replaced, STALE, a CRIT line', { r: S5.resyncing, why: S5.staleWhy, msg: S5.alerts[0] && S5.alerts[0].msg });
+    snap5 = baseSnap(); snap5.seq = 500;
+    await new Promise(r => setTimeout(r, 1150)); await flushMicro();
+    check(!S5.resyncing && S5.seq === 500, 'the retry after 1 s takes the good snapshot', { r: S5.resyncing, seq: S5.seq });
+    S5.apply({ type: 'hb', seq: 501, ts_ms: T0, data: EX.hb });
+    // a snapshot that throws while applying is rolled back whole
+    const mk0 = S5.markets, ord0 = S5.orders;
+    S5.validate = false;
+    snap5 = baseSnap(); snap5.seq = 600; snap5.markets = [EX.mkt, null];
+    S5.resync('USER'); await flushMicro();
+    check(S5.markets === mk0 && S5.orders === ord0 && S5.seq === 501 && S5.resyncing && S5.stale, 'a snapshot that throws half-way leaves the old maps in place and stays STALE', { seq: S5.seq });
+    S5.validate = true;
+    // settled markets are forgotten after 30 min unless a position or a ladder holds them
+    const sm = JSON.parse(JSON.stringify(EX.mkt)); sm.tk = 'KXOLD-1'; sm.status = 'SETTLED'; sm.result = 'YES';
+    const sm2 = JSON.parse(JSON.stringify(sm)); sm2.tk = 'KXOLD-2';
+    S5._handlers.mkt(sm); S5._handlers.mkt(sm2);
+    const pp = JSON.parse(JSON.stringify(EX.pos)); pp.tk = 'KXOLD-2'; pp.pos = 0; pp.avg = null; pp.mark = null; S5._handlers.pos(pp);
+    const later = Date.now() + 31 * 60000;
+    S5.prune(Date.now() + 60000);
+    check(S5.markets.has('K|KXOLD-1'), 'a market settled a minute ago stays');
+    S5.prune(later);
+    check(!S5.markets.has('K|KXOLD-1') && !S5.books.has('K|KXOLD-1') && S5.markets.has('K|KXOLD-2'), 'after 30 min it goes, unless a position row holds it');
   }
 
   if (process.env.V) console.log('section 6');
@@ -623,6 +736,47 @@ const flushMicro = () => new Promise(r => setImmediate(r));
   check(evs.every(e => e.type !== 'ord' || e.data.tif === 'POST' || (e.data.st !== 'WORK' && e.data.st !== 'PART')), 'no IOC or FOK ever rested in the whole run');
   const cross = evs.filter(e => e.type === 'fill' && e.data.liq === 'T').map(e => sim.order(e.data.cid)).filter(o => o && o.tif === 'POST');
   eq(cross.length, 0, 'no POST order ever took liquidity in the whole run');
+  // order revisions: up on every change, the same state carries the same rev in a reply
+  {
+    const last = {}; let back = 0, same = 0, mism = 0;
+    evs.filter(e => e.type === 'ord').forEach(e => {
+      const d = e.data, k = d.cid, sig = d.st + '|' + d.filled + '|' + d.left;
+      if (last[k] && d.rev < last[k].rev) back++;
+      if (last[k] && d.rev === last[k].rev && sig !== last[k].sig) same++;
+      last[k] = { rev: d.rev, sig };
+    });
+    eq(back + same, 0, 'every order\'s rev rises on the stream, and a change always carries a new rev');
+    replies.forEach(([meth, p, s2, j]) => {
+      if (!j || !j.ord) return;
+      const evRev = evs.filter(e => e.type === 'ord' && e.data.cid === j.ord.cid && e.data.rev === j.ord.rev);
+      if (evRev.length && evRev[0].data.st !== j.ord.st) mism++;
+    });
+    eq(mism, 0, 'a reply and a stream event with the same rev carry the same state');
+  }
+  check(evs.some(e => e.type === 'ord' && e.data.why === 'LANE_OFF' && e.data.lane === 'M1'), 'switching a lane off cancels its orders with why LANE_OFF');
+  {
+    const fids = new Set(snap.fills.map(f => f.fid));
+    check(snap.fills.length <= 5000 && snap.mos.every(m => fids.has(m.fid)), 'the snapshot carries at most 5000 fills and only their markouts', { fills: snap.fills.length, mos: snap.mos.length });
+    const bs = call('POST', '/api/subscribe', { sid: 'someone-else', ladders: [], tops: 'ALL' });
+    check(bs.s === 409 && bs.j.err.code === 'BAD_STATE', 'a subscribe for a sid with no open stream is refused BAD_STATE', bs);
+    let gs = null; sim.request('GET', '/api/snapshot?sid=nobody', undefined, (s2, j) => { gs = { s: s2, j }; }); run(50);
+    check(gs && gs.s === 409 && gs.j.err.code === 'BAD_STATE', 'so is a snapshot', gs);
+  }
+  // the browser loop wakes for a reply due before its next world tick (real timers)
+  {
+    const simR = D.sim.create({ seed: 9, sid: 'wake0001', emit: () => {} });
+    simR.start();
+    await new Promise(r => setTimeout(r, 300));
+    const lags = [];
+    for (let i = 0; i < 8; i++) {
+      const t0 = Date.now();
+      await new Promise(res => simR.request('GET', '/api/health', undefined, () => { lags.push(Date.now() - t0); res(); }));
+      await new Promise(r => setTimeout(r, 37));
+    }
+    simR.stop();
+    lags.sort((a, b) => a - b);
+    check(lags[4] <= 15, 'a reply due in 1 ms arrives in about that, not at the next 100 ms tick (p50 ms)', lags);
+  }
 
   if (process.env.V) console.log('section 8');
   // ---- 8. the store follows the sim end to end, through a dropped message --------------------
@@ -652,13 +806,14 @@ const flushMicro = () => new Promise(r => setImmediate(r));
   if (process.env.V) console.log('section 9');
   // ---- 9. live transport: the X-Desk token from the page, refreshed after a restart -----------
   {
-    let srvToken = 'tok-B';
+    let srvToken = 'tok-B', healthOk = false;
     const calls = [];
     const page = tok => '<!doctype html><html><head><meta charset="utf-8">\n<meta name="desk-token" content="' + tok + '">\n</head></html>';
     const resp = (status, body) => ({ status, text: () => Promise.resolve(typeof body === 'string' ? body : JSON.stringify(body)) });
     const fetchMock = (url, init) => {
       calls.push({ url, method: init.method, xdesk: init.headers && init.headers['X-Desk'], cache: init.cache });
       if (init.method === 'GET' && url === '/desk/') return Promise.resolve(resp(200, page(srvToken)));
+      if (init.method === 'GET' && url === '/api/health') return Promise.resolve(healthOk ? resp(200, { ok: true, epoch: 'e-2', srv_ms: Date.now() }) : resp(503, ''));
       if (init.method === 'POST') {
         if (init.headers['X-Desk'] !== srvToken) return Promise.resolve(resp(403, { ok: false, err: { code: 'FORBIDDEN', msg: 'stale X-Desk token' } }));
         return Promise.resolve(resp(200, { ok: true, run: { state: 'KILLED', since_ms: Date.now(), rearm_ms: Date.now() + 60000, why: 'operator' }, n: 0 }));
@@ -698,6 +853,35 @@ const flushMicro = () => new Promise(r => setImmediate(r));
     const posts = calls.filter(x => x.method === 'POST');
     check(posts.every(x => typeof x.xdesk === 'string' && x.xdesk.length), 'every POST carried X-Desk');
     check(calls.filter(x => x.method === 'GET').every(x => x.xdesk === undefined), 'GETs carry no token');
+    // the watchdog: a stream silent for 5 s is closed and opened again
+    const nEs = esList.length;
+    T5.impl.lastMsg = Date.now() - 6000;
+    await new Promise(r => setTimeout(r, 1100));
+    check(esList.length === nEs + 1, 'a stream with no message for 5 s is reopened', { before: nEs, after: esList.length });
+    // while the stream is down, GET /api/health every 5 s; an answer reopens the stream at once
+    healthOk = true;
+    esList[esList.length - 1].readyState = 0;
+    T5.impl.lastProbe = 0;
+    const nEs2 = esList.length;
+    await new Promise(r => setTimeout(r, 1100)); await flushMicro();
+    check(calls.some(x => x.url === '/api/health') && esList.length === nEs2 + 1, 'a down stream probes /api/health and reopens when it answers', { es: esList.length - nEs2 });
+    T5.impl.close();
+  }
+  // live vs demo: never switched by a health probe; a page the backend served is always live
+  {
+    const mk = (protocol, search, tok) => {
+      const c6 = { console, setTimeout, clearTimeout, setInterval, clearInterval, performance, Promise, Uint8Array, AbortController,
+                   localStorage: { getItem() { return null; }, setItem() {} }, fetch: () => Promise.reject(new Error('no backend')),
+                   location: { protocol, search, pathname: '/' },
+                   document: { querySelector: sel => (sel === 'meta[name="desk-token"]' ? { getAttribute: () => tok } : null) } };
+      c6.window = c6; vm.createContext(c6);
+      for (const f of ['contract.js', 'core.js', 'store.js', 'sim.js', 'transport.js']) vm.runInContext(fs.readFileSync(path.join(JS, f), 'utf8'), c6, { filename: f });
+      return c6.Desk.transport.choose();
+    };
+    eq(await mk('file:', '', ''), 'demo', 'file:// with no token is demo');
+    eq(await mk('http:', '?demo=1', ''), 'demo', '?demo=1 with no token is demo');
+    eq(await mk('http:', '', ''), 'live', 'http with no token and no ?demo=1 is live (a backend that is down shows SRV DOWN, never the simulation)');
+    eq(await mk('http:', '?demo=1', 'tok-X'), 'live', 'a page the backend served (a token) is live even with ?demo=1');
   }
 
   console.log(fails ? `${fails} of ${checks} checks FAILED` : `ui desk v3: ${checks} checks, 0 failures`);

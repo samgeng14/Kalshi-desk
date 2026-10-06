@@ -6,11 +6,15 @@
  *          so the order POST rides a warm connection; one stream leaves 5 of the 6 per-host
  *          connections free).
  *   demo   the simulated venues (sim.js) in this page. No network at all.
- * Mode: file:// or ?demo=1 -> demo; ?live=1 -> live (never falls back); otherwise a 1.5 s
- * GET /api/health probe decides, and no answer means demo (the header says DEMO in amber).
+ * Mode, never switched once chosen: a page the backend served (a non-empty desk-token meta) or
+ * ?live=1 is live; with no token, file:// or ?demo=1 is demo; anything else is live. A live
+ * page with no backend shows SRV DOWN and keeps trying; it never falls back to the simulation.
+ * Live keeps its stream alive: no message for 5 s closes and reopens the EventSource (as does a
+ * page restored from Safari's back-forward cache), and while the stream is down it probes
+ * GET /api/health every 5 s and reopens the stream as soon as the backend answers.
  *
  *   Desk.transport.choose() -> Promise<'demo'|'live'>
- *   Desk.transport.connect(onEnv(env), onState(state, isReconnect))
+ *   Desk.transport.connect(onEnv(env), onState(state, isReconnect))   ('open' on every open)
  *   Desk.transport.snapshot() -> Promise<snapshot>
  *   Desk.transport.post(path, body) -> Promise<{status, json}>   (status 0 = no answer)
  *
@@ -23,13 +27,18 @@
  * Desk.act: every operator action. Each paints its optimistic state into the store first
  * (synchronously, so the next frame shows it), then sends; nothing ever awaits the network
  * before painting.
- *   Desk.act.order({v, tk, side, px (u), qty, tif, ttl_s, exp_ms, reduce_only, override, touch (u)}, ev)
- *     -> cid | null
+ *   Desk.act.order({v, tk, side, px (u), qty, tif, ttl_s, exp_ms, reduce_only, override, touch (u),
+ *                   onReply(r, cid)}, ev) -> cid | null
  *   Desk.act.cancel(cids), Desk.act.cancelWhere({v, tk, own, side, px}), Desk.act.cancelAll(own, v)
- *   Desk.act.amend(cid, {px (u), qty, ttl_s}), Desk.act.lane(id, on), Desk.act.start(), .stop(),
- *   .kill(), .rearm(), .release(v, tk), .transfer(from, to, amt (u)), .resync()
+ *   Desk.act.lane(id, on), Desk.act.start(), .stop(), .kill(), .rearm(), .release(v, tk),
+ *   .transfer(from, to, amt (u)), .resync()
+ *   Desk.act.killing          null, or {at, tries, failed} from the KILL click until the backend
+ *                             confirms it. KILL retries by itself (1, 2 ... 5 s apart) until it
+ *                             lands; new orders stay refused meanwhile (store.killPend).
  *
- * Desk.subs.sync(): subscribe the stream to the ladders on screen plus every market's top.
+ * Desk.subs.sync(): subscribe the stream to the ladders on screen plus every market's top;
+ * Desk.subs.reset() sends it again (every stream open); Desk.subs.check(snap.subs) re-sends it
+ * when a snapshot shows the backend holding something else. A refused subscribe retries in 2 s.
  */
 (function (root) {
   'use strict';
@@ -94,7 +103,12 @@
     });
   }
 
-  function Live(sid) { this.sid = sid; this.es = null; this.opened = false; this.retry = null; this.epoch = null; token.read(); }
+  var SILENT_MS = 5000, PROBE_MS = 5000;
+  function Live(sid) {
+    this.sid = sid; this.es = null; this.opened = false; this.retry = null; this.epoch = null;
+    this.lastMsg = 0; this.wd = null; this.probing = false; this.lastProbe = 0; this.reopens = 0;
+    token.read();
+  }
   Live.prototype.connect = function (onEnv, onState) {
     var self = this;
     var inner = onEnv;
@@ -108,19 +122,43 @@
     };
     var open = function () {
       if (self.es) { try { self.es.close(); } catch (e) { /* closed */ } }
+      self.lastMsg = Date.now();                      // the new socket gets SILENT_MS to say something
       var es = self.es = new EventSource('/api/stream?sid=' + encodeURIComponent(self.sid));
-      es.onopen = function () { onState('open', self.opened); self.opened = true; };
+      es.onopen = function () { if (es !== self.es) return; self.lastMsg = Date.now(); onState('open', self.opened); self.opened = true; };
       es.onerror = function () {
+        if (es !== self.es) return;
         onState(es.readyState === 2 ? 'closed' : 'error', false);
         if (es.readyState === 2 && !self.retry) self.retry = setTimeout(function () { self.retry = null; open(); }, 2000);
       };
       EVENT_TYPES.forEach(function (t) {
         es.addEventListener(t, function (e) {
+          if (es !== self.es) return;
+          self.lastMsg = Date.now();
           var env; try { env = JSON.parse(e.data); } catch (x) { return; }
           onEnv(env);
         });
       });
     };
+    // close and open again: a stream that stopped talking without an error event (a wedged
+    // backend stream, sleep/wake, a page back from the back-forward cache)
+    self.reopen = function () {
+      self.reopens++;
+      if (self.retry) { clearTimeout(self.retry); self.retry = null; }
+      onState('error', false);
+      open();
+    };
+    if (!self.wd) self.wd = setInterval(function () {
+      var now = Date.now(), es = self.es, up = !!es && es.readyState === 1;
+      if (up && now - self.lastMsg > SILENT_MS) { self.reopen(); return; }
+      if (!up && !self.probing && now - self.lastProbe >= PROBE_MS) {
+        self.lastProbe = now; self.probing = true;
+        fetchJSON('GET', '/api/health', undefined, 2000).then(function (r) {
+          self.probing = false;
+          if (r.status === 200 && r.json && r.json.ok === true && !(self.es && self.es.readyState === 1)) self.reopen();
+        });
+      }
+    }, 1000);
+    if (root.addEventListener) root.addEventListener('pageshow', function (e) { if (e && e.persisted) self.reopen(); });
     open();
   };
   Live.prototype.snapshot = function () {
@@ -135,7 +173,7 @@
       return token.refresh().then(function () { return fetchJSON('POST', path, body, 5000); });
     });
   };
-  Live.prototype.close = function () { if (this.es) this.es.close(); };
+  Live.prototype.close = function () { if (this.wd) clearInterval(this.wd); this.wd = null; if (this.es) this.es.close(); };
 
   // ---------------------------------------------------------------------------------------------
   // demo
@@ -170,15 +208,14 @@
     mode: null,
     sid: randomId(8),
     impl: null,
+    // the simulation runs only where no backend can be: a page the backend served is always live
     choose: function () {
       var q = Desk.qs || {};
       var proto = (root.location && root.location.protocol) || 'file:';
       var pick = function (m) { T.mode = m; T.impl = m === 'live' ? new Live(T.sid) : new Demo(T.sid); return m; };
-      if (q.live === '1') return Promise.resolve(pick('live'));
+      if (q.live === '1' || token.read()) return Promise.resolve(pick('live'));
       if (q.demo === '1' || proto === 'file:') return Promise.resolve(pick('demo'));
-      return fetchJSON('GET', '/api/health', undefined, 1500).then(function (r) {
-        return pick(r.status === 200 && r.json && r.json.ok === true && r.json.epoch ? 'live' : 'demo');
-      });
+      return Promise.resolve(pick('live'));
     },
     connect: function (onEnv, onState) { T.impl.connect(onEnv, onState); },
     snapshot: function () { return T.impl.snapshot(); },
@@ -189,26 +226,41 @@
   // ---------------------------------------------------------------------------------------------
   // subscriptions: the ladders on screen at FULL depth, every market's top
   // ---------------------------------------------------------------------------------------------
-  var subTimer = null, lastSub = '';
+  var subTimer = null, subRetry = null, lastSub = '';
+  function wantSubs() {
+    var seen = {}, ladders = [];
+    Desk.layout.ladders().forEach(function (slot) {
+      var k = Desk.focus.ladders[slot];
+      if (k && !seen[k]) { seen[k] = 1; var s = Desk.store.split(k); ladders.push({ v: s.v, tk: s.tk }); }
+    });
+    return { sid: T.sid, ladders: ladders, tops: 'ALL' };
+  }
+  function subKeys(a) { return (a || []).map(function (x) { return x.v + '|' + x.tk; }).sort().join(','); }
+  function sendSubs() {
+    if (!T.impl) return;
+    var body = wantSubs(), sig = JSON.stringify(body);
+    if (sig === lastSub) return;
+    lastSub = sig;
+    T.post('/api/subscribe', body).then(function (r) {
+      if (r.status === 200 && r.json && r.json.ok) return;
+      if (lastSub === sig) lastSub = '';
+      if (!subRetry) subRetry = setTimeout(function () { subRetry = null; Desk.subs.sync(); }, 2000);
+    });
+  }
   Desk.subs = {
     sync: function () {
       if (subTimer) return;
-      subTimer = setTimeout(function () {
-        subTimer = null;
-        if (!T.impl) return;
-        var seen = {}, ladders = [];
-        Desk.layout.ladders().forEach(function (slot) {
-          var k = Desk.focus.ladders[slot];
-          if (k && !seen[k]) { seen[k] = 1; var s = Desk.store.split(k); ladders.push({ v: s.v, tk: s.tk }); }
-        });
-        var body = { sid: T.sid, ladders: ladders, tops: 'ALL' };
-        var sig = JSON.stringify(body);
-        if (sig === lastSub) return;
-        lastSub = sig;
-        T.post('/api/subscribe', body).then(function (r) { if (r.status !== 200) lastSub = ''; });
-      }, 0);
+      subTimer = setTimeout(function () { subTimer = null; sendSubs(); }, 0);
     },
-    reset: function () { lastSub = ''; Desk.subs.sync(); }
+    reset: function () { lastSub = ''; Desk.subs.sync(); },
+    // a snapshot's subs: what the backend holds for this sid; re-send when it is not what we show
+    check: function (subs) {
+      if (!T.impl || !subs) return false;
+      var w = wantSubs();
+      var same = subKeys(subs.ladders) === subKeys(w.ladders) && (subs.tops === 'ALL') === (w.tops === 'ALL');
+      if (!same) Desk.subs.reset();
+      return !same;
+    }
   };
 
   // ---------------------------------------------------------------------------------------------
@@ -229,6 +281,28 @@
     };
   }
 
+  function killSend() {
+    var k = Desk.act.killing;
+    if (!k) return Promise.resolve(null);
+    if (k.timer) { clearTimeout(k.timer); k.timer = null; }
+    k.tries++;
+    return T.post('/api/kill', {}).then(function (r) {
+      if (Desk.act.killing !== k) return r;
+      if (r.json && r.json.ok) {
+        runReply('kill')(r);
+        Desk.act.killing = null; st().killPend = false;
+        Desk.render.mark('hdr'); Desk.render.mark('stale');
+        return r;
+      }
+      var e = (r.json && r.json.err) || { code: 'INTERNAL', msg: 'HTTP ' + r.status };
+      st().localAlert('CRIT', 'KILL', 'KILL not confirmed (' + (r.status === 0 ? 'no answer' : e.code) + ': ' + e.msg + '), retrying');
+      if (!k.failed) { k.failed = true; st().cxlPend(k.cids, false); }
+      Desk.render.mark('hdr');
+      k.timer = setTimeout(killSend, Math.min(5000, 1000 * k.tries));
+      return r;
+    });
+  }
+
   Desk.act = {
     // place an order. o.px and o.touch are in u. Returns the cid, or null if it was not sent.
     order: function (o, ev) {
@@ -242,7 +316,7 @@
       var expMs = o.tif === 'POST' && o.exp_ms ? o.exp_ms : null;
       var ttl = o.tif === 'POST' && !expMs ? (o.ttl_s || 15) : null;
       var tClickMs = Desk.lat.epoch(ev);
-      Desk.lat.click(cid, ev, o.v);
+      Desk.lat.click(cid, ev);
       S.pend({ cid: cid, v: o.v, tk: o.tk, side: o.side, px: o.px, qty: o.qty, tif: o.tif, ttl_s: ttl, exp_ms: expMs,
                touch: o.touch === undefined ? null : o.touch, t_click_ms: tClickMs });
       var body = {
@@ -252,7 +326,10 @@
       };
       if (expMs) body.exp_ms = expMs;
       if (o.reduce_only && o.tif === 'IOC') body.reduce_only = true;
-      T.post('/api/order', body).then(function (r) { S.reply(cid, r.status, r.json); });
+      T.post('/api/order', body).then(function (r) {
+        S.reply(cid, r.status, r.json);
+        if (o.onReply) { try { o.onReply(r, cid); } catch (e) { if (root.console) console.error('[desk order reply]', e); } }
+      });
       return cid;
     },
     cancel: function (cids) {
@@ -279,18 +356,6 @@
       T.post('/api/cancel_all', { own: own, v: v || null }).then(function (r) { if (!(r.json && r.json.ok)) { S.cxlPend(cids, false); failAlert('cancel all', r); } });
       return cids.length;
     },
-    amend: function (cid, a) {
-      var S = st(), o = S.orders.get(cid);
-      if (!o || o.terminal) return false;
-      if (!o.local) o.local = { pend: false, cxlPend: false, amendPend: null, tClick: null, at: Date.now(), acked: true };
-      if (a.px !== null && a.px !== undefined) { o.local.amendPend = a.px; Desk.render.mark('ord'); Desk.render.mark('ord:' + o.key); }
-      T.post('/api/amend', { cid: cid, px: a.px === null || a.px === undefined ? null : N.pxStr(a.px), qty: a.qty === undefined ? null : a.qty, ttl_s: a.ttl_s === undefined ? null : a.ttl_s })
-        .then(function (r) {
-          if (r.json && r.json.ord) S._handlers.ord(r.json.ord, null, false);
-          if (!(r.json && r.json.ok)) { if (o.local) o.local.amendPend = null; Desk.render.mark('ord'); failAlert('amend', r); }
-        });
-      return true;
-    },
     lane: function (id, on) {
       var S = st(), l = S.lanes.get(id);
       if (l) { l.pendOn = !!on; l.pendAt = Date.now(); Desk.render.mark('lane'); }
@@ -301,11 +366,20 @@
     },
     start: function () { return T.post('/api/start', {}).then(runReply('start')); },
     stop: function () { return T.post('/api/stop', {}).then(runReply('stop')); },
+    // KILL paints at once (KILL ... on the button, every working order struck through, new orders
+    // refused) and shows KILLED only when the backend confirms it. A failure says KILL FAIL,
+    // un-strikes the orders it did not cancel, and KILL retries by itself until it lands (it is
+    // idempotent); a click on KILL FAIL retries at once.
+    killing: null,
     kill: function () {
-      var S = st();
-      S.cxlPend(S.working().map(function (o) { return o.cid; }), true);
-      if (S.hdr) { S.hdr.run = { state: 'KILLED', since_ms: Date.now(), rearm_ms: Date.now() + 60000, why: 'operator' }; Desk.render.mark('hdr'); }
-      return T.post('/api/kill', {}).then(runReply('kill'));
+      var S = st(), k = Desk.act.killing;
+      if (k) { if (k.failed) return killSend(); return Promise.resolve(null); }
+      var cids = S.working().map(function (o) { return o.cid; });
+      S.cxlPend(cids, true);
+      Desk.act.killing = { at: Date.now(), tries: 0, failed: false, cids: cids, timer: null };
+      S.killPend = true;
+      Desk.render.mark('hdr'); Desk.render.mark('stale');
+      return killSend();
     },
     rearm: function () { return T.post('/api/rearm', {}).then(runReply('rearm')); },
     release: function (v, tk) { return T.post('/api/release', { v: v, tk: tk }).then(function (r) { if (!(r.json && r.json.ok)) failAlert('release', r); return r; }); },

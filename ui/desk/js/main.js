@@ -1,9 +1,11 @@
 /* ui/desk/js/main.js
  *
  * Boot: restore the per-viewer settings, wire the keys and panel linking, initialise the header
- * and both tabs, pick the transport (demo from file:// or ?demo=1, live with ?live=1, otherwise
- * a health probe), connect the stream, take the snapshot, start the one 250 ms clock. Rendering
- * runs only from requestAnimationFrame when something is dirty.
+ * and both tabs, pick the transport (live when the backend served the page or with ?live=1;
+ * demo from file:// or with ?demo=1), connect the stream, start the one 250 ms clock. Every time
+ * the stream opens (the first time included) the store takes a snapshot and the page sends its
+ * subscription; after every snapshot it re-sends the subscription if the backend's differs.
+ * Rendering runs only from requestAnimationFrame when something is dirty.
  */
 (function (root) {
   'use strict';
@@ -45,11 +47,10 @@
     Desk.transport.choose().then(function (mode) {
       Desk.store.mode = mode;
       Desk.store.fetchSnapshot = function () { return Desk.transport.snapshot(); };
+      Desk.store.onSnapshot = function (snap) { Desk.subs.check(snap.subs); };
       Desk.transport.connect(
         function (env) { Desk.store.apply(env); },
-        function (state, reconnect) { Desk.store.onTransport(state, reconnect); if (state === 'open' && reconnect) Desk.subs.reset(); });
-      Desk.store.resync('BOOT');
-      Desk.subs.reset();
+        function (state, reconnect) { Desk.store.onTransport(state, reconnect); if (state === 'open') Desk.subs.reset(); });
       Desk.render.mark('hdr');
     }, function (e) {
       Desk.store.localAlert('CRIT', 'BOOT', 'transport: ' + (e && e.message));

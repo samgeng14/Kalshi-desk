@@ -55,7 +55,9 @@
 #tab-manual table.lad tr.be.inside > td.px { background: var(--be); }
 
 /* ------------------------------------------------------------------------------------------
-   Watchlist (288 px; 320 px wide): 11 px rows so Market keeps some room
+   Watchlist (288 px; 320 px wide, more when the capped right column leaves it room): 11 px rows
+   so Market keeps some room. F (model fair, purple) and E (ESPN) head their columns with the
+   ladder's marker letters; T and Close start 4 px in so they never touch the column before.
    ------------------------------------------------------------------------------------------ */
 #m-watch:focus { outline: none; }
 #m-watch .ptools button { height: 16px; min-width: 22px; padding: 0 4px; font: 600 10px/1 var(--font-ui); }
@@ -63,8 +65,11 @@
 #tab-manual table.watch th { padding: 0 1px; }
 #tab-manual table.watch th:first-child { padding-left: 4px; }
 #tab-manual table.watch td { padding: 0 2px; font-size: 11px; }
+#tab-manual table.watch td.n { padding: 0 1px; }
 #tab-manual table.watch td.t { padding-left: 3px; font: 11px/1 var(--font-ui); }
-#tab-manual table.watch td.tcl { padding: 0 2px; font: 10px/1 var(--font-num); font-variant-numeric: tabular-nums; color: var(--tx1); }
+#tab-manual table.watch th.tcl { padding-left: 4px; }
+#tab-manual table.watch td.tcl { padding: 0 1px 0 4px; font: 10px/1 var(--font-num); font-variant-numeric: tabular-nums; color: var(--tx1); }
+#tab-manual table.watch th.fair, #tab-manual table.watch th.espn { font-weight: 700; }
 #tab-manual table.watch td.dim { color: var(--tx2); }
 #tab-manual table.watch td.fair { color: var(--fair); }
 #tab-manual table.watch td.espn { color: var(--espn); }

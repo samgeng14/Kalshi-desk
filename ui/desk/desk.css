@@ -17,7 +17,8 @@
   --bg1: #111418;   /* panels */
   --bg2: #171B21;   /* title bars, table headers, inputs */
   --bg3: #1E232B;   /* hover, active tab, pending cell */
-  --sel: #1A2433;   /* selected row */
+  --sel: #1A2433;   /* selected row (the one clicked: with a 2 px bar) */
+  --fmk: #151C26;   /* the focused market's other rows: a tint, no bar */
   --line: #242A33;  /* hairlines */
   --line2: #323A45; /* panel edges, scrollbars */
   /* ink */
@@ -25,8 +26,10 @@
   --tx1: #A2A9B4;   /* labels */
   --tx2: #848D97;   /* tertiary, disabled, stale */
   /* book side (buy blue, sell red) */
-  --bid-tx: #4DA3FF; --bid-cell: #0E2238; --bid-bar: #16304F; --buy: #1F6FEB; --my-buy: #1C4F8F;
-  --ask-tx: #FF5C5C; --ask-cell: #2B1216; --ask-bar: #3A171C; --sell: #C93C37; --my-sell: #7A2328;
+  /* depth bars: raised from the spec's #16304F / #3A171C (1.2:1 on the cell, unreadable) to about
+     2:1, white text still better than 7:1 on them */
+  --bid-tx: #4DA3FF; --bid-cell: #0E2238; --bid-bar: #1E4270; --buy: #1F6FEB; --my-buy: #1C4F8F;
+  --ask-tx: #FF5C5C; --ask-cell: #2B1216; --ask-bar: #55212A; --sell: #C93C37; --my-sell: #7A2328;
   /* direction: P&L, markouts, price-change flashes only */
   --up: #3FB950; --dn: #F85149;
   /* other meanings */
@@ -133,10 +136,13 @@ input:focus { outline: 1px solid var(--tx0); outline-offset: -1px; }
   display: flex; align-items: stretch; height: var(--hdr-h); min-width: 0;
   background: var(--bg0); border-bottom: 1px solid var(--line2); white-space: nowrap; overflow: hidden;
 }
-/* The data cells take their text's width, at least the spec's width from 1400 px up (so the
+/* The data cells take their text's width, at least a floor width from 1400 px up (so the
    header does not jump as numbers change), and may shrink below it (clipping their own text)
    when the window is too narrow; the health cells, the clock and KILL never shrink, so KILL
-   stays on screen at any width. At 1512 px everything fits. */
+   stays on screen at any width. Under 1600 px the sub-values (KAL free, PM free, the DAY split)
+   move to the cells' titles: with Safari's SF Mono and worst-case values (DAY -12.34 split
+   S -10.10 M -2.24, LOSS 21.79/25.00, SYS 141.2/168.7, PM free 88.70) the full header needs
+   about 1555 px. */
 .tabsw { display: flex; flex: 0 0 auto; }
 .tabsw button {
   height: 27px; border: 0; background: transparent; color: var(--tx2); padding: 0 6px;
@@ -152,8 +158,14 @@ body:not([data-split])[data-tab="systematic"] #tab-sys, body:not([data-split])[d
 .tst.up { color: var(--up); } .tst.dn { color: var(--dn); } .tst.dim { color: var(--tx2); }
 .hc { display: flex; align-items: center; gap: 5px; padding: 0 6px; border-left: 1px solid var(--line); flex: 0 1 auto; min-width: 0; overflow: hidden; }
 @media (min-width: 1400px) {
-  #hc-kal { min-width: 150px; } #hc-pm { min-width: 112px; } #hc-day { min-width: 160px; } #hc-risk { min-width: 88px; }
-  #hc-stop { min-width: 124px; } #hc-sys { min-width: 112px; }
+  #hc-kal { min-width: 96px; } #hc-pm { min-width: 96px; } #hc-day { min-width: 100px; } #hc-risk { min-width: 88px; }
+  #hc-stop { min-width: 134px; } #hc-sys { min-width: 128px; }
+}
+@media (min-width: 1600px) {
+  #hc-kal { min-width: 168px; } #hc-pm { min-width: 148px; } #hc-day { min-width: 204px; }
+}
+@media (max-width: 1599px) {
+  #h-kal-free, #h-pm-free, #h-day-split { display: none; }      /* on the cells' titles instead */
 }
 #hc-mode { flex: 0 0 48px; justify-content: center; padding: 0 2px; }
 .hl { font: 10px/1 var(--font-ui); color: var(--tx2); text-transform: uppercase; letter-spacing: .04em; }
@@ -178,11 +190,14 @@ body:not([data-split])[data-tab="systematic"] #tab-sys, body:not([data-split])[d
    so the money cells keep their digits */
 @media (max-width: 1399px) {
   .hclock { display: none; }
-  #h-day-split { display: none; }          /* on the DAY cell's title instead */
   .hh { flex-basis: 56px; width: 56px; font-size: 10px; }
 }
-#kill.locked { background: var(--bg3); color: var(--dn); font: 700 11px/1 var(--font-num); }
-#kill.rearm { background: var(--bg3); color: var(--warn); }
+/* KILL: 'KILL ...' sent, not confirmed; 'KILL FAIL' not confirmed, retrying (a click retries
+   now); 'KILLED 58s' the lockout; RE-ARM, then CONFIRM. 71 px of text room. */
+#kill.pend { background: var(--bg3); color: var(--dn); outline: 1px dotted var(--dn); outline-offset: -3px; }
+#kill.fail { background: var(--crit); color: #fff; font-size: 11px; letter-spacing: 0; outline: 2px solid var(--warn); outline-offset: -2px; }
+#kill.locked { background: var(--bg3); color: var(--dn); font: 700 10px/1 var(--font-num); letter-spacing: 0; }
+#kill.rearm { background: var(--bg3); color: var(--warn); font-size: 11px; letter-spacing: 0; }
 #kill.rearm.confirm { background: var(--warn); color: #000; }
 
 /* ------------------------------------------------------------------------------------------
@@ -211,6 +226,15 @@ body[data-hk="1"] #sb-hk { color: var(--warn); }
   display: none; border-top: 1px solid var(--line2);
 }
 body.log #logdrawer { display: flex; }
+/* the read-only settings drawer (p, or SET in the status bar): three grids side by side */
+#setdrawer {
+  position: fixed; left: 0; right: 0; bottom: var(--sbar-h); height: 300px; z-index: 21;
+  display: none; border-top: 1px solid var(--line2);
+}
+body.set #setdrawer { display: flex; }
+#setdrawer .set-body { display: grid; grid-template-columns: 420px 480px minmax(0, 1fr); gap: 1px; background: var(--bg0); overflow: hidden; }
+#setdrawer .set-col { background: var(--bg1); overflow: auto; min-width: 0; }
+table.set td.lbl { color: var(--tx1); }
 #keysheet { position: fixed; left: 0; right: 0; top: var(--hdr-h); bottom: var(--sbar-h); z-index: 30; display: none; background: rgba(11,13,16,.88); }
 body.keys #keysheet { display: flex; align-items: flex-start; justify-content: center; padding-top: 40px; }
 #keysheet .sheet { width: 640px; max-height: 80%; border: 1px solid var(--line2); }
@@ -220,15 +244,19 @@ table.keys td.kk { font-family: var(--font-num); color: var(--tx0); }
 /* ------------------------------------------------------------------------------------------
    Tab roots: both always mounted; switching is one attribute on <body>
    ------------------------------------------------------------------------------------------ */
+/* The hidden tab keeps its layout (visibility, not display: none): a switch repaints the shown
+   tab instead of laying it out from scratch, which took 25-35 ms with 200 fills. A hidden tab
+   is not painted, hit-tested or focusable, and its renderers are skipped until it shows. */
 main#tabs { position: relative; min-height: 0; min-width: 0; overflow: hidden; }
-.tabroot { display: none; position: absolute; inset: 0; gap: 1px; background: var(--bg0); min-height: 0; }
+.tabroot { display: grid; visibility: hidden; position: absolute; inset: 0; gap: 1px; background: var(--bg0); min-height: 0; }
 .tabroot:focus { outline: none; }        /* focusable (-1) so a click in a SPLIT half takes that tab's keys */
-body[data-tab="systematic"] #tab-systematic { display: grid; }
-body[data-tab="manual"] #tab-manual { display: grid; }
+body[data-tab="systematic"] #tab-systematic { visibility: visible; z-index: 1; }
+body[data-tab="manual"] #tab-manual { visibility: visible; z-index: 1; }
 
-/* SYSTEMATIC: 36 / 164 / lower; lower = 1fr | 607 px; left 250 / rest; right 330 / rest */
+/* SYSTEMATIC: 36 / 164 / lower; lower = 1fr | 607 px (| LOG from 2400 px); left 250 / rest; right 330 / rest */
 #tab-systematic { grid-template-rows: 36px 164px minmax(0, 1fr); grid-template-columns: minmax(0, 1fr); }
 .s-lower { display: grid; grid-template-columns: minmax(0, 1fr) 607px; gap: 1px; min-height: 0; min-width: 0; }
+#s-log { display: none; }
 .s-left { display: grid; grid-template-rows: 250px minmax(0, 1fr); gap: 1px; min-height: 0; min-width: 0; }
 .s-right { display: grid; grid-template-rows: 330px minmax(0, 1fr); gap: 1px; min-height: 0; min-width: 0; }
 
@@ -237,20 +265,24 @@ body[data-tab="manual"] #tab-manual { display: grid; }
 #m-lad-c, #m-lad-d { display: none; }
 .m-right { display: grid; grid-template-rows: 176px 180px 200px minmax(0, 1fr); gap: 1px; min-height: 0; min-width: 0; }
 
-/* WIDE (external monitor, >= 1920 px): a third ladder, a wider watchlist and right column */
+/* WIDE (external monitor, >= 1920 px): a third ladder; the right column stops at 600 px and the
+   watchlist takes what is left (from 420 px it adds Sprd, Vol and Close) */
 @media (min-width: 1920px) {
   :root { --watch-w: 320px; }
-  #tab-manual { grid-template-columns: var(--watch-w) var(--lad-w) var(--lad-w) var(--lad-w) minmax(0, 1fr); }
+  #tab-manual { grid-template-columns: max(var(--watch-w), calc(100% - 3 * var(--lad-w) - 600px - 4px)) var(--lad-w) var(--lad-w) var(--lad-w) minmax(0, 1fr); }
   #m-lad-c { display: flex; }
   .m-right { grid-template-rows: 176px 220px 260px minmax(0, 1fr); }
   .s-lower { grid-template-columns: minmax(0, 1fr) 760px; }
   .s-left { grid-template-rows: 320px minmax(0, 1fr); }
   .s-right { grid-template-rows: 400px minmax(0, 1fr); }
 }
-/* 2400 px and wider: a fourth ladder (the stream carries at most four at full depth) */
+/* 2400 px and wider: a fourth ladder (the stream carries at most four at full depth), and
+   SYSTEMATIC keeps an always-open LOG beside its blotters */
 @media (min-width: 2400px) {
-  #tab-manual { grid-template-columns: var(--watch-w) var(--lad-w) var(--lad-w) var(--lad-w) var(--lad-w) minmax(0, 1fr); }
+  #tab-manual { grid-template-columns: max(var(--watch-w), calc(100% - 4 * var(--lad-w) - 600px - 5px)) var(--lad-w) var(--lad-w) var(--lad-w) var(--lad-w) minmax(0, 1fr); }
   #m-lad-d { display: flex; }
+  body:not([data-split="1"]) .s-lower { grid-template-columns: minmax(0, 1fr) 760px 640px; }
+  body:not([data-split="1"]) #s-log { display: flex; }
 }
 /* NARROW (< 1400 px): one ladder; the right column takes the room */
 @media (max-width: 1399px) {
@@ -260,7 +292,7 @@ body[data-tab="manual"] #tab-manual { display: grid; }
 }
 /* SPLIT (>= 2400 px, operator's choice): SYSTEMATIC left half, MANUAL right half, each laid out
    as a window under 1400 px */
-body[data-split="1"] .tabroot { display: grid; }
+body[data-split="1"] .tabroot { visibility: visible; }
 body[data-split="1"] #tab-systematic { right: calc(50% + 1px); }
 body[data-split="1"] #tab-manual { left: 50%; grid-template-columns: var(--watch-w) var(--lad-w) minmax(0, 1fr); }
 body[data-split="1"] #m-lad-b, body[data-split="1"] #m-lad-c, body[data-split="1"] #m-lad-d { display: none; }
@@ -302,6 +334,7 @@ table.grid th {
   border-bottom: 1px solid var(--line2); white-space: nowrap; overflow: hidden; text-overflow: clip;
 }
 table.grid th.n, table.grid th.r { text-align: right; }
+table.grid th.fair { color: var(--fair); } table.grid th.espn { color: var(--espn); }
 table.grid td {
   height: var(--row); padding: 0 6px; border-bottom: 1px solid var(--line);
   font: 12px/1 var(--font-num); font-variant-numeric: tabular-nums slashed-zero; color: var(--tx0);
@@ -309,13 +342,26 @@ table.grid td {
 }
 table.grid td.n { text-align: right; }
 table.grid td.t { font-family: var(--font-ui); }          /* text cells in the label face */
+/* meaning colours inside grids: 'table.grid td' (0,1,2) sets the ink, so a bare .up (0,1,0)
+   would never show; these sit after it and before the thin, row-state and stale rules, which
+   still win (n < 30 grey, CXL/REJ/PEND rows, STALE) */
+table.grid td.up { color: var(--up); } table.grid td.dn { color: var(--dn); }
+table.grid td.dim { color: var(--tx2); }
+table.grid td.bid { color: var(--bid-tx); } table.grid td.ask { color: var(--ask-tx); }
+table.grid td.warn { color: var(--warn); }
+table.grid td.fair { color: var(--fair); } table.grid td.espn { color: var(--espn); }
+table.grid td.lbl { color: var(--tx1); }
+table.grid td.st-FILL { font-weight: 700; } table.grid td.st-REJ { color: var(--dn); }
+table.grid td.st-PEND, table.grid td.st-CXL, table.grid td.st-EXP { color: var(--tx2); }
 table.grid tbody tr { cursor: default; }
 table.grid tbody tr[data-mkt] { cursor: pointer; }
 table.grid tbody tr:hover > td { background: var(--bg3); }
+table.grid tr.fmk > td { background: var(--fmk); }
 table.grid tr.sel > td { background: var(--sel); }
 table.grid tr.sel > td:first-child { box-shadow: inset 2px 0 0 var(--tx0); }
 table.grid tr.none > td { color: var(--tx2); text-align: left; }
 table.grid tr.grp > td { color: var(--tx1); font-weight: 700; background: var(--bg1); }
+table.grid tr.grp > td.up { color: var(--up); } table.grid tr.grp > td.dn { color: var(--dn); }
 table.grid tr.total > td { font-weight: 700; border-top: 1px solid var(--line2); }
 table.grid td.x { padding: 0; text-align: center; color: var(--tx2); cursor: pointer; }
 table.grid td.x:hover { color: var(--tx0); background: var(--crit); }

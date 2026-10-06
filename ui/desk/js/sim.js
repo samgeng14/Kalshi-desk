@@ -23,7 +23,8 @@
  *
  * What is simulated:
  *  - Kalshi 15-minute LIP windows (copper, platinum, palladium, natgas, EURUSD, GBPUSD, USDJPY):
- *    fee-free, one market per series, rolled every 15 minutes, fair = Phi(ln(S/S0)/(sigma sqrt tau)).
+ *    fee type QUAD (takers pay, makers free), one market per series, rolled every 15 minutes,
+ *    fair = Phi(ln(S/S0)/(sigma sqrt tau)).
  *  - Kalshi daily high-temperature brackets (4 cities today, 2 tomorrow), 6 brackets each.
  *  - Thin college football games on Kalshi (one market per team) and Polymarket US (one market per
  *    game), with a game clock, scores, a win-probability model, ESPN ~41 s behind, and a model
@@ -33,7 +34,8 @@
  *  - A matching engine for our orders: IOC/FOK never rest, POST never crosses (PostOnlyCross
  *    cancel), rests with queue position, fills when prints or the market trade through it,
  *    expires at its deadline; cancel, amend, kill; self-trade prevention.
- *  - Positions netted per market, cash per Kalshi shard, Kalshi and Polymarket fees by formula,
+ *  - Positions netted per market, cash per Kalshi shard (reservations by Desk.risk, the contract's
+ *    rule), order revisions (rev), Kalshi and Polymarket fees by formula,
  *    markouts at 1/10/60 s and settlement, the 70% Systematic ceiling, a daily cost budget, the
  *    daily stop, lanes that trade when Start is pressed, LIP reward accrual, ~40-80 ms acks on
  *    Kalshi and ~80-150 ms on Polymarket.
@@ -46,6 +48,7 @@
   var MON3 = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
   var ET = 4 * 3600000;                 // EDT (the demo assumes UTC-4)
   var Q15 = 15 * 60000;
+  var SNAP_FILLS = 5000;                // fills in a snapshot (contract: the newest 5000)
 
   var GRID_LINEAR = [{ start: '0.0000', end: '1.0000', step: '0.0100' }];
   var GRID_TAPERED = [{ start: '0.0000', end: '0.1000', step: '0.0010' }, { start: '0.1000', end: '0.9000', step: '0.0100' },
@@ -95,11 +98,7 @@
       return ((t ^ t >>> 14) >>> 0) / 4294967296;
     };
   }
-  function ncdf(x) {
-    var t = 1 / (1 + 0.2316419 * Math.abs(x)), d = 0.3989422804014327 * Math.exp(-x * x / 2);
-    var p = d * t * (0.319381530 + t * (-0.356563782 + t * (1.781477937 + t * (-1.821255978 + t * 1.330274429))));
-    return x > 0 ? 1 - p : p;
-  }
+  function ncdf(x) { return Desk.num.ncdf(x); }
   function pad2(n) { return n < 10 ? '0' + n : '' + n; }
   function etD(ms) { return new Date(ms - ET); }
   function evDate(ms) { var d = etD(ms); return String(d.getUTCFullYear()).slice(2) + MONTHS[d.getUTCMonth()] + pad2(d.getUTCDate()); }
@@ -114,7 +113,7 @@
 
   function create(opts) {
     opts = opts || {};
-    var N = Desk.num, G = Desk.grid, FEES = Desk.fees, C = Desk.contract;
+    var N = Desk.num, G = Desk.grid, FEES = Desk.fees, C = Desk.contract, RISK = Desk.risk;
     var clock = opts.now || function () { return Date.now(); };
     var rnd = mulberry32((opts.seed >>> 0) || 20261006);
     var out = opts.emit || function () {};
@@ -179,10 +178,18 @@
     // ------------------------------------------------------------------------------------------
     // timers
     // ------------------------------------------------------------------------------------------
+    // the browser loop (start) sleeps until the next timer or world tick; a timer due sooner than
+    // that wakes it, so a reply due in 2 ms is not held to the next 100 ms tick
+    var loopTimer = null, running = false, wakeAt = Infinity;
     function at(due, fn) {
       var t = { due: due, fn: fn }, a = S.timers, lo = 0, hi = a.length;
       while (lo < hi) { var mid = (lo + hi) >> 1; if (a[mid].due <= due) lo = mid + 1; else hi = mid; }
       a.splice(lo, 0, t);
+      if (running && due < wakeAt) {
+        if (loopTimer) clearTimeout(loopTimer);
+        wakeAt = due;
+        loopTimer = setTimeout(loop, Math.max(0, due - clock()));
+      }
     }
     function latency(v) { return Math.round(v === 'P' ? R(80, 150) : R(40, 80)); }
 
@@ -481,15 +488,21 @@
       if (m && m.ref.fair !== null && m.ref.fair !== undefined) o.edge = Math.round((m.ref.fair - o.px) * (o.side === 'BUY' ? 1 : -1));
       return o;
     }
+    // every record of an order goes through here: rev counts the changes (the same state always
+    // carries the same rev), so the page can order the stream against the HTTP replies
     function ordData(o) {
       var resting = o.st === 'WORK' || o.st === 'PART';
-      return {
+      var d = {
         cid: o.cid, oid: o.oid, v: o.v, tk: o.tk, side: o.side, px: pxs(o.px), qty: r2(o.qty), filled: r2(o.filled),
         left: r2(o.left), avg: o.filled > 0 ? pxs(o.avgNum / o.filled) : null, tif: o.tif, exp_ms: o.exp_ms,
         st: o.st, why: o.why, own: o.own, lane: o.lane, piq: resting ? r2(o.ahead) : null, fee: ms(o.fee),
         touch: o.touch === null ? null : pxs(o.touch), edge: o.edge === null ? null : ms(o.edge),
-        t: { click: o.t.click, recv: o.t.recv, sent: o.t.sent, ack: o.t.ack, done: o.t.done }
+        t: { click: o.t.click, recv: o.t.recv, sent: o.t.sent, ack: o.t.ack, done: o.t.done }, rev: 0
       };
+      var sig = [d.oid, d.px, d.qty, d.filled, d.left, d.avg, d.exp_ms, d.st, d.why, d.piq, d.fee, d.t.sent, d.t.ack, d.t.done].join('|');
+      if (sig !== o.revSig) { o.revSig = sig; o.rev = (o.rev || 0) + 1; }
+      d.rev = o.rev;
+      return d;
     }
     function fillData(f) {
       return { fid: f.fid, cid: f.cid, oid: f.oid, v: f.v, tk: f.tk, side: f.side, px: pxs(f.px), qty: f.qty, liq: f.liq,
@@ -509,14 +522,20 @@
     function httpOf(code) { return C.errors[code] ? C.errors[code].http : 500; }
 
     function posOf(key) { var P = S.pos.get(key); return P ? P.pos : 0; }
-    function reserveU(side, px, qty, pos) {
-      if (side === 'BUY') return Math.max(0, qty - Math.max(0, -pos)) * px;
-      return Math.max(0, qty - Math.max(0, pos)) * (U - px);
+    // reservations by the contract's rule (Desk.risk): a set of live orders, summed over markets
+    function reserved(pred) {
+      var list = []; S.live.forEach(function (o) { if (!pred || pred(o)) list.push(o); });
+      var tot = 0; RISK.byMarket(list, posOf).forEach(function (u) { tot += u; });
+      return tot;
+    }
+    // what one more order adds to its market's reservation, given the orders already there
+    function addedReserve(key, side, px, qty, pred) {
+      var list = []; S.live.forEach(function (o) { if (o.key === key && (!pred || pred(o))) list.push(o); });
+      var before = RISK.market(list, posOf(key));
+      return RISK.market(list.concat([{ side: side, px: px, left: qty }]), posOf(key)) - before;
     }
     function freeOf(shard) {
-      var res = 0;
-      S.live.forEach(function (o) { var m = S.markets.get(o.key); if (m && (m.shard || 'PM') === shard) res += reserveU(o.side, o.px, o.left, posOf(o.key)); });
-      return S.cash[shard] - res;
+      return S.cash[shard] - reserved(function (o) { var m = S.markets.get(o.key); return !!m && (m.shard || 'PM') === shard; });
     }
     function checkOrder(req, own, m, now) {
       if (!m) return err('UNKNOWN_MARKET', req.v + '|' + req.tk);
@@ -540,9 +559,12 @@
         else { var bb = bestLevel(m, 'BUY'); if (bb !== null && px < G.step(m.g, bb, -2)) return err('PRICE_BAND', 'SELL ' + req.px + ' is ' + G.ticks(m.g, px, bb) + ' ticks through bid ' + N.pxStr(bb) + ' (max 2)'); }
       }
       var shard = m.shard || 'PM';
-      var need = reserveU(req.side, px, req.qty, posOf(m.key)) + Math.max(0, FEES.estimate(m.v, m.fee, req.side, px, req.qty, 'T'));
+      var need = addedReserve(m.key, req.side, px, req.qty) + Math.max(0, FEES.estimate(m.v, m.fee, req.side, px, req.qty, 'T'));
       if (need > freeOf(shard)) return err(m.v === 'K' ? 'SHARD_CASH' : 'NO_CASH', 'needs ' + N.moneyStr(need) + ', ' + shard + ' free ' + N.moneyStr(freeOf(shard)));
-      if (own === 'SYS') { var cl = ceilings(); if (cl[m.v].used + need > cl[m.v].eff) return err('SYS_CEILING', 'systematic ceiling'); }
+      if (own === 'SYS') {
+        var cl = ceilings(), sysAdd = addedReserve(m.key, req.side, px, req.qty, function (o) { return o.own === 'SYS'; });
+        if (cl[m.v].used + sysAdd > cl[m.v].eff) return err('SYS_CEILING', 'systematic ceiling');
+      }
       return null;
     }
     function reply2(reply, status, json, delay) { if (reply) at(clock() + (delay || 2), function () { reply(status, json); }); }
@@ -901,8 +923,8 @@
       var out2 = { K: { used: 0, ceiling: 0, eff: 0 }, P: { used: 0, ceiling: 0, eff: 0 } };
       var open = groupLoss(function () { return true; }, true), sysOpen = groupLoss(function (P) { return !!P.own.SYS; }, true);
       var openK = open.K, openP = open.P;
-      out2.K.used = sysOpen.K; out2.P.used = sysOpen.P;
-      S.live.forEach(function (o) { if (o.own === 'SYS') out2[o.v].used += reserveU(o.side, o.px, o.left, posOf(o.key)); });
+      out2.K.used = sysOpen.K + reserved(function (o) { return o.own === 'SYS' && o.v === 'K'; });
+      out2.P.used = sysOpen.P + reserved(function (o) { return o.own === 'SYS' && o.v === 'P'; });
       var cashK = S.cash.S0 + S.cash.S1 + S.cash.S2 + S.cash.S3;
       var freeK = freeOf('S0') + freeOf('S1') + freeOf('S2') + freeOf('S3'), freeP = freeOf('PM');
       out2.K.ceiling = 0.7 * (cashK + openK); out2.P.ceiling = 0.7 * (S.cash.PM + openP);
@@ -911,8 +933,8 @@
       return out2;
     }
     function laneUse(L) {
-      var used = 0, unrl = 0, wrk = 0;
-      S.live.forEach(function (o) { if (o.lane === L.id) { used += reserveU(o.side, o.px, o.left, posOf(o.key)); wrk++; } });
+      var used = reserved(function (o) { return o.lane === L.id; }), unrl = 0, wrk = 0;
+      S.live.forEach(function (o) { if (o.lane === L.id) wrk++; });
       var mine = function (P) { return P.lane === L.id && !!P.own.SYS; };
       S.pos.forEach(function (P) { if (P.pos && mine(P)) unrl += posMath(P, S.markets.get(P.key)).unrl; });
       var open = groupLoss(mine, false).all;
@@ -925,11 +947,11 @@
     }
     function laneSubmit(L, m, side, pxU, qty, tif, ttl, touch) {
       if (pxU === null || !(qty > 0)) return null;
-      var res = reserveU(side, pxU, qty, posOf(m.key));
+      var res = addedReserve(m.key, side, pxU, qty, function (o) { return o.lane === L.id; });
       var u = laneUse(L), cl = ceilings();
       if (u.used + res > L.budgetU) { L.capHit = 'budget ' + (u.used / U).toFixed(2) + '/' + (L.budgetU / U).toFixed(2); return null; }
       if (cl[m.v].used + res > cl[m.v].eff) { L.capHit = 'ceiling ' + m.v + ' ' + (cl[m.v].used / U).toFixed(2) + '/' + (cl[m.v].eff / U).toFixed(2); return null; }
-      if (res + Math.max(0, FEES.estimate(m.v, m.fee, side, pxU, qty, 'T')) > freeOf(m.shard || 'PM')) { L.capHit = 'shard ' + (m.shard || 'PM') + ' cash'; return null; }
+      if (addedReserve(m.key, side, pxU, qty) + Math.max(0, FEES.estimate(m.v, m.fee, side, pxU, qty, 'T')) > freeOf(m.shard || 'PM')) { L.capHit = 'shard ' + (m.shard || 'PM') + ' cash'; return null; }
       var req = { cid: 'S' + L.id + '-' + EPS + '-' + (++S.cidN).toString(36), v: m.v, tk: m.tk, side: side, px: N.pxStr(pxU),
                   qty: r2(qty), tif: tif, ttl_s: tif === 'POST' ? ttl : null, override: false, touch: touch === null || touch === undefined ? null : N.pxStr(touch), t_click_ms: null };
       return submit(req, 'SYS', L.id, null);
@@ -1002,7 +1024,7 @@
             side = 'SELL'; px = baO;
             if (bbO !== null && G.ticks(m.g, bbO, baO) >= 2 && G.step(m.g, baO, -1) >= 100) px = G.step(m.g, baO, -1);
           }
-          if (side && groupWorst(m.og) - reserveU(side, px, 5, posOf(m.key)) < -150000) side = null;
+          if (side && groupWorst(m.og) - RISK.one(side, px, 5, side === 'BUY' ? -posOf(m.key) : posOf(m.key)) < -150000) side = null;
           if (side) n++;
           manage(L, m, 'BUY', side === 'BUY' ? px : null, mine.BUY, 5, 60, now);
           manage(L, m, 'SELL', side === 'SELL' ? px : null, mine.SELL, 5, 60, now);
@@ -1165,12 +1187,11 @@
       ];
     }
     function hdrData() {
-      var cl = ceilings(), unrlMan = 0, unrlSys = 0, risk = groupLoss(function () { return true; }, false).all, manW = 0;
+      var cl = ceilings(), unrlMan = 0, unrlSys = 0, risk = groupLoss(function () { return true; }, false).all + reserved(null);
       S.pos.forEach(function (P) {
         if (!P.pos) return; var x = posMath(P, S.markets.get(P.key));
         if (P.own.SYS && !P.own.MAN) unrlSys += x.unrl; else unrlMan += x.unrl;
       });
-      S.live.forEach(function (o) { risk += reserveU(o.side, o.px, o.left, posOf(o.key)); if (o.own === 'MAN') manW++; });
       var sys = S.realBy.SYS + unrlSys + S.lipU, man = S.realBy.MAN + unrlMan;
       var left = S.stopLimitU + Math.min(0, sys);
       var shards = ['S0', 'S1', 'S2', 'S3'].map(function (s) { return { id: s, cash: ms(S.cash[s]), free: ms(freeOf(s)) }; });
@@ -1187,7 +1208,6 @@
         cost: { used: ms(S.costU), budget: ms(S.costBudgetU) },
         run: { state: S.run.state, since_ms: S.run.since_ms, rearm_ms: S.run.rearm_ms, why: S.run.why },
         preflight: preflight(),
-        man_working: manW,
         lat: { kx_lag_ms: S.feeds.KX.up ? S.lat.kx : null, pm_lag_ms: S.feeds.PM.up && !S.pmRO ? S.lat.pm : null,
                gw_ack_ms: gw === null ? null : Math.round(gw), clk_off_ms: S.lat.clk }
       };
@@ -1320,13 +1340,17 @@
       var mkts = [];
       S.markets.forEach(function (m) { mkts.push(mktData(m)); });
       var pos = []; S.pos.forEach(function (P) { pos.push(posData(P)); });
+      // the newest 5000 fills (the page keeps no more) and only their markouts
+      var fl = S.fills.filter(function (f) { return f.emitted; }).slice(-SNAP_FILLS), fids = new Set();
+      fl.forEach(function (f) { fids.add(f.fid); });
       return {
         epoch: S.epoch, sid: S.sid, seq: S.seq, srv_ms: now, hdr: hdrData(), markets: mkts, books: books, orders: orders,
-        fills: S.fills.filter(function (f) { return f.emitted; }).map(fillData), mos: S.mos.slice(), pos: pos,
+        fills: fl.map(fillData), mos: S.mos.filter(function (x) { return fids.has(x.fid); }), pos: pos,
         lanes: S.lanes.map(laneData), risk: riskData(), alerts: S.alerts.slice(-200), feeds: feedsData(),
         subs: { ladders: S.subs.ladders.slice(), tops: S.subs.tops === 'ALL' ? 'ALL' : S.subs.tops.slice() }
       };
     }
+    function sidOf(path) { var m = /[?&]sid=([^&]*)/.exec(String(path)); return m ? decodeURIComponent(m[1]) : ''; }
     function runResp(n) { return { ok: true, run: { state: S.run.state, since_ms: S.run.since_ms, rearm_ms: S.run.rearm_ms, why: S.run.why }, n: n || 0 }; }
     function request(method, path, body, reply, hdrs) {
       reply = reply || function () {};
@@ -1341,9 +1365,12 @@
       }
       var L, n;
       switch (key) {
-        case 'GET /api/snapshot': reply2(reply, 200, snapshot(), 3); return;
+        case 'GET /api/snapshot':
+          if (sidOf(path) !== S.sid) { reply2(reply, 409, { ok: false, err: err('BAD_STATE', 'no open stream for sid ' + sidOf(path)) }); return; }
+          reply2(reply, 200, snapshot(), 3); return;
         case 'GET /api/health': reply2(reply, 200, { ok: true, epoch: S.epoch, srv_ms: now }, 1); return;
         case 'POST /api/subscribe':
+          if (body.sid !== S.sid) { reply2(reply, 409, { ok: false, err: err('BAD_STATE', 'no open stream for sid ' + body.sid) }); return; }
           var before = {}; S.markets.forEach(function (m) { before[m.key] = depthOf(m); });
           S.subs = { ladders: body.ladders.slice(0, 4), tops: body.tops === 'ALL' ? 'ALL' : body.tops.slice() };
           S.markets.forEach(function (m) { var d = depthOf(m); if (d && d !== before[m.key]) S.forceBook.add(m.key); });
@@ -1375,7 +1402,7 @@
           at(now + Math.round(R(8, 20)), function () {
             var now2 = clock();
             L.on = body.on;
-            if (!L.on) cancelWhere(function (o) { return o.lane === L.id; }, 'STOP');
+            if (!L.on) cancelWhere(function (o) { return o.lane === L.id; }, 'LANE_OFF');
             var s = laneState(L, now2); L.state = s.st; L.why = s.why;
             var ld = laneData(L); L.lastJson = JSON.stringify(ld); emit('lane', ld);
             alert('INFO', L.id, L.on ? 'lane on' : 'lane off');
@@ -1439,6 +1466,7 @@
       if (body.px !== null && !G.onGrid(m.g, N.px(body.px))) { reply2(reply, 400, { ok: false, err: err('OFF_GRID', body.px), ord: ordData(o) }); return; }
       if (body.qty !== null && (!(body.qty > o.filled) || (m.v === 'P' && body.qty % 1 !== 0))) { reply2(reply, 400, { ok: false, err: err('BAD_QTY', 'qty ' + body.qty), ord: ordData(o) }); return; }
       if (S.run.state === 'KILLED') { reply2(reply, 409, { ok: false, err: err('KILLED', 'kill lockout'), ord: ordData(o) }); return; }
+      if (m.v === 'K' ? (!S.feeds.KXP.up || !S.feeds.KX.up || S.feeds.KX.gap) : !S.feeds.PM.up) { reply2(reply, 409, { ok: false, err: err('STALE', 'feed down'), ord: ordData(o) }); return; }
       at(clock() + latency(o.v), function () {
         var now = clock();
         if (o.st !== 'WORK' && o.st !== 'PART') { reply(409, { ok: false, err: err('BAD_STATE', o.cid + ' is ' + o.st), ord: ordData(o) }); return; }
@@ -1464,11 +1492,12 @@
       if (now >= S.nextTick) { S.nextTick = now + 100 - ((now - S.nextTick) % 100); tick(now); }
     }
     function nextDue() { return Math.min(S.timers.length ? S.timers[0].due : Infinity, S.nextTick); }
-    var loopTimer = null, running = false;
     function loop() {
       if (!running) return;
+      loopTimer = null; wakeAt = Infinity;
       pump();
       var wait = Math.max(1, Math.min(250, nextDue() - clock()));
+      wakeAt = clock() + wait;
       loopTimer = setTimeout(loop, wait);
     }
 
@@ -1497,7 +1526,7 @@
       pump: pump,
       nextDue: nextDue,
       start: function () { if (!running) { running = true; loop(); } },
-      stop: function () { running = false; if (loopTimer) clearTimeout(loopTimer); loopTimer = null; },
+      stop: function () { running = false; if (loopTimer) clearTimeout(loopTimer); loopTimer = null; wakeAt = Infinity; },
       dropNext: function () { S.drop = true; },
       setFeed: function (name, up) { if (S.feeds[name]) { S.feeds[name].up = !!up; alert(up ? 'INFO' : 'CRIT', name, up ? 'feed up' : 'feed down'); } },
       market: function (key) { return S.markets.get(key); },

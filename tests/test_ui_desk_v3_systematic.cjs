@@ -341,8 +341,8 @@ function bootPage(opts) {
   eq(start.disabled, false, 'START is enabled when stopped and every check passes');
   eq(stop.disabled, true, 'STOP is disabled with nothing to stop');
   const plan = P.text($('s-plan'));
-  check(/^budget 70% K \d+\.\d\d P \d+\.\d\d \| used \d+\.\d\d \| cost \d+\.\d\d\/4\.80 \| P\(stop\) \d+% \| stop 25\.00\/25\.00 \| floor 150\.00 eq \d+\.\d\d$/.test(plan),
-    'plan line: budget 70% K P | used | cost used/budget | P(stop) | stop | floor', plan);
+  check(/^budget 70% K \d+\.\d\d P \d+\.\d\d \| used \d+\.\d\d \| cost \d+\.\d\d\/4\.80 \| P\(stop\) \d+% \| loss 25\.00\/25\.00$/.test(plan),
+    'plan line: budget 70% K P | used | cost used/budget | P(stop) | loss (the daily loss stop); the floor is on the risk summary', plan);
   const ceilK = D.store.hdr.sys.K.ceiling;
   check(plan.indexOf(' K ' + D.fmt.money(ceilK)) > 0, 'plan shows Kalshi\'s 70% ceiling', [plan, ceilK]);
   check(P.doc.innerHTMLWrites === 0, 'nothing writes innerHTML');
@@ -352,15 +352,18 @@ function bootPage(opts) {
   eq(lanes.length, 6, 'lanes grid: 5 lanes + TOTAL');
   eq(lanes[5].className, 'total', 'the last row is TOTAL, bold');
   const LH = P.heads('s-lanes-body');
-  ['Lane', 'State', 'Budget', 'Used', 'Wrk', 'Fills', 'Ctrs', 'Pred', 'Rlzd', 'MO10', 'MO60', 'Fees', 'P&L', 'LIP', 'Reason'].forEach(h =>
+  ['Lane', 'State', 'On', 'Budget', 'Used', 'Wrk', 'Fills', 'Ctrs', 'Pred\u00a2', 'Rlzd\u00a2', 'MO10\u00a2', 'MO60\u00a2', 'Fees', 'P&L', 'LIP', 'Day', 'Last', 'Reason'].forEach(h =>
     check(LH.indexOf(h) >= 0, 'lanes grid has a ' + h + ' column at 1512 px', LH));
-  check(LH.indexOf('Style') < 0 && LH.indexOf('Last') < 0, 'WIDE-only lane columns are hidden at 1512 px', LH);
+  check(LH.indexOf('Style') < 0 && LH.indexOf('Unrl') < 0 && LH.indexOf('Thr\u00a2') < 0, 'WIDE-only lane columns are hidden at 1512 px', LH);
+  eq(LH.indexOf('On'), LH.indexOf('State') + 1, 'the lane toggle sits next to State');
   const laneRow = id => P.rows('s-lanes-body').find(r => r.getAttribute('data-lane') === id);
-  const tgOf = id => laneRow(id)._children[P.heads('s-lanes-body').length - 2];
-  const klOf = id => laneRow(id)._children[P.heads('s-lanes-body').length - 1];
+  const tgOf = id => laneRow(id)._children.find(c => /\btg\b/.test(c.className));
+  const klOf = id => laneRow(id)._children.find(c => /\bkl\b/.test(c.className));
   eq(tgOf('M1').textContent, 'ON', 'M1 toggle reads ON');
   eq(tgOf('X1').textContent, 'OFF', 'X1 (the ESPN experiment) starts OFF');
-  eq(P.cell(laneRow('M1'), 'State', 's-lanes-body').textContent, 'OFF', 'a lane reads OFF while Systematic is stopped');
+  eq(P.cell(laneRow('M1'), 'State', 's-lanes-body').textContent, 'IDLE', 'a lane switched on reads IDLE while Systematic is stopped (not OFF)');
+  eq(P.cell(laneRow('X1'), 'State', 's-lanes-body').textContent, 'OFF', 'a lane switched off reads OFF');
+  check(klOf('M1').className === 'kl' && klOf('X1').className === 'kl dis', 'the lane KILL is grey at rest (red only with live orders)', [klOf('M1').className, klOf('X1').className]);
   eq(P.text($('s-lanes-tools')), 'ON 4/5', 'lanes title counts lanes switched on');
 
   // ---- START: pending paints on the next frame, before the venue answers
@@ -384,7 +387,11 @@ function bootPage(opts) {
   lanes = P.rows('s-lanes-body');
   check(/^\d+$/.test(P.cell(laneRow('M1'), 'Fills', 's-lanes-body').textContent) && +P.cell(laneRow('M1'), 'Fills', 's-lanes-body').textContent === S.lanes.get('M1').fills,
     'lane Fills column shows the lane\'s fills');
-  eq(P.cell(laneRow('M1'), 'State', 's-lanes-body').textContent, S.lanes.get('M1').state, 'lane State follows the backend');
+  eq(P.cell(laneRow('M1'), 'State', 's-lanes-body').textContent, S.lanes.get('M1').state, 'lane State follows the backend while running');
+  {
+    const busyLane = ['M1', 'M2'].find(id => S.working(o => o.own === 'SYS' && o.lane === id).length);
+    if (busyLane) check(/\blive\b/.test(klOf(busyLane).className), 'a lane with live orders shows its KILL red', klOf(busyLane).className);
+  }
   const tot = lanes[5];
   const sumFills = [...S.lanes.values()].reduce((x, l) => x + l.fills, 0);
   eq(P.cell(tot, 'Fills', 's-lanes-body').textContent, String(sumFills), 'TOTAL sums the lanes\' fills');
@@ -402,18 +409,20 @@ function bootPage(opts) {
   check(workRows().every(r => S.orders.get(r.dataset.k).own === 'SYS'), 'WORKING lists only Systematic orders');
   check(workRows().every(r => r.getAttribute('data-mkt') && r.getAttribute('data-v')), 'working rows carry data-mkt and data-v');
   const WH = P.heads('s-work-body');
-  eq(WH.join('|'), 'Time|Lane|Market|Side|Px|Qty|Left|PIQ|TTL|Edge|St|', 'WORKING columns at 1512 px follow the spec');
+  eq(WH.join('|'), 'Time|Lane|Market|Side|Px|Qty|Left|PIQ|TTL|Edge\u00a2|St|', 'WORKING columns at 1512 px follow the spec (cents marked)');
+  check(workRows().every(r => { const o = S.orders.get(r.dataset.k); return !o.terminal || !(o.st === 'FILL' || o.st === 'EXP' || (o.st === 'CXL' && (o.why === 'PULL' || o.why === 'MARKET_CLOSED'))); }),
+    'WORKING drops routine endings at once (requote pulls, expiries, fills)');
   // fills: systematic only, newest first
   const fillRows = () => P.rows('s-fills-body').filter(r => r.className !== 'none' && r.className.indexOf('none') < 0);
   check(fillRows().length === Math.min(200, S.fills.filter(f => f.own === 'SYS').length), 'FILLS lists the Systematic fills', fillRows().length);
   check(fillRows().every(r => S.fillIdx.get(r.dataset.k).own === 'SYS'), 'FILLS lists only Systematic fills');
-  eq(P.heads('s-fills-body').join('|'), 'Time|Lane|Market|Side|Px|Qty|Liq|Fee|Fair|Edge|MO10|MO60|Real', 'FILLS columns at 1512 px follow the spec');
+  eq(P.heads('s-fills-body').join('|'), 'Time|Lane|Market|Side|Px|Qty|Liq|Fee|Fair|Edge\u00a2|MO10\u00a2|MO60\u00a2|Real', 'FILLS columns at 1512 px follow the spec (cents marked)');
   const f0 = S.fillIdx.get(fillRows()[0].dataset.k), f1 = S.fillIdx.get(fillRows()[fillRows().length - 1].dataset.k);
   check(f0.ts_ms >= f1.ts_ms, 'FILLS newest first');
   const matured = fillRows().map(r => S.fillIdx.get(r.dataset.k)).find(f => f.mo['10s'] !== undefined);
   if (matured) {
     const r = fillRows().find(x => x.dataset.k === matured.fid);
-    eq(P.cell(r, 'MO10', 's-fills-body').textContent, D.fmt.cents(matured.mo['10s']), 'a matured MO10 shows signed cents');
+    eq(P.cell(r, 'MO10\u00a2', 's-fills-body').textContent, D.fmt.cents(matured.mo['10s']), 'a matured MO10 shows signed cents');
   }
   // markouts: one row per lane, ALL, then recent fills
   const moRows = P.rows('s-mo-body');
@@ -426,20 +435,27 @@ function bootPage(opts) {
   // risk book: groups by outcome, members, total; cash footer
   const riskRows = P.rows('s-risk-body');
   const grpRows = riskRows.filter(r => r.className === 'grp');
-  eq(grpRows.length, S.risk.groups.length, 'one group row per real-world outcome');
+  const multi = S.risk.groups.filter(g => g.members.length > 1), single = S.risk.groups.filter(g => g.members.length === 1);
+  eq(grpRows.length, multi.length, 'a group header only for an outcome with two or more markets');
+  eq(riskRows.filter(r => /^solo/.test(r.className)).length, single.length, 'a one-market outcome is one row');
   if (S.risk.groups.length) {
-    const g = S.risk.groups[0];
-    eq(P.cell(grpRows[0], 'MaxL', 's-risk-body').textContent, D.fmt.money(Math.max(0, -g.worst)), 'a group row shows its worst-case loss');
     check(riskRows[riskRows.length - 1].className === 'total', 'the risk book ends with TOTAL');
-    const mem = riskRows.find(r => r.className.indexOf('mem') === 0);
-    const p = S.position(mem.getAttribute('data-mkt'));
-    eq(P.cell(mem, 'Pos', 's-risk-body').textContent, D.fmt.ssize(p.pos), 'a member row shows its signed position');
+    const one = riskRows.find(r => /^(solo|mem)/.test(r.className));
+    const p = S.position(one.getAttribute('data-mkt'));
+    eq(P.cell(one, 'Pos', 's-risk-body').textContent, D.fmt.ssize(p.pos), 'a market row shows its signed position');
+    if (single.length) {
+      const g = single[0], row = riskRows.find(r => /^solo/.test(r.className) && r.getAttribute('data-mkt') === g.members[0]);
+      const mm = S.market(g.members[0]);
+      check(row && P.cell(row, 'Outcome / Market', 's-risk-body').textContent === (mm ? mm.short : g.name) && P.cell(row, 'MaxL', 's-risk-body').textContent === D.fmt.money(Math.max(0, -g.worst)),
+        'it carries the market\'s label and the group\'s worst case', row && row._children.map(c => c.textContent));
+    }
+    if (multi.length) eq(P.cell(grpRows[0], 'MaxL', 's-risk-body').textContent, D.fmt.money(Math.max(0, -multi[0].worst)), 'a group row shows its worst-case loss');
   }
   eq(P.heads('s-risk-body').join('|'), 'Outcome / Market|V|Own|Pos|Avg|Mark|Unrl|IfYES|IfNO|MaxL', 'RISK BOOK columns follow the spec');
   const foot = P.text($('s-risk-foot'));
   check(/^K S0 \d+\.\d\d S1 \d+\.\d\d S2 \d+\.\d\d S3 \d+\.\d\d \| PM \d+\.\d\d$/.test(foot), 'cash footer: K S0..S3 | PM', foot);
   const sum = P.text($('s-risk-sum'));
-  check(/^risk \d+\.\d\d open \d+\.\d\d rsv \d+\.\d\d \| stop \d+\.\d\d\/25\.00 \| floor 150\.00 eq \d+\.\d\d$/.test(sum), 'risk summary: risk, open, reserved, stop, floor', sum);
+  check(/^risk \d+\.\d\d open \d+\.\d\d rsv \d+\.\d\d \| loss \d+\.\d\d\/25\.00 \| floor 150\.00 eq \d+\.\d\d$/.test(sum), 'risk summary: risk, open, reserved, loss, floor', sum);
   const rsvShown = +sum.split(' rsv ')[1].split(' ')[0];
   let rsvWant = 0; D.systematic._t.reservations().forEach(u => { rsvWant += u; });
   let rsvNaive = 0; S.orders.forEach(o => { if (!o.terminal && o.left > 0) rsvNaive += o.side === 'BUY' ? o.left * o.px : o.left * (10000 - o.px); });
@@ -452,14 +468,15 @@ function bootPage(opts) {
   P.click(fr._children[3]);
   eq(D.focus.key, fr.getAttribute('data-mkt'), 'clicking a fill row sets the focused market');
   P.flush();
-  check(fillRows()[0].className.indexOf('sel') >= 0, 'the focused market\'s rows are selected');
+  check(/\bsel\b/.test(fillRows()[0].className), 'the clicked row carries the selection bar');
+  check(fillRows().slice(1).filter(r => r.getAttribute('data-mkt') === D.focus.key).every(r => /\bfmk\b/.test(r.className) && !/\bsel\b/.test(r.className)), 'the market\'s other rows a tint, never a second bar');
   const other = D.focus.otherLadder();
   const wr = workRows().find(r => r.getAttribute('data-mkt') !== D.focus.key) || workRows()[0];
   if (wr) {
     P.click(wr._children[3], { shiftKey: true });
     eq(D.focus.ladders[other], wr.getAttribute('data-mkt'), 'Shift+click on a working row loads the other ladder');
   }
-  const mem2 = P.rows('s-risk-body').find(r => r.className.indexOf('mem') === 0);
+  const mem2 = P.rows('s-risk-body').find(r => /^(mem|solo)/.test(r.className));
   if (mem2) { P.click(mem2._children[0]); eq(D.focus.key, mem2.getAttribute('data-mkt'), 'clicking a risk book row sets the focused market'); }
   const moFill = P.rows('s-mo-body').find(r => r.getAttribute('data-mkt'));
   if (moFill) { P.click(moFill._children[0]); eq(D.focus.key, moFill.getAttribute('data-mkt'), 'clicking a recent markout row sets the focused market'); }
@@ -566,10 +583,30 @@ function bootPage(opts) {
   await P.advance(3000);
   check(S.gaps > gaps0 && !S.stale && !start.disabled, 'a dropped message is detected as a gap and healed', { gaps: S.gaps, stale: S.staleWhy });
 
-  // ---- KILL from the header: KILLED with the re-arm countdown, START disabled
-  P.click($('kill'));
-  P.flush();
+  // ---- KILL from the header: pending at once, KILLED with the re-arm countdown once confirmed;
+  // a KILL with no answer says KILL FAIL, un-strikes the orders and retries by itself
+  {
+    const post0 = D.transport.post;
+    let tries = 0;
+    D.transport.post = (p, b) => (p === '/api/kill' ? (tries++, Promise.resolve({ status: 0, json: { ok: false, err: { code: 'EXCHANGE', msg: 'desk unreachable' } } })) : post0(p, b));
+    const wk = S.working().map(o => o.cid);
+    P.click($('kill'));
+    P.flush();
+    eq($('kill').textContent, 'KILL ...', 'KILL paints pending at once (not KILLED before the backend says so)');
+    check(S.canTrade('K') === 'KILLED', 'new orders are refused from the click on');
+    await P.settle(); P.flush();
+    check($('kill').textContent === 'KILL FAIL' && /fail/.test($('kill').className) && wk.every(c => !S.orders.get(c) || S.orders.get(c).terminal || !S.orders.get(c).local || !S.orders.get(c).local.cxlPend),
+      'no answer: KILL FAIL, and the orders it did not cancel are no longer struck through', $('kill').textContent);
+    check(/KILL not confirmed/.test(S.alerts[0].msg) && S.alerts[0].lvl === 'CRIT', 'a CRIT line says so');
+    check(S.canTrade('K') === 'KILLED', 'new orders stay refused while KILL retries');
+    D.transport.post = post0;
+    await new Promise(r => setTimeout(r, 1100));     // the retry runs on its own 1 s timer
+    await P.advance(200);
+    check(tries === 1 && D.act.killing === null, 'the automatic retry got through', { tries, killing: !!D.act.killing });
+  }
   check(/^KILLED re-arm 0:\d\d$/.test(P.text($('s-run'))) || /^KILLED re-arm 1:00$/.test(P.text($('s-run'))), 'KILL shows KILLED re-arm m:ss', P.text($('s-run')));
+  check(/^KILLED \d+s$/.test($('kill').textContent), 'the button counts the lockout down in seconds', $('kill').textContent);
+  eq(P.text($('tab-sys-st')), 'KILL', 'the tab says KILL');
   eq(start.disabled, true, 'START is disabled during the kill lockout');
   await P.advance(61000, 5000);
   eq(P.text($('s-run')), 'KILLED RE-ARM', 'after 60 s the strip asks for a re-arm');
@@ -607,13 +644,18 @@ function bootPage(opts) {
   P.flush();
   check(D.layout.wide && D.systematic._t.mode() === 'w', 'WIDE mode at 1920 px');
   const LW = P.heads('s-lanes-body');
-  ['V', 'Style', 'Open', 'Unrl', 'Day', 'Last'].forEach(h => check(LW.indexOf(h) >= 0, 'WIDE adds the lane column ' + h, LW));
+  ['V', 'Style', 'Open', 'Unrl', 'Day', 'Last', 'Thr\u00a2'].forEach(h => check(LW.indexOf(h) >= 0, 'WIDE adds the lane column ' + h, LW));
+  check(LW[LW.length - 1] === '' && LW[LW.length - 2] === '' && P.heads('s-work-body')[P.heads('s-work-body').length - 1] === '', 'WIDE caps Market and Reason: a blank filler column takes the slack', LW.slice(-3));
   check(P.heads('s-work-body').indexOf('Touch') >= 0 && P.heads('s-work-body').indexOf('Ack') >= 0, 'WIDE adds Touch and Ack to WORKING');
-  check(P.heads('s-fills-body').indexOf('Mid') >= 0 && P.heads('s-fills-body').indexOf('Settle') >= 0, 'WIDE adds Mid and Settle to FILLS');
+  check(P.heads('s-fills-body').indexOf('Mid') >= 0 && P.heads('s-fills-body').indexOf('Settle\u00a2') >= 0, 'WIDE adds Mid and Settle to FILLS');
   check(P.heads('s-risk-body').indexOf('Rsv') >= 0, 'WIDE adds reservations to the RISK BOOK');
   check(P.heads('s-mo-body').indexOf('Net60') >= 0, 'WIDE adds Net60 to MARKOUTS');
   check(/S0 \d+\.\d\d\/\d+\.\d\d/.test(P.text($('s-risk-foot'))), 'WIDE shows free cash per shard in the footer', P.text($('s-risk-foot')));
   eq(P.rows('s-lanes-body').length, 6, 'the lanes grid keeps its rows across a layout change');
+  // 2400 px and wider (not SPLIT): an always-open LOG beside the blotters
+  P.setWidth(2560);
+  P.flush();
+  check(P.rows('s-log-body').length > 0 && P.heads('s-log-body').join('|') === 'Time|Lvl|Source|Message', 'from 2400 px SYSTEMATIC shows the LOG', P.rows('s-log-body').length);
   P.setWidth(1280);
   P.flush();
   const LN = P.heads('s-lanes-body');
@@ -638,6 +680,14 @@ function bootPage(opts) {
     check(/\| PM \d+\.\d\d RO$/.test(P.text($('s-risk-foot'))), 'the cash footer tags PM RO', P.text($('s-risk-foot')));
     check(/ RO \|/.test(P.text($('s-plan'))), 'the plan line tags P RO', P.text($('s-plan')));
   }
+
+  // ---- the read-only settings drawer: p (or SET in the status bar)
+  P.key('p'); P.flush();
+  check(P.doc.body.className.indexOf('set') >= 0 && P.rows('set-lanes').length === 5 && P.rows('set-fees').length > 0 && P.rows('set-limits').length > 5,
+    'p opens the settings drawer: lanes, fees, limits', [P.rows('set-lanes').length, P.rows('set-fees').length, P.rows('set-limits').length]);
+  check(P.rows('set-lanes').find(r => r.dataset.k === 'S1')._children[5].textContent === '2.0', 'it shows a lane\'s threshold in cents');
+  P.key('Escape'); P.flush();
+  check(P.doc.body.className.indexOf('set') < 0, 'Esc closes it');
 
   // ---- the page stayed healthy
   eq(D.render.errors, 0, 'no render errors' + (D.render.lastError ? ' (' + D.render.lastError + ')' : ''));
