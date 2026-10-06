@@ -1,0 +1,5 @@
+/* ui/desk/systematic.css
+ * Rules specific to the SYSTEMATIC tab (control strip, lanes, working, fills, risk book,
+ * markouts). Shared tokens, grid and order-state classes live in desk.css. Scope selectors
+ * under #tab-systematic so they cannot leak into the MANUAL tab.
+ */

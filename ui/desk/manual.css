@@ -1,0 +1,5 @@
+/* ui/desk/manual.css
+ * Rules specific to the MANUAL tab (watchlist, ladders, ticket, blotters, positions).
+ * Shared tokens, grid, ladder and order-state classes live in desk.css. Scope selectors under
+ * #tab-manual so they cannot leak into the SYSTEMATIC tab.
+ */

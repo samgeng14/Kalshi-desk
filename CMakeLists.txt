@@ -156,6 +156,10 @@ if(NODE_EXE)
   # The operator-facing structures: lanes, the self-explaining empty board, the funnel, halted
   # never reading as running, and the ticket's side logic. Also reads the page, no browser.
   add_test(NAME ui-desk-ux COMMAND ${NODE_EXE} ${CMAKE_SOURCE_DIR}/tests/test_ui_desk_ux.cjs)
+  # The v3 screen's foundation (ui/desk): formatting, the store, sequence-gap resync, the demo
+  # venues' matching rules and fees, and every simulated event checked against the backend
+  # contract (ui/desk/js/contract.js). Loads the scripts into a node vm; no browser, no packages.
+  add_test(NAME ui-desk-v3 COMMAND ${NODE_EXE} ${CMAKE_SOURCE_DIR}/tests/test_ui_desk_v3.cjs)
 endif()
 
 # Recorder data integrity: unit conversion and sequence-gap handling, no network required.

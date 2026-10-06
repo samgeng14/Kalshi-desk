@@ -1,0 +1,384 @@
+/* ui/desk/desk.css
+ *
+ * The desk's visual system. Rules: no rounded corners, no drop shadows, no gradients as
+ * decoration, no emoji; colour only for meaning (bid/buy blue, ask/sell red, up/down, attention
+ * amber, failure red, model fair purple); everything else grey. Panels tile edge to edge with
+ * 1 px gaps; the page never scrolls, panels scroll inside. The only motion is a 300 ms flash.
+ * Inset box-shadows below draw 1-2 px rules (selected row bar, touch outline, active tab), not
+ * shadows. Tab-specific rules live in manual.css and systematic.css.
+ */
+
+/* ------------------------------------------------------------------------------------------
+   Tokens (hex values from the UI spec; contrast checked there on #111418)
+   ------------------------------------------------------------------------------------------ */
+:root {
+  /* surfaces */
+  --bg0: #0B0D10;   /* gutters, header, status bar */
+  --bg1: #111418;   /* panels */
+  --bg2: #171B21;   /* title bars, table headers, inputs */
+  --bg3: #1E232B;   /* hover, active tab, pending cell */
+  --sel: #1A2433;   /* selected row */
+  --line: #242A33;  /* hairlines */
+  --line2: #323A45; /* panel edges, scrollbars */
+  /* ink */
+  --tx0: #E6E8EB;   /* numbers */
+  --tx1: #A2A9B4;   /* labels */
+  --tx2: #848D97;   /* tertiary, disabled, stale */
+  /* book side (buy blue, sell red) */
+  --bid-tx: #4DA3FF; --bid-cell: #0E2238; --bid-bar: #16304F; --buy: #1F6FEB; --my-buy: #1C4F8F;
+  --ask-tx: #FF5C5C; --ask-cell: #2B1216; --ask-bar: #3A171C; --sell: #C93C37; --my-sell: #7A2328;
+  /* direction: P&L, markouts, price-change flashes only */
+  --up: #3FB950; --dn: #F85149;
+  /* other meanings */
+  --warn: #E3A008;  /* stale, near a limit, read-only, hotkeys on (black text on it as a fill) */
+  --crit: #9B1C1C;  /* KILL, a feed down, a stop hit (white text) */
+  --ok: #1A7F37;    /* START available */
+  --fair: #C792EA;  /* model fair */
+  --espn: #9AA4B2;  /* ESPN */
+  --be: #1C1F2B;    /* break-even band */
+  /* flashes */
+  --fl-up: rgba(63,185,80,.22); --fl-dn: rgba(248,81,73,.22); --fl-sz: rgba(230,232,235,.10); --fl-warn: rgba(227,160,8,.35);
+  /* type */
+  --font-ui: -apple-system, BlinkMacSystemFont, "Helvetica Neue", Helvetica, Arial, sans-serif;
+  --font-num: ui-monospace, "SF Mono", Menlo, monospace;
+  /* sizes */
+  --hdr-h: 28px; --sbar-h: 20px; --title-h: 20px; --th-h: 20px; --row: 18px; --lad-row: 18px;
+  --btn-h: 22px; --input-h: 22px;
+  --lad-w: 340px; --watch-w: 288px;
+}
+:root[data-density="normal"] { --row: 20px; }
+@media (max-height: 759px) { :root { --row: 16px; } }      /* ladder rows stay 18 px */
+/* colour-blind palette (key c): the sign is always shown, so colour is never the only cue */
+:root[data-cb="1"] { --up: #58A6FF; --dn: #F0883E; --ask-tx: #F0883E; --fl-up: rgba(88,166,255,.22); --fl-dn: rgba(240,136,62,.22); }
+
+/* ------------------------------------------------------------------------------------------
+   Base
+   ------------------------------------------------------------------------------------------ */
+*, *::before, *::after { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; overflow: hidden; }
+html { background: var(--bg0); color-scheme: dark; }
+body {
+  background: var(--bg0); color: var(--tx0);
+  font: 12px/1.2 var(--font-ui);
+  -webkit-font-smoothing: antialiased; -webkit-text-size-adjust: 100%;
+  display: grid; grid-template-rows: var(--hdr-h) minmax(0, 1fr) var(--sbar-h);
+  height: 100vh; min-width: 1024px;
+  user-select: none; -webkit-user-select: none;
+}
+.n, .num, td.n, th.n { font-family: var(--font-num); font-variant-numeric: tabular-nums slashed-zero; font-feature-settings: "tnum" 1, "zero" 1; }
+button, input, select { font: inherit; color: inherit; }
+button {
+  height: var(--btn-h); padding: 0 8px; border: 1px solid var(--line2); border-radius: 0;
+  background: var(--bg2); color: var(--tx0); cursor: pointer; font: 12px/1 var(--font-ui); white-space: nowrap;
+}
+button:hover { background: var(--bg3); }
+button:active { background: var(--sel); }
+button:disabled, button.dis { color: var(--tx2); cursor: default; background: var(--bg2); }
+button.on, button[aria-pressed="true"] { background: var(--bg3); color: var(--tx0); box-shadow: inset 0 -2px 0 var(--tx0); }
+button.buy { background: var(--buy); border-color: var(--buy); color: #fff; font-weight: 600; }
+button.sell { background: var(--sell); border-color: var(--sell); color: #fff; font-weight: 600; }
+button.go { background: var(--ok); border-color: var(--ok); color: #fff; font-weight: 600; }
+button.stop { background: var(--bg3); }
+button.killb { background: var(--crit); border-color: var(--crit); color: #fff; font-weight: 700; }
+button.confirm { background: var(--warn); border-color: var(--warn); color: #000; font-weight: 700; }
+button.buy:disabled, button.sell:disabled, button.go:disabled { background: var(--bg3); border-color: var(--line2); color: var(--tx2); }
+input, select {
+  height: var(--input-h); padding: 0 4px; border: 1px solid var(--line2); border-radius: 0;
+  background: var(--bg2); color: var(--tx0); font: 12px/1 var(--font-num); font-variant-numeric: tabular-nums;
+  user-select: text; -webkit-user-select: text; -webkit-appearance: none; appearance: none;
+}
+input[type="number"] { -moz-appearance: textfield; }
+input::-webkit-outer-spin-button, input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+input:focus, select:focus, button:focus-visible, [tabindex]:focus-visible { outline: 1px solid var(--tx0); outline-offset: -1px; }
+:focus:not(:focus-visible) { outline: none; }
+input:focus { outline: 1px solid var(--tx0); outline-offset: -1px; }
+
+/* scrollbars: 6 px, panel-edge grey (Safari honours ::-webkit-scrollbar) */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-thumb { background: var(--line2); }
+::-webkit-scrollbar-track, ::-webkit-scrollbar-corner { background: transparent; }
+
+/* meaning classes (text) */
+.up { color: var(--up); } .dn { color: var(--dn); }
+.bid, .buy-tx { color: var(--bid-tx); } .ask, .sell-tx { color: var(--ask-tx); }
+.warn { color: var(--warn); } .crit-tx { color: var(--dn); }
+.fair { color: var(--fair); } .espn { color: var(--espn); }
+.dim { color: var(--tx2); } .lbl { color: var(--tx1); } .tx0 { color: var(--tx0); }
+.b { font-weight: 700; }
+.l { text-align: left; } .r { text-align: right; } .c { text-align: center; }
+/* meaning classes (fills) */
+.crit { background: var(--crit); color: #fff; }
+.warn-bg { background: var(--warn); color: #000; }
+.ok-bg { background: var(--ok); color: #fff; }
+/* raw tags: OK, DOWN, GAP, RO */
+.tag { display: inline-block; padding: 0 3px; font: 600 10px/14px var(--font-ui); letter-spacing: .04em; text-transform: uppercase; }
+.tag.warn { color: var(--warn); } .tag.dim { color: var(--tx2); }
+.tag.crit { background: var(--crit); color: #fff; } .tag.ok { color: var(--up); }
+.tag.ro { display: none; } .tag.ro.on { display: inline-block; }
+
+/* value flash fallback (the renderer uses the Web Animations API when it can) */
+@keyframes fl-up { from { background-color: var(--fl-up); } to { background-color: transparent; } }
+@keyframes fl-dn { from { background-color: var(--fl-dn); } to { background-color: transparent; } }
+@keyframes fl-sz { from { background-color: var(--fl-sz); } to { background-color: transparent; } }
+@keyframes fl-warn { from { background-color: var(--fl-warn); } to { background-color: transparent; } }
+.fl-up { animation: fl-up .3s linear; } .fl-dn { animation: fl-dn .3s linear; }
+.fl-sz { animation: fl-sz .3s linear; } .fl-warn { animation: fl-warn .6s linear; }
+@media (prefers-reduced-motion: reduce) { .fl-up, .fl-dn, .fl-sz, .fl-warn { animation: none; } }
+
+/* ------------------------------------------------------------------------------------------
+   Header (28 px)
+   ------------------------------------------------------------------------------------------ */
+#hdr {
+  display: flex; align-items: stretch; height: var(--hdr-h); min-width: 0;
+  background: var(--bg0); border-bottom: 1px solid var(--line2); white-space: nowrap; overflow: hidden;
+}
+.tabsw { display: flex; flex: 0 0 184px; }
+.tabsw button {
+  height: 27px; border: 0; background: transparent; color: var(--tx2); padding: 0 6px;
+  font: 600 11px/1 var(--font-ui); letter-spacing: .04em; text-align: left;
+}
+#tab-sys { width: 104px; } #tab-man { width: 80px; }
+.tabsw button:hover { background: var(--bg2); }
+body[data-tab="systematic"] #tab-sys, body[data-tab="manual"] #tab-man { background: var(--bg3); color: var(--tx0); box-shadow: inset 0 -2px 0 var(--tx0); }
+.tst { font: 700 11px/1 var(--font-num); margin-left: 2px; }
+.tst.up { color: var(--up); } .tst.dn { color: var(--dn); } .tst.dim { color: var(--tx2); }
+.hc { display: flex; align-items: center; gap: 5px; padding: 0 8px; border-left: 1px solid var(--line); flex: 0 0 auto; overflow: hidden; }
+#hc-kal { width: 150px; } #hc-pm { width: 112px; } #hc-day { width: 160px; } #hc-risk { width: 96px; }
+#hc-stop { width: 124px; } #hc-sys { width: 112px; } #hc-mode { width: 52px; justify-content: center; }
+.hl { font: 10px/1 var(--font-ui); color: var(--tx2); text-transform: uppercase; letter-spacing: .04em; }
+.hv { font: 13px/1 var(--font-num); font-variant-numeric: tabular-nums slashed-zero; color: var(--tx0); }
+.hv.up { color: var(--up); } .hv.dn { color: var(--dn); }
+.hs { font: 11px/1 var(--font-num); font-variant-numeric: tabular-nums slashed-zero; color: var(--tx1); }
+.hc.warn .hv { color: var(--warn); }
+.hc.crit { background: var(--crit); } .hc.crit .hv, .hc.crit .hl { color: #fff; }
+.hgap { flex: 1 1 auto; min-width: 0; }
+.hh {
+  flex: 0 0 64px; width: 64px; display: flex; align-items: center; justify-content: center; border-left: 1px solid var(--line);
+  font: 11px/1 var(--font-num); font-variant-numeric: tabular-nums; color: var(--tx1); overflow: hidden;
+}
+.hh.warn { color: var(--warn); } .hh.crit { background: var(--crit); color: #fff; font-weight: 700; }
+.hclock { flex: 0 0 64px; display: flex; align-items: center; justify-content: center; border-left: 1px solid var(--line); font: 12px/1 var(--font-num); color: var(--tx1); }
+#kill {
+  flex: 0 0 72px; width: 72px; height: 27px; border: 0; border-left: 1px solid var(--line);
+  background: var(--crit); color: #fff; font: 700 12px/1 var(--font-ui); letter-spacing: .04em; padding: 0;
+}
+#kill:hover { background: #B42121; }
+#kill.locked { background: var(--bg3); color: var(--dn); font: 700 11px/1 var(--font-num); }
+#kill.rearm { background: var(--bg3); color: var(--warn); }
+
+/* ------------------------------------------------------------------------------------------
+   Status bar (20 px) and overlays
+   ------------------------------------------------------------------------------------------ */
+#sbar {
+  display: flex; align-items: stretch; height: var(--sbar-h); min-width: 0;
+  background: var(--bg0); border-top: 1px solid var(--line2); white-space: nowrap; overflow: hidden;
+  font: 11px/19px var(--font-num); color: var(--tx1);
+}
+.sb-alert {
+  flex: 1 1 auto; min-width: 0; height: 19px; border: 0; background: transparent; text-align: left;
+  padding: 0 8px; overflow: hidden; text-overflow: ellipsis; color: var(--tx1); font: 11px/19px var(--font-num); cursor: pointer;
+}
+.sb-alert.warn { color: var(--warn); } .sb-alert.crit { color: var(--dn); }
+.sb-alert:hover { background: var(--bg2); }
+.sbc { flex: 0 0 auto; padding: 0 8px; border-left: 1px solid var(--line); height: 19px; font: 11px/19px var(--font-num); }
+.sbc.off { display: none; }
+.sbc.warn { color: var(--warn); } .sbc.dim { color: var(--tx2); } .sbc.crit { background: var(--crit); color: #fff; }
+button.sbc { border: 0; border-left: 1px solid var(--line); background: transparent; color: var(--tx1); }
+#sb-hk { cursor: pointer; }
+body[data-hk="1"] #sb-hk { color: var(--warn); }
+
+#logdrawer {
+  position: fixed; left: 0; right: 0; bottom: var(--sbar-h); height: 240px; z-index: 20;
+  display: none; border-top: 1px solid var(--line2);
+}
+body.log #logdrawer { display: flex; }
+#keysheet { position: fixed; left: 0; right: 0; top: var(--hdr-h); bottom: var(--sbar-h); z-index: 30; display: none; background: rgba(11,13,16,.88); }
+body.keys #keysheet { display: flex; align-items: flex-start; justify-content: center; padding-top: 40px; }
+#keysheet .sheet { width: 640px; max-height: 80%; border: 1px solid var(--line2); }
+table.keys td.kk { font-family: var(--font-num); color: var(--tx0); }
+.ptools button { height: 16px; padding: 0 5px; font-size: 11px; }
+
+/* ------------------------------------------------------------------------------------------
+   Tab roots: both always mounted; switching is one attribute on <body>
+   ------------------------------------------------------------------------------------------ */
+main#tabs { position: relative; min-height: 0; min-width: 0; overflow: hidden; }
+.tabroot { display: none; position: absolute; inset: 0; gap: 1px; background: var(--bg0); min-height: 0; }
+body[data-tab="systematic"] #tab-systematic { display: grid; }
+body[data-tab="manual"] #tab-manual { display: grid; }
+
+/* SYSTEMATIC: 36 / 164 / lower; lower = 1fr | 607 px; left 250 / rest; right 330 / rest */
+#tab-systematic { grid-template-rows: 36px 164px minmax(0, 1fr); grid-template-columns: minmax(0, 1fr); }
+.s-lower { display: grid; grid-template-columns: minmax(0, 1fr) 607px; gap: 1px; min-height: 0; min-width: 0; }
+.s-left { display: grid; grid-template-rows: 250px minmax(0, 1fr); gap: 1px; min-height: 0; min-width: 0; }
+.s-right { display: grid; grid-template-rows: 330px minmax(0, 1fr); gap: 1px; min-height: 0; min-width: 0; }
+
+/* MANUAL: 288 | 340 | 340 | 1fr (about 541 px at 1512); right column 176 / 180 / 200 / rest */
+#tab-manual { grid-template-columns: var(--watch-w) var(--lad-w) var(--lad-w) minmax(0, 1fr); grid-template-rows: minmax(0, 1fr); }
+#m-lad-c { display: none; }
+.m-right { display: grid; grid-template-rows: 176px 180px 200px minmax(0, 1fr); gap: 1px; min-height: 0; min-width: 0; }
+
+/* WIDE (external monitor, >= 1920 px): a third ladder, a wider watchlist and right column */
+@media (min-width: 1920px) {
+  :root { --watch-w: 320px; }
+  #tab-manual { grid-template-columns: var(--watch-w) var(--lad-w) var(--lad-w) var(--lad-w) minmax(0, 1fr); }
+  #m-lad-c { display: flex; }
+  .m-right { grid-template-rows: 176px 220px 260px minmax(0, 1fr); }
+  .s-lower { grid-template-columns: minmax(0, 1fr) 760px; }
+  .s-left { grid-template-rows: 320px minmax(0, 1fr); }
+  .s-right { grid-template-rows: 400px minmax(0, 1fr); }
+}
+/* NARROW (< 1400 px): one ladder; the right column takes the room */
+@media (max-width: 1399px) {
+  #tab-manual { grid-template-columns: var(--watch-w) var(--lad-w) minmax(0, 1fr); }
+  #m-lad-b { display: none; }
+  .s-lower { grid-template-columns: minmax(0, 1fr) 520px; }
+}
+/* short windows */
+@media (max-height: 759px) {
+  .m-right { grid-template-rows: 176px 150px 160px minmax(0, 1fr); }
+  .s-left { grid-template-rows: 200px minmax(0, 1fr); }
+  .s-right { grid-template-rows: 280px minmax(0, 1fr); }
+}
+
+/* ------------------------------------------------------------------------------------------
+   Panels: one panel = one grid with a 20 px title bar
+   ------------------------------------------------------------------------------------------ */
+.panel { background: var(--bg1); display: flex; flex-direction: column; min-height: 0; min-width: 0; overflow: hidden; position: relative; }
+.ptitle {
+  flex: 0 0 var(--title-h); height: var(--title-h); display: flex; align-items: center; gap: 6px; padding: 0 6px;
+  background: var(--bg2); border-bottom: 1px solid var(--line); white-space: nowrap; overflow: hidden;
+}
+.pname { font: 600 11px/1 var(--font-ui); text-transform: uppercase; letter-spacing: .04em; color: var(--tx1); }
+.pinfo { font: 11px/1 var(--font-num); color: var(--tx2); }
+.ptools { margin-left: auto; display: flex; align-items: center; gap: 4px; min-width: 0; }
+.ptools input { height: 16px; font-size: 11px; }
+.pbody { flex: 1 1 auto; min-height: 0; overflow: auto; position: relative; overscroll-behavior: contain; }
+.pfoot {
+  flex: 0 0 20px; height: 20px; display: flex; align-items: center; gap: 8px; padding: 0 6px;
+  border-top: 1px solid var(--line); background: var(--bg2); font: 11px/1 var(--font-num); color: var(--tx1); white-space: nowrap; overflow: hidden;
+}
+.panel.strip { flex-direction: row; align-items: center; }
+.panel.strip > .pbody { overflow: hidden; display: flex; align-items: center; gap: 8px; padding: 0 8px; height: 100%; }
+
+/* ------------------------------------------------------------------------------------------
+   Grids (blotters, positions, lanes, risk, markouts, watchlist)
+   ------------------------------------------------------------------------------------------ */
+table.grid { width: 100%; border-collapse: separate; border-spacing: 0; table-layout: fixed; }
+table.grid th {
+  position: sticky; top: 0; z-index: 1; height: var(--th-h); padding: 0 6px;
+  background: var(--bg2); color: var(--tx2); font: 400 11px/1 var(--font-ui); text-align: left;
+  border-bottom: 1px solid var(--line2); white-space: nowrap; overflow: hidden; text-overflow: clip;
+}
+table.grid th.n, table.grid th.r { text-align: right; }
+table.grid td {
+  height: var(--row); padding: 0 6px; border-bottom: 1px solid var(--line);
+  font: 12px/1 var(--font-num); font-variant-numeric: tabular-nums slashed-zero; color: var(--tx0);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; vertical-align: middle;
+}
+table.grid td.n { text-align: right; }
+table.grid td.t { font-family: var(--font-ui); }          /* text cells in the label face */
+table.grid tbody tr { cursor: default; }
+table.grid tbody tr[data-mkt] { cursor: pointer; }
+table.grid tbody tr:hover > td { background: var(--bg3); }
+table.grid tr.sel > td { background: var(--sel); }
+table.grid tr.sel > td:first-child { box-shadow: inset 2px 0 0 var(--tx0); }
+table.grid tr.none > td { color: var(--tx2); text-align: left; }
+table.grid tr.grp > td { color: var(--tx1); font-weight: 700; background: var(--bg1); }
+table.grid tr.total > td { font-weight: 700; border-top: 1px solid var(--line2); }
+table.grid td.x { padding: 0; text-align: center; color: var(--tx2); cursor: pointer; }
+table.grid td.x:hover { color: var(--tx0); background: var(--crit); }
+table.grid td.side-BUY { color: var(--bid-tx); } table.grid td.side-SELL { color: var(--ask-tx); }
+table.grid td.thin { color: var(--tx2); }                 /* n < 30: never looks conclusive */
+table.grid td.btn { padding: 0 2px; } table.grid td.btn button { height: 16px; font-size: 11px; padding: 0 4px; }
+
+/* ------------------------------------------------------------------------------------------
+   Order states (CQG/IB conventions)
+   PEND  grey on bg3, dotted outline: sent, not acknowledged
+   WORK  white; PART white with filled in brackets; FILL white bold
+   CXL   grey; shown 3 s then dropped (IOC killed: 'IOC 0/10 killed')
+   REJ   red strikethrough with the reason, 3 s, then to the log
+   EXP   grey
+   cxlpend  a cancel sent, not confirmed: grey
+   ------------------------------------------------------------------------------------------ */
+.st-PEND { color: var(--tx2); } .st-WORK { color: var(--tx0); } .st-PART { color: var(--tx0); }
+.st-FILL { color: var(--tx0); font-weight: 700; } .st-CXL { color: var(--tx2); } .st-REJ { color: var(--dn); } .st-EXP { color: var(--tx2); }
+table.grid tr.o-PEND > td { color: var(--tx2); }
+table.grid tr.o-PEND > td.st { background: var(--bg3); outline: 1px dotted var(--tx2); outline-offset: -2px; }
+table.grid tr.o-CXL > td, table.grid tr.o-EXP > td { color: var(--tx2); }
+table.grid tr.o-REJ > td { color: var(--dn); text-decoration: line-through; }
+table.grid tr.o-REJ > td.why { text-decoration: none; }
+table.grid tr.cxlpend > td { color: var(--tx2); }
+table.grid tr.cxlpend > td.st { text-decoration: line-through; }
+
+/* ------------------------------------------------------------------------------------------
+   Ladder (340 px, YES terms): WRK B 48 | BID 60 | REF 20 | PRICE 56 | ASK 60 | WRK S 48 | LTQ 48
+   ------------------------------------------------------------------------------------------ */
+.panel.lad { outline: none; }
+.panel.lad[data-focused="1"] { box-shadow: inset 0 0 0 1px var(--tx0); z-index: 1; }
+.panel.lad:focus-visible { outline: none; }
+.lad-head { flex: 0 0 60px; height: 60px; background: var(--bg2); border-bottom: 1px solid var(--line); overflow: hidden; }
+.lad-head .ln { height: 20px; display: flex; align-items: center; gap: 6px; padding: 0 6px; font: 11px/1 var(--font-num); color: var(--tx1); white-space: nowrap; overflow: hidden; }
+.lad-head .ln.t { font: 600 12px/1 var(--font-ui); color: var(--tx0); }
+.lad-cols { flex: 0 0 18px; height: 18px; background: var(--bg2); border-bottom: 1px solid var(--line2); overflow: hidden; }
+.lad-rows { overflow-y: auto; overflow-x: hidden; overflow-anchor: none; }
+.lad-foot { flex: 0 0 56px; height: 56px; background: var(--bg2); border-top: 1px solid var(--line); overflow: hidden; }
+.lad-foot .ln { height: 28px; display: flex; align-items: center; gap: 2px; padding: 0 4px; }
+.lad-foot button { height: 22px; padding: 0 4px; font-size: 11px; }
+.lad-foot.ro { background: var(--warn); color: #000; }
+.panel.lad[data-ro="1"] .lad-foot { background: var(--warn); color: #000; }
+
+table.lad { width: var(--lad-w); border-collapse: separate; border-spacing: 0; table-layout: fixed; }
+table.lad col.wb, table.lad col.ws { width: 48px; } table.lad col.bq, table.lad col.aq { width: 60px; }
+table.lad col.rf { width: 20px; } table.lad col.px { width: 56px; } table.lad col.lt { width: 48px; }
+table.lad th { height: 18px; padding: 0 4px; font: 400 11px/1 var(--font-ui); color: var(--tx2); text-align: right; background: var(--bg2); }
+table.lad th.px, table.lad th.rf { text-align: center; }
+table.lad td {
+  height: var(--lad-row); padding: 0 4px; border-bottom: 1px solid var(--bg1);
+  font: 13px/1 var(--font-num); font-variant-numeric: tabular-nums slashed-zero; color: var(--tx0);
+  text-align: right; white-space: nowrap; overflow: hidden; cursor: default;
+}
+table.lad td.bq, table.lad td.aq { cursor: pointer; }
+/* BID / ASK size cells: tinted, with a flat depth bar sized by --d (0..1) */
+table.lad td.bq.has {
+  background-color: var(--bid-cell);
+  background-image: linear-gradient(var(--bid-bar), var(--bid-bar)); background-repeat: no-repeat;
+  background-position: right center; background-size: calc(var(--d, 0) * 100%) 100%;
+}
+table.lad td.aq.has {
+  background-color: var(--ask-cell);
+  background-image: linear-gradient(var(--ask-bar), var(--ask-bar)); background-repeat: no-repeat;
+  background-position: left center; background-size: calc(var(--d, 0) * 100%) 100%; text-align: left;
+}
+table.lad td.aq { text-align: left; }
+table.lad td.bq:hover { box-shadow: inset 0 0 0 1px var(--bid-tx); }
+table.lad td.aq:hover { box-shadow: inset 0 0 0 1px var(--ask-tx); }
+table.lad td.px { text-align: center; color: var(--tx1); cursor: copy; }
+table.lad td.px.bb, table.lad td.px.ba { color: var(--tx0); font-weight: 700; box-shadow: inset 0 0 0 1px var(--line2); }
+table.lad td.px.last { text-decoration: underline; text-decoration-color: var(--tx1); text-decoration-thickness: 1px; text-underline-offset: 2px; }
+table.lad tr.inside > td.px { background: var(--bg0); }
+table.lad tr.be > td.px { background: var(--be); box-shadow: inset 2px 0 0 var(--fair); }
+table.lad td.rf { text-align: center; padding: 0; font: 700 11px/1 var(--font-num); }
+.mk-f { color: var(--fair); } .mk-e { color: var(--espn); } .mk-a { color: var(--tx0); }
+/* our orders: 'qty secs' e.g. '8 12s'; partial '8(2)' */
+table.lad td.wb, table.lad td.ws { font-size: 11px; cursor: context-menu; }
+table.lad td.wb.my { background: var(--my-buy); color: #fff; }
+table.lad td.ws.my { background: var(--my-sell); color: #fff; }
+table.lad td.my.pend { background: var(--bg3); color: var(--tx2); outline: 1px dotted var(--tx2); outline-offset: -1px; }
+table.lad td.my.cxlpend { color: var(--tx2); text-decoration: line-through; }
+table.lad td.my.drag { outline: 1px solid var(--tx0); outline-offset: -1px; }
+table.lad td.lt { color: var(--tx0); font-size: 11px; }
+table.lad td.lt.dim { color: var(--tx2); }
+table.lad tr.ctr > td { border-bottom-color: var(--line); }   /* recentre anchor */
+
+/* ------------------------------------------------------------------------------------------
+   STALE: when the stream gaps or stops every number below the header greys out. Cancel and
+   KILL stay live; new-order controls disable with the reason (the tab code reads
+   Desk.store.canTrade). Venue-level: anything carrying data-v="K" / "P" greys when that venue's
+   feed is down.
+   ------------------------------------------------------------------------------------------ */
+body.stale #tabs td, body.stale #tabs .n, body.stale #tabs .hv,
+body.stale #tabs table.lad td { color: var(--tx2) !important; }
+body.stale #tabs td.bq.has, body.stale #tabs td.aq.has { background-image: none; }
+body[data-kstale="1"] #tabs [data-v="K"] td, body[data-kstale="1"] #tabs td[data-v="K"],
+body[data-pstale="1"] #tabs [data-v="P"] td, body[data-pstale="1"] #tabs td[data-v="P"] { color: var(--tx2) !important; }
+.panel[data-stale="1"] td { color: var(--tx2) !important; }
