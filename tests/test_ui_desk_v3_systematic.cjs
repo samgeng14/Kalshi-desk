@@ -169,7 +169,7 @@ function bootPage(opts) {
   const clock = { t: opts.t0 || Date.UTC(2026, 9, 6, 17, 30, 0) };
   const store = Object.assign({}, opts.storage || {});
   const ctx = {
-    console: { log: console.log, warn: console.warn, info() {}, error: (...a) => { errors.push(a.map(x => (x && x.stack) || String(x)).join(' ')); } },
+    console: { log: console.log, warn: console.warn, info() {}, debug() {}, error: (...a) => { errors.push(a.map(x => (x && x.stack) || String(x)).join(' ')); } },
     setTimeout, clearTimeout, setInterval, clearInterval, performance, document: doc, Promise, Uint8Array, Map, Set, JSON, Math,
     location: { protocol: 'file:', search: opts.search || '?seed=11' },
     localStorage: { getItem: k => (k in store ? store[k] : null), setItem: (k, v) => { store[k] = String(v); } },
@@ -688,6 +688,44 @@ function bootPage(opts) {
   check(P.rows('set-lanes').find(r => r.dataset.k === 'S1')._children[5].textContent === '2.0', 'it shows a lane\'s threshold in cents');
   P.key('Escape'); P.flush();
   check(P.doc.body.className.indexOf('set') < 0, 'Esc closes it');
+
+  // ---- instant controls: pressed at pointerdown; STOP, cancels and the lane filter act there,
+  // START and the lane toggle keep the click
+  {
+    const pd = el => fire(P.doc, el, 'pointerdown', { button: 0, pointerType: 'mouse' });
+    const pu = el => fire(P.doc, el, 'pointerup', { button: 0 });
+    D.tabs.set('systematic'); P.flush();
+    pd(start); P.flush();
+    check(/\bprs\b/.test(start.className) && P.text($('s-run')) === 'STOPPED', 'START shows pressed at pointerdown and does not start yet', [start.className, P.text($('s-run'))]);
+    pu(start);
+    check(!/\bprs\b/.test(start.className), 'pointerup clears it');
+    P.click(start); P.flush();
+    eq(P.text($('s-run')), 'STARTING', 'START acts on the click');
+    await P.advance(1500);
+    const cell0 = laneRow('M1')._children[0];
+    pd(cell0); P.flush();
+    eq(D.systematic.filter, 'M1', 'a lane row filters at pointerdown');
+    P.click(cell0); P.flush();
+    eq(D.systematic.filter, 'M1', 'the click that follows does not toggle it back');
+    const tg = tgOf('M2'), on0 = D.store.lanes.get('M2').on;
+    pd(tg); P.flush();
+    check(D.store.lanes.get('M2').pendOn === null && tgOf('M2').textContent === (on0 ? 'ON' : 'OFF'), 'the lane toggle does nothing at pointerdown');
+    pd(stop); P.flush();
+    eq(P.text($('s-run')), 'STOPPING', 'STOP acts at pointerdown (it only takes risk off)');
+    P.click(stop);
+    await P.advance(1500);
+    eq(P.text($('s-run')), 'STOPPED', 'stopped once');
+    // the dev check over the tab's controls
+    D.perf.set(true);
+    const ctl = [P.$('tab-man'), P.$('tab-sys'), laneRow('M2')._children[0], laneRow('M2')._children[0], P.$('s-cxlall'), P.$('sb-set'), P.$('set-close')];
+    for (const c of ctl) { pd(c); pu(c); P.click(c); P.flush(); }
+    D.systematic.setFilter(null); P.flush();
+    const rep = D.perf.report();
+    check(rep.some(r => r.ctl === '#tab-sys') && rep.some(r => /s-lanes:/.test(r.ctl)), 'the dev check times the tab\'s controls', rep.map(r => r.ctl));
+    const over = rep.filter(r => r.h > 16.7 || r.p > 16.7);
+    eq(over.map(r => r.ctl + ' ' + r.h + '/' + r.p).join(', '), '', 'every control inside one frame here (handler and the frame it caused)');
+    D.perf.set(false);
+  }
 
   // ---- the page stayed healthy
   eq(D.render.errors, 0, 'no render errors' + (D.render.lastError ? ' (' + D.render.lastError + ')' : ''));

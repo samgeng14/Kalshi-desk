@@ -824,6 +824,14 @@
     var key = laneMarket(lid);
     if (key && Desk.focus) Desk.focus.set(key, { other: !!(ev && ev.shiftKey), from: panel });
   }
+  var FAST = { stop: 1, lkill: 1, cxl: 1, cxlall: 1, fclear: 1 };
+  function fastCtl(ev) {
+    var t = ev.target;
+    if (!t || !t.closest) return null;
+    var a = t.closest('[data-act]');
+    if (a) return FAST[a.getAttribute('data-act')] && !a.disabled && !(a.classList && a.classList.contains('dis')) ? a : null;
+    return t.closest('[data-lane]');
+  }
   function onClick(ev) {
     var t = ev.target;
     if (!t || !t.closest) return;
@@ -913,8 +921,10 @@
     grids.fills = new Grid('s-fills-body', 'fills', FILL_COLS);
     grids.risk = new Grid('s-risk-body', 'risk', RISK_COLS);
     grids.mo = new Grid('s-mo-body', 'mo', MO_COLS);
+    // safe controls act on pointerdown (STOP, a lane KILL, cancels, the lane filter); START and the
+    // lane toggle (it can switch a lane on) keep the click; every control shows pressed at once
     var rootEl = $('tab-systematic');
-    if (rootEl) rootEl.addEventListener('click', onClick);
+    if (rootEl) D.onPress(rootEl, onClick, fastCtl);
     bindKeys();
   }
 

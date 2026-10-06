@@ -190,10 +190,16 @@
     this.sim.start();
     onState('open', false);
   };
+  // The simulated backend runs in this page: its work is deferred until the frame the click caused
+  // has been painted (Desk.later), as a real request would leave the page at once and do its work
+  // elsewhere. A handler never runs the venue's matching itself.
   Demo.prototype.request = function (method, path, body) {
     var sim = this.sim;
     var hdrs = method === 'POST' ? { 'Content-Type': 'application/json', 'X-Desk': token.value } : {};
-    return new Promise(function (resolve) { sim.request(method, path, body, function (status, json) { resolve({ status: status, json: json }); }, hdrs); });
+    return new Promise(function (resolve) {
+      var go = function () { sim.request(method, path, body, function (status, json) { resolve({ status: status, json: json }); }, hdrs); };
+      if (Desk.later) Desk.later(go); else go();
+    });
   };
   Demo.prototype.snapshot = function () {
     return this.request('GET', '/api/snapshot?sid=' + this.sid).then(function (r) { return r.json; });

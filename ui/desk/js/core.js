@@ -33,17 +33,26 @@
   // or with site data blocked, and an unhandled SecurityError would blank the screen. Kept from
   // ui/index.html (the safe wrapper), with JSON helpers. Keys are prefixed 'desk3.'.
   // ---------------------------------------------------------------------------------------------
-  var mem = Object.create(null);
+  // Writes land in memory at once and reach localStorage 250 ms later, coalesced (a click never
+  // waits on Safari's synchronous storage); reads see the pending value. pagehide flushes.
+  var mem = Object.create(null), dirtyKeys = Object.create(null), storeTimer = null;
+  function flushStore() {
+    storeTimer = null;
+    var ks = Object.keys(dirtyKeys); dirtyKeys = Object.create(null);
+    ks.forEach(function (k) { try { root.localStorage.setItem(k, mem[k]); } catch (e) { /* blocked or full */ } });
+  }
   Desk.storage = {
     get: function (k) {
       k = 'desk3.' + k;
+      if (k in dirtyKeys) return mem[k];
       try { var v = root.localStorage.getItem(k); if (v !== null) return v; } catch (e) { /* blocked */ }
       return k in mem ? mem[k] : null;
     },
     set: function (k, v) {
-      k = 'desk3.' + k; v = String(v); mem[k] = v;
-      try { root.localStorage.setItem(k, v); } catch (e) { /* blocked or full */ }
+      k = 'desk3.' + k; v = String(v); mem[k] = v; dirtyKeys[k] = 1;
+      if (!storeTimer) storeTimer = setTimeout(flushStore, 250);
     },
+    flush: function () { if (storeTimer) clearTimeout(storeTimer); flushStore(); },
     getJSON: function (k, dflt) {
       var s = this.get(k);
       if (s === null) return dflt;
@@ -515,6 +524,161 @@
   };
 
   // ---------------------------------------------------------------------------------------------
+  // Instant controls (2026-10-06: "every button must feel instant").
+  //   Desk.press.attach()   at boot: every pressable control (a button, a [data-act]/[data-a]
+  //                         control, a ladder or grid cell that does something, a linked row) gets
+  //                         the class 'prs' on pointerdown, in the same event, so the next frame
+  //                         shows it pressed whatever the action; pointerup anywhere clears it.
+  //   Desk.dom.onPress(host, fn, fastFn)
+  //                         one delegated handler for a panel's controls. fastFn(ev) returns true for
+  //                         a control that is safe to act on at pointerdown (a tab, a filter, a
+  //                         preset, a cancel): fn runs then, and the click that follows is swallowed.
+  //                         Everything else (an order button, KILL, START, a lane ON) keeps the
+  //                         click, so a press dragged off the control never sends. A keyboard
+  //                         "click" (Enter, Space) or el.click() always runs fn.
+  //   Desk.later(fn)        non-urgent work (the simulated backend in demo mode, storage) runs
+  //                         after the next frame has been painted, never inside the handler.
+  // ---------------------------------------------------------------------------------------------
+  var PRESSABLE = 'button, [data-act], [data-a], [data-cid], [data-flat], td.bq, td.aq, td.wb, td.ws, td.px, tr[data-mkt], tr[data-grp], tr[data-lane], tr[data-uk]';
+  var pressed = null;
+  function unpress() { if (pressed) { pressed.classList.remove('prs'); pressed = null; } }
+  Desk.press = {
+    sel: PRESSABLE,
+    attach: function () {
+      if (!hasDoc || Desk.press.attached) return;
+      Desk.press.attached = true;
+      document.addEventListener('pointerdown', function (ev) {
+        unpress();
+        if (ev.button !== 0) return;
+        var t = ev.target, el = t && t.closest ? t.closest(PRESSABLE) : null;
+        if (!el || el.disabled || (el.classList && el.classList.contains('dis'))) return;
+        pressed = el; el.classList.add('prs');
+      }, true);
+      document.addEventListener('pointerup', unpress, true);
+      document.addEventListener('pointercancel', unpress, true);
+      if (root.addEventListener) root.addEventListener('pagehide', function () { Desk.storage.flush(); });
+    }
+  };
+  Desk.dom.onPress = function (host, fn, fast) {
+    if (!host) return;
+    var done = null;                 // the control a pointerdown acted on; its click is swallowed
+    host.addEventListener('pointerdown', function (ev) {
+      done = null;
+      if (ev.button !== 0 || !fast) return;
+      var el = fast(ev);
+      if (!el) return;
+      done = el === true ? ev.target : el;
+      fn(ev, 'down');
+    });
+    host.addEventListener('click', function (ev) {
+      var d = done; done = null;
+      if (d && ev.target && (d === ev.target || (d.contains && d.contains(ev.target)) || (ev.target.contains && ev.target.contains(d)))) return;
+      fn(ev, 'click');
+    });
+  };
+  var laterQ = [], laterArmed = false, laterMc = null;
+  function runLater() {
+    laterArmed = false;
+    var q = laterQ; laterQ = [];
+    for (var i = 0; i < q.length; i++) { try { q[i](); } catch (e) { if (root.console) console.error('[desk later]', e); } }
+  }
+  try {
+    if (hasDoc && typeof root.MessageChannel === 'function') { laterMc = new root.MessageChannel(); laterMc.port1.onmessage = runLater; }
+  } catch (e) { laterMc = null; }
+  // a frame is coming: run after it (R.frame posts the message once it has drawn); else next task
+  Desk.later = function (fn) {
+    laterQ.push(fn);
+    if (laterArmed) return;
+    laterArmed = true;
+    // a hidden tab gets no frames (Safari pauses them): never wait more than 100 ms for one
+    if (R && R.scheduled && laterMc) setTimeout(function () { if (laterArmed) runLater(); }, 100);
+    else setTimeout(runLater, 0);
+  };
+  function laterAfterFrame() {
+    if (!laterArmed || !laterQ.length || !laterMc) return;
+    try { laterMc.port2.postMessage(0); } catch (e) { setTimeout(runLater, 0); }
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // The dev check (?perf=1, or PERF in the settings drawer): for every pointerdown, click and
+  // key, the time the page's handlers took and the time until the frame they caused was on
+  // screen, per control. Anything over one frame (Desk.lat.budget(), ~21 ms at 60 Hz) is SLOW
+  // and logged with console.warn; the rest with console.debug.
+  //   Desk.perf.on, .set(bool), .report() -> [{ctl, n, h (max handler ms), p (max paint ms),
+  //   hLast, pLast, slow}] worst first, .slow (count), .recs (the last 200)
+  // ---------------------------------------------------------------------------------------------
+  function ctlName(ev) {
+    var t = ev.target;
+    if (ev.type === 'keydown') return 'key:' + (Desk.keys ? Desk.keys.combo(ev) : ev.key);
+    if (!t || !t.closest) return '?';
+    var panelOf = function (e) { var p = e.closest('.panel'); return p && p.id ? p.id : (e.closest('#hdr') ? 'hdr' : (e.closest('#sbar') ? 'sbar' : '')); };
+    var c = t.closest('[data-act]'); if (c) return panelOf(c) + ':' + c.getAttribute('data-act');
+    c = t.closest('[data-a]'); if (c) return panelOf(c) + ':' + c.getAttribute('data-a');
+    c = t.closest('button'); if (c) return c.id ? '#' + c.id : panelOf(c) + ':' + String(c.textContent).slice(0, 10);
+    c = t.closest('td'); if (c) return panelOf(c) + ':' + String(c.className).split(' ')[0];
+    c = t.closest('tr'); if (c) return panelOf(c) + ':row';
+    c = t.closest('[id]'); return c ? '#' + c.getAttribute('id') : String(t.tagName || '?');
+  }
+  var perfCur = null, perfWait = [], perfMc = null;
+  try {
+    if (hasDoc && typeof root.MessageChannel === 'function') { perfMc = new root.MessageChannel(); perfMc.port1.onmessage = function () { P.stampPaint(); }; }
+  } catch (e) { perfMc = null; }
+  var P = Desk.perf = {
+    on: false, slow: 0, recs: [], rows: new Map(), frameMs: 0,
+    set: function (on) { P.on = !!on; Desk.storage.set('perf', P.on ? '1' : '0'); if (R) R.mark('set'); },
+    load: function () { P.on = (Desk.qs && Desk.qs.perf === '1') || Desk.storage.get('perf') === '1'; },
+    begin: function (ev) { if (!P.on) return; perfCur = { ctl: ctlName(ev), type: ev.type, t0: lat.t0(ev), h: null, f: null, p: null }; },
+    end: function (ev) {
+      var r = perfCur;
+      if (!r || r.type !== ev.type) return;
+      perfCur = null;
+      r.h = perf.now() - r.t0;
+      perfWait.push(r);
+      if (R) R.mark('perf');               // make sure a frame follows, so the paint is timed
+    },
+    // end of a render pass: its records get their frame time; the paint is stamped next task
+    framed: function () {
+      if (!perfWait.length) return;
+      var n = perf.now(), batch = perfWait; perfWait = [];
+      batch.forEach(function (r) { r.f = n - r.t0; });
+      P._painting = (P._painting || []).concat(batch);
+      if (perfMc) { try { perfMc.port2.postMessage(0); return; } catch (e) { /* fall through */ } }
+      P.stampPaint();
+    },
+    stampPaint: function () {
+      var batch = P._painting || []; P._painting = [];
+      var n = perf.now(), budget = lat.budget();
+      batch.forEach(function (r) {
+        r.p = n - r.t0;
+        P.recs.push(r); if (P.recs.length > 200) P.recs.shift();
+        var row = P.rows.get(r.ctl);
+        if (!row) { row = { ctl: r.ctl, n: 0, h: 0, p: 0, hLast: 0, pLast: 0, slow: 0 }; P.rows.set(r.ctl, row); }
+        row.n++; row.hLast = r.h; row.pLast = r.p; if (r.h > row.h) row.h = r.h; if (r.p > row.p) row.p = r.p;
+        var slow = r.h > budget || r.p - r.h > budget * 2;
+        if (slow) { row.slow++; P.slow++; }
+        if (root.console) (slow ? console.warn : (console.debug || console.log)).call(console, '[desk perf] ' + (slow ? 'SLOW ' : '') + r.type + ' ' + r.ctl +
+          ' handler ' + r.h.toFixed(1) + 'ms frame ' + (r.f === null ? '-' : r.f.toFixed(1)) + 'ms painted ' + r.p.toFixed(1) + 'ms');
+      });
+      if (batch.length && R) R.mark('set');
+    },
+    report: function () {
+      return Array.from(P.rows.values()).sort(function (a, b) { return b.p - a.p; }).map(function (r) {
+        return { ctl: r.ctl, n: r.n, h: Math.round(r.h * 10) / 10, p: Math.round(r.p * 10) / 10, hLast: Math.round(r.hLast * 10) / 10, pLast: Math.round(r.pLast * 10) / 10, slow: r.slow };
+      });
+    },
+    attach: function () {
+      if (!hasDoc || P.attached) return;
+      P.attached = true;
+      // begin: the first capture listener on document; end: a bubble listener on document added
+      // after every other one (main.js attaches it last), so it runs after all the page's handlers
+      ['pointerdown', 'click', 'keydown'].forEach(function (t) {
+        document.addEventListener(t, P.begin, true);
+        document.addEventListener(t, P.end);
+      });
+    }
+  };
+
+  // ---------------------------------------------------------------------------------------------
   // Latency meters. Rolling windows; p50 over the last N.
   //   click-to-paint  from the input event until the frame that drew its pending state has been
   //                   painted. The render pass runs inside requestAnimationFrame, before the
@@ -622,6 +786,7 @@
     scheduled: false,
     errors: 0,
     lastError: null,
+    lastMs: 0, maxMs: 0,              // the render pass's own work, ms (the last one, the worst)
     mark: function (t) { R.dirty.add(t); if (!R.scheduled) { R.scheduled = true; raf(R.frame); } },
     add: function (spec) {
       var r = { id: spec.id, tab: spec.tab || null, fn: spec.fn, missed: true };
@@ -643,6 +808,7 @@
           var hit = false; set.forEach(function (t) { if (!hit && t.indexOf(p) === 0) hit = true; }); return hit;
         }
       };
+      var f0 = perf.now();
       for (var i = 0; i < R.renderers.length; i++) {
         var r = R.renderers[i];
         if (r.tab && R.tab && r.tab !== R.tab) { if (set.size) r.missed = true; continue; }
@@ -653,7 +819,11 @@
           if (root.console) console.error('[desk render]', r.id, e);
         }
       }
+      R.lastMs = perf.now() - f0;
+      if (R.lastMs > R.maxMs) R.maxMs = R.lastMs;
       lat.painted();
+      P.framed();
+      laterAfterFrame();
     },
     flush: function () { R.frame(); }
   };
@@ -731,16 +901,22 @@
       var ladderOf = function (ev) { var t = ev.target; var l = t && t.closest ? t.closest('[data-ladder]') : null; if (l) F.setLadder(l.getAttribute('data-ladder')); };
       document.addEventListener('mousedown', ladderOf, true);
       document.addEventListener('focusin', ladderOf);
-      document.addEventListener('click', function (ev) {
+      // a linked row: the market loads at pointerdown (linking only changes what is shown)
+      var rowOf = function (ev) {
         var t = ev.target;
-        if (!t || !t.closest) return;
+        if (!t || !t.closest) return null;
         var row = t.closest('[data-mkt]');
-        if (!row) return;
+        if (!row || !row.getAttribute('data-mkt')) return null;
         var ctl = t.closest('button, input, select, a, [data-nolink]');
-        if (ctl && row.contains(ctl) && ctl !== row) return;
+        if (ctl && row.contains(ctl) && ctl !== row) return null;
+        return row;
+      };
+      Desk.dom.onPress(document, function (ev) {
+        var row = rowOf(ev);
+        if (!row) return;
         var panel = row.closest('.panel'), pid = panel ? panel.id : null;
         F.set(row.getAttribute('data-mkt'), { other: ev.shiftKey, from: pid, row: { panel: pid, k: row.getAttribute('data-k') } });
-      });
+      }, rowOf);
     }
   };
 

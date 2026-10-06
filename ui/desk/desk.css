@@ -89,6 +89,13 @@ button.stop { background: var(--bg3); }
 button.killb { background: var(--crit); border-color: var(--crit); color: #fff; font-weight: 700; }
 button.confirm { background: var(--warn); border-color: var(--warn); color: #000; font-weight: 700; }
 button.buy:disabled, button.sell:disabled, button.go:disabled { background: var(--bg3); border-color: var(--line2); color: var(--tx2); }
+/* pressed (core.js Desk.press): drawn from pointerdown, before any handler or network reply, the
+   same 1 px white inset on every control (buttons, ladder cells, grid cells, linked rows) so a
+   press always reads whatever the control's own colour */
+.prs { box-shadow: inset 0 0 0 1px var(--tx0) !important; }
+button.prs { background: var(--bg3); }
+button.buy.prs, button.sell.prs, button.go.prs, button.confirm.prs, #kill.prs { filter: brightness(1.3); }
+table.grid tr.prs > td { background: var(--bg3); }
 input, select {
   height: var(--input-h); padding: 0 4px; border: 1px solid var(--line2); border-radius: 0;
   background: var(--bg2); color: var(--tx0); font: 12px/1 var(--font-num); font-variant-numeric: tabular-nums;
@@ -270,6 +277,14 @@ main#tabs { position: relative; min-height: 0; min-width: 0; overflow: hidden; }
 .tabroot:focus { outline: none; }        /* focusable (-1) so a click in a SPLIT half takes that tab's keys */
 body[data-tab="systematic"] #tab-systematic { visibility: visible; z-index: 1; }
 body[data-tab="manual"] #tab-manual { visibility: visible; z-index: 1; }
+/* Where the engine has it (Safari 18+, Chrome), the hidden tab is content-visibility: hidden
+   instead: its rendering state stays cached, so a switch does not restyle its whole subtree
+   (measured in Chrome at 1512 px with the lanes running: style and layout of a switch 8 ms -> 4 ms).
+   Its contents are not painted, hit-tested or focusable, as with visibility: hidden. */
+@supports (content-visibility: hidden) {
+  .tabroot { visibility: visible; content-visibility: hidden; }
+  body[data-tab="systematic"] #tab-systematic, body[data-tab="manual"] #tab-manual, body[data-split="1"] .tabroot { content-visibility: visible; }
+}
 
 /* SYSTEMATIC: 36 / 164 / lower; lower = 1fr | 607 px (| LOG from 2400 px); left 250 / rest; right 330 / rest */
 #tab-systematic { grid-template-rows: 36px 164px minmax(0, 1fr); grid-template-columns: minmax(0, 1fr); }

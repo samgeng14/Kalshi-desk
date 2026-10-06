@@ -467,7 +467,8 @@
     H.espnL = el('span', 'lb', 'ESPN'); H.espn = el('span', 'n espn'); H.chg = el('span', 'n chg');
     add(l3, H.midL, H.mid, H.mdlL, H.mdl, H.espnL, H.espn, H.chg);
     add(L.head, l1, l2, l3);
-    L.head.addEventListener('click', function (ev) {
+    // REL and the zoom act on pointerdown (neither sends an order)
+    Desk.dom.onPress(L.head, function (ev) {
       var b = ev.target && ev.target.closest ? ev.target.closest('button') : null;
       if (!b) return;
       var a = b.getAttribute('data-a');
@@ -477,7 +478,7 @@
         setZoom(zm, ZOOMS[(ZOOMS.indexOf(zoomFor(zm)) + 1) % ZOOMS.length]);
         dirtyAllLads();
       }
-    });
+    }, btnOf);
     // column header
     var colgroup = function () {
       var cg = el('colgroup');
@@ -508,11 +509,13 @@
     Fo.ttl.forEach(function (b) { f2.appendChild(b); }); f2.appendChild(Fo.capL); Fo.cap.forEach(function (b) { f2.appendChild(b); }); add(f2, Fo.del, Fo.hk);
     Fo.ro = el('div', 'ro-msg', 'READ-ONLY: PM key');
     add(L.foot, f1, f2, Fo.ro);
-    L.foot.addEventListener('click', function (ev) { onLadFoot(L, ev); });
-    Fo.qty.addEventListener('input', function () { var m = S().market(L.shownKey); L.cfg.qty = logic.parseQty(Fo.qty.value, m ? m.v : 'K'); saveCfg(); dirtyLad(L); });
+    // every footer control is a setting or a cancel: it acts on pointerdown and repaints only the footer
+    Desk.dom.onPress(L.foot, function (ev) { onLadFoot(L, ev); }, btnOf);
+    Fo.qty.addEventListener('input', function () { var m = S().market(L.shownKey); L.cfg.qty = logic.parseQty(Fo.qty.value, m ? m.v : 'K'); saveCfg(); footDirty(L); });
     Fo.qty.addEventListener('keydown', function (ev) { if (ev.key === 'Enter') { Fo.qty.blur(); L.el.focus(); } });
-    // pointer
-    L.body.addEventListener('click', function (ev) { onLadClick(L, ev); });
+    // pointer: a BID/ASK/WRK click sends on click (a press dragged away never sends; the cell shows
+    // pressed from pointerdown); a PRICE click only copies to the ticket, so it acts on pointerdown
+    Desk.dom.onPress(L.body, function (ev) { onLadClick(L, ev); }, function (ev) { var c = cellOf(ev); return c && c.col === 'px' ? c.td : null; });
     L.body.addEventListener('contextmenu', function (ev) { onLadContext(L, ev); });
     L.body.addEventListener('mousedown', function (ev) { onLadDown(L, ev); });
     L.body.addEventListener('mousemove', function (ev) { onLadMove(L, ev); });
@@ -532,6 +535,11 @@
   }
   function dirtyLad(L) { L.dirty = true; mark('mlad'); }
   function dirtyAllLads() { SLOTS.forEach(function (s) { if (LAD[s]) LAD[s].dirty = true; }); mark('mlad'); mark('mtk'); }
+  // a footer setting (size, expiry, cap, HK): only the footer repaints, not the 38 rows
+  function footDirty(L) { L.footDirty = true; mark('mlad'); }
+  function footAll() { SLOTS.forEach(function (s) { if (LAD[s]) LAD[s].footDirty = true; }); mark('mlad'); mark('mtk'); }
+  // the button under a pointerdown, for the controls that act on it
+  function btnOf(ev) { var b = ev.target && ev.target.closest ? ev.target.closest('button') : null; return b && !b.disabled ? b : null; }
   function measureLad(L) {
     if (L.ro || !L.body) return;
     var h = L.body.clientHeight;
@@ -730,11 +738,11 @@
     if (a === 'q') L.cfg.qty = ev.shiftKey ? Math.round((L.cfg.qty + v) * 100) / 100 : v;
     else if (a === 'clr') L.cfg.qty = 0;
     else if (a === 'ttl') L.cfg.ttl = v;
-    else if (a === 'cap') { cfg.cap = v; dirtyAllLads(); }
+    else if (a === 'cap') { cfg.cap = v; footAll(); }
     else if (a === 'del') { var m = S().market(L.shownKey); if (m) Desk.act.cancelWhere({ v: m.v, tk: m.tk, own: 'MAN' }); }
     else if (a === 'hk') Desk.keys.setHK(!Desk.keys.hk);
     else return;
-    saveCfg(); dirtyLad(L);
+    saveCfg(); footDirty(L);
   }
 
   // our orders on a market grouped into ladder rows: {BUY: Map row -> agg, SELL: Map row -> agg}
@@ -776,7 +784,7 @@
   // own order changing, the market changing, a stale feed); routine updates (the book, the clock,
   // Systematic's orders, the header's cash) are coalesced to at most one paint per LAD_MIN_MS.
   function ladUrgent(L, d, key, changed) {
-    return d.all || changed || L.dirty || d.has('focus') || d.has('layout') || d.has('stale') || d.has('hk') || d.has('ui') ||
+    return d.all || changed || L.dirty || d.has('focus') || d.has('layout') || d.has('stale') || d.has('ui') ||
       (key !== null && (d.has('mord:' + key) || d.has('mkt:' + key)));
   }
   function ladRoutine(d, key) {
@@ -789,6 +797,7 @@
   function renderLadder(L, d, now) {
     var st = S(), key = Desk.focus.ladders[L.slot] || null;
     var changed = key !== L.shownKey;
+    if (L.footDirty || d.has('hk')) { L.footDirty = false; renderLadFoot(L); }
     if (!ladUrgent(L, d, key, changed)) {
       if (!ladRoutine(d, key) && !L.due) return;
       if (now - L.paintAt < LAD_MIN_MS) { L.due = true; ladLater(L, L.paintAt + LAD_MIN_MS - now); return; }
@@ -1025,7 +1034,11 @@
     E.buy = btn('BUY', 'buy', { 'data-a': 'send', 'data-v': 'BUY' }); E.sell = btn('SELL', 'sell', { 'data-a': 'send', 'data-v': 'SELL' });
     add(r7, E.buy, E.sell);
     add(host, r1, r2, r3, r4, l5, l6, r7);
-    host.addEventListener('click', onTicketClick);
+    // the ticket's settings act on pointerdown; BUY / SELL and MOVE (it moves cash) keep the click
+    Desk.dom.onPress(host, onTicketClick, function (ev) {
+      var b = btnOf(ev), a = b ? b.getAttribute('data-a') : null;
+      return b && a !== 'send' && a !== 'move' ? b : null;
+    });
     E.qty.addEventListener('input', function () { var m = S().market(TK.key); cfg.tk.qty = logic.parseQty(E.qty.value, m ? m.v : 'K'); TK.arm = null; saveCfg(); mark('mtk'); });
     E.qty.addEventListener('keydown', function (ev) {
       if (ev.key !== 'ArrowUp' && ev.key !== 'ArrowDown') return;
@@ -1087,7 +1100,7 @@
       TK.px = p; TK.pxBad = false;
     }
     else if (a === 'auto') { TK.px = null; TK.pxBad = false; }
-    else if (a === 'cap') { cfg.cap = +v; dirtyAllLads(); }
+    else if (a === 'cap') { cfg.cap = +v; footAll(); }
     else if (a === 'type') cfg.tk.type = v;
     else return;
     TK.arm = null; saveCfg(); mark('mtk');
@@ -1206,20 +1219,21 @@
       E.vb = ['K', 'P', 'ALL'].map(function (v) { return btn(v, 'vf', { 'data-a': 'venue', 'data-v': v }); });
       E.q = el('input', 'srch', null, { type: 'text', placeholder: '/', autocomplete: 'off', spellcheck: 'false' });
       E.vb.forEach(function (b) { tools.appendChild(b); }); tools.appendChild(E.q);
-      tools.addEventListener('click', function (ev) {
+      Desk.dom.onPress(tools, function (ev) {
         var b = ev.target && ev.target.closest ? ev.target.closest('button') : null; if (!b) return;
         cfg.watch.venue = b.getAttribute('data-v'); saveCfg(); W.dirty = true; mark('mwatch');
-      });
+      }, btnOf);
       E.q.addEventListener('input', function () { W.q = E.q.value; W.dirty = true; mark('mwatch'); });
     }
     W.body = body;
     buildWatchTable(false);
-    body.addEventListener('click', function (ev) {
-      var tr = ev.target && ev.target.closest ? ev.target.closest('tr') : null; if (!tr || !W.tb || !W.tb.contains(tr)) return;
+    var rowAt = function (ev) { var tr = ev.target && ev.target.closest ? ev.target.closest('tr') : null; return tr && W.tb && W.tb.contains(tr) ? tr : null; };
+    Desk.dom.onPress(body, function (ev) {
+      var tr = rowAt(ev); if (!tr) return;
       var grp = tr.getAttribute('data-grp');
       if (grp) { if (cfg.watch.collapsed[grp]) delete cfg.watch.collapsed[grp]; else cfg.watch.collapsed[grp] = true; saveCfg(); W.dirty = true; mark('mwatch'); return; }
       var k = tr.getAttribute('data-mkt'); if (k) { W.cursor = k; mark('mwatch'); }
-    });
+    }, rowAt);
     // a wider watchlist (an external monitor gives it the room the capped right column leaves)
     // adds the spread, the day's volume and the close time
     if (root.ResizeObserver) {
@@ -1334,17 +1348,15 @@
       GR.work = D.table(wb, [{ h: 'Time', w: 62 }, { h: 'Mkt' }, { h: 'Side', w: 40 }, { h: 'Px', w: 44, cls: 'n' }, { h: 'Qty', w: 40, cls: 'n' },
                              { h: 'Fill', w: 40, cls: 'n' }, { h: 'Left', w: 40, cls: 'n' }, { h: 'Exp', w: 36, cls: 'n' }, { h: 'PIQ', w: 44, cls: 'n' },
                              { h: 'St', w: 52 }, { h: '', w: 20 }], 'work');
-      GR.work.addEventListener('click', function (ev) {
-        var td = ev.target && ev.target.closest ? ev.target.closest('td') : null;
-        var cid = td ? td.getAttribute('data-cid') : null;
-        if (cid) Desk.act.cancel([cid]);
-      });
+      // x cancels at pointerdown (a cancel is always safe)
+      var cxOf = function (ev) { var td = ev.target && ev.target.closest ? ev.target.closest('td') : null; return td && td.getAttribute('data-cid') ? td : null; };
+      Desk.dom.onPress(GR.work, function (ev) { var td = cxOf(ev); if (td) Desk.act.cancel([td.getAttribute('data-cid')]); }, cxOf);
     }
     var wt = $('m-work-tools');
     if (wt) {
       GR.workN = el('span', 'pinfo'); GR.workDel = btn('DEL ALL', '', { 'data-a': 'delall' });
       wt.textContent = ''; add(wt, GR.workN, GR.workDel);
-      GR.workDel.addEventListener('click', function () { Desk.act.cancelAll('MAN', null); });
+      Desk.dom.onPress(GR.workDel, function () { Desk.act.cancelAll('MAN', null); }, function () { return true; });
     }
     if (fb) GR.fills = D.table(fb, [{ h: 'Time', w: 76 }, { h: 'Mkt' }, { h: 'Side', w: 40 }, { h: 'Px', w: 44, cls: 'n' }, { h: 'Qty', w: 40, cls: 'n' },
                                     { h: 'Liq', w: 28 }, { h: 'Fee', w: 40, cls: 'n' }, { h: 'MO10\u00a2', w: 48, cls: 'n', title: 'cents per contract' },
@@ -1567,10 +1579,10 @@
     K.bind({ key: 'Shift+Escape', scope: 'manual', order: true, desc: 'cancel every manual order, both venues', fn: function () { Desk.act.cancelAll('MAN', null); } });
     PRESETS.forEach(function (q, i) {
       K.bind({ key: String(i + 1), scope: 'ladder', order: true, desc: i === 0 ? 'size presets 1 5 10 25 50 100' : null, fn: function (ev, ctx) {
-        var L = ladderOf(ctx); if (!L) return; L.cfg.qty = q; saveCfg(); dirtyLad(L);
+        var L = ladderOf(ctx); if (!L) return; L.cfg.qty = q; saveCfg(); footDirty(L);
       } });
     });
-    var stepQ = function (n) { return function (ev, ctx) { var L = ladderOf(ctx); if (!L) return; L.cfg.qty = Math.max(0, Math.round((L.cfg.qty + n) * 100) / 100); saveCfg(); dirtyLad(L); }; };
+    var stepQ = function (n) { return function (ev, ctx) { var L = ladderOf(ctx); if (!L) return; L.cfg.qty = Math.max(0, Math.round((L.cfg.qty + n) * 100) / 100); saveCfg(); footDirty(L); }; };
     K.bind({ key: '+', scope: 'ladder', order: true, desc: 'size +1', fn: stepQ(1) });
     K.bind({ key: '=', scope: 'ladder', order: true, fn: stepQ(1) });
     K.bind({ key: '-', scope: 'ladder', order: true, desc: 'size ' + MINUS + '1', fn: stepQ(-1) });

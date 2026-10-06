@@ -162,7 +162,7 @@ function bootPage(opts) {
   const errors = [];
   const mem = {};
   const ctx = {
-    console: { log: console.log, warn: console.warn, error: (...a) => { errors.push(a.map(x => (x && x.stack) || String(x)).join(' ')); } },
+    console: { log: console.log, warn: console.warn, debug() {}, error: (...a) => { errors.push(a.map(x => (x && x.stack) || String(x)).join(' ')); } },
     setTimeout, clearTimeout, setInterval, clearInterval, setImmediate, performance, Promise, Map, Set, WeakSet, Uint8Array,
     document: doc, location: { protocol: 'file:', search: opts.search || '' },
     localStorage: { getItem(k) { return k in mem ? mem[k] : null; }, setItem(k, v) { mem[k] = String(v); } },
@@ -1075,6 +1075,86 @@ function manOrders(P, key) { const a = []; P.D.store.orders.forEach(o => { if (o
     proto.animate = anim0;
     P.sim().freeze(natKey, { bids: [[6300, 120], [6200, 85], [6100, 40]], asks: [[6400, 80], [6500, 210], [6700, 12]] });
     await run(500);
+  }
+  // ---- instant controls: pressed at pointerdown, safe controls act there, orders keep the click --
+  {
+    const press = (el, props) => fire(el, 'pointerdown', Object.assign({ button: 0, pointerType: 'mouse' }, props || {}));
+    const up = el => fire(el, 'pointerup', { button: 0 });
+    const foot = P.$('m-lad-a-foot');
+    const fb = t => foot.children[0].children.concat(foot.children[1].children).find(b => b.textContent === t);
+    D.focus.set(natKey, { ladder: 'A' }); await run(300);
+    click(fb('1'));
+    const paints0 = A.paints;
+    press(fb('CLR'));
+    check(/\bprs\b/.test(fb('CLR').className), 'a pressed control shows pressed in the same event');
+    eq(A.cfg.qty, 0, 'a footer setting acts at pointerdown, before the click');
+    up(fb('CLR')); fire(fb('CLR'), 'click', {});
+    check(!/\bprs\b/.test(fb('CLR').className), 'pointerup clears the pressed state');
+    press(fb('5'), { shiftKey: true }); fire(fb('5'), 'click', { shiftKey: true });
+    eq(A.cfg.qty, 5, 'the click after a pointerdown that acted is swallowed (Shift+5 adds once, not twice)');
+    P.frame();
+    check(/\bon\b/.test(fb('5').className) && A.paints === paints0, 'the footer repaints alone: the 38 rows are not redrawn for a setting', { paints: A.paints - paints0 });
+    fire(fb('15s'), 'click', {});
+    eq(A.cfg.ttl, 15, 'a keyboard or scripted click (no pointerdown) still acts');
+    // an order cell: pressed at pointerdown, sent only on the click
+    const n1 = st.orders.size, cell = ladCell(P, 'A', 6000, 'bq');
+    press(cell);
+    check(st.orders.size === n1 && /\bprs\b/.test(cell.className), 'an order cell shows pressed at pointerdown but sends nothing yet');
+    up(cell); fire(cell, 'click', {});
+    const sent = newest(P, x => x.own === 'MAN');
+    check(st.orders.size === n1 + 1 && sent.px === 6000 && sent.st === 'PEND', 'the click sends it, PEND in the store at once');
+    check(!P.sim().order(sent.cid), 'the simulated venue has not seen it inside the handler (its work runs after the paint)');
+    P.frame();
+    check(/\bpend\b/.test(ladCell(P, 'A', 6000, 'wb').className), 'the next frame paints it pending');
+    await run(300);
+    check(P.sim().order(sent.cid) && st.orders.get(sent.cid).st === 'WORK', 'then the venue takes it and the ack arrives');
+    D.act.cancel([sent.cid]); await run(300);
+    // a press dragged off an order cell never sends
+    const n2 = st.orders.size;
+    press(ladCell(P, 'A', 5900, 'bq')); up(P.$('m-lad-a-head'));
+    eq(st.orders.size, n2, 'a press released elsewhere sends nothing');
+    // PRICE copies to the ticket at pointerdown
+    press(ladCell(P, 'A', 6100, 'px'));
+    eq(MS.ticket.px, 6100, 'a PRICE press copies the price to the ticket at once');
+    fire(ladCell(P, 'A', 6100, 'px'), 'click', {});
+    // the tab switch acts at pointerdown
+    press(P.$('tab-sys'));
+    eq(D.render.tab, 'systematic', 'the tab switch acts at pointerdown');
+    fire(P.$('tab-sys'), 'click', {});
+    press(P.$('tab-man')); fire(P.$('tab-man'), 'click', {});
+    eq(D.render.tab, 'manual', 'and back');
+    // the ticket: settings at pointerdown, BUY / SELL on the click
+    const E2 = MS.ticket.el, n3 = st.orders.size;
+    press(E2.types.find(b => b.textContent === '60s'));
+    eq(MS.cfg.tk.type, 'P60', 'a ticket order type acts at pointerdown');
+    press(E2.buy);
+    eq(st.orders.size, n3, 'BUY does not send at pointerdown');
+    fire(E2.buy, 'click', {});
+    eq(st.orders.size, n3 + 1, 'it sends on the click');
+    click(E2.types.find(b => b.textContent === '15s'));
+    await run(300);
+    // a working row's x cancels at pointerdown
+    const live1 = manOrders(P).find(x => !x.terminal);
+    const xr = P.$('m-work-body').children[0].children[2].children.find(r => r.getAttribute('data-k') === live1.cid);
+    press(xr.children[10]);
+    check(st.orders.get(live1.cid).local.cxlPend, 'a working order\'s x cancels at pointerdown');
+    fire(xr.children[10], 'click', {});
+    await run(300);
+    // the dev check: handler and paint time per control
+    D.perf.set(true);
+    const ctls = [fb('1'), fb('5'), fb('60s'), fb('15s'), P.$('tab-sys'), P.$('tab-man'), E2.types.find(b => b.textContent === 'IOC'),
+                  E2.types.find(b => b.textContent === '15s'), MS.watch.el.vb[0], MS.watch.el.vb[2], P.$('sb-keys'), P.$('keysheet-close'), P.$('sb-set'), P.$('set-close')];
+    for (const c of ctls) { press(c); up(c); fire(c, 'click', {}); P.frame(); }
+    click(ladCell(P, 'A', 5800, 'bq')); P.frame();
+    A.el.focus(); key('Space', ' '); P.frame();
+    const rep = D.perf.report();
+    check(rep.length >= 10 && rep.some(r => r.ctl === '#tab-sys') && rep.some(r => /m-lad-a:q$/.test(r.ctl)) && rep.some(r => /m-lad-a:bq$/.test(r.ctl)) && rep.some(r => r.ctl === 'key:Space'),
+      'the dev check records handler and paint time per control', rep.map(r => r.ctl));
+    const over = rep.filter(r => r.h > 16.7 || r.p > 16.7);
+    eq(over.map(r => r.ctl + ' ' + r.h + '/' + r.p).join(', '), '', 'every control: handler and frame inside one frame (16.7 ms) here');
+    check(P.errors.length === 0, 'and the dev check logs no SLOW control', P.errors.slice(0, 2));
+    D.perf.set(false);
+    D.act.cancelAll('MAN', null); await run(300);
   }
 
   // ---- 2400 px and wider: a fourth ladder, and SPLIT ------------------------------------------

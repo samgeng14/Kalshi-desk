@@ -319,19 +319,32 @@
     host.textContent = '';
     setHead(host, 'Display');
     SU.flash = setRow(host, 'Flash', [['off', 'OFF'], ['subtle', 'SUBTLE'], ['full', 'FULL']], 'flash');
-    host.addEventListener('click', onSetUi);
+    SU.perf = setRow(host, 'Perf', [['0', 'OFF'], ['1', 'ON']], 'perf');
+    SU.perfSt = mk('span', 'st'); SU.perf.row.appendChild(SU.perfSt);
+    // choices act on pointerdown; the permission request (ALERTS) keeps the click: Safari asks
+    // for a click to show its prompt
+    D.onPress(host, onSetUi, function (ev) {
+      var b = ev.target && ev.target.closest ? ev.target.closest('button') : null;
+      return b && !b.disabled && b.getAttribute('data-a') !== 'alerts' ? b : null;
+    });
   }
   function onSetUi(ev) {
     var b = ev.target && ev.target.closest ? ev.target.closest('button') : null;
     if (!b || b.disabled) return;
     var a = b.getAttribute('data-a'), v = b.getAttribute('data-v');
     if (a === 'flash') Desk.ui.setFlash(v);
+    else if (a === 'perf') Desk.perf.set(v === '1');
     R.mark('set');
   }
   function onOf(r, v) { if (r) r.btns.forEach(function (b) { D.setClass(b, 'on', b.getAttribute('data-v') === String(v)); }); }
   function renderSetUi(d) {
     if (!H.setOpen || !(d.has('set') || d.has('ui') || d.all)) return;
     onOf(SU.flash, Desk.ui.flash);
+    onOf(SU.perf, Desk.perf.on ? '1' : '0');
+    // the dev check's worst control: handler / painted, ms
+    var w = Desk.perf.on ? Desk.perf.report()[0] : null;
+    D.setText(SU.perfSt, w ? 'worst ' + w.ctl + ' ' + w.h + '/' + w.p + 'ms' + (Desk.perf.slow ? ' SLOW ' + Desk.perf.slow : '') : '');
+    if (SU.perfSt) SU.perfSt.className = 'st' + (Desk.perf.slow ? ' warn' : '');
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -343,17 +356,20 @@
     var saved = (q === 'systematic' || q === 'manual' ? q : Desk.storage.get('tab')) === 'systematic' ? 'systematic' : 'manual';
     if (Desk.layout && Desk.layout.split) { tabs.cur = saved; document.body.setAttribute('data-tab', saved); R.tab = null; R.mark('tab'); }
     else tabs.set(saved);
-    $('tab-sys').addEventListener('click', function () { tabs.set('systematic'); });
-    $('tab-man').addEventListener('click', function () { tabs.set('manual'); });
-    var sp = $('tab-split'); if (sp) sp.addEventListener('click', function () { tabs.split(); });
+    // the tab switch, the drawers and the status-bar buttons act on pointerdown (safe: they change
+    // only what the screen shows); KILL keeps the click (pressed state on pointerdown)
+    var now = function () { return true; }, press = D.onPress;
+    press($('tab-sys'), function () { tabs.set('systematic'); }, now);
+    press($('tab-man'), function () { tabs.set('manual'); }, now);
+    press($('tab-split'), function () { tabs.split(); }, now);
     $('kill').addEventListener('click', onKill);
-    $('sb-alert').addEventListener('click', function () { H.openLog(); });
-    $('sb-keys').addEventListener('click', function () { H.openKeys(); });
-    var sbSet = $('sb-set'); if (sbSet) sbSet.addEventListener('click', function () { H.openSet(); });
-    var setClose = $('set-close'); if (setClose) setClose.addEventListener('click', function () { H.openSet(false); });
-    $('sb-hk').addEventListener('click', function () { Desk.keys.setHK(!Desk.keys.hk); });
-    var closeBtn = $('keysheet-close'); if (closeBtn) closeBtn.addEventListener('click', function () { H.openKeys(false); });
-    var logClose = $('log-close'); if (logClose) logClose.addEventListener('click', function () { H.openLog(false); });
+    press($('sb-alert'), function () { H.openLog(); }, now);
+    press($('sb-keys'), function () { H.openKeys(); }, now);
+    press($('sb-set'), function () { H.openSet(); }, now);
+    press($('set-close'), function () { H.openSet(false); }, now);
+    press($('sb-hk'), function () { Desk.keys.setHK(!Desk.keys.hk); }, now);
+    press($('keysheet-close'), function () { H.openKeys(false); }, now);
+    press($('log-close'), function () { H.openLog(false); }, now);
     buildSetUi();
 
     Desk.keys.overlays.push(function () { if (H.keysOpen) { H.openKeys(false); return true; } return false; });

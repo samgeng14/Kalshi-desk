@@ -26,6 +26,7 @@
     safe('layout', function () { Desk.layout.init(); });
     Desk.keys.attach();
     Desk.focus.bindClicks();
+    Desk.press.attach();
     safe('header', function () { Desk.header.init(); });
     safe('manual', function () { if (Desk.manual && Desk.manual.init) Desk.manual.init(); });
     safe('systematic', function () { if (Desk.systematic && Desk.systematic.init) Desk.systematic.init(); });
@@ -39,6 +40,9 @@
       if (!d.has('focus') && !d.has('layout') && !d.all) return;
       ['A', 'B', 'C', 'D'].forEach(function (s) { Desk.dom.setAttr(Desk.dom.$('m-lad-' + s.toLowerCase()), 'data-focused', Desk.focus.ladder === s ? '1' : null); });
     } });
+
+    // the dev check's listeners go last, so they time every other handler of the event
+    safe('perf', function () { Desk.perf.load(); Desk.perf.attach(); });
 
     Desk.store.begin();
     Desk.tick.on(function (now) { Desk.store.tick(now); });
