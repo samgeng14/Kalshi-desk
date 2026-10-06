@@ -185,6 +185,12 @@ body:not([data-split])[data-tab="systematic"] #tab-sys, body:not([data-split])[d
   #h-kal-free, #h-pm-free, #h-day-split { display: none; }      /* on the cells' titles instead */
 }
 #hc-mode { flex: 0 0 48px; justify-content: center; padding: 0 2px; }
+/* ACT: events not seen yet (fills and exits by default; the alert filters in settings); amber
+   while any; a click shows the tab they happened on */
+button.hc { height: 27px; border: 0; border-left: 1px solid var(--line); background: transparent; color: inherit; cursor: pointer; }
+button.hc:hover { background: var(--bg2); }
+#hc-act { flex: 0 0 auto; min-width: 56px; }
+#hc-act.warn .hv { color: var(--warn); } #hc-act .hv { color: var(--tx2); }
 .hl { font: 10px/1 var(--font-ui); color: var(--tx2); text-transform: uppercase; letter-spacing: .04em; }
 .hv { font: 13px/1 var(--font-num); font-variant-numeric: tabular-nums slashed-zero; color: var(--tx0); }
 .hv.up { color: var(--up); } .hv.dn { color: var(--dn); }
@@ -290,13 +296,13 @@ body[data-tab="manual"] #tab-manual { visibility: visible; z-index: 1; }
 #tab-systematic { grid-template-rows: 36px 164px minmax(0, 1fr); grid-template-columns: minmax(0, 1fr); }
 .s-lower { display: grid; grid-template-columns: minmax(0, 1fr) 607px; gap: 1px; min-height: 0; min-width: 0; }
 #s-log { display: none; }
-.s-left { display: grid; grid-template-rows: 250px minmax(0, 1fr); gap: 1px; min-height: 0; min-width: 0; }
+.s-left { display: grid; grid-template-rows: 210px 170px minmax(0, 1fr); gap: 1px; min-height: 0; min-width: 0; }
 .s-right { display: grid; grid-template-rows: 330px minmax(0, 1fr); gap: 1px; min-height: 0; min-width: 0; }
 
 /* MANUAL: 288 | 340 | 340 | 1fr (about 541 px at 1512); right column 176 / 180 / 200 / rest */
 #tab-manual { grid-template-columns: var(--watch-w) var(--lad-w) var(--lad-w) minmax(0, 1fr); grid-template-rows: minmax(0, 1fr); }
 #m-lad-c, #m-lad-d { display: none; }
-.m-right { display: grid; grid-template-rows: 176px 180px 200px minmax(0, 1fr); gap: 1px; min-height: 0; min-width: 0; }
+.m-right { display: grid; grid-template-rows: 176px 160px 140px 150px minmax(0, 1fr); gap: 1px; min-height: 0; min-width: 0; }
 
 /* WIDE (external monitor, >= 1920 px): a third ladder; the right column stops at 600 px and the
    watchlist takes what is left (from 420 px it adds Sprd, Vol and Close) */
@@ -304,9 +310,9 @@ body[data-tab="manual"] #tab-manual { visibility: visible; z-index: 1; }
   :root { --watch-w: 320px; }
   #tab-manual { grid-template-columns: max(var(--watch-w), calc(100% - 3 * var(--lad-w) - 600px - 4px)) var(--lad-w) var(--lad-w) var(--lad-w) minmax(0, 1fr); }
   #m-lad-c { display: flex; }
-  .m-right { grid-template-rows: 176px 220px 260px minmax(0, 1fr); }
+  .m-right { grid-template-rows: 176px 200px 200px 240px minmax(0, 1fr); }
   .s-lower { grid-template-columns: minmax(0, 1fr) 760px; }
-  .s-left { grid-template-rows: 320px minmax(0, 1fr); }
+  .s-left { grid-template-rows: 280px 240px minmax(0, 1fr); }
   .s-right { grid-template-rows: 400px minmax(0, 1fr); }
 }
 /* 2400 px and wider: a fourth ladder (the stream carries at most four at full depth), and
@@ -332,8 +338,8 @@ body[data-split="1"] #m-lad-b, body[data-split="1"] #m-lad-c, body[data-split="1
 body[data-split="1"] .s-lower { grid-template-columns: minmax(0, 1fr) 560px; }
 /* short windows */
 @media (max-height: 759px) {
-  .m-right { grid-template-rows: 176px 150px 160px minmax(0, 1fr); }
-  .s-left { grid-template-rows: 200px minmax(0, 1fr); }
+  .m-right { grid-template-rows: 176px 120px 110px 120px minmax(0, 1fr); }
+  .s-left { grid-template-rows: 170px 140px minmax(0, 1fr); }
   .s-right { grid-template-rows: 280px minmax(0, 1fr); }
 }
 
@@ -401,6 +407,18 @@ table.grid td.x:hover { color: var(--tx0); background: var(--crit); }
 table.grid td.side-BUY { color: var(--bid-tx); } table.grid td.side-SELL { color: var(--ask-tx); }
 table.grid td.thin { color: var(--tx2); }                 /* n < 30: never looks conclusive */
 table.grid td.btn { padding: 0 2px; } table.grid td.btn button { height: 16px; font-size: 11px; padding: 0 4px; }
+
+/* ACTIVITY tape: fills bold, exits by their P&L, rejects red, the rest (sent, cancelled,
+   expired) grey; the side in its colour */
+table.grid.act td.ev { font: 600 10px/1 var(--font-ui); letter-spacing: .04em; }
+table.grid.act tr.a-SUB > td, table.grid.act tr.a-CXL > td, table.grid.act tr.a-EXP > td { color: var(--tx2); }
+table.grid.act tr.a-SUB > td.side-BUY, table.grid.act tr.a-SUB > td.side-SELL { opacity: .75; }
+table.grid.act tr.a-FILL > td { font-weight: 700; }
+table.grid.act tr.a-REJ > td { color: var(--dn); }
+table.grid.act tr.a-EXIT > td.ev { color: var(--tx0); }
+table.grid.act tr.ext > td { box-shadow: none; }
+table.grid.act td.tm { font-size: 11px; }
+.ptools button[data-a="kind"] { min-width: 0; }
 
 /* ------------------------------------------------------------------------------------------
    Order states (CQG/IB conventions)

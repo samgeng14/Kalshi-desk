@@ -364,6 +364,7 @@
       };
       st.orders.set(o.cid, o);
       mark('ord'); mark('ord:' + key); mark('mord:' + key);
+      if (Desk.activity) Desk.activity.onPend(o);            // the tape's SUB, at the click
       return o;
     },
     // the HTTP answer to POST /api/order; status 0 = no answer at all
@@ -386,6 +387,7 @@
             o.left = 0; o.terminal = true; o.doneAt = nowMs();
             if (o.local) { o.local.pend = false; o.local.prov = true; }
             mark('ord'); mark('ord:' + o.key); mark('mord:' + o.key);
+            if (Desk.activity) Desk.activity.onOrd(o, { st: 'PEND' }, false);
           }
           st.localAlert('WARN', 'GW', 'REJ ' + e.code + ' ' + what + ': ' + e.msg);
         } else {
@@ -509,6 +511,7 @@
         if (o.terminal) o.local.cxlPend = false;
       }
       st.orders.set(o.cid, o);
+      if (Desk.activity) Desk.activity.onOrd(o, old || null, !!fromSnap);
       if (o.st !== 'PEND' && !quiet) st.acked(o.cid);
       mark('ord'); mark('ord:' + o.key);
       if (o.own !== 'SYS') mark('mord:' + o.key);      // a manual (or foreign) order: painted at once
@@ -524,14 +527,17 @@
       if (pend) { pend.forEach(function (m) { f.mo[m.h] = m.mo; }); st.moPending.delete(d.fid); }
       st.fills.unshift(f); st.fillIdx.set(f.fid, f);
       if (st.fills.length > 5000) { var gone = st.fills.splice(4000); gone.forEach(function (x) { st.fillIdx.delete(x.fid); }); }
+      if (Desk.activity) Desk.activity.onFill(f, !!fromSnap);
       mark('fill');
     },
-    pos: function (d) {
-      var key = d.v + '|' + d.tk;
-      st.pos.set(key, {
+    pos: function (d, env, fromSnap) {
+      var key = d.v + '|' + d.tk, old = st.pos.get(key) || null;
+      var p = {
         v: d.v, tk: d.tk, key: key, pos: d.pos, avg: px(d.avg), own: d.own, mark: px(d.mark), unrl: money(d.unrl),
         real: money(d.real), fees: money(d.fees), maxl: money(d.maxl), if_yes: money(d.if_yes), if_no: money(d.if_no)
-      });
+      };
+      st.pos.set(key, p);
+      if (Desk.activity) Desk.activity.onPos(p, old, !!fromSnap);
       mark('pos');
     },
     lane: function (d) {

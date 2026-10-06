@@ -33,6 +33,7 @@
       document.body.setAttribute('data-tab', name);
       R.tab = name;
       Desk.storage.set('tab', name);
+      if (Desk.activity) Desk.activity.seen(name === 'systematic' ? 'SYS' : 'MAN');
       R.force(name);
       R.mark('tab');
     },
@@ -114,6 +115,16 @@
 
   function renderHeader(d) {
     var S = Desk.store, h = S.hdr, now = Date.now();
+    if (d.has('act') || d.has('tab') || d.all) {
+      // ACT: events (by the alert filters) not seen yet; amber while any
+      var A = Desk.activity, na = A ? A.total() : 0, hca = $('hc-act');
+      cell('h-act', String(na));
+      if (hca) {
+        var ca = 'hc' + (na ? ' warn' : '');
+        if (hca.className !== ca) hca.className = ca;
+        D.setAttr(hca, 'title', A ? 'not seen: SYS ' + A.unseen.SYS + ', MAN ' + A.unseen.MAN + '; desktop alerts ' + (A.cfg.on ? 'on' : 'off') : null);
+      }
+    }
     if (d.has('hdr') || d.has('snapshot') || d.has('ord') || d.has('clock') || d.all) {
       // the tab's run state: RUN, OFF (stopped: STOP is the button's word), KILL, HALT
       var run = h ? h.run.state : null;
@@ -321,26 +332,55 @@
     SU.flash = setRow(host, 'Flash', [['off', 'OFF'], ['subtle', 'SUBTLE'], ['full', 'FULL']], 'flash');
     SU.perf = setRow(host, 'Perf', [['0', 'OFF'], ['1', 'ON']], 'perf');
     SU.perfSt = mk('span', 'st'); SU.perf.row.appendChild(SU.perfSt);
-    // choices act on pointerdown; the permission request (ALERTS) keeps the click: Safari asks
-    // for a click to show its prompt
+    // ALERTS: desktop notifications (Web Notifications), a short sound, when, and which events
+    // per mode; at most one alert per mode every 4 s, the rest batched into it
+    var T = Desk.activity ? Desk.activity.TYPES : [];
+    setHead(host, 'Alerts');
+    SU.desk = setRow(host, 'Desktop', [['on', 'ON'], ['off', 'OFF']], 'alerts');
+    SU.deskSt = mk('span', 'st'); SU.desk.row.appendChild(SU.deskSt);
+    SU.sound = setRow(host, 'Sound', [['1', 'ON'], ['0', 'OFF']], 'sound');
+    SU.when = setRow(host, 'When', [['hidden', 'HIDDEN'], ['always', 'ALWAYS']], 'when');
+    SU.sys = setRow(host, 'SYS', T.map(function (t) { return [t, t]; }), 'tsys');
+    SU.man = setRow(host, 'MAN', T.map(function (t) { return [t, t]; }), 'tman');
+    SU.test = setRow(host, 'Test', [['SYS', 'SYS'], ['MAN', 'MAN']], 'atest');
+    SU.rate = mk('span', 'st', 'max 1 per mode per 4 s'); SU.test.row.appendChild(SU.rate);
+    // choices act on pointerdown; the permission request (Desktop ON) and the sound keep the click:
+    // Safari shows its prompt, and starts audio, only for a click
     D.onPress(host, onSetUi, function (ev) {
-      var b = ev.target && ev.target.closest ? ev.target.closest('button') : null;
-      return b && !b.disabled && b.getAttribute('data-a') !== 'alerts' ? b : null;
+      var b = ev.target && ev.target.closest ? ev.target.closest('button') : null, a = b ? b.getAttribute('data-a') : null;
+      return b && !b.disabled && a !== 'alerts' && a !== 'sound' && a !== 'atest' ? b : null;
     });
   }
   function onSetUi(ev) {
     var b = ev.target && ev.target.closest ? ev.target.closest('button') : null;
     if (!b || b.disabled) return;
     var a = b.getAttribute('data-a'), v = b.getAttribute('data-v');
+    var A = Desk.activity;
     if (a === 'flash') Desk.ui.setFlash(v);
     else if (a === 'perf') Desk.perf.set(v === '1');
-    R.mark('set');
+    else if (a === 'alerts' && A) { if (v === 'on') A.enable().then(function () { R.mark('set'); R.mark('act'); }); else A.disable(); }
+    else if (a === 'sound' && A) A.setSound(v === '1');
+    else if (a === 'when' && A) A.setWhen(v);
+    else if (a === 'tsys' && A) A.toggleType('SYS', v);
+    else if (a === 'tman' && A) A.toggleType('MAN', v);
+    else if (a === 'atest' && A) A.test(v);
+    R.mark('set'); R.mark('act');
   }
   function onOf(r, v) { if (r) r.btns.forEach(function (b) { D.setClass(b, 'on', b.getAttribute('data-v') === String(v)); }); }
   function renderSetUi(d) {
     if (!H.setOpen || !(d.has('set') || d.has('ui') || d.all)) return;
     onOf(SU.flash, Desk.ui.flash);
     onOf(SU.perf, Desk.perf.on ? '1' : '0');
+    var A = Desk.activity;
+    if (A && SU.desk) {
+      var perm = A.permission();
+      onOf(SU.desk, A.cfg.on ? 'on' : 'off');
+      D.setText(SU.deskSt, perm === 'granted' ? 'allowed' : perm === 'denied' ? 'blocked (Safari settings)' : perm === 'default' ? 'not asked' : 'not in this browser');
+      SU.deskSt.className = 'st' + (perm === 'denied' || perm === 'unsupported' ? ' warn' : (perm === 'granted' ? ' ok' : ''));
+      onOf(SU.sound, A.cfg.sound ? '1' : '0');
+      onOf(SU.when, A.cfg.when);
+      [[SU.sys, 'SYS'], [SU.man, 'MAN']].forEach(function (x) { x[0].btns.forEach(function (b) { D.setClass(b, 'on', A.cfg[x[1]].indexOf(b.getAttribute('data-v')) >= 0); }); });
+    }
     // the dev check's worst control: handler / painted, ms
     var w = Desk.perf.on ? Desk.perf.report()[0] : null;
     D.setText(SU.perfSt, w ? 'worst ' + w.ctl + ' ' + w.h + '/' + w.p + 'ms' + (Desk.perf.slow ? ' SLOW ' + Desk.perf.slow : '') : '');
@@ -362,6 +402,12 @@
     press($('tab-sys'), function () { tabs.set('systematic'); }, now);
     press($('tab-man'), function () { tabs.set('manual'); }, now);
     press($('tab-split'), function () { tabs.split(); }, now);
+    // ACT: show the tab with the events not seen yet, and count them seen
+    press($('hc-act'), function () {
+      var A = Desk.activity; if (!A || !A.total()) return;
+      var mode = A.unseen.SYS >= A.unseen.MAN ? 'SYS' : 'MAN';
+      tabs.set(mode === 'SYS' ? 'systematic' : 'manual'); A.seen(mode); R.mark('act');
+    }, now);
     $('kill').addEventListener('click', onKill);
     press($('sb-alert'), function () { H.openLog(); }, now);
     press($('sb-keys'), function () { H.openKeys(); }, now);

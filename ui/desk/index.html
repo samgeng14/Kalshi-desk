@@ -19,6 +19,7 @@
 <script defer src="js/sim.js"></script>
 <script defer src="js/transport.js"></script>
 <script defer src="js/universe.js"></script>
+<script defer src="js/activity.js"></script>
 <script defer src="js/header.js"></script>
 <script defer src="js/manual.js"></script>
 <script defer src="js/browse.js"></script>
@@ -39,6 +40,7 @@
   <div class="hc" id="hc-risk"><span class="hl">RISK</span><span class="hv" id="h-risk"></span></div>
   <div class="hc" id="hc-stop"><span class="hl">LOSS</span><span class="hv" id="h-stop"></span></div>
   <div class="hc" id="hc-sys"><span class="hl">SYS</span><span class="hv" id="h-sys"></span></div>
+  <button class="hc" id="hc-act" type="button"><span class="hl">ACT</span><span class="hv" id="h-act">0</span></button>
   <div class="hgap"></div>
   <div class="hh" id="h-kx">KX -</div>
   <div class="hh" id="h-pmh">PM -</div>
@@ -52,7 +54,7 @@
 
 <main id="tabs">
 
-  <!-- SYSTEMATIC: strip 36 / lanes 164 / lower (working 250 + fills | risk 330 + markouts | LOG from 2400 px) -->
+  <!-- SYSTEMATIC: strip 36 / lanes 164 / lower (working 210 + activity 170 + fills | risk 330 + markouts | LOG from 2400 px) -->
   <div class="tabroot" id="tab-systematic" tabindex="-1">
     <section class="panel strip" id="s-ctl">
       <div class="pbody" id="s-ctl-body"></div>
@@ -66,6 +68,10 @@
         <section class="panel" id="s-work">
           <div class="ptitle"><span class="pname">WORKING</span><span class="ptools" id="s-work-tools"></span></div>
           <div class="pbody" id="s-work-body"></div>
+        </section>
+        <section class="panel" id="s-act">
+          <div class="ptitle"><span class="pname">ACTIVITY</span><span class="ptools" id="s-act-tools"></span></div>
+          <div class="pbody" id="s-act-body"></div>
         </section>
         <section class="panel" id="s-fills">
           <div class="ptitle"><span class="pname">FILLS</span><span class="ptools" id="s-fills-tools"></span></div>
@@ -130,6 +136,10 @@
       <section class="panel" id="m-work">
         <div class="ptitle"><span class="pname">WORKING</span><span class="ptools" id="m-work-tools"></span></div>
         <div class="pbody" id="m-work-body"></div>
+      </section>
+      <section class="panel" id="m-act">
+        <div class="ptitle"><span class="pname">ACTIVITY</span><span class="ptools" id="m-act-tools"></span></div>
+        <div class="pbody" id="m-act-body"></div>
       </section>
       <section class="panel" id="m-fills">
         <div class="ptitle"><span class="pname">FILLS</span><span class="ptools" id="m-fills-tools"></span></div>

@@ -169,12 +169,14 @@ function bootPage(opts) {
     matchMedia, requestAnimationFrame: f => { rafs.push(f); }, confirm: () => true, crypto: require('crypto').webcrypto,
     AbortController, fetch: () => Promise.reject(new Error('no network in tests')), __clock: clock
   };
+  if (opts.Notification) ctx.Notification = opts.Notification;
+  if (opts.AudioContext) ctx.AudioContext = opts.AudioContext;
   ctx.window = ctx;
   ctx.addEventListener = () => {};
   vm.createContext(ctx);
   vm.runInContext('Date.now = function () { return __clock.t; };', ctx);
   const load = f => vm.runInContext(fs.readFileSync(path.join(JS, f), 'utf8'), ctx, { filename: f });
-  ['contract.js', 'core.js', 'store.js', 'sim.js', 'transport.js', 'universe.js', 'header.js', 'manual.js', 'browse.js', 'systematic.js'].forEach(load);
+  ['contract.js', 'core.js', 'store.js', 'sim.js', 'transport.js', 'universe.js', 'activity.js', 'header.js', 'manual.js', 'browse.js', 'systematic.js'].forEach(load);
   const D = ctx.Desk;
   let sim = null;
   const create = D.sim.create;
@@ -1400,6 +1402,49 @@ function manOrders(P, key) { const a = []; P.D.store.orders.forEach(o => { if (o
   await run(500);
   eq(A.shownKey, nk, 'and shows it');
 
+  // ---- ACTIVITY: the operator's own tape, and the header's count of what he has not seen ------
+  {
+    D.tabs.set('manual');
+    const ak = D.focus.ladders.A;                    // the natural gas window open now (natKey rolled)
+    P.sim().freeze(ak, { bids: [[6300, 120], [6200, 85]], asks: [[6400, 80], [6500, 210]] }); await run(300);
+    const atb = P.$('m-act-body').children[0].children[2], arows = () => atb.children.filter(r => /^a-/.test(r.className));
+    const top = () => arows()[0], ev = r => r.children[1].textContent;
+    eq(P.$('m-act').children[0].textContent.indexOf('ACTIVITY'), 0, 'MANUAL has an ACTIVITY tape');
+    click(ladCell(P, 'A', 6200, 'bq'));
+    const ca = newest(P, x => x.own === 'MAN');
+    P.frame();
+    check(top() && ev(top()) === 'SUB' && top().children[2].textContent === 'BUY' && /side-BUY/.test(top().children[2].className) && top().getAttribute('data-mkt') === ak,
+      'an order shows on the tape at the click: SUB, side in its colour, linked to its market', top() && top().textContent);
+    await run(300);
+    D.act.cancel([ca.cid]); await run(300);
+    check(ev(top()) === 'CXL' && /USER/.test(top().children[6].textContent) && /a-CXL/.test(top().className), 'a cancel shows CXL with its reason (grey)', top().textContent);
+    click(ladCell(P, 'A', 6400, 'bq')); await run(400);
+    check(arows().slice(0, 3).some(r => ev(r) === 'FILL' && /\bT\b/.test(r.children[6].textContent)), 'an IOC that fills shows FILL with its liquidity (T)', arows().slice(0, 3).map(r => r.textContent));
+    const pr = P.$('m-pos-body').children[0].children[2].children.find(r => r.getAttribute('data-k') === ak);
+    click(pr.children[10]); await run(400);
+    const ex = arows().find(r => ev(r) === 'EXIT');
+    check(ex && /^[+−]?\d+\.\d\d$/.test(ex.children[6].textContent) && ex.getAttribute('data-mkt') === ak, 'flattening shows EXIT with the market\'s P&L', ex && ex.textContent);
+    const fb = P.$('m-act-tools').children.find(b => b.textContent === 'FILLS');
+    click(fb); await run(300);
+    check(arows().length && arows().every(r => /^(FILL|PART|EXIT)$/.test(ev(r))), 'FILLS shows fills and exits only');
+    click(P.$('m-act-tools').children.find(b => b.textContent === 'ALL')); await run(300);
+    click(ex.children[4]); P.frame();
+    eq(D.focus.key, ak, 'a tape row focuses its market');
+    // the counter: SYS fills while MANUAL shows count as not seen; ACT shows them
+    eq(D.activity.unseen.MAN, 0, 'the operator\'s own events count as seen while MANUAL is on screen');
+    D.activity.seen('SYS'); await run(300);
+    eq(P.$('h-act').textContent, '0', 'ACT reads 0 with nothing unseen');
+    const id0 = D.activity.n;
+    D.act.start(); await run(60000, 250);
+    const un = +P.$('h-act').textContent, fresh = D.activity.lists.SYS.filter(e => e.id > id0);
+    check(un > 0 && /\bwarn\b/.test(P.$('hc-act').className) && D.activity.unseen.SYS === un, 'Systematic\'s fills and exits, while MANUAL shows, count in the header\'s ACT (amber)', { un, cls: P.$('hc-act').className });
+    check(fresh.some(e => e.type === 'SUB') && un === fresh.filter(e => e.type === 'FILL' || e.type === 'EXIT').length,
+      'only the alert types count (fills and exits by default), not every quote', { un, fills: fresh.filter(e => e.type === 'FILL' || e.type === 'EXIT').length, all: fresh.length });
+    fire(P.$('hc-act'), 'pointerdown', { button: 0 }); fire(P.$('hc-act'), 'click', {}); await run(300);
+    check(D.render.tab === 'systematic' && P.$('h-act').textContent === '0', 'ACT shows the tab they happened on and counts them seen');
+    D.act.stop(); D.tabs.set('manual'); await run(500);
+  }
+
   // ---- no errors anywhere ---------------------------------------------------------------------
   eq(D.render.errors, 0, 'no render errors' + (D.render.lastError ? ': ' + D.render.lastError : ''));
   eq(st.invalid, 0, 'no contract violations' + (st.lastInvalid ? ': ' + st.lastInvalid : ''));
@@ -1425,6 +1470,50 @@ function manOrders(P, key) { const a = []; P.D.store.orders.forEach(o => { if (o
     check(s2.orders.size === n1 && /RO/.test(s2.alerts[0].msg), 'and refuses clicks');
     check(Q.D.manual.state().ticket.el.buy.disabled && Q.D.manual.state().ticket.el.blk.textContent === 'RO', 'the ticket too');
     eq(Q.D.render.errors, 0, 'no render errors (read-only)');
+  }
+
+  // =============================================================================================
+  // 4. desktop alerts: permission from a click, filters, the 4 s rate limit, the sound
+  // =============================================================================================
+  {
+    class Note { constructor(title, o) { Note.list.push({ title, body: o.body, tag: o.tag }); } close() {} }
+    Note.list = []; Note.permission = 'default'; Note.asked = 0;
+    Note.requestPermission = cb => { Note.asked++; Note.permission = 'granted'; if (cb) cb('granted'); return Promise.resolve('granted'); };
+    let tones = 0;
+    class Audio { constructor() { this.state = 'running'; this.currentTime = 0; this.destination = {}; }
+      createOscillator() { return { frequency: { value: 0 }, connect() {}, start() { tones++; }, stop() {} }; }
+      createGain() { return { gain: { setValueAtTime() {}, exponentialRampToValueAtTime() {} }, connect() {} }; } }
+    const Q = bootPage({ seed: 13, Notification: Note, AudioContext: Audio });
+    await Q.run(1500);
+    const A = Q.D.activity, su = Q.D.header.su;
+    check(!A.cfg.on && !A.cfg.sound && A.cfg.when === 'hidden' && A.cfg.MAN.join() === 'FILL,EXIT' && A.cfg.SYS.join() === 'FILL,EXIT', 'alerts start off: fills and exits only, only while the page is hidden');
+    Q.key('KeyP', 'p'); Q.frame();
+    const onBtn = su.desk.btns.find(b => b.textContent === 'ON');
+    Q.fire(onBtn, 'pointerdown', { button: 0 });
+    eq(Note.asked, 0, 'the permission is never asked on pointerdown');
+    Q.fire(onBtn, 'click', {}); await Q.run(100);
+    check(Note.asked === 1 && A.cfg.on && /allowed/.test(su.deskSt.textContent), 'Desktop ON asks for the permission from the click, and shows it allowed', su.deskSt.textContent);
+    Q.click(su.sound.btns.find(b => b.textContent === 'ON'));
+    Q.click(su.when.btns.find(b => b.textContent === 'ALWAYS'));
+    check(A.cfg.sound && A.cfg.when === 'always' && Q.D.storage.getJSON('alerts').on === true, 'sound and ALWAYS are saved');
+    Q.key('Escape', 'Escape');
+    const st2 = Q.D.store, nk = Q.D.focus.ladders.A;
+    Q.sim().freeze(nk, { bids: [[6300, 120]], asks: [[6400, 300]] }); await Q.run(300);
+    const buy = () => Q.D.act.order({ v: 'K', tk: st2.market(nk).tk, side: 'BUY', px: 6400, qty: 1, tif: 'IOC', touch: 6400 }, null);
+    buy(); await Q.run(400);
+    check(Note.list.length === 1 && Note.list[0].title === 'MAN FILL' && /BUY 1 .*@0\.64/.test(Note.list[0].body) && Note.list[0].tag === 'desk-MAN', 'a fill raises one desktop alert: MAN FILL, what and where', Note.list);
+    check(tones === 1, 'with one short tone');
+    eq(A.list('MAN', 'ALL').filter(e => e.type === 'SUB').length >= 1 && Note.list.every(n => !/^MAN SUB/.test(n.title)), true, 'a sent order is on the tape but raises no alert (not in the filter)');
+    buy(); buy(); await Q.run(1000);
+    eq(Note.list.length, 1, 'more fills inside 4 s wait (one alert per mode per 4 s)');
+    await Q.run(3500, 250);
+    await new Promise(r => setTimeout(r, 4100));       // the batch flushes on a real 4 s timer
+    check(Note.list.length === 2 && /^MAN: 2 fills$/.test(Note.list[1].title) && Note.list[1].body.split('\n').length === 2, 'then one alert for the batch: MAN: 2 fills', Note.list.slice(1));
+    Q.D.activity.toggleType('MAN', 'SUB');
+    Q.D.activity.sent.MAN = 0;
+    buy(); await Q.run(400);
+    check(Note.list.some(n => /SUB/.test(n.title) || /SUB/.test(n.body)), 'a type switched on in the filter alerts too');
+    eq(Q.D.render.errors, 0, 'no render errors (alerts)');
   }
 
   console.log(fails ? `${fails} of ${checks} checks FAILED` : `ui desk v3 manual: ${checks} checks, 0 failures`);

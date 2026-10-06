@@ -424,6 +424,27 @@ function bootPage(opts) {
     const r = fillRows().find(x => x.dataset.k === matured.fid);
     eq(P.cell(r, 'MO10\u00a2', 's-fills-body').textContent, D.fmt.cents(matured.mo['10s']), 'a matured MO10 shows signed cents');
   }
+  // ACTIVITY: the lanes' tape (sent, filled, cancelled, expired, exits), newest first
+  {
+    const arows = () => P.rows('s-act-body').filter(r => /^a-/.test(r.className));
+    eq(P.heads('s-act-body').join('|'), 'Time|Lane|Ev|Side|Qty|Market|Px|Info', 'SYSTEMATIC has an ACTIVITY tape with the lane');
+    const evs = new Set(arows().map(r => r._children[2].textContent));
+    check(arows().length > 20 && evs.has('SUB') && (evs.has('FILL') || evs.has('PART')) && evs.has('CXL'), 'it shows the lanes\' orders sent, filled and cancelled', [...evs]);
+    check(arows().every(r => /^[A-Z]\d$/.test(r._children[1].textContent) || r._children[2].textContent === 'EXIT'), 'every order row names its lane');
+    check(arows().every(r => r.getAttribute('data-mkt')), 'every row links to its market');
+    const ts = arows().map(r => r._children[0].textContent);
+    check(ts.every((x, i) => !i || x <= ts[i - 1]), 'newest first');
+    const fb = $('s-act-tools')._children.find(b => b.textContent === 'FILLS');
+    P.click(fb); P.flush();
+    check(arows().length && arows().every(r => /^(FILL|PART|EXIT)$/.test(r._children[2].textContent)), 'FILLS keeps fills and exits');
+    P.click($('s-act-tools')._children.find(b => b.textContent === 'ORDERS')); P.flush();
+    check(arows().length && arows().every(r => /^(SUB|CXL|EXP|REJ)$/.test(r._children[2].textContent)), 'ORDERS keeps the order events');
+    P.click($('s-act-tools')._children.find(b => b.textContent === 'ALL')); P.flush();
+    D.systematic.setFilter('M1'); await P.advance(300);
+    check(arows().length && arows().every(r => r._children[1].textContent === 'M1' || r._children[2].textContent === 'EXIT'), 'the lane filter narrows the tape too');
+    D.systematic.setFilter(null); await P.advance(300);
+    eq(D.activity.unseen.SYS, 0, 'nothing counts unseen while SYSTEMATIC is on screen');
+  }
   // markouts: one row per lane, ALL, then recent fills
   const moRows = P.rows('s-mo-body');
   eq(moRows.slice(0, 6).map(r => r._children[0].textContent.split(' ')[0]).join(','), 'M1,M2,S1,C1,X1,ALL', 'MARKOUTS: one row per lane, then ALL');
