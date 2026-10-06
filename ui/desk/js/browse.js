@@ -225,6 +225,8 @@
     K.bind({ key: '*', scope: 'browse', fn: function () { if (B.cursor) pin(B.cursor); } });
     K.bind({ key: '/', scope: 'browse', fn: function () { if (B.el.q) { B.el.q.focus(); if (B.el.q.select) B.el.q.select(); } } });
     Desk.render.add({ id: 'm-browse', tab: 'manual', fn: render });
+    // its DOM is built after the first paint, so the first u / + only shows it (no build in the handler)
+    if (Desk.later) Desk.later(build); else build();
   }
 
   Desk.browse = {
