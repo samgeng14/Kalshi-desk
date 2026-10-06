@@ -296,6 +296,7 @@ file(GENERATE OUTPUT ${CMAKE_BINARY_DIR}/generated/deskd/build_paths.h CONTENT
 #define DESKD_SOURCE_DIR \"${CMAKE_SOURCE_DIR}\"
 #define DESKD_BIN \"$<TARGET_FILE:deskd>\"
 #define DESKCTL_BIN \"$<TARGET_FILE:deskctl>\"
+#define FAKE_KALSHI_BIN \"$<TARGET_FILE:fake-kalshi>\"
 #define DESKD_NODE \"${DESKD_NODE_PATH}\"
 ")
 
@@ -343,5 +344,26 @@ add_executable(fake-kalshi tests/fake_exchange/main.cpp)
 target_link_libraries(fake-kalshi PRIVATE fake_kalshi)
 target_precompile_headers(fake-kalshi REUSE_FROM deskd_core)
 
+# The fake's own tests:
+#   fake-engine  no sockets: units, grids and fees (the venue's worked rounding example), matching
+#                (price-time, IOC, FOK, post-only, expiry, reduce-only, self-trade, pause, close),
+#                duplicate client ids, netting and cash per shard, order groups, the socket's
+#                message fields, the street and tape debts, the archive reader on recorded frames
+#                and the synthetic fixture, scenarios, the fixture played to its end, and 5,000
+#                resting orders
+#   fake-wire    over loopback: every REST route and shape, cursor paging, auth (a real RSA-PSS
+#                signature), rate limits per shard, the socket's commands, sids and seq, every
+#                channel, and each fault (drops, 5xx, a cut body, chunked, 429, stalls, socket
+#                drops, seq gaps, duplicate fills, the fill before the 201, a cancel racing a fill,
+#                a cancel before the 201), the fixture tape over the socket, eight clients at once,
+#                and the fake-kalshi binary started and stopped
+foreach(t engine wire)
+  add_executable(deskd-test-fake-${t} tests/deskd/test_fake_${t}.cpp)
+  target_link_libraries(deskd-test-fake-${t} PRIVATE fake_kalshi)
+  target_precompile_headers(deskd-test-fake-${t} REUSE_FROM deskd_core)
+  add_test(NAME deskd-fake-${t} COMMAND deskd-test-fake-${t})
+endforeach()
+add_dependencies(deskd-test-fake-wire fake-kalshi)  # it starts the binary once
+
 add_custom_target(deskd-all DEPENDS deskd deskctl deskd-test-bus deskd-test-ops deskd-test-web deskd-test-process
-                                    fake-kalshi)
+                                    fake-kalshi deskd-test-fake-engine deskd-test-fake-wire)
