@@ -17,9 +17,13 @@
  *   Desk.universe.order(rows, sort)     the backend's order (category, group by its best row, the
  *                                        rows), for the live set the page holds itself
  *   Desk.universe.liveRow(m, b, pos)    a live market as a row
- *   Desk.vlist(host, cols, cls)          a virtual table: only the rows in view (plus 8 above and
+ *   Desk.vlist(host, cols, cls, opts)    a virtual table: only the rows in view (plus 8 above and
  *                                        below) exist in the DOM; two spacer rows keep the scroll
- *                                        height, so thousands of rows cost what forty do
+ *                                        height, so thousands of rows cost what forty do. The
+ *                                        drawn window moves 8 rows at a time: scrolling inside it
+ *                                        redraws nothing. .retable(cols) swaps the column set.
+ *                                        (The watchlist, the browser, both ACTIVITY tapes and
+ *                                        Systematic's FILLS.)
  *
  * Row shape (page side, prices in u): {key, v, tk, ev, title, short, cat, grp, gk, kind, date,
  * close_ms, bid, ask, sprd, vol, fee, fair, edge, pin, live}.
@@ -179,28 +183,42 @@
   // ---------------------------------------------------------------------------------------------
   // the virtual table
   // ---------------------------------------------------------------------------------------------
-  var OVER = 8;
+  // OVER rows above and below the view are drawn too; the drawn window moves in steps of CHUNK
+  // rows, so most scroll frames only scroll (the browser moves the rows already there: no script,
+  // no table layout) and a redraw comes once every CHUNK rows
+  var OVER = 8, CHUNK = 8;
+  // opts: rowH (px, or a function returning it, e.g. Desk.dom.rowPx), headH, h (until measured),
+  // onScroll (called when the window to draw changed: the owner redraws on its next frame)
   function vlist(host, cols, cls, opts) {
     opts = opts || {};
-    var L = { host: host, rowH: opts.rowH || 18, headH: opts.headH || 20, top: 0, h: opts.h || 600, n: 0, a: 0, b: 0, ncol: cols.length, onScroll: opts.onScroll || null };
+    var L = { host: host, rowH: typeof opts.rowH === 'number' ? opts.rowH : 18, rowPx: typeof opts.rowH === 'function' ? opts.rowH : null,
+              headH: opts.headH || 20, top: 0, h: opts.h || 600, n: 0, a: 0, b: 0, ncol: cols.length, onScroll: opts.onScroll || null };
     L.tb = Desk.dom.table(host, cols, cls);
+    // a scroll that stays inside the drawn window needs nothing from us
+    L.moved = function () { var w = L.range(L.n); return w.a !== L.a || w.b !== L.b; };
     if (host && host.addEventListener) {
-      host.addEventListener('scroll', function () { L.top = host.scrollTop || 0; if (L.onScroll) L.onScroll(); }, { passive: true });
+      host.addEventListener('scroll', function () { L.top = host.scrollTop || 0; if (L.onScroll && L.moved()) L.onScroll(); }, { passive: true });
       if (root.ResizeObserver) {
         try {
           new root.ResizeObserver(function (en) { var h = en && en[0] && en[0].contentRect ? en[0].contentRect.height : 0; if (h > 0 && h !== L.h) { L.h = h; if (L.onScroll) L.onScroll(); } }).observe(host);
         } catch (e) { /* the default height */ }
       }
     }
-    // the item range to draw for n items
+    // a new column set on the same host (a wider watchlist, another layout): a new table, the
+    // same scroll and resize listeners
+    L.retable = function (cols2, cls2) { L.tb = Desk.dom.table(host, cols2, cls2); L.ncol = cols2.length; L.a = 0; L.b = 0; return L.tb; };
+    // the item range to draw for n items: [a, b), a on a CHUNK boundary
     L.range = function (n) {
-      var vis = Math.ceil(L.h / L.rowH);
+      var rh = L.rowH, vis = Math.ceil(L.h / rh) + 1;
+      var first = Math.max(0, Math.floor(L.top / rh));
+      var a = Math.floor(Math.max(0, first - OVER) / CHUNK) * CHUNK;
       // a list that shrank under a scrolled view: draw its end, never an empty window
-      var a = Math.max(0, Math.min(Math.floor((L.top - L.headH) / L.rowH) - OVER, n - vis - OVER));
-      var b = Math.min(n, a + vis + 2 * OVER);
+      a = Math.max(0, Math.min(a, n - vis - OVER));
+      var b = Math.min(n, a + vis + 2 * OVER + CHUNK);
       return { a: a, b: b };
     };
     L.draw = function (items, keyFn, cellsFn, rowFn, kopts) {
+      if (L.rowPx) { var rp = L.rowPx(); if (rp > 0) L.rowH = rp; }
       var n = items.length, w = L.range(n), list = [];
       L.n = n; L.a = w.a; L.b = w.b;
       list.push({ pad: 't', h: w.a * L.rowH });

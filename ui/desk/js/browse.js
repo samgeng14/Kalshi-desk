@@ -115,15 +115,23 @@
     if (!B.open && ms && ms.watch) B.q.day = ms.watch.day;
     B.open = true;
     Desk.dom.setClass(document.body, 'browse', true);
-    if (B.el.q && B.el.q.focus) B.el.q.focus();
+    // the search takes the keys once the frame that shows the browser is painted: focusing an
+    // element that was display:none a moment ago forces a layout, which would run inside the
+    // handler (7-11 ms at pointerdown in Chrome); later, the layout is already done (and the
+    // press's own default focus change is over)
+    B.focusQ = true;
     mark();
+    var focusQ = function () { if (B.open && B.focusQ) { B.focusQ = false; if (B.el.q && B.el.q.focus) B.el.q.focus(); } };
+    if (Desk.later) Desk.later(focusQ); else focusQ();
   }
   function close() {
     if (!B.open) return false;
     B.open = false;
-    Desk.dom.setClass(document.body, 'browse', false);
+    B.focusQ = false;
+    // blur first: blurring after the class change would restyle the page inside the handler
     var a = document.activeElement;
     if (a && a.blur && B.el.q === a) a.blur();
+    Desk.dom.setClass(document.body, 'browse', false);
     return true;
   }
   function move(n) {

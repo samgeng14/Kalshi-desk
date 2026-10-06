@@ -470,10 +470,15 @@
           if (cell.attr) for (var ak in cell.attr) setAttr(td, ak, cell.attr[ak]);
           if (cell.style) for (var sk in cell.style) setStyleVar(td, sk, cell.style[sk]);
           if (cell.fk !== undefined) {
-            // keyed: the state it stands for changed (and is something), whatever the text did
+            // keyed: the state it stands for changed (and is something), whatever the text did;
+            // fl 'd' on a numeric key flashes by the key's direction (P&L keyed on its realized part)
             var fk = cell.fk === null ? '' : String(cell.fk), was = td._fk;
             td._fk = fk;
-            if (old && was !== undefined && fk !== '' && fk !== was && cell.fl) flash(td, cell.fl === 'd' || cell.fl === 's' ? 'sz' : cell.fl, cell.flv, cell.flg);
+            if (old && was !== undefined && fk !== '' && fk !== was && cell.fl) {
+              var kk = cell.fl === 's' ? 'sz' : cell.fl;
+              if (cell.fl === 'd') { var ka = numOf(was), kb = numOf(fk); kk = isNaN(ka) || isNaN(kb) || ka === kb ? 'sz' : (kb > ka ? 'up' : 'dn'); }
+              flash(td, kk, cell.flv, cell.flg);
+            }
           } else if (old && changed && before !== '' && td.textContent !== '' && cell.fl) {
             // a value that changed flashes; one that appeared or went away (a level pulled) does not
             if (cell.fl === 'd') { var a = numOf(before), b = numOf(td.textContent); flash(td, b > a ? 'up' : (b < a ? 'dn' : 'sz'), cell.flv, cell.flg); }
@@ -502,10 +507,23 @@
     }, function () { return 'none'; });
   }
   var byId = function (id) { return hasDoc ? document.getElementById(id) : null; };
+  // a grid row's height in px (--row: 18 compact, 20 normal, 16 under 760 px of height), read
+  // once from the computed style and cached until the density or the window height changes
+  // (Desk.ui.apply, Desk.layout); a virtual list needs it to place its rows
+  var rowPxC = 0;
+  function rowPx() {
+    if (rowPxC) return rowPxC;
+    var v = 18;
+    try {
+      if (hasDoc && root.getComputedStyle) { var s = parseFloat(root.getComputedStyle(document.documentElement).getPropertyValue('--row')); if (s > 0) v = s; }
+    } catch (e) { /* the default */ }
+    return (rowPxC = v);
+  }
   Desk.dom = {
     $: byId,
     setText: setText, setHTML: setHTML, setClass: setClass, setAttr: setAttr, setVar: setStyleVar,
     keyedRows: keyedRows, emptyRow: emptyRow, flash: flash,
+    rowPx: rowPx, rowPxReset: function () { rowPxC = 0; },
     // build a <table> with a <thead> from column specs [{h:'Px', w:44, cls:'n'}]; returns tbody
     table: function (host, cols, cls) {
       if (!host) return null;
@@ -1078,9 +1096,11 @@
     init: function () {
       if (!hasDoc || !root.matchMedia) return;
       var w = root.matchMedia('(min-width: 1920px)'), n = root.matchMedia('(max-width: 1399px)'), s = root.matchMedia('(min-width: 2400px)');
+      var sh = root.matchMedia('(max-height: 759px)');      // short windows: 16 px grid rows
       Desk.layout.splitOn = Desk.storage.get('split') === '1';
       var upd = Desk.layout.upd = function () {
         var L = Desk.layout;
+        Desk.dom.rowPxReset();
         L.wide = w.matches; L.narrow = n.matches; L.splitOK = !!s.matches; L.split = L.splitOK && L.splitOn;
         document.body.setAttribute('data-wide', w.matches ? '1' : '0');
         document.body.setAttribute('data-splitok', L.splitOK ? '1' : '0');
@@ -1089,7 +1109,7 @@
         if (L.ladders().indexOf(F.ladder) < 0) F.setLadder('A');
         R.mark('layout'); R.mark('tab'); R.force(null);
       };
-      [w, n, s].forEach(function (m) { if (m.addEventListener) m.addEventListener('change', upd); else if (m.addListener) m.addListener(upd); });
+      [w, n, s, sh].forEach(function (m) { if (!m) return; if (m.addEventListener) m.addEventListener('change', upd); else if (m.addListener) m.addListener(upd); });
       upd();
     }
   };
@@ -1108,6 +1128,7 @@
       document.documentElement.setAttribute('data-density', Desk.ui.density);
       document.documentElement.setAttribute('data-cb', Desk.ui.cb ? '1' : '0');
       document.documentElement.setAttribute('data-flash', Desk.ui.flash);
+      Desk.dom.rowPxReset();
       R.mark('ui');
     },
     load: function () {

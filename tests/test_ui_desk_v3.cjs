@@ -1044,6 +1044,20 @@ const flushMicro = () => new Promise(r => setImmediate(r));
     eq(bad.join(', '), '', 'every ink keeps at least 4.5:1 on every surface it sits on');
   }
 
+  // ---- 11. 2026-10-06 browser pass: layout containment, the browser overlay, pressable controls ---
+  {
+    const css = fs.readFileSync(path.join(JS, '..', 'desk.css'), 'utf8'), mcss = fs.readFileSync(path.join(JS, '..', 'manual.css'), 'utf8');
+    const html = fs.readFileSync(path.join(JS, '..', 'index.html'), 'utf8');
+    check(/#tabs \.panel > \.pbody \{ contain: strict; \}/.test(css), 'a panel body in the tabs is strictly contained: a change inside it never lays out the rest of the screen');
+    const wide = /@media \(min-width: 1920px\) \{\s*body:not\(\[data-split="1"\]\) #m-browse \{([^}]*)\}/.exec(mcss);
+    check(!!wide && /grid-column: 1 \/ 4/.test(wide[1]) && /width: auto/.test(wide[1]), 'WIDE: the market browser covers the grid\'s watchlist and ladders A and B, not a computed width that ends inside ladder B', wide && wide[1]);
+    check(/<button class="sbc dim" id="sb-hk" type="button">/.test(html), 'the status bar\'s HOTKEYS cell is a button (it shows pressed like every control)');
+    const FD = makeCtx().Desk;
+    eq(FD.dom.rowPx(), 18, 'a grid row is 18 px when the page cannot read its style (the compact default)');
+    FD.dom.rowPxReset();
+    eq(FD.dom.rowPx(), 18, 'and again after a density or height change resets it');
+  }
+
   console.log(fails ? `${fails} of ${checks} checks FAILED` : `ui desk v3: ${checks} checks, 0 failures`);
   process.exit(fails ? 1 : 0);
 })().catch(e => { console.log('FAIL: test crashed: ' + (e && e.stack || e)); process.exit(1); });

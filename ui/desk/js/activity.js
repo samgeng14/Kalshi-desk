@@ -59,7 +59,7 @@
   }
   function base(o, type) {
     return { mode: modeOf(o.own), type: type, key: o.key, v: o.v, tk: o.tk, side: o.side, qty: o.qty, px: o.px, lane: o.lane || null,
-             why: o.why || '', cid: o.cid, tif: o.tif, filled: o.filled, ext: o.own === 'EXT' };
+             why: o.why || '', cid: o.cid, tif: o.tif, exp: o.exp_ms || null, filled: o.filled, ext: o.own === 'EXT' };
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -212,18 +212,38 @@
   A.test = function (mode) { A.sent[mode] = 0; var keep = A.cfg.when; A.cfg.when = 'always'; queue({ mode: mode, type: 'FILL', side: 'BUY', qty: 1, px: 5000, tk: 'TEST', key: 'K|TEST', ts: now() }); A.cfg.when = keep; };
 
   // ---------------------------------------------------------------------------------------------
-  // the ACTIVITY tape (one panel per tab): newest first, 200 rows, coloured by side and state;
+  // the ACTIVITY tape (one panel per tab): newest first, every kept event (virtual rows), coloured
+  // by side and state; a new fill, exit or reject gets a short highlight (A.news);
   // [ALL] [FILLS] [ORDERS] in its title (remembered); a row links to its market (data-mkt)
   //   A.mount({mode, body, tools, panel, lane: true}) -> a renderer fn(d)
   // ---------------------------------------------------------------------------------------------
   var KINDS = [['ALL', 'ALL'], ['FILLS', 'FILLS'], ['ORDERS', 'ORDERS']];
+  // what a sent order rests for: 'IOC', 'POST 15s', 'POST CL' (until the close), 'POST ST' (until
+  // the start), 'POST' (an EXT order with no expiry)
+  function subInfo(e) {
+    if (e.tif !== 'POST') return e.tif || '';
+    if (!e.exp) return 'POST';
+    var m = Desk.store ? Desk.store.market(e.key) : null;
+    if (m && m.close_ms && e.exp >= Math.floor(m.close_ms / 1000) * 1000) return 'POST CL';
+    if (m && m.start_ms && e.exp === Math.floor(m.start_ms / 1000) * 1000) return 'POST ST';
+    // the venue's expiry is a whole second (rounded up) and the record arrives a little after the
+    // send: a time within 2 s of one of the contract's expiries is that expiry
+    var x = (e.exp - e.ts) / 1000, T = (Desk.contract && Desk.contract.enums.TTL_S) || [5, 15, 60, 300, 1800];
+    for (var i = 0; i < T.length; i++) if (Math.abs(x - T[i]) <= 2) { x = T[i]; break; }
+    var s = Math.max(0, Math.round(x));
+    return 'POST ' + (s < 100 ? s + 's' : (s < 6000 ? Math.round(s / 60) + 'm' : Math.round(s / 3600) + 'h'));
+  }
   function info(e) {
     var f = F();
     if (e.type === 'FILL' || e.type === 'PART') return (e.liq || '') + (e.fee ? ' ' + f.money(e.fee) : '');
     if (e.type === 'EXIT') return f.pnl(e.real);
-    if (e.type === 'SUB') return e.tif || '';
+    if (e.type === 'SUB') return subInfo(e);
     return e.why || '';
   }
+  // a new row on the tape is news (a short highlight) when it is a fill, an exit or a reject; the
+  // quoting churn (sent, cancelled, expired: ten a second from busy lanes) flashes only with FLASH FULL
+  var NEWS = { FILL: 1, PART: 1, EXIT: 1, REJ: 1 };
+  A.news = function (e) { return !!NEWS[e.type] || (!!Desk.ui && Desk.ui.flash === 'full'); };
   A.mount = function (o) {
     if (!hasDoc || !o.body) return function () {};
     var D = Desk.dom, T = { kind: 'ALL', lastAt: 0, dirty: true };
@@ -233,7 +253,10 @@
     var cols = [{ h: 'Time', w: 70 }];
     if (o.lane) cols.push({ h: 'Lane', w: 38 });
     cols.push({ h: 'Ev', w: 44 }, { h: 'Side', w: 44 }, { h: 'Qty', w: 42, cls: 'n' }, { h: 'Market' }, { h: 'Px', w: 50, cls: 'n' }, { h: 'Info', w: 72 });
-    T.tb = D.table(o.body, cols, 'act');
+    // a virtual table: the whole kept tape scrolls (2,000 events a mode), only the rows in view
+    // exist, so a busy lane's ten events a second never relay out hundreds of rows
+    T.V = Desk.vlist(o.body, cols, 'act', { rowH: D.rowPx, headH: 20, onScroll: function () { T.dirty = true; Desk.render.mark('act'); } });
+    T.tb = T.V.tb;
     T.ncol = cols.length;
     if (o.tools) {
       o.tools.textContent = '';
@@ -258,21 +281,21 @@
       T.lastAt = t; T.dirty = false; T.due = false;
       if (T.btns) T.btns.forEach(function (b) { D.setClass(b, 'on', b.getAttribute('data-v') === T.kind); });
       var lf = o.lane && Desk.systematic ? Desk.systematic.filter : null;
-      var src = A.list(o.mode, T.kind), items = [];
-      for (var i = 0; i < src.length && items.length < 200; i++) { var e = src[i]; if (!lf || !e.lane || e.lane === lf) items.push(e); }
+      var src = A.list(o.mode, T.kind), items = src;
+      if (lf) { items = []; for (var i = 0; i < src.length; i++) { var e = src[i]; if (!e.lane || e.lane === lf) items.push(e); } }
       D.setText(T.n, A.lists[o.mode].length ? String(A.lists[o.mode].length) : '');
       if (!items.length) { D.emptyRow(T.tb, T.ncol); return; }
       var fm = F();
-      D.keyedRows(T.tb, items, function (e) { return 'a' + e.id; }, function (e) {
-        var m = Desk.store.market(e.key), g = m ? m.g : null;
-        var cells = [{ t: fm.time(e.ts), cls: 'n tm', nf: 'sz' }];
-        if (o.lane) cells.push({ t: e.lane || '', cls: 't', nf: 'sz' });
-        cells.push({ t: e.type, cls: 't ev', nf: 'sz' },
-                   { t: e.side || '', cls: 't side-' + e.side, nf: 'sz' },
-                   { t: e.qty === undefined ? '' : fm.size(e.qty), cls: 'n', nf: 'sz' },
-                   { t: (e.ext ? 'EXT ' : '') + (m ? m.short : e.tk), cls: 't', title: e.tk, nf: 'sz' },
-                   { t: e.px === null || e.px === undefined ? '' : (g ? fm.pxg(e.px, g) : fm.px(e.px)), cls: 'n', nf: 'sz' },
-                   { t: info(e), cls: e.type === 'EXIT' ? 'n ' + fm.sign(e.real) : 't dim', title: e.why || null, nf: 'sz' });
+      T.V.draw(items, function (e) { return 'a' + e.id; }, function (e) {
+        var m = Desk.store.market(e.key), g = m ? m.g : null, nf = A.news(e) ? 'sz' : undefined;
+        var cells = [{ t: fm.time(e.ts), cls: 'n tm', nf: nf }];
+        if (o.lane) cells.push({ t: e.lane || '', cls: 't', nf: nf });
+        cells.push({ t: e.type, cls: 't ev', nf: nf },
+                   { t: e.side || '', cls: 't side-' + e.side, nf: nf },
+                   { t: e.qty === undefined ? '' : fm.size(e.qty), cls: 'n', nf: nf },
+                   { t: (e.ext ? 'EXT ' : '') + (m ? m.short : e.tk), cls: 't', title: e.tk, nf: nf },
+                   { t: e.px === null || e.px === undefined ? '' : (g ? fm.pxg(e.px, g) : fm.px(e.px)), cls: 'n', nf: nf },
+                   { t: info(e), cls: e.type === 'EXIT' ? 'n ' + fm.sign(e.real) : 't dim', title: e.why || null, nf: nf });
         return cells;
       }, function (e) {
         return { cls: 'a-' + e.type + (e.ext ? ' ext' : ''), attr: { 'data-mkt': e.key || null, 'data-v': e.v || null } };

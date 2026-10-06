@@ -83,6 +83,12 @@ table.grid tr.vpad > td { padding: 0; border: 0; }
 #m-browse { display: none; position: absolute; left: 0; top: 0; bottom: 0; width: min(100%, calc(var(--watch-w) + 2 * var(--lad-w) + 2px)); z-index: 6;
             border-right: 1px solid var(--line2); }
 body.browse #m-browse { display: flex; }
+/* WIDE: the watchlist column grows past --watch-w (it takes what the ladders and the right column
+   leave), so the overlay takes the grid's own first three columns (the watchlist and ladders A
+   and B) instead of a computed width that would end inside ladder B */
+@media (min-width: 1920px) {
+  body:not([data-split="1"]) #m-browse { grid-column: 1 / 4; grid-row: 1; right: 0; width: auto; }
+}
 #m-browse:focus { outline: none; }
 #m-browse .ptools button { height: 16px; min-width: 22px; padding: 0 5px; font: 600 10px/1 var(--font-ui); }
 #m-browse .ptools input.srch { width: 180px; height: 16px; }

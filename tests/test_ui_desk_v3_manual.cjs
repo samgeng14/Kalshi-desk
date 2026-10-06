@@ -299,6 +299,8 @@ function manOrders(P, key) { const a = []; P.D.store.orders.forEach(o => { if (o
     eq(L.woText(1000, 0, 59, false), '1000', 'working cell keeps the size when nothing else fits');
     eq(L.woText(5, 0, null, false), '5', 'IOC or pending: size only');
     eq(L.woText(8, 0, 840, false), '8 14m', 'a long expiry (until close) counts in minutes');
+    eq(L.woText(1, 0, 402, false), '1 ' + D.fmt.left(402000), 'in whole minutes, as the ticket and WORKING count time to close (6m42s: 6m, not 7m)');
+    eq(L.woText(8, 0, 100, false), '8 1m', 'from 100 s');
     eq(L.woText(8, 0, 3 * 3600 + 300, false), '8 3h', 'and in hours past 100 minutes');
     eq(L.woText(1000, 0, 840, false), '1000', 'it still never overflows the cell');
     {
@@ -866,7 +868,9 @@ function manOrders(P, key) { const a = []; P.D.store.orders.forEach(o => { if (o
   // THE MARKET BROWSER: u (or + on the watchlist)
   {
     const BR = D.browse.state(), BE = BR.el;
-    A.el.focus(); key('KeyU', 'u'); await run(600);
+    A.el.focus(); key('KeyU', 'u');
+    check(D.browse.isOpen && P.doc.activeElement !== BE.q, 'the handler only shows the browser: its search takes focus after the frame (a focus there would force a layout in the handler)');
+    await run(600);
     check(D.browse.isOpen && /\bbrowse\b/.test(P.doc.body.className) && P.doc.activeElement === BE.q, 'u opens the market browser with its search focused');
     const btb = BR.V.tb, brows = () => btb.children.filter(r => r.getAttribute('data-mkt'));
     check(+BE.n.textContent.split(' ')[0] > 500 && brows().length > 10 && btb.children.filter(r => !/\bvpad\b/.test(r.className)).length <= 70, 'it lists the day\'s universe, virtual', BE.n.textContent);
@@ -889,6 +893,41 @@ function manOrders(P, key) { const a = []; P.D.store.orders.forEach(o => { if (o
     click(WE.scope[0]); await run(300);
     check(wrows().some(r => r.getAttribute('data-mkt') === dk), 'the market pinned in the browser is on the watchlist');
     D.focus.set(natKey, { ladder: 'A' }); await run(300);
+  }
+  // ---- virtual lists: the drawn window moves 8 rows at a time, so most scroll frames redraw
+  // nothing (2026-10-06 browser pass: every 2-row scroll step relaid out ~50 rows, ~5 ms)
+  {
+    const host = P.doc.createElement('div'); P.doc.body.appendChild(host);
+    let calls = 0;
+    const V = D.vlist(host, [{ h: 'A' }, { h: 'B', w: 40 }], 'grid', { rowH: 18, headH: 20, h: 360, onScroll: () => { calls++; } });
+    const items = Array.from({ length: 1000 }, (_, i) => i);
+    const drawAll = () => V.draw(items, String, i => [String(i), ''], () => '');
+    const firstKey = () => { const r = V.tb.children.find(x => !/\bvpad\b/.test(x.className)); return r ? r.getAttribute('data-k') : null; };
+    const scrollTo = row => { host.scrollTop = row * 18; fire(host, 'scroll', {}); };
+    drawAll();
+    eq(V.a + '-' + V.b + ' ' + firstKey(), '0-45 0', 'a virtual list draws the rows in view and a margin: 45 of 1,000');
+    scrollTo(5);
+    eq(calls, 0, 'scrolling inside the drawn window asks for no redraw (the browser just scrolls)');
+    scrollTo(20);
+    eq(calls, 1, 'leaving it asks for one');
+    drawAll();
+    eq(V.a + ' ' + firstKey(), '8 8', 'and the window moves by whole chunks of 8 rows, 8 rows above the view');
+    scrollTo(23);
+    eq(calls, 1, 'the next rows scroll free again');
+    scrollTo(995); drawAll();
+    check(V.b === 1000 && V.a <= 1000 - 21, 'at the end it draws the end, never an empty window', [V.a, V.b]);
+    const pads = V.tb.children.filter(r => /\bvpad\b/.test(r.className)).map(r => parseInt(r.children[0].style.getPropertyValue('height'), 10));
+    eq(pads.reduce((x, y) => x + y, 0) + (V.b - V.a) * 18, 1000 * 18, 'the spacers keep the whole list\'s height');
+    const nScroll = () => host._ls.filter(l => l.type === 'scroll').length;
+    const tb0 = V.tb;
+    V.retable([{ h: 'A' }, { h: 'B', w: 40 }, { h: 'C', w: 40 }], 'grid');
+    check(V.tb !== tb0 && host.contains(V.tb) && !host.contains(tb0) && nScroll() === 1, 'a new column set swaps the table, not the listeners', nScroll());
+    host.remove();
+    // the watchlist's wider column set (from 420 px) reuses its list
+    const n0 = MS.watch.body._ls.filter(l => l.type === 'scroll').length;
+    MS.watch.wide = true; D.render.mark('mwatch'); await run(300);
+    MS.watch.wide = false; D.render.mark('mwatch'); await run(300);
+    check(n0 === 1 && MS.watch.body._ls.filter(l => l.type === 'scroll').length === 1 && MS.watch.body.contains(MS.watch.tb), 'the watchlist widening and narrowing keeps one scroll listener', [n0, MS.watch.body._ls.filter(l => l.type === 'scroll').length]);
   }
   // ---- ticket ---------------------------------------------------------------------------------
   const E = MS.ticket.el;
@@ -1176,6 +1215,20 @@ function manOrders(P, key) { const a = []; P.D.store.orders.forEach(o => { if (o
     draw('');
     eq(n, 1, 'a level that goes away does not flash (no grey box on an empty cell)');
   }
+  // ---- a P&L keyed on its realized part: no flash when only the mark moves; green up, red down
+  {
+    const tb = P.doc.createElement('tbody');
+    const draw = (t, fk) => D.dom.keyedRows(tb, [1], String, () => [{ t, cls: 'n', fl: 'd', flg: 1500, fk }]);
+    draw('+1.00', '100');
+    const td = tb.children[0].children[0], got = [];
+    td.animate = kf => { got.push(kf[0].boxShadow); return {}; };
+    draw('+1.40', '100');
+    eq(got.length, 0, 'a P&L keyed on its realized part does not flash when only the mark moves');
+    draw('+2.40', '150');
+    check(got.length === 1 && /63,185,80/.test(got[0]), 'it flashes green when the realized part rises', got);
+    td._flT = 0; draw('+0.40', '20');
+    check(got.length === 2 && /248,81,73/.test(got[1]), 'and red when it falls', got);
+  }
   // ---- FLASH: calm by default (SUBTLE), routine book updates only with FULL, nothing with OFF ---
   {
     const proto = P.doc.createElement('td').constructor.prototype, anim0 = proto.animate;
@@ -1218,6 +1271,26 @@ function manOrders(P, key) { const a = []; P.D.store.orders.forEach(o => { if (o
     eq(fl.length, 0, 'OFF: nothing flashes anywhere');
     key('KeyF', 'f');
     eq(D.ui.flash, 'subtle', 'f cycles FLASH (OFF to SUBTLE)');
+    // POSITIONS: unrealized P&L moves with every mark, so it flashes only with FULL (2026-10-06
+    // browser pass: twenty Systematic positions twinkled ~9 cells a second in SUBTLE)
+    {
+      P.sim().freeze(natKey, { bids: [[6300, 120]], asks: [[6400, 300]] }); await run(300);
+      D.act.order({ v: 'K', tk: nat.tk, side: 'BUY', px: 6400, qty: 2, tif: 'IOC', touch: 6400 }, null); await run(800);
+      const ptbF = P.$('m-pos-body').children[0].children[2];
+      const unrlOf = () => { const r = ptbF.children.find(x => x.getAttribute('data-k') === natKey); return r ? r.children[7] : null; };
+      check(!!unrlOf() && st.position(natKey).pos >= 2, 'a position to mark', st.position(natKey));
+      const u0 = unrlOf().textContent;
+      fl = [];
+      P.sim().freeze(natKey, { bids: [[6600, 120]], asks: [[6700, 300]] }); await run(1200);
+      P.sim().freeze(natKey, { bids: [[6100, 120]], asks: [[6200, 300]] }); await run(1200);
+      check(unrlOf().textContent !== u0 && !fl.some(x => x.el === unrlOf()), 'SUBTLE: unrealized P&L in POSITIONS does not flash when the mark moves', [u0, unrlOf().textContent]);
+      D.ui.setFlash('full'); fl = [];
+      P.sim().freeze(natKey, { bids: [[6600, 120]], asks: [[6700, 300]] }); await run(1200);
+      check(fl.some(x => x.el === unrlOf()), 'FULL: it does');
+      D.ui.setFlash('subtle');
+      D.act.order({ v: 'K', tk: nat.tk, side: 'SELL', px: 6600, qty: st.position(natKey).pos, tif: 'IOC', touch: 6600 }, null); await run(800);
+      eq(st.position(natKey).pos, 0, 'flat again');
+    }
     // a busy book repaints the ladder at most about 10 times a second
     const bk = JSON.parse(JSON.stringify(D.contract.examples.book));
     bk.tk = nat.tk; bk.trades = []; bk.last = null;
@@ -1415,9 +1488,20 @@ function manOrders(P, key) { const a = []; P.D.store.orders.forEach(o => { if (o
     P.frame();
     check(top() && ev(top()) === 'SUB' && top().children[2].textContent === 'BUY' && /side-BUY/.test(top().children[2].className) && top().getAttribute('data-mkt') === ak,
       'an order shows on the tape at the click: SUB, side in its colour, linked to its market', top() && top().textContent);
+    eq(top().children[6].textContent, 'POST 15s', 'a sent post says what it rests for');
     await run(300);
     D.act.cancel([ca.cid]); await run(300);
     check(ev(top()) === 'CXL' && /USER/.test(top().children[6].textContent) && /a-CXL/.test(top().className), 'a cancel shows CXL with its reason (grey)', top().textContent);
+    {
+      const ttlBtn = v => P.$('m-lad-a-foot').children[1].children.find(b => b.getAttribute('data-v') === v);
+      click(ttlBtn('CLOSE')); await run(600);           // (clear of the ladder's roll hold)
+      click(ladCell(P, 'A', 6100, 'bq'));
+      const cc = newest(P, x => x.own === 'MAN');
+      P.frame();
+      check(ev(top()) === 'SUB' && top().children[6].textContent === 'POST CL' && cc.exp_ms === Math.floor(st.market(ak).close_ms / 1000) * 1000, 'an until-close post says POST CL on the tape', top().textContent + ' | ' + st.alerts.slice(0, 2).map(a => a.msg).join(' / '));
+      await run(300); D.act.cancel([cc.cid]); await run(300);
+      click(ttlBtn('15')); P.frame();
+    }
     click(ladCell(P, 'A', 6400, 'bq')); await run(400);
     check(arows().slice(0, 3).some(r => ev(r) === 'FILL' && /\bT\b/.test(r.children[6].textContent)), 'an IOC that fills shows FILL with its liquidity (T)', arows().slice(0, 3).map(r => r.textContent));
     const pr = P.$('m-pos-body').children[0].children[2].children.find(r => r.getAttribute('data-k') === ak);
@@ -1442,6 +1526,12 @@ function manOrders(P, key) { const a = []; P.D.store.orders.forEach(o => { if (o
       'only the alert types count (fills and exits by default), not every quote', { un, fills: fresh.filter(e => e.type === 'FILL' || e.type === 'EXIT').length, all: fresh.length });
     fire(P.$('hc-act'), 'pointerdown', { button: 0 }); fire(P.$('hc-act'), 'click', {}); await run(300);
     check(D.render.tab === 'systematic' && P.$('h-act').textContent === '0', 'ACT shows the tab they happened on and counts them seen');
+    // the tape is a virtual list: a minute of busy lanes is hundreds of events, a few dozen rows
+    D.render.force('systematic'); P.frame();
+    const stb = P.$('s-act-body').children[0].children[2], sDrawn = stb.children.filter(r => /^a-/.test(r.className)).length;
+    check(D.activity.lists.SYS.length > 200 && sDrawn > 10 && sDrawn <= 64, 'the tape keeps every event and draws only the rows in view', { events: D.activity.lists.SYS.length, drawn: sDrawn });
+    const sPads = stb.children.filter(r => /\bvpad\b/.test(r.className)).map(r => parseInt(r.children[0].style.getPropertyValue('height'), 10) || 0);
+    eq(sPads.reduce((x, y) => x + y, 0) + sDrawn * D.dom.rowPx(), D.activity.lists.SYS.length * D.dom.rowPx(), 'its spacers keep the whole tape\'s height (it scrolls back through all of it)');
     D.act.stop(); D.tabs.set('manual'); await run(500);
   }
 

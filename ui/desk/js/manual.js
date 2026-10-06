@@ -157,8 +157,9 @@
       var F = Desk.fmt, s = F.size(left);
       if (part && filled > 0) return s + '(' + F.size(filled) + ')';
       if (secs === null || secs === undefined) return s;
-      // a long expiry (until close, 30 min) counts in minutes or hours: '8 14m', '8 3h'
-      if (secs >= 100) return logic.fit6(s + ' ' + (secs < 6000 ? Math.ceil(secs / 60) + 'm' : Math.floor(secs / 3600) + 'h'), s);
+      // a long expiry (until close, 30 min) counts in whole minutes or hours, as the ticket, the
+      // watchlist and WORKING show time left (Desk.fmt.left): '8 14m', '8 3h'
+      if (secs >= 100) return logic.fit6(s + ' ' + (secs < 6000 ? Math.floor(secs / 60) + 'm' : Math.floor(secs / 3600) + 'h'), s);
       var t = s + ' ' + secs + 's';
       if (t.length > 6) t = s + ' ' + secs;
       if (t.length > 6) t = s;
@@ -1327,7 +1328,9 @@
                 { h: 'F', w: 29, cls: 'n fair', title: 'model fair' }, { h: 'E', w: 29, cls: 'n espn', title: 'ESPN win probability' },
                 { h: 'Pos', w: 30, cls: 'n' }, { h: 'T', w: 51, cls: 'tcl' }];
     if (wide) cols.push({ h: 'Sprd¢', w: 46, cls: 'n' }, { h: 'Vol', w: 52, cls: 'n' }, { h: 'Close', w: 46, cls: 'tcl' });
-    W.V = Desk.vlist(W.body, cols, 'watch', { rowH: 18, headH: 20, onScroll: function () { W.dirty = true; mark('mwatch'); } });
+    // one virtual list per body: a wider column set swaps its table, not its listeners
+    if (W.V) W.V.retable(cols, 'watch');
+    else W.V = Desk.vlist(W.body, cols, 'watch', { rowH: 18, headH: 20, onScroll: function () { W.dirty = true; mark('mwatch'); } });
     W.tb = W.V.tb;
     W.ncol = cols.length; W.builtWide = !!wide;
   }
@@ -1608,7 +1611,9 @@
         { t: P.pos ? px(P.avg) : '', cls: 'n' },
         { t: b ? px(b.bb) : '', cls: 'n bid' },
         { t: b ? px(b.ba) : '', cls: 'n ask' },
-        { t: P.pos ? F.pnl(P.unrl) : '', cls: 'n ' + F.sign(P.unrl), fl: 'd', flg: 1500 },
+        // unrealized moves with every mark: it flashes only with FLASH FULL; realized (a fill, an
+        // exit, a settlement) flashes in SUBTLE too
+        { t: P.pos ? F.pnl(P.unrl) : '', cls: 'n ' + F.sign(P.unrl), fl: 'd', flg: 1500, flv: 'full' },
         { t: F.pnl(P.real), cls: 'n ' + F.sign(P.real), fl: 'd' },
         { t: P.pos ? F.money(P.maxl) : '', cls: 'n' },
         canFlat ? { t: 'FLAT', cls: 'flat', attr: { 'data-flat': P.key, 'data-nolink': '1' } } : { t: '', cls: '', attr: { 'data-flat': null, 'data-nolink': null } }

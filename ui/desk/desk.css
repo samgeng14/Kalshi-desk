@@ -356,6 +356,11 @@ body[data-split="1"] .s-lower { grid-template-columns: minmax(0, 1fr) 560px; }
 .ptools { margin-left: auto; display: flex; align-items: center; gap: 4px; min-width: 0; }
 .ptools input { height: 16px; font-size: 11px; }
 .pbody { flex: 1 1 auto; min-height: 0; overflow: auto; position: relative; overscroll-behavior: contain; }
+/* A panel body in the tabs takes its size from the panel, never from its rows: strict containment
+   keeps a change inside it (a fill on top of a tape, a new working order) from laying out the
+   rest of the screen (measured in Chrome with the lanes trading: frames over 8 ms 1 in 9 -> 1 in
+   75; a row added to a 200-row grid 4.6 -> 1.4 ms). */
+#tabs .panel > .pbody { contain: strict; }
 .pfoot {
   flex: 0 0 20px; height: 20px; display: flex; align-items: center; gap: 8px; padding: 0 6px;
   border-top: 1px solid var(--line); background: var(--bg2); font: 11px/1 var(--font-num); color: var(--tx1); white-space: nowrap; overflow: hidden;
