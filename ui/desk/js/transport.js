@@ -14,13 +14,20 @@
  *   Desk.transport.snapshot() -> Promise<snapshot>
  *   Desk.transport.post(path, body) -> Promise<{status, json}>   (status 0 = no answer)
  *
+ * Desk.token: the per-start X-Desk token the backend writes into the page
+ * (<meta name="desk-token">). Every POST carries it. Live mode re-reads it from the page after
+ * a backend restart (hb.epoch changes) and retries a POST refused FORBIDDEN once after that;
+ * demo mode takes the simulated backend's token.
+ *   Desk.token.value, .read(), .refresh() -> Promise<token>
+ *
  * Desk.act: every operator action. Each paints its optimistic state into the store first
  * (synchronously, so the next frame shows it), then sends; nothing ever awaits the network
  * before painting.
- *   Desk.act.order({v, tk, side, px (u), qty, tif, ttl_s, override, touch (u)}, ev) -> cid | null
+ *   Desk.act.order({v, tk, side, px (u), qty, tif, ttl_s, exp_ms, reduce_only, override, touch (u)}, ev)
+ *     -> cid | null
  *   Desk.act.cancel(cids), Desk.act.cancelWhere({v, tk, own, side, px}), Desk.act.cancelAll(own, v)
  *   Desk.act.amend(cid, {px (u), qty, ttl_s}), Desk.act.lane(id, on), Desk.act.start(), .stop(),
- *   .kill(), .rearm(), .release(v, tk), .resync()
+ *   .kill(), .rearm(), .release(v, tk), .transfer(from, to, amt (u)), .resync()
  *
  * Desk.subs.sync(): subscribe the stream to the ladders on screen plus every market's top.
  */
@@ -39,12 +46,39 @@
   var EVENT_TYPES = Desk.contract ? Object.keys(Desk.contract.events) : ['hdr', 'mkt', 'book', 'ord', 'fill', 'pos', 'lane', 'risk', 'mo', 'alert', 'hb'];
 
   // ---------------------------------------------------------------------------------------------
+  // the X-Desk token
+  // ---------------------------------------------------------------------------------------------
+  var META = (Desk.contract && Desk.contract.TOKEN_META) || 'desk-token';
+  var RE_META = new RegExp('<meta\\s+name=["\']' + META + '["\']\\s+content=["\']([^"\']*)["\']', 'i');
+  var tokenRefresh = null;
+  var token = Desk.token = {
+    value: '',
+    read: function () {
+      try {
+        var el = root.document && root.document.querySelector ? root.document.querySelector('meta[name="' + META + '"]') : null;
+        token.value = el ? (el.getAttribute('content') || '') : '';
+      } catch (e) { token.value = ''; }
+      return token.value;
+    },
+    // fetch this page again (never cached) and take the token the backend wrote into it
+    refresh: function () {
+      if (tokenRefresh) return tokenRefresh;
+      var path = (root.location && root.location.pathname) || '/';
+      tokenRefresh = fetch(path, { method: 'GET', credentials: 'same-origin', cache: 'no-store' }).then(function (r) { return r.text(); })
+        .then(function (t) { var m = RE_META.exec(t); if (m) token.value = m[1]; tokenRefresh = null; return token.value; },
+              function () { tokenRefresh = null; return token.value; });
+      return tokenRefresh;
+    }
+  };
+
+  // ---------------------------------------------------------------------------------------------
   // live
   // ---------------------------------------------------------------------------------------------
   function fetchJSON(method, path, body, timeoutMs) {
     var ctl = typeof AbortController !== 'undefined' ? new AbortController() : null;
     var timer = ctl ? setTimeout(function () { ctl.abort(); }, timeoutMs || 5000) : null;
-    var init = { method: method, credentials: 'same-origin', cache: 'no-store', headers: { 'X-Desk': '1' } };
+    var init = { method: method, credentials: 'same-origin', cache: 'no-store', headers: {} };
+    if (method === 'POST') init.headers['X-Desk'] = token.value;
     if (body !== undefined) { init.headers['Content-Type'] = 'application/json'; init.body = JSON.stringify(body); }
     if (ctl) init.signal = ctl.signal;
     return fetch(path, init).then(function (r) {
@@ -60,9 +94,18 @@
     });
   }
 
-  function Live(sid) { this.sid = sid; this.es = null; this.opened = false; this.retry = null; }
+  function Live(sid) { this.sid = sid; this.es = null; this.opened = false; this.retry = null; this.epoch = null; token.read(); }
   Live.prototype.connect = function (onEnv, onState) {
     var self = this;
+    var inner = onEnv;
+    // a new hb.epoch is a backend restart: its token is new too
+    onEnv = function (env) {
+      if (env && env.type === 'hb' && env.data && env.data.epoch) {
+        if (self.epoch !== null && env.data.epoch !== self.epoch) token.refresh();
+        self.epoch = env.data.epoch;
+      }
+      inner(env);
+    };
     var open = function () {
       if (self.es) { try { self.es.close(); } catch (e) { /* closed */ } }
       var es = self.es = new EventSource('/api/stream?sid=' + encodeURIComponent(self.sid));
@@ -86,7 +129,12 @@
       return r.json;
     });
   };
-  Live.prototype.post = function (path, body) { return fetchJSON('POST', path, body, 5000); };
+  Live.prototype.post = function (path, body) {
+    return fetchJSON('POST', path, body, 5000).then(function (r) {
+      if (r.status !== 403 || !(r.json && r.json.err && r.json.err.code === 'FORBIDDEN')) return r;
+      return token.refresh().then(function () { return fetchJSON('POST', path, body, 5000); });
+    });
+  };
   Live.prototype.close = function () { if (this.es) this.es.close(); };
 
   // ---------------------------------------------------------------------------------------------
@@ -98,14 +146,16 @@
     this.sim = Desk.sim.create({
       sid: this.sid, mode: 'DEMO', emit: onEnv,
       seed: q.seed ? (parseInt(q.seed, 10) >>> 0) : ((Date.now() / 1000) >>> 0),
-      pmRO: q.pmro === '1', chaos: q.chaos === '1'
+      pmRO: q.pmro === '1', chaos: q.chaos === '1', ext: q.ext !== '0'
     });
+    token.value = this.sim.token;           // what the backend would have written into the page
     this.sim.start();
     onState('open', false);
   };
   Demo.prototype.request = function (method, path, body) {
     var sim = this.sim;
-    return new Promise(function (resolve) { sim.request(method, path, body, function (status, json) { resolve({ status: status, json: json }); }); });
+    var hdrs = method === 'POST' ? { 'Content-Type': 'application/json', 'X-Desk': token.value } : {};
+    return new Promise(function (resolve) { sim.request(method, path, body, function (status, json) { resolve({ status: status, json: json }); }, hdrs); });
   };
   Demo.prototype.snapshot = function () {
     return this.request('GET', '/api/snapshot?sid=' + this.sid).then(function (r) { return r.json; });
@@ -189,16 +239,19 @@
       if (m && !Desk.grid.onGrid(m.g, o.px)) { S.localAlert('WARN', 'GW', 'not sent: ' + Desk.fmt.px(o.px) + ' is off the grid'); return null; }
       if (!(o.qty > 0)) { S.localAlert('WARN', 'GW', 'not sent: qty ' + o.qty); return null; }
       var cid = newCid();
-      var ttl = o.tif === 'POST' ? (o.ttl_s || 15) : null;
+      var expMs = o.tif === 'POST' && o.exp_ms ? o.exp_ms : null;
+      var ttl = o.tif === 'POST' && !expMs ? (o.ttl_s || 15) : null;
       var tClickMs = Desk.lat.epoch(ev);
       Desk.lat.click(cid, ev, o.v);
-      S.pend({ cid: cid, v: o.v, tk: o.tk, side: o.side, px: o.px, qty: o.qty, tif: o.tif, ttl_s: ttl,
+      S.pend({ cid: cid, v: o.v, tk: o.tk, side: o.side, px: o.px, qty: o.qty, tif: o.tif, ttl_s: ttl, exp_ms: expMs,
                touch: o.touch === undefined ? null : o.touch, t_click_ms: tClickMs });
       var body = {
         cid: cid, v: o.v, tk: o.tk, side: o.side, px: N.pxStr(o.px), qty: o.qty, tif: o.tif,
         ttl_s: ttl, override: !!o.override,
         touch: o.touch === null || o.touch === undefined ? null : N.pxStr(o.touch), t_click_ms: tClickMs
       };
+      if (expMs) body.exp_ms = expMs;
+      if (o.reduce_only && o.tif === 'IOC') body.reduce_only = true;
       T.post('/api/order', body).then(function (r) { S.reply(cid, r.status, r.json); });
       return cid;
     },
@@ -256,6 +309,10 @@
     },
     rearm: function () { return T.post('/api/rearm', {}).then(runReply('rearm')); },
     release: function (v, tk) { return T.post('/api/release', { v: v, tk: tk }).then(function (r) { if (!(r.json && r.json.ok)) failAlert('release', r); return r; }); },
+    // move free cash between Kalshi shards; amt in u
+    transfer: function (from, to, amt) {
+      return T.post('/api/transfer', { from: from, to: to, amt: N.moneyStr(amt) }).then(function (r) { if (!(r.json && r.json.ok)) failAlert('move', r); return r; });
+    },
     resync: function () { st().resync('USER'); }
   };
 })(typeof window !== 'undefined' ? window : globalThis);

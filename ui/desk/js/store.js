@@ -316,12 +316,12 @@
     // ------------------------------------------------------------------------------------------
     // local writes (optimistic)
     // ------------------------------------------------------------------------------------------
-    // req: {cid, v, tk, side, px (u), qty, tif, ttl_s, touch (u|null), t_click_ms, tClick (perf)}
+    // req: {cid, v, tk, side, px (u), qty, tif, ttl_s, exp_ms, touch (u|null), t_click_ms, tClick (perf)}
     pend: function (req) {
       var now = nowMs(), key = req.v + '|' + req.tk;
       var o = {
         cid: req.cid, oid: null, v: req.v, tk: req.tk, key: key, side: req.side, px: req.px, qty: req.qty, filled: 0,
-        left: req.qty, avg: null, tif: req.tif, exp_ms: req.tif === 'POST' && req.ttl_s ? now + req.ttl_s * 1000 : null,
+        left: req.qty, avg: null, tif: req.tif, exp_ms: req.tif === 'POST' && req.ttl_s ? now + req.ttl_s * 1000 : (req.tif === 'POST' && req.exp_ms ? req.exp_ms : null),
         st: 'PEND', why: '', own: 'MAN', lane: null, piq: null, fee: 0, touch: req.touch === undefined ? null : req.touch, edge: null,
         t: { click: req.t_click_ms || null, recv: null, sent: null, ack: null, done: null },
         terminal: false, doneAt: null,
@@ -405,7 +405,7 @@
         v: d.v, tk: d.tk, key: key, ev: d.ev, title: d.title, short: d.short, grp: d.grp, kind: d.kind, og: d.og, oc: d.oc,
         open_ms: d.open_ms, close_ms: d.close_ms, status: d.status, result: d.result, grid: d.grid,
         g: old && JSON.stringify(old.grid) === JSON.stringify(d.grid) ? old.g : Desk.grid.make(d.grid),
-        fee: { type: d.fee.type, mult: d.fee.mult }, shard: d.shard, lip: d.lip
+        fee: { type: d.fee.type, mult: d.fee.mult }, shard: d.shard, lip: d.lip, start_ms: d.start_ms, man: d.man
       };
       st.markets.set(key, m);
       mark('mkt'); mark('mkt:' + key);

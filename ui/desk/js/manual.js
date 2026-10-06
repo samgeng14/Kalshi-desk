@@ -22,9 +22,11 @@
  *   - REF markers: F model fair, E ESPN, A our average entry. Break-even band: prices within the
  *     taker fee of the model fair.
  * TICKET: venue (paired market on the other venue), side, qty, price (AUTO follows the touch until
- *   typed or stepped), IOC / FOK / POST 5s 15s 60s 5m 30m START (15 s default, no GTC; options the
- *   contract does not carry yet are disabled), cost / max loss / fee / shard line, edge vs model
- *   and ESPN, the guard as a second click (the button turns OVERRIDE for 3 s).
+ *   typed or stepped), IOC / FOK / POST 5s 15s 60s 5m 30m START (15 s default, no GTC; START = an
+ *   exchange-side expiry at the game's start_ms, off when the market has none or it has passed),
+ *   cost / max loss / fee / shard line (a short Kalshi shard offers MOVE: one click moves the
+ *   missing cash from the shard with the most free cash), edge vs model and ESPN, the guard as a
+ *   second click (the button turns OVERRIDE for 3 s).
  * HOTKEYS: off at load (H toggles, foundation). In a focused ladder: B/F1 S/F2 take (IOC at the
  *   touch plus the cap), Shift+B/F3 Shift+S/F4 join, Alt+B/F5 Alt+S/F6 improve one tick (spread of
  *   2+ ticks), Esc cancel this market, 1-6 size presets, + / - step size. Shift+Esc cancels every
@@ -37,10 +39,10 @@
  *   logic                    pure helpers, no DOM (the node tests drive these)
  *   state()                  the tab's runtime state, for tests and debugging
  *
- * Store extension kept inside this file (no store change): which markets are held manual. A manual
- * order marks its market MAN (the backend cancels Systematic's orders there, why TAKEOVER) until
- * POST /api/release; the contract has no field for it yet, so the set is inferred from our own
- * sends and from SYS orders cancelled with why TAKEOVER, and kept per viewer.
+ * Held markets: a manual order makes its market MAN (the backend cancels Systematic's orders
+ * there, why TAKEOVER) until POST /api/release; the backend reports it as mkt.man. Between our send
+ * and the mkt echo the ladder shows MAN from the send itself (at most 3 s). Foreign orders are
+ * own EXT (placed outside the desk); they show amber as EXT.
  */
 (function (root) {
   'use strict';
@@ -58,6 +60,7 @@
   var TERM_SHOW_MS = 3000;           // CXL / REJ / FILL rows stay in WORKING this long
   var LTQ_MS = 3000;                 // a print shows in LTQ this long
   var KEY_HOLD_MS = 10000;           // a keyboard scroll holds off the auto-recentre this long
+  var HELD_MS = 3000;                // our send shows the market MAN until the mkt echo, at most this long
   // ticket order types; ttl 'START' = until the game starts
   var TK_TYPES = [
     { id: 'IOC', tif: 'IOC', ttl: null, label: 'IOC' }, { id: 'FOK', tif: 'FOK', ttl: null, label: 'FOK' },
@@ -149,7 +152,25 @@
     },
     // client order ids are prefixed M (manual) or S<lane> (systematic); anything else is foreign
     foreign: function (cid) { return !/^[MS]/.test(String(cid || '')); },
+    // an order this desk did not place: own EXT (contract 1.1), or a cid that is neither M nor S
+    isExt: function (o) { return !!o && (o.own === 'EXT' || logic.foreign(o.cid)); },
     ttlOK: function (ttl) { var e = Desk.contract && Desk.contract.enums.TTL_S; return !!e && e.indexOf(ttl) >= 0; },
+    // START: an expiry at the game's start, a whole second, 5 s to 24 h ahead; null when not possible
+    startExp: function (m, nowS) {
+      if (!m || !m.start_ms) return null;
+      var e = Math.floor(m.start_ms / 1000) * 1000;
+      return e - nowS >= 5000 && e - nowS <= 86400000 ? e : null;
+    },
+    // MOVE for a short Kalshi shard: the shard with the most free cash and the amount to move
+    // (the shortfall rounded up to the dollar, at most that shard's free cash); null when none
+    moveFor: function (shards, to, need) {
+      if (!shards || !to || !(need > 0)) return null;
+      var best = null;
+      shards.forEach(function (x) { if (x.id !== to && x.free > 0 && (!best || x.free > best.free)) best = x; });
+      if (!best) return null;
+      var amt = Math.min(Math.ceil(need / U) * U, Math.floor(best.free / 100) * 100);
+      return amt > 0 ? { from: best.id, amt: amt, full: amt >= need } : null;
+    },
     // a reference value (model, ESPN) on the market's decimals, not snapped to the grid
     fmtRef: function (u, g) { if (u === null || u === undefined || isNaN(u)) return ''; return (u / U).toFixed(g ? g.dp : 2); },
     // the cash an order ties up (reducing orders tie up nothing), its fee and the position after
@@ -247,7 +268,7 @@
   function defaults() {
     var lad = {};
     SLOTS.forEach(function (s) { lad[s] = { qty: 1, ttl: 15, zoom: 1 }; });
-    return { cap: 1, lad: lad, tk: { qty: 1, type: 'P15', side: 'BUY' }, watch: { venue: 'ALL', collapsed: {} }, taken: [] };
+    return { cap: 1, lad: lad, tk: { qty: 1, type: 'P15', side: 'BUY' }, watch: { venue: 'ALL', collapsed: {} } };
   }
   function loadCfg() {
     var c = defaults(), s = Desk.storage ? Desk.storage.getJSON('manual', null) : null;
@@ -269,12 +290,10 @@
       if (s.watch.venue === 'K' || s.watch.venue === 'P' || s.watch.venue === 'ALL') c.watch.venue = s.watch.venue;
       if (s.watch.collapsed && typeof s.watch.collapsed === 'object') Object.keys(s.watch.collapsed).forEach(function (g) { if (s.watch.collapsed[g]) c.watch.collapsed[g] = true; });
     }
-    if (Array.isArray(s.taken)) c.taken = s.taken.filter(function (k) { return typeof k === 'string'; }).slice(0, 200);
     return c;
   }
   function saveCfg() {
     if (!cfg || !Desk.storage) return;
-    cfg.taken = Array.from(taken);
     Desk.storage.setJSON('manual', cfg);
   }
 
@@ -285,7 +304,7 @@
   var TK = { key: null, px: null, pxBad: false, arm: null, el: {} };
   var W = { cursor: null, lastFocus: null, keys: [], q: '', lastAt: 0, dirty: false, scroll: false, el: {} };
   var GR = { work: null, fills: null, pos: null, posAt: 0, posDirty: false };
-  var taken = new Set();             // markets held manual (see the header note)
+  var sentAt = new Map();            // key -> our last send there (MAN shown until the mkt echo)
   var clickAt = new Map();           // cid -> the row clicked, for a pending IOC (its limit includes the cap)
   var vap = new Map();               // key -> Map px -> contracts printed since load (dim LTQ)
   var seenPrint = typeof WeakSet !== 'undefined' ? new WeakSet() : null;
@@ -319,6 +338,13 @@
     return '';
   }
   function alertWarn(msg) { S().localAlert('WARN', 'MAN', msg); }
+  // held by Manual: the backend's mkt.man, or our own send in the last HELD_MS
+  function held(key) {
+    var m = S().market(key);
+    if (m && m.man) return true;
+    var t = sentAt.get(key);
+    return !!t && Date.now() - t < HELD_MS && !(m && m.status !== 'OPEN');
+  }
   function sysThere(key) {
     var on = false;
     S().orders.forEach(function (o) { if (!on && o.key === key && !o.terminal && o.own === 'SYS') on = true; });
@@ -330,11 +356,12 @@
   // Sending (every path ends here; Desk.act paints PEND synchronously, then posts)
   // ---------------------------------------------------------------------------------------------
   function markTaken(key) {
-    if (taken.has(key)) return;
-    taken.add(key); saveCfg(); mark('mlad');
+    sentAt.set(key, Date.now()); mark('mlad');
+    if (sentAt.size > 200) sentAt.delete(sentAt.keys().next().value);
   }
   function send(key, m, side, it, qty, override, ev, clickRow) {
-    var cid = Desk.act.order({ v: m.v, tk: m.tk, side: side, px: it.px, qty: qty, tif: it.tif, ttl_s: it.tif === 'POST' ? it.ttl_s : null,
+    var cid = Desk.act.order({ v: m.v, tk: m.tk, side: side, px: it.px, qty: qty, tif: it.tif, ttl_s: it.tif === 'POST' && !it.exp_ms ? it.ttl_s : null,
+                               exp_ms: it.tif === 'POST' && it.exp_ms ? it.exp_ms : null, reduce_only: !!it.reduce_only,
                                override: !!override, touch: it.touch === undefined ? null : it.touch }, ev);
     if (cid) {
       if (clickRow !== undefined && clickRow !== null && it.tif !== 'POST' && clickRow !== it.px) {
@@ -348,7 +375,7 @@
   function release(key) {
     var m = S().market(key); if (!m) return;
     Desk.act.release(m.v, m.tk).then(function (r) {
-      if (r && r.json && r.json.ok) { taken.delete(key); saveCfg(); mark('mlad'); }
+      if (r && r.json && r.json.ok) { sentAt.delete(key); mark('mlad'); }
     });
   }
   function flatten(key, ev) {
@@ -359,6 +386,7 @@
     var side = P.pos > 0 ? 'SELL' : 'BUY';
     var it = logic.hotIntent('take', m.g, b ? b.bb : null, b ? b.ba : null, side, cfg.cap, null);
     if (it.err) { alertWarn('FLAT ' + m.short + ': ' + it.err); return null; }
+    it.reduce_only = true;                   // IOC with reduce_only: it can never flip the position
     return send(key, m, side, it, Math.abs(P.pos), false, ev, it.touch);
   }
 
@@ -625,14 +653,14 @@
       if (row === null) return;
       var e = r[o.side].get(row);
       if (!e) { e = { man: 0, sys: 0, filled: 0, pend: false, part: false, nMan: 0, nCxl: 0, cxl: false, exp: null, ext: false, cids: [], sysCids: [], piq: null }; r[o.side].set(row, e); }
-      if (o.own === 'SYS' && !logic.foreign(o.cid)) { e.sys = Math.round((e.sys + o.left) * 100) / 100; e.sysCids.push(o.cid); return; }
+      if (o.own === 'SYS' && !logic.isExt(o)) { e.sys = Math.round((e.sys + o.left) * 100) / 100; e.sysCids.push(o.cid); return; }
       e.man = Math.round((e.man + o.left) * 100) / 100; e.filled = Math.round((e.filled + o.filled) * 100) / 100; e.nMan++; e.cids.push(o.cid);
       if (o.st === 'PEND') e.pend = true;
       if (o.st === 'PART') e.part = true;
       if (o.local && o.local.cxlPend) e.nCxl++;
       if (o.exp_ms && (e.exp === null || o.exp_ms < e.exp)) e.exp = o.exp_ms;
       if (o.piq !== null && o.piq !== undefined && (e.piq === null || o.piq < e.piq)) e.piq = o.piq;
-      if (logic.foreign(o.cid)) e.ext = true;
+      if (logic.isExt(o)) e.ext = true;
     });
     r.BUY.forEach(function (e) { e.cxl = e.nMan > 0 && e.nCxl === e.nMan; });
     r.SELL.forEach(function (e) { e.cxl = e.nMan > 0 && e.nCxl === e.nMan; });
@@ -745,11 +773,11 @@
     else clk = F.left(m.close_ms - nowS);
     D.setText(H.clk, clk);
     D.setText(H.src, game ? game.src : '');
-    var own = taken.has(key) ? 'MAN' : (sysThere(key) ? 'SYS' : '');
+    var isHeld = held(key), own = isHeld ? 'MAN' : (sysThere(key) ? 'SYS' : '');
     D.setText(H.own, own); setCls(H.own, 'tag own' + (own === 'SYS' ? ' dim' : ''));
-    D.setClass(H.rel, 'off', !taken.has(key));
+    D.setClass(H.rel, 'off', !isHeld);
     var ext = false;
-    st.orders.forEach(function (o) { if (!ext && o.key === key && !o.terminal && logic.foreign(o.cid)) ext = true; });
+    st.orders.forEach(function (o) { if (!ext && o.key === key && !o.terminal && logic.isExt(o)) ext = true; });
     D.setClass(H.ext, 'off', !ext);
     var why = blockReason(m);
     D.setText(H.blk, why && why !== m.status ? why : '');
@@ -791,7 +819,11 @@
   // Ticket
   // ---------------------------------------------------------------------------------------------
   function tkType() { var id = cfg.tk.type; for (var i = 0; i < TK_TYPES.length; i++) if (TK_TYPES[i].id === id) return TK_TYPES[i]; return TK_TYPES[3]; }
-  function typeOK(t) { return t.tif !== 'POST' || logic.ttlOK(t.ttl); }
+  function typeOK(t, m) {
+    if (t.tif !== 'POST') return true;
+    if (t.ttl === 'START') return logic.startExp(m, Date.now() + (S().srvOffset || 0)) !== null;
+    return logic.ttlOK(t.ttl);
+  }
   function tkLoad(key) { TK.key = key; TK.px = null; TK.pxBad = false; TK.arm = null; }
   // the order a ticket button would send now: {px, tif, ttl_s, touch, liq}; px null = no price
   function tkOrder(side, m, b) {
@@ -801,8 +833,9 @@
       if (t.tif === 'POST') px = buy ? bb : ba;
       else px = touch === null ? null : Desk.grid.step(g, touch, buy ? cfg.cap : -cfg.cap);
     }
-    // a post-only order can only make; an IOC/FOK fill takes
-    return { px: px, tif: t.tif, ttl_s: t.tif === 'POST' ? t.ttl : null, touch: touch, liq: t.tif === 'POST' ? 'M' : 'T', auto: TK.px === null };
+    // a post-only order can only make; an IOC/FOK fill takes. START: the expiry is the game's start
+    var start = t.ttl === 'START', exp = start ? logic.startExp(m, Date.now() + (S().srvOffset || 0)) : null;
+    return { px: px, tif: t.tif, ttl_s: t.tif === 'POST' && !start ? t.ttl : null, exp_ms: exp, touch: touch, liq: t.tif === 'POST' ? 'M' : 'T', auto: TK.px === null };
   }
   function ticketPrice(key, px) {
     if (!key) return;
@@ -814,7 +847,7 @@
     var st = S(), key = TK.key, m = key ? st.market(key) : null, b = key ? st.book(key) : null;
     if (!m) return null;
     var btnEl = side === 'BUY' ? TK.el.buy : TK.el.sell;
-    var why = blockReason(m) || qtyReason(m, cfg.tk.qty) || (TK.pxBad ? 'PRICE OFF GRID' : '') || (typeOK(tkType()) ? '' : 'EXPIRY NOT IN CONTRACT');
+    var why = blockReason(m) || qtyReason(m, cfg.tk.qty) || (TK.pxBad ? 'PRICE OFF GRID' : '') || (typeOK(tkType(), m) ? '' : (tkType().ttl === 'START' ? 'NO START TIME' : 'EXPIRY NOT IN CONTRACT'));
     if (why) { refuse(null, btnEl, why); return null; }
     var o = tkOrder(side, m, b);
     if (o.px === null) { refuse(null, btnEl, 'NO PRICE: empty book side'); return null; }
@@ -825,7 +858,7 @@
       else { TK.arm = { side: side, px: o.px, key: key, until: now + ARM_MS }; alertWarn(guard + ': click OVERRIDE to send'); mark('mtk'); return null; }
     }
     TK.arm = null;
-    var cid = send(key, m, side, { tif: o.tif, px: o.px, ttl_s: o.ttl_s, touch: o.touch }, cfg.tk.qty, override, ev);
+    var cid = send(key, m, side, { tif: o.tif, px: o.px, ttl_s: o.ttl_s, exp_ms: o.exp_ms, touch: o.touch }, cfg.tk.qty, override, ev);
     mark('mtk');
     return cid;
   }
@@ -856,8 +889,9 @@
     var l5 = el('div', 'tk-l'), l6 = el('div', 'tk-l');
     E.costL = el('span', 'lb', 'cost'); E.cost = el('span', 'n v'); E.maxlL = el('span', 'lb', 'max loss'); E.maxl = el('span', 'n v');
     E.feeL = el('span', 'lb', 'fee'); E.fee = el('span', 'n v'); E.shL = el('span', 'lb'); E.sh = el('span', 'n v'); E.shOk = el('span', 'tag');
+    E.move = btn('', 'mv off', { 'data-a': 'move' });
     E.guard = el('span', 'tag warn');
-    add(l5, E.costL, E.cost, E.maxlL, E.maxl, E.feeL, E.fee, E.shL, E.sh, E.shOk, E.guard);
+    add(l5, E.costL, E.cost, E.maxlL, E.maxl, E.feeL, E.fee, E.shL, E.sh, E.shOk, E.move, E.guard);
     E.eML = el('span', 'lb', 'vs model'); E.eM = el('span', 'n fair'); E.eEL = el('span', 'lb', 'vs ESPN'); E.eE = el('span', 'n espn');
     E.eNL = el('span', 'lb', 'net'); E.eN = el('span', 'n v'); E.touch = el('span', 'n dim tch');
     add(l6, E.eML, E.eM, E.eEL, E.eE, E.eNL, E.eN, E.touch);
@@ -915,6 +949,7 @@
     var a = b.getAttribute('data-a'), v = b.getAttribute('data-v'), st = S();
     var m = TK.key ? st.market(TK.key) : null, bk = TK.key ? st.book(TK.key) : null;
     if (a === 'send') { tkSubmit(v, ev); return; }
+    if (a === 'move') { tkMove(); return; }
     if (a === 'venue') { if (m && v !== m.v) { var pk = logic.pairOf(st.markets, m); if (pk) Desk.focus.set(pk, { from: 'm-ticket' }); } return; }
     if (a === 'side') cfg.tk.side = v;
     else if (a === 'q') cfg.tk.qty = ev.shiftKey ? Math.round((cfg.tk.qty + +v) * 100) / 100 : +v;
@@ -930,6 +965,14 @@
     else if (a === 'type') cfg.tk.type = v;
     else return;
     TK.arm = null; saveCfg(); mark('mtk');
+  }
+  // move the missing cash onto the market's Kalshi shard (one click; the reply updates hdr)
+  function tkMove() {
+    var mv = TK.move;
+    if (!mv || TK.movePend) return null;
+    TK.movePend = true; mark('mtk');
+    return Desk.act.transfer(mv.from, mv.to, mv.amt).then(function (r) { TK.movePend = false; mark('mtk'); return r; },
+                                                          function () { TK.movePend = false; mark('mtk'); });
   }
   function renderTicket(d) {
     var st = S(), key = Desk.focus.key || null;
@@ -958,11 +1001,14 @@
     E.cap.forEach(function (x, i) { D.setClass(x, 'on', cfg.cap === CAPS[i]); });
     var t = tkType();
     E.types.forEach(function (x, i) {
-      var tt = TK_TYPES[i], ok = typeOK(tt) && !(tt.ttl === 'START');
+      var tt = TK_TYPES[i], ok = typeOK(tt, m);
       D.setClass(x, 'on', tt.id === t.id); setDisabled(x, !ok);
-      D.setAttr(x, 'title', ok ? null : 'not in contract ' + (Desk.contract ? Desk.contract.version : ''));
+      D.setAttr(x, 'title', ok ? (tt.ttl === 'START' && m ? 'expires at the start ' + Desk.fmt.time(m.start_ms) : null)
+        : (tt.ttl === 'START' ? (m && m.start_ms ? 'started' : 'no start time') : 'not in contract ' + (Desk.contract ? Desk.contract.version : '')));
     });
+    TK.move = null;
     if (!m) {
+      D.setClass(E.move, 'off', true);
       setVal(E.px, ''); [E.cost, E.maxl, E.fee, E.shL, E.sh, E.shOk, E.guard, E.eM, E.eE, E.eN, E.touch].forEach(function (x) { D.setText(x, ''); });
       D.setText(E.buy, 'BUY'); D.setText(E.sell, 'SELL'); setDisabled(E.buy, true); setDisabled(E.sell, true);
       setCls(E.buy, 'buy'); setCls(E.sell, 'sell');
@@ -986,7 +1032,12 @@
       var short = free !== null && ci.cost > free;
       D.setText(E.shOk, free === null ? '' : (short ? 'SHORT ' + F.money(ci.cost - free) : 'OK'));
       setCls(E.shOk, 'tag ' + (short ? 'warn' : 'ok'));
-    } else { [E.cost, E.maxl, E.fee, E.sh, E.shOk].forEach(function (x) { D.setText(x, ''); }); D.setText(E.shL, ''); }
+      var mv = short && m.v === 'K' && m.shard && st.hdr ? logic.moveFor(st.hdr.cash.K.shards, m.shard, ci.cost - free) : null;
+      if (mv) TK.move = { from: mv.from, to: m.shard, amt: mv.amt };
+      D.setText(E.move, mv ? (TK.movePend ? 'MOVING' : 'MOVE ' + F.money(mv.amt, 0) + ' ' + mv.from + '>' + m.shard) : '');
+      D.setClass(E.move, 'off', !mv); D.setClass(E.move, 'pend', !!TK.movePend); D.setClass(E.move, 'part', !!mv && !mv.full);
+      setDisabled(E.move, !mv || !!TK.movePend || !!S().canTrade('K'));
+    } else { [E.cost, E.maxl, E.fee, E.sh, E.shOk].forEach(function (x) { D.setText(x, ''); }); D.setText(E.shL, ''); D.setClass(E.move, 'off', true); }
     var guard = o.px !== null ? st.priceGuard(key, side, o.px) : '';
     D.setText(E.guard, guard ? 'GUARD ' + guard.replace(/^PRICE_BAND /, '').replace(/ \(.*$/, '') : '');
     // edge line: per contract, + in our favour
@@ -1007,7 +1058,7 @@
       if (x.tif === 'POST') return sd + ' ' + q + ' @' + F.pxg(x.px, g) + ' ' + (tkType().label);
       return sd + ' ' + q + ' ' + (x.tif === 'FOK' ? 'FOK ' : '') + '\u2264' + F.pxg(x.px, g);
     };
-    var blocked = !!(why || qtyReason(m, cfg.tk.qty) || TK.pxBad || !typeOK(t));
+    var blocked = !!(why || qtyReason(m, cfg.tk.qty) || TK.pxBad || !typeOK(t, m));
     [['BUY', E.buy, ob], ['SELL', E.sell, os]].forEach(function (x) {
       var armed = TK.arm && TK.arm.side === x[0] && TK.arm.key === key && TK.arm.px === x[2].px;
       D.setText(x[1], (armed ? 'OVERRIDE ' : '') + lab(x[0], x[2]));
@@ -1150,18 +1201,19 @@
   function renderWork(d) {
     if (!GR.work || !(d.all || d.has('ord') || d.has('focus') || d.has('clock') || d.has('mkt'))) return;
     var st = S(), F = Desk.fmt, nowS = Date.now() + (st.srvOffset || 0), fk = Desk.focus.key;
-    var pred = function (o) { return o.own === 'MAN' || logic.foreign(o.cid); };
+    var pred = function (o) { return o.own === 'MAN' || logic.isExt(o); };
     var live = st.working(pred), items = live.concat(st.recent(TERM_SHOW_MS, pred));
     items.sort(function (a, b) { return orderTime(b) - orderTime(a); });
     Desk.dom.setText(GR.workN, live.length ? String(live.length) : '');
     if (!items.length) { Desk.dom.emptyRow(GR.work, 11); return; }
     Desk.dom.keyedRows(GR.work, items, function (o) { return o.cid; }, function (o) {
-      var m = st.market(o.key), g = m ? m.g : null, ext = logic.foreign(o.cid);
+      var m = st.market(o.key), g = m ? m.g : null, ext = logic.isExt(o);
       var mkt = (ext ? 'EXT ' : '') + (m ? m.short : o.tk), stTxt = o.st, why = '';
       if (o.st === 'CXL' && o.tif !== 'POST' && (o.why === 'IOC_REST' || o.why === 'FOK' || o.why === 'STP'))
         mkt = o.tif + ' ' + F.size(o.filled) + '/' + F.size(o.qty) + ' killed ' + (m ? m.short : o.tk);
       if (o.st === 'REJ') why = o.why || 'REJ';
-      var exp = o.tif === 'POST' ? (o.exp_ms && !o.terminal ? F.secs(o.exp_ms - nowS) : '') : o.tif;
+      var expLeft = o.exp_ms && !o.terminal ? o.exp_ms - nowS : null;
+      var exp = o.tif === 'POST' ? (expLeft === null ? (ext && !o.terminal ? 'GTC' : '') : (expLeft >= 100000 ? F.dur(expLeft) : F.secs(expLeft))) : o.tif;
       var lat = o.t.click && o.t.ack ? ' ack ' + (o.t.ack - o.t.click) + 'ms' : '';
       return [
         { t: F.time(orderTime(o)), cls: 'n tm', title: o.cid + lat },
@@ -1285,23 +1337,8 @@
       }
     });
   }
-  // each SYS order cancelled with why TAKEOVER marks its market once (the store keeps terminal
-  // orders for 2 minutes; a REL in that time must not be undone by the same order)
-  var tookCids = new Set();
-  function noteTakeovers() {
-    var st = S(), changed = false;
-    st.orders.forEach(function (o) {
-      if (o.own !== 'SYS' || o.why !== 'TAKEOVER' || tookCids.has(o.cid)) return;
-      tookCids.add(o.cid);
-      if (tookCids.size > 2000) tookCids.delete(tookCids.values().next().value);
-      if (!taken.has(o.key)) { taken.add(o.key); changed = true; }
-    });
-    taken.forEach(function (k) { var m = st.market(k); if (st.markets.size && !st.resyncing && (!m || m.status !== 'OPEN')) { taken.delete(k); changed = true; } });
-    if (changed) { saveCfg(); mark('mlad'); }
-  }
   function renderCore(d) {
-    if (d.all || d.has('mkt') || d.has('snapshot') || d.has('layout')) { ensureLadders(); noteTakeovers(); }
-    else if (d.has('ord')) noteTakeovers();
+    if (d.all || d.has('mkt') || d.has('snapshot') || d.has('layout')) ensureLadders();
   }
   function trackPrints(d) {
     if (!seenPrint) return;
@@ -1393,7 +1430,6 @@
   // ---------------------------------------------------------------------------------------------
   function init() {
     cfg = loadCfg();
-    taken = new Set(cfg.taken);
     if (!hasDoc) return;
     SLOTS.forEach(buildLadder);
     buildWatch(); buildTicket(); buildGrids();
@@ -1418,7 +1454,7 @@
     // the panels render through their own renderers (registered in init); kept for the contract
     render: function (d) { void d; },
     logic: logic,
-    state: function () { return { cfg: cfg, ladders: LAD, ticket: TK, watch: W, taken: taken, clickAt: clickAt, vap: vap }; },
+    state: function () { return { cfg: cfg, ladders: LAD, ticket: TK, watch: W, sentAt: sentAt, held: held, clickAt: clickAt, vap: vap }; },
     // actions, for tests and the console
     flatten: flatten, release: release, ticketPrice: ticketPrice, tkSubmit: tkSubmit, recentre: function (s) { if (LAD[s]) recentre(LAD[s]); },
     hotOrder: function (s, kind, side, ev) { return LAD[s] ? hotOrder(LAD[s], kind, side, ev) : null; }

@@ -97,6 +97,9 @@
 #tab-manual .tk-l .lb { text-transform: none; letter-spacing: 0; font-size: 11px; }
 #tab-manual .tk-l .fair { color: var(--fair); } #tab-manual .tk-l .espn { color: var(--espn); }
 #tab-manual .tk-l .tch { margin-left: auto; }
+#tab-manual .tk-l button.mv { height: 14px; padding: 0 4px; font: 600 10px/1 var(--font-num); color: var(--warn); box-shadow: inset 0 0 0 1px var(--warn); }
+#tab-manual .tk-l button.mv.part { color: var(--tx1); box-shadow: inset 0 0 0 1px var(--line2); }
+#tab-manual .tk-l button.mv.pend { color: var(--tx2); box-shadow: inset 0 0 0 1px var(--line2); }
 #tab-manual .tk-b { display: flex; gap: 2px; flex: 0 0 32px; height: 32px; margin-top: 2px; }
 #tab-manual .tk-b button { flex: 1 1 50%; height: 32px; font: 600 13px/1 var(--font-num); letter-spacing: 0; }
 #tab-manual .tk-b button.confirm { font-weight: 700; }

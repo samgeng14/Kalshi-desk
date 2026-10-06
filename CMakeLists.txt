@@ -160,6 +160,10 @@ if(NODE_EXE)
   # venues' matching rules and fees, and every simulated event checked against the backend
   # contract (ui/desk/js/contract.js). Loads the scripts into a node vm; no browser, no packages.
   add_test(NAME ui-desk-v3 COMMAND ${NODE_EXE} ${CMAKE_SOURCE_DIR}/tests/test_ui_desk_v3.cjs)
+  # The v3 MANUAL and SYSTEMATIC tabs: the real index.html booted into a small fake DOM on the
+  # demo venues with a fake clock (clicks, keys, order states, KILL and re-arm, WIDE mode).
+  add_test(NAME ui-desk-v3-manual COMMAND ${NODE_EXE} ${CMAKE_SOURCE_DIR}/tests/test_ui_desk_v3_manual.cjs)
+  add_test(NAME ui-desk-v3-systematic COMMAND ${NODE_EXE} ${CMAKE_SOURCE_DIR}/tests/test_ui_desk_v3_systematic.cjs)
 endif()
 
 # Recorder data integrity: unit conversion and sequence-gap handling, no network required.

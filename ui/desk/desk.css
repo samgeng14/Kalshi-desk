@@ -165,6 +165,7 @@ body[data-tab="systematic"] #tab-sys, body[data-tab="manual"] #tab-man { backgro
 #kill:hover { background: #B42121; }
 #kill.locked { background: var(--bg3); color: var(--dn); font: 700 11px/1 var(--font-num); }
 #kill.rearm { background: var(--bg3); color: var(--warn); }
+#kill.rearm.confirm { background: var(--warn); color: #000; }
 
 /* ------------------------------------------------------------------------------------------
    Status bar (20 px) and overlays

@@ -14,7 +14,7 @@
   var Desk = root.Desk = root.Desk || {};
   var D = Desk.dom, F = Desk.fmt, R = Desk.render;
   var $ = D.$;
-  var REARM_CONFIRM = 'RE-ARM: accept new orders again?';
+  var REARM_MS = 3000;          // RE-ARM, then CONFIRM within this long
 
   // ---------------------------------------------------------------------------------------------
   // tabs: one data attribute on <body>; CSS swaps display; nothing is fetched
@@ -38,7 +38,7 @@
   // overlays
   // ---------------------------------------------------------------------------------------------
   var H = Desk.header = {
-    logOpen: false, keysOpen: false, killArmedAt: 0,
+    logOpen: false, keysOpen: false, rearmAt: 0, rearmPend: false,
     openLog: function (on) {
       H.logOpen = on === undefined ? !H.logOpen : !!on;
       D.setClass(document.body, 'log', H.logOpen);
@@ -62,18 +62,26 @@
   }
 
   // ---------------------------------------------------------------------------------------------
-  // KILL: one click, no dialog; 60 s lockout; re-arm is the only confirm() in the app
+  // KILL: one click, no dialog; 60 s lockout; re-arm is two clicks (RE-ARM, then CONFIRM within
+  // 3 s), no dialog either. After the re-arm Systematic is STOPPED and START waits for the order
+  // groups to reset (the GROUPS preflight row).
   // ---------------------------------------------------------------------------------------------
   function killState(now) {
     var h = Desk.store.hdr;
     if (!h || h.run.state !== 'KILLED') return { st: 'ARMED' };
     if (h.run.rearm_ms && now < h.run.rearm_ms) return { st: 'LOCKED', left: h.run.rearm_ms - now };
-    return { st: 'REARM' };
+    if (H.rearmPend) return { st: 'REARMING' };
+    return { st: now - H.rearmAt < REARM_MS ? 'CONFIRM' : 'REARM' };
   }
   function onKill(ev) {
-    var k = killState(Date.now());
+    var now = Date.now(), k = killState(now);
     if (k.st === 'ARMED') { Desk.act.kill(); R.mark('hdr'); return; }
-    if (k.st === 'REARM' && root.confirm(REARM_CONFIRM)) Desk.act.rearm();
+    if (k.st === 'REARM') { H.rearmAt = now; R.mark('hdr'); return; }
+    if (k.st === 'CONFIRM') {
+      H.rearmAt = 0; H.rearmPend = true; R.mark('hdr');
+      var done = function () { H.rearmPend = false; R.mark('hdr'); };
+      Desk.act.rearm().then(done, done);
+    }
     void ev;
   }
 
@@ -144,9 +152,9 @@
       // KILL label
       var k = killState(now), kb = $('kill');
       if (kb) {
-        var label = k.st === 'ARMED' ? 'KILL' : k.st === 'LOCKED' ? 'KILLED ' + F.mmss(k.left) : 'RE-ARM';
+        var label = k.st === 'ARMED' ? 'KILL' : k.st === 'LOCKED' ? 'KILLED ' + F.mmss(k.left) : k.st === 'CONFIRM' ? 'CONFIRM' : k.st === 'REARMING' ? 'RE-ARMING' : 'RE-ARM';
         D.setText(kb, label);
-        var kc = k.st === 'ARMED' ? '' : k.st === 'LOCKED' ? 'locked' : 'rearm';
+        var kc = k.st === 'ARMED' ? '' : k.st === 'LOCKED' ? 'locked' : k.st === 'CONFIRM' ? 'rearm confirm' : 'rearm';
         if (kb.className !== kc) kb.className = kc;
       }
     }

@@ -328,9 +328,10 @@ const flushMicro = () => new Promise(r => setImmediate(r));
   const sim = D.sim.create({ now: () => t, emit: e => evs.push(e), seed: 7, sid: 'testsid1' });
   const replies = [];
   function run(ms) { const end = t + ms; while (t < end) { t = Math.min(end, Math.max(t + 1, Math.min(sim.nextDue(), t + 100))); sim.pump(); } }
-  function call(method, p, body, ms) {
+  const HDRS = { 'Content-Type': 'application/json', 'X-Desk': sim.token };
+  function call(method, p, body, ms, hdrs) {
     let out = null;
-    sim.request(method, p, body, (s, j) => { out = { s, j }; replies.push([method, p, s, j]); });
+    sim.request(method, p, body, (s, j) => { out = { s, j }; replies.push([method, p, s, j]); }, hdrs === undefined ? HDRS : hdrs);
     run(ms === undefined ? 300 : ms);
     return out;
   }
@@ -342,6 +343,20 @@ const flushMicro = () => new Promise(r => setImmediate(r));
   const fillsOf = cid => evs.filter(e => e.type === 'fill' && e.data.cid === cid).map(e => e.data);
 
   run(1000);
+  // the web worker's guards: Host, then the per-start X-Desk token on every POST
+  check(C.hostOk('127.0.0.1:8788', 8788) && C.hostOk('localhost:8788', 8788) && C.hostOk('LOCALHOST:8788', 8788), 'Host 127.0.0.1:<port> and localhost:<port> pass');
+  check(!C.hostOk('evil.example:8788', 8788) && !C.hostOk('127.0.0.1:8787', 8788) && !C.hostOk('127.0.0.1', 8788) && !C.hostOk('', 8788), 'any other Host is refused (DNS rebinding)');
+  check(typeof sim.token === 'string' && sim.token.length >= 16, 'the sim has a per-start token (what the backend writes into the page)');
+  let g1 = call('POST', '/api/kill', {}, 300, {});
+  check(g1.s === 403 && g1.j.err.code === 'FORBIDDEN' && sim.state.run.state === 'STOP', 'a POST without the token is refused, KILL included', g1.j);
+  g1 = call('POST', '/api/stop', {}, 300, { 'X-Desk': 'stale-token-from-before' });
+  check(g1.s === 403 && g1.j.err.code === 'FORBIDDEN' && /stale/.test(g1.j.err.msg), 'a stale token is refused', g1.j);
+  g1 = call('GET', '/api/health', undefined, 300, { Host: 'evil.example:8788' });
+  check(g1.s === 403 && g1.j.err.code === 'FORBIDDEN', 'a GET with a foreign Host is refused', g1.j);
+  g1 = call('GET', '/api/health', undefined, 300, { Host: '127.0.0.1:8788' });
+  eq(g1.s, 200, 'a GET with Host 127.0.0.1:<port> is served');
+  g1 = call('POST', '/api/stop', {}, 300, { 'X-Desk': sim.token, Host: 'localhost:8788' });
+  eq(g1.s, 200, 'a POST with the token and a local Host is served');
   const ng = sim.markets().find(x => x.tk.startsWith('KXNATGAS15M'));
   const ngm = sim.freeze(ng.key, { bids: [[6300, 50], [6200, 40]], asks: [[6400, 30], [6500, 40]] });
   sim.cash()[ng.shard] += 2000000;        // room on the shard for the matching tests
@@ -448,15 +463,86 @@ const flushMicro = () => new Promise(r => setImmediate(r));
   const pmf = fillsOf(r.j.ord.cid)[0];
   check(pmf && pmf.liq === 'M' && pmf.fee === N.moneyStr(-D.fees.roundHE(0.0125 * 10 * 0.51 * 0.49 * 100) * 100), 'Polymarket maker fill earns the rebate', pmf);
   const ngFill = fillsOf(firstIoc)[0];
-  eq(ngFill.fee, '0.0000', 'the LIP 15-minute series are fee-free');
+  eq(ngFill.fee, (Math.ceil(0.07 * 10 * 0.64 * 0.36 * 100 - 1e-9) / 100).toFixed(4), 'the LIP 15-minute series charge takers the quadratic fee (makers pay nothing)');
+  check(sim.markets().filter(x => x.kind === 'LIP15').every(x => x.fee.type === 'QUAD') && sim.markets().filter(x => x.kind === 'GAME' && x.v === 'K' && /^KXNCAAFGAME/.test(x.tk)).some(x => x.fee.type === 'QUAD_MAKER'),
+    'fee types: 15-minute series QUAD, FBS games QUAD_MAKER');
   r = order(pm, 'BUY', 5000, 1.5, 'IOC');
   check(r.s === 400 && r.j.err.code === 'BAD_QTY', 'Polymarket takes whole contracts only');
+
+  // reduce_only (IOC only): never increases the position, qty cut to it
+  {
+    sim.freeze(wx.key, { bids: [[2900, 50]], asks: [[3000, 50]] });
+    const p0 = sim.position(wx.key).pos;
+    r = order(wx, 'BUY', 3000, 1, 'IOC', null, { reduce_only: true });
+    check(r.s === 409 && r.j.err.code === 'REDUCE' && r.j.ord.st === 'REJ' && r.j.ord.why === 'REDUCE', 'reduce_only on the increasing side is refused (REDUCE)', r.j);
+    r = order(wx, 'SELL', 2900, p0 + 5, 'IOC', null, { reduce_only: true });
+    check(r.s === 200 && r.j.ord.qty === p0 && r.j.ord.filled === p0 && sim.position(wx.key).pos === 0, 'reduce_only cuts the qty to the position and flattens it', { ord: r.j.ord, pos: sim.position(wx.key).pos });
+    r = order(wx, 'SELL', 2900, 1, 'IOC', null, { reduce_only: true });
+    check(r.s === 409 && r.j.err.code === 'REDUCE', 'reduce_only on a flat position is refused', r.j);
+    r = order(wx, 'SELL', 3100, 1, 'POST', 15, { reduce_only: true });
+    check(r.s === 400 && r.j.err.code === 'BAD_REQUEST', 'reduce_only is IOC only', r.j);
+  }
+  // an absolute expiry (the ticket's START): exactly one of ttl_s and exp_ms on a POST
+  {
+    const e1 = Math.ceil((t + 20000) / 1000) * 1000;
+    r = order(ng, 'BUY', 6000, 1, 'POST', null, { ttl_s: null, exp_ms: e1 });
+    check(r.s === 200 && r.j.ord.st === 'WORK' && r.j.ord.exp_ms === e1, 'a POST with exp_ms rests until that time', r.j.ord);
+    const ce = r.j.ord.cid;
+    run(e1 - t + 200);
+    check(sim.order(ce).st === 'EXP' && sim.order(ce).why === 'EXPIRY', 'and expires there');
+    r = order(ng, 'BUY', 6000, 1, 'POST', 15, { exp_ms: e1 + 60000 });
+    check(r.s === 400 && r.j.err.code === 'BAD_REQUEST', 'ttl_s and exp_ms together are a bad request');
+    r = order(ng, 'BUY', 6000, 1, 'POST', null, { ttl_s: null, exp_ms: Math.ceil((t + 2000) / 1000) * 1000 });
+    check(r.s === 400 && r.j.err.code === 'BAD_REQUEST', 'an expiry under 5 s ahead is a bad request');
+    r = order(ng, 'BUY', 6000, 1, 'IOC', null, { exp_ms: e1 + 60000 });
+    check(r.s === 400 && r.j.err.code === 'BAD_REQUEST', 'an IOC carries no expiry');
+    const game = sim.markets().find(x => x.kind === 'GAME');
+    check(sim.markets().every(x => x.kind === 'GAME' ? x.game && typeof x.game.start === 'number' : true), 'games carry their start');
+    const gev = evs.filter(e => e.type === 'mkt').map(e => e.data).concat(sim.snapshot().markets).find(x => x.tk === game.tk);
+    check(gev && gev.start_ms === game.game.start && sim.snapshot().markets.filter(x => x.kind !== 'GAME').every(x => x.start_ms === null), 'mkt.start_ms is the game start (null for other markets)');
+  }
+  // moving cash between Kalshi shards
+  {
+    const c0 = Object.assign({}, sim.cash());
+    r = call('POST', '/api/transfer', { from: 'S0', to: 'S1', amt: '5.0000' });
+    check(r.s === 200 && sim.cash().S0 === c0.S0 - 50000 && sim.cash().S1 === c0.S1 + 50000 && r.j.shards.length === 2, 'a transfer moves free cash between shards', r.j);
+    r = call('POST', '/api/transfer', { from: 'S0', to: 'S1', amt: '99999.0000' });
+    check(r.s === 409 && r.j.err.code === 'NO_CASH', 'more than the free cash is refused', r.j);
+    r = call('POST', '/api/transfer', { from: 'S1', to: 'S1', amt: '1.0000' });
+    check(r.s === 400 && r.j.err.code === 'BAD_REQUEST', 'a shard to itself is a bad request', r.j);
+  }
+  // a manual order takes a market over (mkt.man) until release
+  {
+    const lk = sim.markets().find(x => x.kind === 'LIP15' && x.status === 'OPEN' && !x.frozen && x.key !== ng.key);
+    const nMkt = evs.length;
+    r = order(lk, 'BUY', 100, 1, 'POST', 60);
+    const mk1 = evs.slice(nMkt).filter(e => e.type === 'mkt' && e.data.tk === lk.tk).map(e => e.data);
+    check(mk1.length === 1 && mk1[0].man === true, 'a manual order emits the market held (man true)', mk1);
+    call('POST', '/api/cancel', { cids: [r.j.ord.cid] });
+    const nRel = evs.length;
+    r = call('POST', '/api/release', { v: lk.v, tk: lk.tk });
+    const mk2 = evs.slice(nRel).filter(e => e.type === 'mkt' && e.data.tk === lk.tk).map(e => e.data);
+    check(r.s === 200 && mk2.length === 1 && mk2[0].man === false, 'release hands it back (man false)', mk2);
+  }
+  // an order placed outside the desk (own EXT)
+  const extCid = sim.external(wx.key, 'BUY', 2000, 3);
+  run(300);
+  {
+    const xe = ordEvents(extCid);
+    check(extCid && xe.length && xe[xe.length - 1].own === 'EXT' && xe[xe.length - 1].st === 'WORK' && xe[xe.length - 1].exp_ms === null, 'an EXT order shows on the stream, resting without an expiry', xe[xe.length - 1]);
+    call('POST', '/api/cancel_all', { own: 'MAN', v: null });
+    call('POST', '/api/stop', {});
+    eq(sim.order(extCid).st, 'WORK', 'Stop and cancel-all MAN leave an EXT order alone');
+  }
 
   // kill lockout and re-arm
   r = order(ng, 'BUY', 6000, 5, 'POST', 60);
   const k1 = call('POST', '/api/kill', {});
   check(k1.j.ok && k1.j.run.state === 'KILLED' && k1.j.run.rearm_ms === k1.j.run.since_ms + 60000, 'KILL stops everything for 60 s', k1.j);
   check(sim.order(r.j.ord.cid).st === 'CXL' && sim.order(r.j.ord.cid).why === 'KILL', 'KILL cancels working orders');
+  check(sim.order(extCid).st === 'CXL' && sim.order(extCid).why === 'KILL', 'KILL cancels EXT orders too (everything on the account)');
+  const pfK = sim.snapshot().hdr.preflight;
+  check(pfK.map(x => x.id).join(' ') === 'KEY CASH SHARD CLK DISK FEED PRIV GROUPS' && pfK.find(x => x.id === 'GROUPS').ok === false, 'preflight carries PRIV and GROUPS; KILL leaves the order groups triggered', pfK);
   r = order(ng, 'BUY', 6000, 5, 'IOC');
   check(r.s === 409 && r.j.err.code === 'KILLED', 'new orders are refused during the lockout');
   const s1 = call('POST', '/api/start', {});
@@ -464,15 +550,26 @@ const flushMicro = () => new Promise(r => setImmediate(r));
   const re1 = call('POST', '/api/rearm', {});
   check(re1.s === 409 && re1.j.err.code === 'BAD_STATE', 're-arm is refused before 60 s');
   run(60000);
-  const re2 = call('POST', '/api/rearm', {});
+  const re2 = call('POST', '/api/rearm', {}, 50);
   check(re2.s === 200 && re2.j.run.state === 'STOP', 're-arm after 60 s returns to STOP');
+  const sg = call('POST', '/api/start', {}, 50);
+  check(sg.s === 409 && sg.j.err.code === 'PREFLIGHT' && /GROUPS/.test(sg.j.err.msg), 'start waits for the order groups to reset after a re-arm', sg.j);
+  run(1500);
+  check(sim.snapshot().hdr.preflight.find(x => x.id === 'GROUPS').ok, 'the groups reset about a second later');
   r = order(ng, 'BUY', 6000, 5, 'IOC');
   eq(r.s, 200, 'orders are accepted again after re-arm');
 
   if (process.env.V) console.log('section 7');
   // ---- 7. a long run: every event and reply validates against the contract ------------------
   call('POST', '/api/subscribe', { sid: 'testsid1', ladders: [{ v: ng.v, tk: ng.tk }, { v: pm.v, tk: pm.tk }], tops: 'ALL' });
-  call('POST', '/api/lane/X1', { on: true });
+  {
+    const nL = evs.length;
+    let laneReply = null;
+    sim.request('POST', '/api/lane/X1', { on: true }, (s2, j2) => { laneReply = { s: s2, j: j2 }; replies.push(['POST', '/api/lane/X1', s2, j2]); }, HDRS);
+    check(!evs.slice(nL).some(e => e.type === 'lane') && laneReply === null && !sim.state.laneById.X1.on, 'a lane toggle is applied by the strategy worker a few ms later, not inside the click');
+    run(300);
+    check(laneReply && laneReply.s === 200 && laneReply.j.lane.on === true && evs.slice(nL).some(e => e.type === 'lane' && e.data.id === 'X1' && e.data.on), 'then the lane echo and the reply arrive', laneReply);
+  }
   const st1 = call('POST', '/api/start', {});
   check(st1.s === 200 && st1.j.run.state === 'RUN', 'start runs the lanes', st1.j);
   run(10 * 60000);
@@ -539,7 +636,7 @@ const flushMicro = () => new Promise(r => setImmediate(r));
     const run3 = async ms => { const end = t3 + ms; while (t3 < end) { t3 = Math.min(end, t3 + 50); sim3.pump(); await flushMicro(); } };
     await run3(1000);
     check(!st3.resyncing && st3.seq === sim3.state.seq, 'the store is in step with the stream after boot', { seq: st3.seq, sim: sim3.state.seq });
-    sim3.request('POST', '/api/start', {}, () => {});
+    sim3.request('POST', '/api/start', {}, () => {}, { 'X-Desk': sim3.token });
     await run3(30000);
     sim3.dropNext();
     await run3(20000);
@@ -550,6 +647,57 @@ const flushMicro = () => new Promise(r => setImmediate(r));
     const sp = Array.from(sim3.state.pos.values()).filter(x => x.pos !== 0).length;
     eq(Array.from(st3.pos.values()).filter(x => x.pos !== 0).length, sp, 'the store\'s open positions match the venue\'s');
     check(st3.hdr && st3.hdr.mode === 'DEMO' && st3.lanes.size === 5, 'header and lanes arrived');
+  }
+
+  if (process.env.V) console.log('section 9');
+  // ---- 9. live transport: the X-Desk token from the page, refreshed after a restart -----------
+  {
+    let srvToken = 'tok-B';
+    const calls = [];
+    const page = tok => '<!doctype html><html><head><meta charset="utf-8">\n<meta name="desk-token" content="' + tok + '">\n</head></html>';
+    const resp = (status, body) => ({ status, text: () => Promise.resolve(typeof body === 'string' ? body : JSON.stringify(body)) });
+    const fetchMock = (url, init) => {
+      calls.push({ url, method: init.method, xdesk: init.headers && init.headers['X-Desk'], cache: init.cache });
+      if (init.method === 'GET' && url === '/desk/') return Promise.resolve(resp(200, page(srvToken)));
+      if (init.method === 'POST') {
+        if (init.headers['X-Desk'] !== srvToken) return Promise.resolve(resp(403, { ok: false, err: { code: 'FORBIDDEN', msg: 'stale X-Desk token' } }));
+        return Promise.resolve(resp(200, { ok: true, run: { state: 'KILLED', since_ms: Date.now(), rearm_ms: Date.now() + 60000, why: 'operator' }, n: 0 }));
+      }
+      return Promise.resolve(resp(404, { ok: false, err: { code: 'NOT_FOUND', msg: url } }));
+    };
+    const esList = [];
+    function FakeES(url) { this.url = url; this.ls = {}; this.readyState = 1; esList.push(this); }
+    FakeES.prototype.addEventListener = function (t, f) { this.ls[t] = f; };
+    FakeES.prototype.close = function () {};
+    const meta = { getAttribute: k => (k === 'content' ? 'tok-A' : null) };
+    const c5 = { console, setTimeout, clearTimeout, setInterval, clearInterval, performance, Promise, Uint8Array, AbortController,
+                 localStorage: { getItem() { return null; }, setItem() {} }, fetch: fetchMock, EventSource: FakeES,
+                 location: { protocol: 'http:', search: '?live=1', pathname: '/desk/' },
+                 document: { querySelector: sel => (sel === 'meta[name="desk-token"]' ? meta : null) } };
+    c5.window = c5; vm.createContext(c5);
+    for (const f of ['contract.js', 'core.js', 'store.js', 'sim.js', 'transport.js']) vm.runInContext(fs.readFileSync(path.join(JS, f), 'utf8'), c5, { filename: f });
+    const T5 = c5.Desk.transport;
+    eq(await T5.choose(), 'live', '?live=1 picks the live transport');
+    eq(c5.Desk.token.value, 'tok-A', 'the token is read from <meta name="desk-token"> at boot');
+    const kr = await T5.post('/api/kill', {});
+    check(kr.status === 200 && calls.length === 3 && calls[0].xdesk === 'tok-A' && calls[1].method === 'GET' && calls[1].url === '/desk/' && calls[1].cache === 'no-store' && calls[2].xdesk === 'tok-B',
+      'a POST refused FORBIDDEN re-reads the token from the page and is retried once with it', calls);
+    eq(c5.Desk.token.value, 'tok-B', 'the new token is kept');
+    // a backend restart (new hb.epoch) re-reads the token before any POST
+    const got = [];
+    T5.connect(e => got.push(e), () => {});
+    const es = esList[esList.length - 1];
+    const hb = ep => ({ data: JSON.stringify({ type: 'hb', seq: 1, ts_ms: Date.now(), data: { epoch: ep, sid: T5.sid, srv_ms: Date.now(), feeds: {} } }) });
+    srvToken = 'tok-C';
+    const n0 = calls.length;
+    es.ls.hb(hb('e-1')); es.ls.hb(hb('e-1'));
+    eq(calls.length, n0, 'the same epoch fetches nothing');
+    es.ls.hb(hb('e-2'));
+    await flushMicro(); await flushMicro();
+    check(calls.length === n0 + 1 && calls[n0].method === 'GET' && c5.Desk.token.value === 'tok-C' && got.length === 3, 'a new hb.epoch re-reads the token', { calls: calls.slice(n0), tok: c5.Desk.token.value });
+    const posts = calls.filter(x => x.method === 'POST');
+    check(posts.every(x => typeof x.xdesk === 'string' && x.xdesk.length), 'every POST carried X-Desk');
+    check(calls.filter(x => x.method === 'GET').every(x => x.xdesk === undefined), 'GETs carry no token');
   }
 
   console.log(fails ? `${fails} of ${checks} checks FAILED` : `ui desk v3: ${checks} checks, 0 failures`);

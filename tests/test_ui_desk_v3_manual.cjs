@@ -296,7 +296,21 @@ function manOrders(P, key) { const a = []; P.D.store.orders.forEach(o => { if (o
     check(L.inBand('K', QUAD, 5000, 5100) && !L.inBand('K', QUAD, 5000, 5200), 'break-even band is the taker fee around the model fair');
     check(!L.inBand('K', QUAD, null, 5000), 'no model fair, no band');
     check(L.foreign('X-abc123') && !L.foreign('Mabc-1') && !L.foreign('SM1-x-2'), 'unprefixed cids are foreign');
-    check(L.ttlOK(15) && L.ttlOK(300) && !L.ttlOK(1800) && !L.ttlOK('START'), 'expiries follow the contract (30m and START not in 1.0.0)');
+    check(L.isExt({ own: 'EXT', cid: 'Mabc-1' }) && L.isExt({ own: 'MAN', cid: 'X-1abc' }) && !L.isExt({ own: 'SYS', cid: 'SM1-x-2' }), 'own EXT (or a foreign cid) marks an order EXT');
+    check(L.ttlOK(15) && L.ttlOK(300) && L.ttlOK(1800) && !L.ttlOK('START'), 'expiries follow the contract (5 s to 30 min; START is a market time)');
+    {
+      const T = Date.UTC(2026, 9, 6, 23, 0, 0);
+      eq(L.startExp({ start_ms: T + 600500 }, T), T + 600000, 'START: the game start, cut to a whole second');
+      eq(L.startExp({ start_ms: T + 3000 }, T), null, 'START: refused under 5 s before the start');
+      eq(L.startExp({ start_ms: T - 60000 }, T), null, 'START: refused once the game started');
+      eq(L.startExp({ start_ms: null }, T), null, 'START: refused without a start time');
+      const sh = [{ id: 'S0', free: 300000 }, { id: 'S1', free: 120000 }, { id: 'S3', free: 50000 }];
+      const mv = L.moveFor(sh, 'S3', 101234);
+      check(mv && mv.from === 'S0' && mv.amt === 110000 && mv.full, 'MOVE: from the shard with the most free cash, the shortfall rounded up to the dollar', mv);
+      const mv2 = L.moveFor([{ id: 'S0', free: 52345 }, { id: 'S3', free: 0 }], 'S3', 101234);
+      check(mv2 && mv2.amt === 52300 && !mv2.full, 'MOVE: at most the source shard\'s free cash (to the cent)', mv2);
+      eq(L.moveFor([{ id: 'S3', free: 0 }], 'S3', 5000), null, 'MOVE: nothing to move from');
+    }
     eq(L.parsePx('0.62'), 6200, 'ticket price in dollars');
     eq(L.parsePx('62'), 6200, 'ticket price in cents');
     eq(L.parsePx('62.5'), 6250, 'ticket price in tenths of a cent');
@@ -388,7 +402,7 @@ function manOrders(P, key) { const a = []; P.D.store.orders.forEach(o => { if (o
   }
   const head = $('m-lad-a-head');
   check(/^K/.test(head.children[0].textContent) && head.children[0].textContent.indexOf(nat.short) >= 0, 'header line 1: venue and market', head.children[0].textContent);
-  check(/POS0UNRL/.test(head.children[1].textContent.replace(/\s/g, '')) && /S3/.test(head.children[1].textContent) && /FEET0\.00M0\.00/.test(head.children[1].textContent.replace(/\s/g, '')), 'header line 2: position, shard, fees (fee-free series)', head.children[1].textContent);
+  check(/POS0UNRL/.test(head.children[1].textContent.replace(/\s/g, '')) && /S3/.test(head.children[1].textContent) && /FEET1\.\d\dM0\.00/.test(head.children[1].textContent.replace(/\s/g, '')), 'header line 2: position, shard, fees (15-minute series: takers pay, makers free)', head.children[1].textContent);
   check(/MID0\.635/.test(head.children[2].textContent.replace(/\s/g, '')) && /MODEL0\.\d\d±0\.02/.test(head.children[2].textContent.replace(/\s/g, '')), 'header line 3: mid one decimal finer, model with sigma', head.children[2].textContent);
   check(/chg/.test(head.children[2].textContent), 'header shows the time since the book last changed');
   eq(P.$('m-lad-a').getAttribute('data-focused'), '1', 'the focused ladder carries the outline flag');
@@ -410,7 +424,7 @@ function manOrders(P, key) { const a = []; P.D.store.orders.forEach(o => { if (o
   check(D.lat.ack.p50() !== null, 'click-to-ack measured');
   check(/^1 1[456]s$/.test(ladCell(P, 'A', 6200, 'wb').textContent) && !/pend/.test(ladCell(P, 'A', 6200, 'wb').className), 'our order shows size and seconds left', ladCell(P, 'A', 6200, 'wb').textContent);
   check(/^UI \d/.test(P.$('sb-ui').textContent) && /^ACK \d/.test(P.$('sb-ack').textContent), 'status bar shows click-to-paint and click-to-ack', P.$('sb-ui').textContent + ' ' + P.$('sb-ack').textContent);
-  check(D.manual.state().taken.has(natKey), 'a manual order marks the market MAN');
+  check(D.manual.state().held(natKey) && st.market(natKey).man === true, 'a manual order marks the market MAN (mkt.man from the backend)');
   P.frame(); await run(100);
   check(/MAN/.test(head.children[0].textContent) && !/\boff\b/.test(head.children[0].children[5].className), 'the ladder header shows MAN with REL', head.children[0].textContent);
 
@@ -667,11 +681,41 @@ function manOrders(P, key) { const a = []; P.D.store.orders.forEach(o => { if (o
   check(/^BUY 1 @0\.63 15s$/.test(E.buy.textContent) && /^SELL 1 @0\.64 15s$/.test(E.sell.textContent), 'AUTO price: a post joins its own side', E.buy.textContent + ' | ' + E.sell.textContent);
   check(/auto/.test(E.px.className) && E.px.value === '0.63', 'the price field shows AUTO in grey');
   const tyBtn = t => E.types.find(b => b.textContent === t);
-  check(tyBtn('30m').disabled && tyBtn('START').disabled && !tyBtn('5m').disabled, '30m and START wait for the contract; 5m is there');
+  check(!tyBtn('30m').disabled && tyBtn('START').disabled && !tyBtn('5m').disabled, '5m and 30m are there; START needs a game start time (a 15-minute window has none)');
   check(['IOC', 'FOK', '5s', '15s', '60s', '5m', '30m', 'START'].every(t => tyBtn(t)), 'IOC FOK POST 5s 15s 60s 5m 30m START, no GTC');
   click(tyBtn('IOC')); P.frame();
   check(/^BUY 1 ≤0\.65$/.test(E.buy.textContent), 'IOC shows how far it may fill (the cap)', E.buy.textContent);
-  check(/cost/.test(E.costL.textContent) && E.cost.textContent === '0.65' && E.shL.textContent === 'S3 free' && E.shOk.textContent === 'OK', 'check line: cost, shard free cash, OK', [E.cost.textContent, E.shL.textContent, E.sh.textContent, E.shOk.textContent]);
+  check(/cost/.test(E.costL.textContent) && E.cost.textContent === '0.67' && E.shL.textContent === 'S3 free' && E.shOk.textContent === 'OK', 'check line: cost (0.65 plus the 0.02 taker fee), shard free cash, OK', [E.cost.textContent, E.shL.textContent, E.sh.textContent, E.shOk.textContent]);
+  // a short shard: MOVE moves the missing cash in one click
+  {
+    const s3 = () => st.hdr.cash.K.shards.find(x => x.id === 'S3').free;
+    E.qty.value = '70'; fire(E.qty, 'input', {}); P.frame();
+    check(/^SHORT /.test(E.shOk.textContent) && !/\boff\b/.test(E.move.className) && /^MOVE \d+ S\d>S3$/.test(E.move.textContent), 'a short shard offers MOVE from the richest shard', [E.shOk.textContent, E.move.textContent]);
+    const free0 = s3();
+    click(E.move); P.frame();
+    check(E.move.textContent === 'MOVING' && E.move.disabled, 'MOVE paints pending at once');
+    await run(400);
+    check(s3() > free0 && E.shOk.textContent === 'OK' && /\boff\b/.test(E.move.className), 'after the move the shard covers the order', [s3(), free0, E.shOk.textContent]);
+    E.qty.value = '1'; fire(E.qty, 'input', {}); P.frame();
+  }
+  // START: a game that has not started posts until its start
+  {
+    const gm = Array.from(st.markets.values()).find(m => m.kind === 'GAME' && m.v === 'K' && m.start_ms && m.start_ms > P.clock.t + 60000);
+    check(!!gm, 'a Kalshi game that has not started yet', gm && gm.tk);
+    D.focus.set(gm.key); await run(300);
+    check(!tyBtn('START').disabled, 'START is live on a game before its start');
+    click(tyBtn('START')); P.frame();
+    n0 = st.orders.size;
+    click(E.buy);
+    o = newest(P, x => x.own === 'MAN');
+    check(st.orders.size === n0 + 1 && o.tif === 'POST' && o.exp_ms === Math.floor(gm.start_ms / 1000) * 1000, 'START sends a post whose exchange expiry is the game start', { tif: o.tif, exp: o.exp_ms, start: gm.start_ms });
+    await run(300);
+    o = st.orders.get(o.cid);
+    check(o.st === 'WORK' && o.exp_ms === Math.floor(gm.start_ms / 1000) * 1000, 'the venue keeps that expiry', { st: o.st, exp: o.exp_ms });
+    D.act.cancel([o.cid]); await run(300);
+    D.focus.set(natKey); await run(300);
+    click(tyBtn('IOC')); P.frame();
+  }
   check(E.eM.textContent !== '' && /c/.test(E.eM.textContent), 'edge vs model shown', E.eM.textContent);
   click(E.q.find(b => b.textContent === '5'));
   eq(MS.cfg.tk.qty, 5, 'ticket size preset');
@@ -732,7 +776,7 @@ function manOrders(P, key) { const a = []; P.D.store.orders.forEach(o => { if (o
   await run(300);
   // foreign order flag
   const ex = JSON.parse(JSON.stringify(D.contract.examples.ord));
-  ex.cid = 'X-foreign-1'; ex.tk = nat.tk; ex.v = 'K'; ex.own = 'MAN'; ex.st = 'WORK'; ex.filled = 0; ex.left = 3; ex.qty = 3; ex.px = '0.5000'; ex.exp_ms = null; ex.tif = 'POST';
+  ex.cid = 'X-foreign-1'; ex.tk = nat.tk; ex.v = 'K'; ex.own = 'EXT'; ex.st = 'WORK'; ex.filled = 0; ex.left = 3; ex.qty = 3; ex.px = '0.5000'; ex.exp_ms = null; ex.tif = 'POST';
   st._handlers.ord(ex); await run(300);
   const xr = wtb2.children.find(r => r.getAttribute('data-k') === 'X-foreign-1');
   check(xr && /^EXT /.test(xr.children[1].textContent) && /\bext\b/.test(xr.children[1].className), 'a foreign working order is flagged EXT', xr && xr.children[1].textContent);
@@ -787,9 +831,13 @@ function manOrders(P, key) { const a = []; P.D.store.orders.forEach(o => { if (o
   check(pr && pr.children[3].textContent === '+' + pos.pos && pr.children[2].textContent === 'MAN' && pr.children[10].textContent === 'FLAT', 'POSITIONS row with FLAT', pr && pr.children.map(c => c.textContent));
   check(ptb.children.some(r => /total/.test(r.className) && r.children[0].textContent === 'TOTAL'), 'a TOTAL row');
   n0 = st.orders.size;
+  const posted = [], post0 = D.transport.post;
+  D.transport.post = (p, b) => { posted.push([p, b]); return post0(p, b); };
   click(pr.children[10]);
+  D.transport.post = post0;
   o = newest(P, x => x.own === 'MAN');
   check(st.orders.size === n0 + 1 && o.side === 'SELL' && o.tif === 'IOC' && o.qty === pos.pos && o.px === 6200, 'FLAT sends an IOC for the whole position at the bid minus the cap', { side: o.side, qty: o.qty, px: o.px });
+  check(posted.length === 1 && posted[0][0] === '/api/order' && posted[0][1].reduce_only === true, 'FLAT is reduce_only, so it can never flip the position', posted.map(x => x[1]));
   await run(400);
   eq(st.position(natKey).pos, 0, 'flat');
   await run(11000, 250);
@@ -815,13 +863,14 @@ function manOrders(P, key) { const a = []; P.D.store.orders.forEach(o => { if (o
   let sawTake = false; st.orders.forEach(x => { if (x.key === cuKey && x.why === 'TAKEOVER') sawTake = true; });
   check(sawTake, 'with why TAKEOVER');
   check(/MAN/.test(headB.children[0].children[4].textContent) && !/\boff\b/.test(headB.children[0].children[5].className), 'the market is MAN with a REL button');
+  eq(st.market(cuKey).man, true, 'the backend reports it held (mkt.man)');
   await run(3000, 100);
   eq(sysThere(), 0, 'Systematic stays out while it is MAN');
   click(headB.children[0].children[5]);
   await run(300);
-  check(!MS.taken.has(cuKey), 'REL hands it back');
+  check(!MS.held(cuKey) && st.market(cuKey).man === false, 'REL hands it back (mkt.man false)');
   await run(1000, 100);
-  check(!MS.taken.has(cuKey), 'and it stays released (the TAKEOVER orders still in the store do not re-take it)');
+  check(!MS.held(cuKey), 'and it stays released (the TAKEOVER orders still in the store do not re-take it)');
   D.act.stop();
   await run(500);
 

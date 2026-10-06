@@ -29,14 +29,32 @@
  *   YES position is a BUY NO at (1 - px); positions net to one signed number per market.
  * - TIF: "IOC" = immediate-or-cancel (never rests; px is the slippage cap, i.e. the worst
  *   acceptable price), "FOK" = fill-or-kill (all or nothing, never rests), "POST" = post-only
- *   with an exchange-side expiry (ttl_s of 5, 15, 60 or 300 seconds). There is no GTC.
- *   A POST that would cross is cancelled by the exchange (st CXL, why POST_CROSS).
+ *   with an exchange-side expiry: ttl_s of 5, 15, 60, 300 or 1800 seconds, or an absolute
+ *   exp_ms (the ticket's START: a game's start_ms). There is no GTC. A POST that would cross
+ *   is cancelled by the exchange (st CXL, why POST_CROSS).
  * - ORDER STATES: PEND (sent, not acknowledged), WORK (resting, nothing filled), PART (resting,
  *   partly filled), and the terminal states FILL (fully filled), CXL (cancelled; filled may be
  *   > 0, e.g. an IOC that filled 6 of 10), REJ (rejected; filled is 0), EXP (exchange expiry
  *   reached; filled may be > 0). A terminal order never changes again.
- * - Every POST must carry the headers "Content-Type: application/json" and "X-Desk: 1" and is
- *   same-origin only. Errors use one shape: {"ok":false,"err":{"code":CODE,"msg":text}}.
+ * - OWNERS: "MAN" orders come from this screen, "SYS" from Systematic's lanes, "EXT" are orders
+ *   on the account that this desk did not place (the venue's website, another tool), seen on the
+ *   private feed. Client order ids: MAN start with M, SYS with S; an EXT order's cid is the
+ *   backend's own ("X" + the venue's order id, cut to 40). EXT orders are never cancelled by
+ *   STOP or a takeover; KILL and cancel_all with own ANY cancel them. Their fills count as MAN
+ *   in positions and P&L.
+ * - REQUEST GUARDS (the web worker):
+ *   - Host: every request (GET included) whose Host header is not exactly 127.0.0.1:<port> or
+ *     localhost:<port> is refused 403 FORBIDDEN (hostOk below). This stops a DNS-rebinding page
+ *     from reading the page and its token.
+ *   - Token: every POST carries "Content-Type: application/json" and "X-Desk: <token>". The
+ *     token is random per backend start; the backend writes it into the page it serves as
+ *     <meta name="desk-token" content="<token>"> (the file on disk has content=""), and the page
+ *     reads it at boot. A POST without the current token is refused 403 FORBIDDEN. After a
+ *     backend restart (hb.epoch changes) the page reads the new token by fetching its own page
+ *     again (no cache), and a POST refused FORBIDDEN is retried once after that refresh. KILL
+ *     carries the token like every other POST.
+ *   - Same-origin only: no CORS headers are ever sent.
+ * - Errors use one shape: {"ok":false,"err":{"code":CODE,"msg":text}}.
  *
  * ---------------------------------------------------------------------------------------------
  * THE STREAM: GET /api/stream?sid=<sid>   (text/event-stream, one per browser tab)
@@ -121,11 +139,11 @@
     VENUE: ['K', 'P'],
     SIDE: ['BUY', 'SELL'],
     TIF: ['IOC', 'FOK', 'POST'],
-    TTL_S: [5, 15, 60, 300],
+    TTL_S: [5, 15, 60, 300, 1800],
     ST: ['PEND', 'WORK', 'PART', 'FILL', 'CXL', 'REJ', 'EXP'],
     TERMINAL: ['FILL', 'CXL', 'REJ', 'EXP'],
     LIQ: ['M', 'T'],                       // maker / taker
-    OWN: ['MAN', 'SYS'],
+    OWN: ['MAN', 'SYS', 'EXT'],             // EXT: on the account, not placed by this desk
     POS_OWN: ['MAN', 'SYS', 'MIX'],
     RUN: ['RUN', 'STOP', 'KILLED', 'HALTED'],
     LANE_STATE: ['ON', 'OFF', 'BLOCKED', 'CAPPED', 'OVERLAY'],
@@ -134,18 +152,26 @@
     KIND: ['LIP15', 'WEATHER', 'GAME', 'OTHER'],
     MKT_STATUS: ['OPEN', 'CLOSED', 'SETTLED'],
     RESULT: ['YES', 'NO'],
+    // Kalshi series fee_type: QUAD = "quadratic" (takers 0.07 C p (1-p) x mult, makers nothing;
+    // the 15-minute series, weather, FCS games); QUAD_MAKER = "quadratic_with_maker_fees" (makers
+    // also pay 0.0175 C p (1-p) x mult: FBS football, NFL, NBA ...); FREE = fee multiplier 0 (no
+    // fee either side); PM = Polymarket US (taker fee, maker rebate)
     FEE_TYPE: ['QUAD', 'QUAD_MAKER', 'FREE', 'PM'],
     DEPTH: ['FULL', 'TOP'],
     GAME_SRC: ['LIVE', 'ESPN'],
     LVL: ['INFO', 'WARN', 'CRIT'],
     MO_H: ['1s', '10s', '60s', 'SETTLE'],
-    PREFLIGHT: ['KEY', 'CASH', 'SHARD', 'CLK', 'DISK', 'FEED'],
+    // KEY venue keys sign; CASH free cash for the lanes; SHARD every shard Systematic uses has
+    // cash; CLK clock offset under 0.5 s; DISK recorder space; FEED market data up; PRIV Kalshi's
+    // private socket (orders, fills) up and reconciled; GROUPS every lane's order group (one per
+    // shard) reset and confirmed by the exchange (after KILL they stay triggered until re-arm).
+    PREFLIGHT: ['KEY', 'CASH', 'SHARD', 'CLK', 'DISK', 'FEED', 'PRIV', 'GROUPS'],
     FEED: ['KX', 'KXP', 'PM'],             // Kalshi market data, Kalshi private (orders/fills), Polymarket
     MODE: ['DEMO', 'LIVE'],
     // why an order is in its state. '' while PEND/WORK/PART/FILL.
     WHY: ['', 'USER', 'KILL', 'STOP', 'HALT', 'PULL', 'IOC_REST', 'FOK', 'POST_CROSS', 'STP', 'TAKEOVER',
           'MARKET_CLOSED', 'EXPIRY', 'BAD_REQUEST', 'OFF_GRID', 'BAD_QTY', 'UNKNOWN_MARKET',
-          'DUP_CID', 'PRICE_BAND', 'KILLED', 'STALE', 'RO', 'NO_CASH', 'SHARD_CASH', 'SYS_CEILING',
+          'DUP_CID', 'PRICE_BAND', 'REDUCE', 'KILLED', 'STALE', 'RO', 'NO_CASH', 'SHARD_CASH', 'SYS_CEILING',
           'HALTED', 'RATE', 'EXCHANGE', 'INTERNAL']
   };
   var WHY_DOC = {
@@ -176,6 +202,8 @@
     DUP_CID: { http: 409, doc: 'cid already used today; the original order is returned in ord' },
     MARKET_CLOSED: { http: 409, doc: 'market is not OPEN' },
     PRICE_BAND: { http: 409, doc: 'crossing order more than 2 ticks through the touch; resend with override:true to send anyway' },
+    REDUCE: { http: 409, doc: 'reduce_only order on a flat position, or on the side that would increase it' },
+    FORBIDDEN: { http: 403, doc: 'Host is not 127.0.0.1:<port> or localhost:<port>, or the POST lacks the current X-Desk token' },
     KILLED: { http: 409, doc: 'KILL lockout active; POST /api/rearm first' },
     STALE: { http: 409, doc: 'fail-closed: feed gap, private socket down or reconcile pending; cancels and KILL still work' },
     RO: { http: 409, doc: 'venue is read-only (key failing)' },
@@ -245,7 +273,10 @@
     grid: ['arr', { start: 'price', end: 'price', step: 'price' }],   // Kalshi price_ranges
     fee: { type: ['enum'].concat(enums.FEE_TYPE), mult: 'num' },
     shard: 'id?',                   // Kalshi cash shard ('S0'..'S3'); null on Polymarket
-    lip: 'bool'                     // pays Kalshi's Liquidity Incentive Program
+    lip: 'bool',                    // pays Kalshi's Liquidity Incentive Program
+    start_ms: 'ms?',                // GAME: scheduled start (the ticket's START expiry); null otherwise
+    man: 'bool'                     // held by Manual: a manual order here cancelled Systematic's
+                                    // orders (why TAKEOVER); lanes stay out until POST /api/release
   };
   S.book = {
     v: ['enum'].concat(enums.VENUE),
@@ -395,7 +426,8 @@
     cost: { used: '1.1200', budget: '4.8000' },
     run: { state: 'RUN', since_ms: T0 - 8040000, rearm_ms: null, why: '' },
     preflight: [{ id: 'KEY', ok: true, why: '' }, { id: 'CASH', ok: true, why: '' }, { id: 'SHARD', ok: true, why: '' },
-                { id: 'CLK', ok: true, why: '' }, { id: 'DISK', ok: true, why: '' }, { id: 'FEED', ok: true, why: '' }],
+                { id: 'CLK', ok: true, why: '' }, { id: 'DISK', ok: true, why: '' }, { id: 'FEED', ok: true, why: '' },
+                { id: 'PRIV', ok: true, why: '' }, { id: 'GROUPS', ok: true, why: '' }],
     man_working: 3,
     lat: { kx_lag_ms: 34, pm_lag_ms: 210, gw_ack_ms: 52, clk_off_ms: 80 }
   };
@@ -405,7 +437,7 @@
     kind: 'LIP15', og: 'KXNATGAS15M-26OCT061930', oc: 'UP',
     open_ms: T0 + 900000, close_ms: T0 + 1800000, status: 'OPEN', result: null,
     grid: [{ start: '0.0000', end: '1.0000', step: '0.0100' }],
-    fee: { type: 'FREE', mult: 1 }, shard: 'S3', lip: true
+    fee: { type: 'QUAD', mult: 1 }, shard: 'S3', lip: true, start_ms: null, man: false
   };
   EX.book = {
     v: 'K', tk: 'KXNATGAS15M-26OCT061930-30', depth: 'FULL',
@@ -537,18 +569,20 @@
                  response: { ok: true, subs: { ladders: [{ v: 'K', tk: 'KXNATGAS15M-26OCT061930-30' }], tops: 'ALL' } } }
     },
     'POST /api/order': {
-      doc: 'Place one order. The reply comes after the venue\'s acknowledgement and carries the order\'s state then (WORK, PART, FILL or CXL; IOC/FOK fills are in it). A refusal returns the error and, when the cid was valid, the REJ order. The gateway checks risk in memory: no pre-check request is ever needed. The price guard refuses a crossing order more than 2 ticks through the touch unless override is true. A manual order in a market Systematic is quoting cancels those Systematic orders (why TAKEOVER) and keeps the market manual until POST /api/release.',
+      doc: 'Place one order. The reply comes after the venue\'s acknowledgement and carries the order\'s state then (WORK, PART, FILL or CXL; IOC/FOK fills are in it). A refusal returns the error and, when the cid was valid, the REJ order. The gateway checks risk in memory: no pre-check request is ever needed. The price guard refuses a crossing order more than 2 ticks through the touch unless override is true. A manual order in a market Systematic is quoting cancels those Systematic orders (why TAKEOVER) and keeps the market manual (mkt.man true) until POST /api/release. POST needs exactly one of ttl_s and exp_ms (a whole second, 5 s to 24 h ahead, e.g. a game\'s start_ms); IOC and FOK carry neither. reduce_only (IOC only, as Kalshi allows) never increases the position: qty is cut to the open position, and an order on a flat position or on the increasing side is refused REDUCE (FLAT sends it).',
       request: {
         cid: 'cid', v: ['enum'].concat(enums.VENUE), tk: 'tk', side: ['enum'].concat(enums.SIDE),
         px: 'price', qty: 'size', tif: ['enum'].concat(enums.TIF),
-        ttl_s: ['enum?'].concat(enums.TTL_S),     // POST: required; IOC/FOK: null
+        ttl_s: ['enum?'].concat(enums.TTL_S),     // POST: this or exp_ms; IOC/FOK: null
+        'exp_ms?': 'ms?',                         // POST: absolute exchange-side expiry instead of ttl_s
+        'reduce_only?': 'bool',                   // IOC only: never increase the position
         override: 'bool',                         // true = skip the 2-tick price guard
         touch: 'price?',                          // the touch shown at click (logging, slippage)
         t_click_ms: 'ms?'                         // browser click time, epoch ms (performance.timeOrigin + event.timeStamp)
       },
       response: OK_ORD,
-      errors: ['BAD_REQUEST', 'OFF_GRID', 'BAD_QTY', 'UNKNOWN_MARKET', 'DUP_CID', 'MARKET_CLOSED', 'PRICE_BAND',
-               'KILLED', 'STALE', 'RO', 'NO_CASH', 'SHARD_CASH', 'RATE', 'EXCHANGE', 'INTERNAL'],
+      errors: ['BAD_REQUEST', 'OFF_GRID', 'BAD_QTY', 'UNKNOWN_MARKET', 'DUP_CID', 'MARKET_CLOSED', 'PRICE_BAND', 'REDUCE',
+               'KILLED', 'STALE', 'RO', 'NO_CASH', 'SHARD_CASH', 'RATE', 'EXCHANGE', 'INTERNAL', 'FORBIDDEN'],
       example: {
         request: { cid: 'Mk3f9x2-17', v: 'K', tk: 'KXNATGAS15M-26OCT061930-30', side: 'BUY', px: '0.6300', qty: 10,
                    tif: 'POST', ttl_s: 15, override: false, touch: '0.6300', t_click_ms: T0 + 1199950 },
@@ -613,18 +647,26 @@
       example: { request: {}, response: { ok: true, run: { state: 'KILLED', since_ms: T0, rearm_ms: T0 + 60000, why: 'operator' }, n: 7 } }
     },
     'POST /api/rearm': {
-      doc: 'Leave the KILLED state after rearm_ms (to STOP; Systematic needs a Start). Refused with BAD_STATE before rearm_ms or when not KILLED.',
+      doc: 'Leave the KILLED state after rearm_ms (to STOP; Systematic needs a Start). The backend then resets every order group; the GROUPS preflight row fails until the exchange confirms them, so START waits for it. Refused with BAD_STATE before rearm_ms or when not KILLED.',
       request: {},
       response: RUN_RESP,
       errors: ['BAD_STATE'],
       example: { request: {}, response: { ok: true, run: { state: 'STOP', since_ms: T0 + 61000, rearm_ms: null, why: '' }, n: 0 } }
     },
     'POST /api/release': {
-      doc: 'Hand a market the operator took over back to Systematic.',
+      doc: 'Hand a market the operator took over back to Systematic (mkt.man false; a mkt event follows).',
       request: { v: ['enum'].concat(enums.VENUE), tk: 'tk' },
       response: { ok: ['enum', true] },
       errors: ['UNKNOWN_MARKET'],
       example: { request: { v: 'K', tk: 'KXNATGAS15M-26OCT061930-30' }, response: { ok: true } }
+    },
+    'POST /api/transfer': {
+      doc: 'Move free cash between two Kalshi shards (the ticket\'s one-click MOVE when a shard is short). amt must not exceed the source shard\'s free cash. The reply comes after the exchange confirms; hdr and risk then carry the new shard cash.',
+      request: { from: 'id', to: 'id', amt: 'money' },
+      response: { ok: ['enum', true], shards: ['arr', { id: 'id', cash: 'money', free: 'money' }] },
+      errors: ['BAD_REQUEST', 'NO_CASH', 'RATE', 'EXCHANGE'],
+      example: { request: { from: 'S1', to: 'S3', amt: '12.0000' },
+                 response: { ok: true, shards: [{ id: 'S1', cash: '24.8100', free: '24.8100' }, { id: 'S3', cash: '43.2000', free: '26.1900' }] } }
     }
   };
   // Every endpoint shares the error shape.
@@ -710,6 +752,11 @@
     if (env.seq < 1) errs.push('$.seq: must be >= 1');
     return validate(events[env.type].schema, env.data, '$.data', errs);
   }
+  // the web worker's Host rule: exactly 127.0.0.1:<port> or localhost:<port>
+  function hostOk(host, port) {
+    var h = String(host || '').toLowerCase();
+    return h === '127.0.0.1:' + port || h === 'localhost:' + port;
+  }
   function endpointFor(method, path) {
     var p = String(path).split('?')[0];
     if (/^\/api\/lane\/[A-Za-z0-9_-]+$/.test(p)) p = '/api/lane/{id}';
@@ -732,7 +779,9 @@
   }
 
   Desk.contract = {
-    version: '1.0.0',
+    version: '1.1.0',
+    TOKEN_META: 'desk-token',            // <meta name="desk-token" content="..."> in the served page
+    hostOk: hostOk,
     types: types,
     enums: enums,
     why: WHY_DOC,

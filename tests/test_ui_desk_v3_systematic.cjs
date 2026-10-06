@@ -288,15 +288,16 @@ function bootPage(opts) {
     eq(lr[2].lip, 20000 + 0, 'TOTAL sums LIP (M1 2.00 + M2 0.00)');
     check(lr[0].lip === 20000 && lr[1].lip === 0, 'LIP stays per lane');
     eq(T.agg().all.n, 80, 'markouts count Systematic fills only (the manual fill is left out)');
-    const pf = T.preflightRows(st.hdr).map(r => r.id + ':' + r.ok);
-    eq(pf.join(' '), 'KEY:true CASH:true SHARD:true CLK:true DISK:true FEED:true PRIV:null GROUPS:null',
-      'preflight shows the plan set: PRIV unknown before any heartbeat, GROUPS unknown (not in contract 1.0.0)');
+    eq(T.preflightRows(st.hdr).map(r => r.id + ':' + r.ok).join(' '), 'KEY:true CASH:true SHARD:true CLK:true DISK:true FEED:true PRIV:true GROUPS:true',
+      'preflight shows the plan set, PRIV and GROUPS from the backend (contract 1.1)');
+    // an older backend without PRIV and GROUPS rows: PRIV derived from the feed, GROUPS unknown
+    const old = Object.assign({}, st.hdr, { preflight: st.hdr.preflight.filter(r => r.id !== 'PRIV' && r.id !== 'GROUPS') });
+    eq(T.preflightRows(old).map(r => r.id + ':' + r.ok).join(' '), 'KEY:true CASH:true SHARD:true CLK:true DISK:true FEED:true PRIV:null GROUPS:null',
+      'without the rows: PRIV unknown before any heartbeat, GROUPS unknown');
     st.feeds = { KX: { up: true, gap: false, lag_ms: 1 }, KXP: { up: false, gap: false, lag_ms: null }, PM: { up: true, gap: false, lag_ms: 1 } };
-    const priv = T.preflightRows(st.hdr).find(r => r.id === 'PRIV');
+    const priv = T.preflightRows(old).find(r => r.id === 'PRIV');
     check(priv.ok === false && priv.why === 'KXP down', 'PRIV derives from the private feed when the backend sends no PRIV row', priv);
-    st.hdr.preflight.push({ id: 'PRIV', ok: true, why: '' });
     eq(T.preflightRows(st.hdr).find(r => r.id === 'PRIV').ok, true, 'a backend PRIV row wins over the derived one');
-    st.hdr.preflight.pop();
     // St text of finished orders
     eq(T.stText({ terminal: true, st: 'CXL', tif: 'IOC', why: 'IOC_REST', filled: 0, qty: 10 }), 'IOC 0/10', 'an IOC whose rest was killed reads IOC 0/10');
     eq(T.stText({ terminal: true, st: 'REJ', tif: 'IOC', why: 'PRICE_BAND', filled: 0, qty: 1 }), 'REJ PRICE_BAND', 'a reject carries its reason');
@@ -336,7 +337,7 @@ function bootPage(opts) {
   eq(P.text($('s-run')), 'STOPPED', 'state text STOPPED');
   const tags = () => $('s-pf')._children.map(e => e.textContent + ':' + e.className);
   eq(tags().map(x => x.split(':')[0]).join(' '), 'KEY CASH SHARD CLK DISK FEED PRIV GROUPS', 'preflight tags in the plan order (plus DISK)');
-  check(tags().slice(0, 7).every(x => x.endsWith(':ok')) && tags()[7] === 'GROUPS:na', 'passing tags are green; GROUPS unknown is grey', tags());
+  check(tags().every(x => x.endsWith(':ok')), 'passing tags are green (the backend reports PRIV and GROUPS)', tags());
   eq(start.disabled, false, 'START is enabled when stopped and every check passes');
   eq(stop.disabled, true, 'STOP is disabled with nothing to stop');
   const plan = P.text($('s-plan'));
@@ -503,17 +504,11 @@ function bootPage(opts) {
     check(S.orders.get(cid) === undefined || S.orders.get(cid).terminal, 'the venue confirmed the cancel');
   } else check(true, 'no resting systematic order to cancel at this moment (skipped)');
 
-  // ---- lane toggle: optimistic, then confirmed
-  // the pending look, as Desk.act.lane leaves it before the backend answers (the demo venue
-  // answers inside the click, so it is set here directly)
-  S.lanes.get('M2').pendOn = false; S.lanes.get('M2').pendAt = Date.now(); D.render.mark('lane');
-  P.flush();
-  check(tgOf('M2').textContent === 'OFF' && tgOf('M2').className.indexOf('pend') >= 0, 'a toggle in flight shows the new state, pending');
-  S.lanes.get('M2').pendOn = null; D.render.mark('lane'); P.flush();
-  eq(tgOf('M2').textContent, 'ON', 'clearing the pending toggle shows the backend state again');
+  // ---- lane toggle: optimistic, then confirmed (the strategy worker answers a few ms later)
   P.click(tgOf('M2'));
   P.flush();
-  eq(tgOf('M2').textContent, 'OFF', 'the M2 toggle shows OFF on the next frame');
+  check(tgOf('M2').textContent === 'OFF' && tgOf('M2').className.indexOf('pend') >= 0 && S.lanes.get('M2').on === true,
+    'the M2 toggle shows OFF, pending, on the next frame, before the backend answers', tgOf('M2').className);
   await P.advance(500);
   check(tgOf('M2').textContent === 'OFF' && tgOf('M2').className.indexOf('pend') < 0 && S.lanes.get('M2').on === false, 'the backend agreed: M2 off');
   P.click(tgOf('M2'));
@@ -548,8 +543,8 @@ function bootPage(opts) {
   await P.advance(1500);
   check(start.disabled, 'START is disabled while a check fails');
   const why = P.text($('s-why'));
-  check(/FEED/.test(why) && /PRIV KXP down/.test(why), 'the failing checks and reasons show next to the tags', why);
-  check(tags().find(x => x.startsWith('PRIV')).endsWith(':bad') && tags().find(x => x.startsWith('FEED')).endsWith(':bad'), 'failing tags turn red', tags());
+  check(/PRIV KXP down/.test(why) && !/FEED/.test(why), 'the failing check and its reason show next to the tags (the private socket is PRIV, not FEED)', why);
+  check(tags().find(x => x.startsWith('PRIV')).endsWith(':bad') && tags().find(x => x.startsWith('FEED')).endsWith(':ok'), 'the failing tag turns red', tags());
   P.click(start); P.flush();
   eq(P.text($('s-run')), 'STOPPED', 'a click on the disabled START does nothing');
   P.sim().setFeed('KXP', true);
@@ -578,10 +573,19 @@ function bootPage(opts) {
   eq(start.disabled, true, 'START is disabled during the kill lockout');
   await P.advance(61000, 5000);
   eq(P.text($('s-run')), 'KILLED RE-ARM', 'after 60 s the strip asks for a re-arm');
-  P.click($('kill'));                              // RE-ARM (confirm() returns true in the test)
-  await P.advance(1000);
+  P.click($('kill'));                              // RE-ARM: no dialog, the label asks for a second click
+  P.flush();
+  eq($('kill').textContent, 'CONFIRM', 'the first RE-ARM click turns the button to CONFIRM');
+  await P.advance(3500);
+  eq($('kill').textContent, 'RE-ARM', 'CONFIRM lapses after 3 s');
+  P.click($('kill')); P.flush();
+  P.click($('kill')); P.flush();
+  eq(P.text($('s-run')), 'KILLED RE-ARM', 'nothing changes before the backend answers');
+  await P.advance(200);
   eq(P.text($('s-run')), 'STOPPED', 're-armed: STOPPED');
-  eq(start.disabled, false, 'START is live after the re-arm');
+  check(start.disabled && /GROUPS/.test(P.text($('s-why'))), 'START waits for the order groups to reset', P.text($('s-why')));
+  await P.advance(1500);
+  eq(start.disabled, false, 'START is live once the groups reset');
 
   // ---- WIDE: more columns; narrow: fewer
   P.setWidth(1920);

@@ -5,13 +5,20 @@
  * network. The demo transport (transport.js) wires it to the store; the node test drives it with
  * a fake clock and validates every event it emits.
  *
- *   var sim = Desk.sim.create({now, seed, emit, sid, mode, pmRO, chaos})
- *   sim.request(method, path, body, reply(status, json))   the HTTP endpoints, with latency
+ *   var sim = Desk.sim.create({now, seed, emit, sid, mode, pmRO, chaos, ext, port})
+ *   sim.request(method, path, body, reply(status, json), headers)
+ *                                                           the HTTP endpoints, with latency and
+ *                                                           the web worker's guards: a POST needs
+ *                                                           headers['X-Desk'] === sim.token, and a
+ *                                                           Host header, when given, must pass
+ *                                                           contract.hostOk(host, port)
+ *   sim.token                                               the per-start token ("in the page")
  *   sim.snapshot()                                          GET /api/snapshot body
  *   sim.pump()                                              run timers and world ticks due now
  *   sim.nextDue()                                           when pump next has work (ms)
  *   sim.start() / sim.stop()                                self-driving loop (browser)
  *   test hooks: dropNext(), setFeed(name, up), freeze(key, {bids, asks}), trade(key, side, qty),
+ *               external(key, side, pxU, qty) (an EXT order placed outside the desk),
  *               market(key), order(cid), position(key), cash(), state
  *
  * What is simulated:
@@ -136,12 +143,22 @@
       ogOutcomes: {}, games: [], wx: [], lip: {},
       gwAcks: [], lat: { kx: 34, pm: 210, clk: 80 },
       costU: 0, costBudgetU: 48000, stopLimitU: 250000,
-      realBy: { MAN: 0, SYS: 0 }, lipU: 0,
+      realBy: { MAN: 0, SYS: 0, EXT: 0 }, lipU: 0,
+      port: opts.port || 8788, token: opts.token || null,
+      groups: { ok: true, why: '' },
       oidN: 0, fidN: 0, alertN: 0, cidN: 0, gameN: 0,
       lanes: [], laneById: {},
       lastHdrJson: '', lastHdrEmit: 0, lastRiskJson: '', teamIdx: 0
     };
     var EPS = S.epoch.slice(-4);
+    // the per-start token the backend writes into the page (never from the seeded generator, so
+    // a seed replays the same market whatever the token is)
+    if (!S.token) {
+      var tk = '', abc = 'abcdefghijkmnpqrstuvwxyz23456789', buf = null;
+      try { if (root.crypto && root.crypto.getRandomValues) { buf = new Uint8Array(24); root.crypto.getRandomValues(buf); } } catch (e) { buf = null; }
+      for (var ti = 0; ti < 24; ti++) tk += abc.charAt((buf ? buf[ti] : Math.floor(Math.random() * 256)) % abc.length);
+      S.token = tk;
+    }
     var rollRate = 0.45;      // game clock seconds per real second
 
     // ------------------------------------------------------------------------------------------
@@ -193,7 +210,8 @@
     function mktData(m) {
       return { v: m.v, tk: m.tk, ev: m.ev, title: m.title, short: m.short, grp: m.grp, kind: m.kind, og: m.og, oc: m.oc,
                open_ms: m.open_ms, close_ms: m.close_ms, status: m.status, result: m.result, grid: m.grid,
-               fee: { type: m.fee.type, mult: m.fee.mult }, shard: m.shard, lip: m.lip };
+               fee: { type: m.fee.type, mult: m.fee.mult }, shard: m.shard, lip: m.lip,
+               start_ms: m.game ? m.game.start : null, man: !!m.manOwned };
     }
 
     // 15-minute LIP windows
@@ -206,7 +224,7 @@
         v: 'K', tk: ev + '-' + pad2(etD(close).getUTCMinutes()), ev: ev, bk: 'LIP15',
         title: spec.full + ' price up in next 15 mins?', short: spec.name + ' ' + hmET(close) + ' UP', grp: '15M',
         kind: 'LIP15', og: ev, oc: 'UP', open_ms: openMs, close_ms: close, grid: spec.grid,
-        fee: { type: 'FREE', mult: 1 }, shard: spec.shard, lip: true, p: lipP(st, close, clock())
+        fee: { type: 'QUAD', mult: 1 }, shard: spec.shard, lip: true, p: lipP(st, close, clock())
       }, quiet);
       st.key = m.key;
       m.ref.fair = m.pU; m.ref.sd = 200;
@@ -268,7 +286,8 @@
       var ph = wp(g);
       var label = g.away + '@' + g.home;
       if (venues.indexOf('K') >= 0) {
-        var fee = opts2.free ? { type: 'FREE', mult: 1 } : { type: 'QUAD', mult: 1 };
+        // FBS football pays maker fees on Kalshi; FCS and smaller conferences do not
+        var fee = opts2.free ? { type: 'QUAD', mult: 1 } : { type: 'QUAD_MAKER', mult: 1 };
         g.keys.K_A = addMarket({ v: 'K', tk: evK + '-' + g.away, ev: evK, bk: 'GAME_K', title: g.awayName + ' wins', short: label + ' ' + g.away,
           grp: lg, kind: 'GAME', og: evK, oc: g.away, open_ms: start - 7 * 86400000, close_ms: close, grid: GRID_LINEAR, fee: fee,
           shard: 'S2', lip: false, p: 1 - ph, game: g }, quiet).key;
@@ -453,7 +472,7 @@
       var o = {
         n: ++S.cidN, cid: req.cid, oid: null, v: req.v, tk: req.tk, key: req.v + '|' + req.tk, side: req.side,
         px: N.px(req.px), qty: r2(req.qty), filled: 0, left: r2(req.qty), avgNum: 0, tif: req.tif,
-        exp_ms: req.tif === 'POST' && req.ttl_s ? Math.ceil((now + 1 + req.ttl_s * 1000) / 1000) * 1000 : null,
+        exp_ms: req.tif === 'POST' && req.ttl_s ? Math.ceil((now + 1 + req.ttl_s * 1000) / 1000) * 1000 : (req.exp_ms || null),
         ttl_s: req.ttl_s, st: 'PEND', why: '', own: own, lane: lane || null, ahead: 0, restAt: 0, fee: 0,
         touch: req.touch ? N.px(req.touch) : null, edge: null, acc: FEES.newAcc(),
         t: { click: req.t_click_ms || null, recv: now, sent: now + 1, ack: null, done: null },
@@ -506,8 +525,12 @@
       if (!G.onGrid(m.g, px)) return err('OFF_GRID', req.px + ' not on the grid');
       if (!(req.qty > 0) || Math.abs(req.qty * 100 - Math.round(req.qty * 100)) > 1e-6 || (m.v === 'P' && req.qty % 1 !== 0))
         return err('BAD_QTY', 'qty ' + req.qty);
-      if ((req.tif === 'POST') !== (req.ttl_s !== null && req.ttl_s !== undefined)) return err('BAD_REQUEST', 'ttl_s is required with POST and null otherwise');
-      if (S.run.state === 'KILLED') return err('KILLED', 'kill lockout');
+      var hasTtl = req.ttl_s !== null && req.ttl_s !== undefined, hasExp = req.exp_ms !== null && req.exp_ms !== undefined;
+      if (own !== 'EXT' && (req.tif === 'POST' ? hasTtl === hasExp : (hasTtl || hasExp))) return err('BAD_REQUEST', 'POST needs one of ttl_s and exp_ms; IOC and FOK neither');
+      if (hasExp && (req.exp_ms % 1000 !== 0 || req.exp_ms < now + 5000 || req.exp_ms > now + 86400000)) return err('BAD_REQUEST', 'exp_ms must be a whole second 5 s to 24 h ahead');
+      if (req.reduce_only && req.tif !== 'IOC') return err('BAD_REQUEST', 'reduce_only is IOC only');
+      if (req.reduce_only) { var rp = posOf(m.key); if (req.side === 'BUY' ? rp >= 0 : rp <= 0) return err('REDUCE', rp === 0 ? 'no position' : 'would increase the position'); }
+      if (S.run.state === 'KILLED' && own !== 'EXT') return err('KILLED', 'kill lockout');
       if (own === 'SYS' && S.run.state !== 'RUN') return err('BAD_STATE', 'systematic not running');
       if (m.v === 'K' && (!S.feeds.KXP.up || !S.feeds.KX.up || S.feeds.KX.gap)) return err('STALE', 'Kalshi feed down');
       if (m.v === 'P' && !S.feeds.PM.up) return err('STALE', 'Polymarket feed down');
@@ -532,6 +555,7 @@
         return null;
       }
       var e = checkOrder(req, own, m, now);
+      if (!e && req.reduce_only) { var rq = Math.abs(posOf(m.key)); if (req.qty > rq) req = Object.assign({}, req, { qty: rq }); }
       if (e) {
         var rec = newOrder(req, own, lane, m, now);
         rec.st = 'REJ'; rec.why = C.enums.WHY.indexOf(e.code) >= 0 ? e.code : 'INTERNAL'; rec.left = 0; rec.t.sent = null; rec.t.done = now; rec.exp_ms = null;
@@ -552,7 +576,7 @@
     function takeover(m, now) {
       var n = 0;
       S.live.forEach(function (o) { if (o.key === m.key && o.own === 'SYS') { cancelOrder(o, 'TAKEOVER'); n++; } });
-      if (!m.manOwned) { m.manOwned = true; if (n) alert('INFO', 'GW', 'TAKEOVER ' + m.tk + ': ' + n + ' systematic orders cancelled'); }
+      if (!m.manOwned) { m.manOwned = true; emit('mkt', mktData(m)); if (n) alert('INFO', 'GW', 'TAKEOVER ' + m.tk + ': ' + n + ' systematic orders cancelled'); }
     }
     function ack(o, reply) {
       var now = clock();
@@ -661,8 +685,9 @@
       }
       S.cash[shard] -= fee;
       P.real += realized - fee; P.fees += fee;
-      S.realBy[o.own] += realized - fee;
-      if (P.pos === 0) P.own = {}; else P.own[o.own] = true;
+      var ownP = o.own === 'SYS' ? 'SYS' : 'MAN';            // EXT fills count as the operator's
+      S.realBy[ownP] += realized - fee;
+      if (P.pos === 0) P.own = {}; else P.own[ownP] = true;
       if (o.own === 'SYS') P.lane = o.lane;
       P.dirty = true;
       return realized - fee;
@@ -1134,7 +1159,9 @@
         { id: 'SHARD', ok: !low.length, why: low.length ? low.join(',') + ' free under 1.00' : '' },
         { id: 'CLK', ok: Math.abs(S.lat.clk) < 500, why: '' },
         { id: 'DISK', ok: true, why: '' },
-        { id: 'FEED', ok: S.feeds.KX.up && S.feeds.KXP.up, why: S.feeds.KX.up && S.feeds.KXP.up ? '' : 'KX down' }
+        { id: 'FEED', ok: S.feeds.KX.up && !S.feeds.KX.gap, why: !S.feeds.KX.up ? 'KX down' : (S.feeds.KX.gap ? 'KX gap' : '') },
+        { id: 'PRIV', ok: S.feeds.KXP.up && !S.feeds.KXP.gap, why: !S.feeds.KXP.up ? 'KXP down' : (S.feeds.KXP.gap ? 'KXP gap' : '') },
+        { id: 'GROUPS', ok: S.groups.ok, why: S.groups.why }
       ];
     }
     function hdrData() {
@@ -1301,9 +1328,12 @@
       };
     }
     function runResp(n) { return { ok: true, run: { state: S.run.state, since_ms: S.run.since_ms, rearm_ms: S.run.rearm_ms, why: S.run.why }, n: n || 0 }; }
-    function request(method, path, body, reply) {
+    function request(method, path, body, reply, hdrs) {
       reply = reply || function () {};
       var key = C.endpointFor(method, path), now = clock();
+      // the web worker's guards come first: Host, then the POST token
+      if (hdrs && hdrs.Host !== undefined && !C.hostOk(hdrs.Host, S.port)) { reply2(reply, 403, { ok: false, err: err('FORBIDDEN', 'Host ' + hdrs.Host) }); return; }
+      if (method === 'POST' && (!hdrs || hdrs['X-Desk'] !== S.token)) { reply2(reply, 403, { ok: false, err: err('FORBIDDEN', hdrs && hdrs['X-Desk'] ? 'stale X-Desk token' : 'no X-Desk token') }); return; }
       if (!key) { reply2(reply, 404, { ok: false, err: err('NOT_FOUND', method + ' ' + path) }); return; }
       if (method === 'POST') {
         var bad = C.validateRequest(key, body);
@@ -1341,17 +1371,21 @@
         case 'POST /api/lane/{id}':
           L = S.laneById[path.split('/').pop()];
           if (!L) { reply2(reply, 404, { ok: false, err: err('NOT_FOUND', path) }); return; }
-          L.on = body.on;
-          if (!L.on) cancelWhere(function (o) { return o.lane === L.id; }, 'STOP');
-          var s = laneState(L, now); L.state = s.st; L.why = s.why;
-          var ld = laneData(L); L.lastJson = JSON.stringify(ld); emit('lane', ld);
-          alert('INFO', L.id, L.on ? 'lane on' : 'lane off');
-          reply2(reply, 200, { ok: true, lane: ld }, 3);
+          // the strategy worker applies it a few ms later; the echo and the reply follow
+          at(now + Math.round(R(8, 20)), function () {
+            var now2 = clock();
+            L.on = body.on;
+            if (!L.on) cancelWhere(function (o) { return o.lane === L.id; }, 'STOP');
+            var s = laneState(L, now2); L.state = s.st; L.why = s.why;
+            var ld = laneData(L); L.lastJson = JSON.stringify(ld); emit('lane', ld);
+            alert('INFO', L.id, L.on ? 'lane on' : 'lane off');
+            reply(200, { ok: true, lane: ld });
+          });
           return;
         case 'POST /api/start':
           if (S.run.state === 'KILLED') { reply2(reply, 409, { ok: false, err: err('KILLED', 'kill lockout; re-arm first') }); return; }
           if (S.run.state === 'HALTED') { reply2(reply, 409, { ok: false, err: err('HALTED', 'daily stop hit') }); return; }
-          var pf = preflight(), failing = pf.filter(function (r) { return !r.ok; });
+          var pf = preflight(), failing = pf.filter(function (r) { return !r.ok && r.id !== 'DISK'; });
           if (failing.length) { reply2(reply, 409, { ok: false, err: err('PREFLIGHT', failing.map(function (r) { return r.id; }).join(',')), preflight: pf }); return; }
           if (S.run.state !== 'RUN') { S.run = { state: 'RUN', since_ms: now, rearm_ms: null, why: '' }; S.nextLane = now; alert('INFO', 'SYS', 'start'); }
           reply2(reply, 200, runResp(0), 3);
@@ -1364,19 +1398,34 @@
         case 'POST /api/kill':
           n = cancelWhere(function () { return true; }, 'KILL').length;
           if (S.run.state !== 'KILLED') { S.run = { state: 'KILLED', since_ms: now, rearm_ms: now + 60000, why: 'operator' }; alert('CRIT', 'KILL', 'kill: ' + n + ' orders cancelled, systematic stopped, re-arm in 60 s'); }
+          S.groups = { ok: false, why: 'triggered by KILL' };
           reply2(reply, 200, runResp(n), 3);
           return;
         case 'POST /api/rearm':
           if (S.run.state !== 'KILLED' || now < S.run.rearm_ms) { reply2(reply, 409, { ok: false, err: err('BAD_STATE', S.run.state !== 'KILLED' ? 'not killed' : 're-arm in ' + Math.ceil((S.run.rearm_ms - now) / 1000) + ' s') }); return; }
           S.run = { state: 'STOP', since_ms: now, rearm_ms: null, why: '' };
           alert('INFO', 'KILL', 're-armed');
+          // the order groups reset; GROUPS passes once the exchange confirms (START waits for it)
+          S.groups = { ok: false, why: 'reset pending' };
+          at(now + Math.round(R(600, 1000)), function () { if (S.run.state !== 'KILLED') { S.groups = { ok: true, why: '' }; alert('INFO', 'GW', 'order groups reset'); } });
           reply2(reply, 200, runResp(0), 3);
           return;
         case 'POST /api/release':
           var mm = S.markets.get(body.v + '|' + body.tk);
           if (!mm) { reply2(reply, 404, { ok: false, err: err('UNKNOWN_MARKET', body.v + '|' + body.tk) }); return; }
-          mm.manOwned = false;
+          if (mm.manOwned) { mm.manOwned = false; emit('mkt', mktData(mm)); }
           reply2(reply, 200, { ok: true });
+          return;
+        case 'POST /api/transfer':
+          var amt = N.money(body.amt), sh = ['S0', 'S1', 'S2', 'S3'];
+          if (sh.indexOf(body.from) < 0 || sh.indexOf(body.to) < 0 || body.from === body.to || !(amt > 0)) { reply2(reply, 400, { ok: false, err: err('BAD_REQUEST', 'from/to must be two Kalshi shards, amt > 0') }); return; }
+          if (amt > freeOf(body.from)) { reply2(reply, 409, { ok: false, err: err('NO_CASH', body.from + ' free ' + N.moneyStr(freeOf(body.from))) }); return; }
+          at(now + latency('K'), function () {
+            if (amt > freeOf(body.from)) { reply(409, { ok: false, err: err('NO_CASH', body.from + ' free ' + N.moneyStr(freeOf(body.from))) }); return; }
+            S.cash[body.from] -= amt; S.cash[body.to] += amt;
+            alert('INFO', 'GW', 'moved ' + N.moneyStr(amt).replace(/0+$/, '').replace(/\.$/, '') + ' ' + body.from + '>' + body.to);
+            reply(200, { ok: true, shards: [body.from, body.to].map(function (x) { return { id: x, cash: ms(S.cash[x]), free: ms(freeOf(x)) }; }) });
+          });
           return;
         default:
           reply2(reply, 404, { ok: false, err: err('NOT_FOUND', key) });
@@ -1423,8 +1472,26 @@
       loopTimer = setTimeout(loop, wait);
     }
 
+    // an order on the account that the desk did not place (the venue's website): rests with no expiry
+    function external(key, side, pxU, qty) {
+      var m = S.markets.get(key); if (!m) return null;
+      var cid = 'X' + (++S.oidN).toString(36) + EPS + 'ext';
+      var o = submit({ cid: cid, v: m.v, tk: m.tk, side: side, px: N.pxStr(pxU), qty: qty, tif: 'POST', ttl_s: null, exp_ms: null,
+                       override: true, touch: null, t_click_ms: null }, 'EXT', null, null);
+      return o ? o.cid : null;
+    }
+    // demo: one order left resting from the venue's website (a tomorrow weather bracket, 3 ticks
+    // under the bid), so the screen shows how a foreign order looks
+    if (opts.ext) at(T0 + 2000, function () {
+      var w = S.wx.filter(function (x) { return !x.today; })[0], m = w && S.markets.get(w.keys[2]);
+      var bb = m ? bestLevel(m, 'BUY') : null;
+      if (m && bb !== null) external(m.key, 'BUY', Math.max(100, G.step(m.g, bb, -3)), 10);
+    });
+
     var api = {
       state: S,
+      token: S.token,
+      external: external,
       request: request,
       snapshot: snapshot,
       pump: pump,
