@@ -9,18 +9,21 @@
  */
 
 /* ------------------------------------------------------------------------------------------
-   Tokens (hex values from the UI spec; contrast checked there on #111418)
+   Tokens. Surfaces are near-black (2026-10-06: the operator asked for a deeper black): the
+   gutters, header and status bar are #000, panels sit one step up so the 1 px hairlines and the
+   lifted greys still separate them. Ink contrast is checked against every surface by the node
+   test (tests/test_ui_desk_v3.cjs): tx0/tx1/tx2 >= 4.5:1 on bg0..bg2, tx2 >= 4.5:1 on bg3.
    ------------------------------------------------------------------------------------------ */
 :root {
   /* surfaces */
-  --bg0: #0B0D10;   /* gutters, header, status bar */
-  --bg1: #111418;   /* panels */
-  --bg2: #171B21;   /* title bars, table headers, inputs */
-  --bg3: #1E232B;   /* hover, active tab, pending cell */
-  --sel: #1A2433;   /* selected row (the one clicked: with a 2 px bar) */
-  --fmk: #151C26;   /* the focused market's other rows: a tint, no bar */
-  --line: #242A33;  /* hairlines */
-  --line2: #323A45; /* panel edges, scrollbars */
+  --bg0: #000000;   /* gutters, header, status bar */
+  --bg1: #08090B;   /* panels */
+  --bg2: #101216;   /* title bars, table headers, inputs */
+  --bg3: #1B1F26;   /* hover, active tab, pending cell, pressed */
+  --sel: #15202F;   /* selected row (the one clicked: with a 2 px bar) */
+  --fmk: #0E1520;   /* the focused market's other rows: a tint, no bar */
+  --line: #212730;  /* hairlines */
+  --line2: #2C333D; /* panel edges, scrollbars */
   /* ink */
   --tx0: #E6E8EB;   /* numbers */
   --tx1: #A2A9B4;   /* labels */
@@ -38,7 +41,7 @@
   --ok: #1A7F37;    /* START available */
   --fair: #C792EA;  /* model fair */
   --espn: #9AA4B2;  /* ESPN */
-  --be: #1C1F2B;    /* break-even band */
+  --be: #171A26;    /* break-even band */
   /* flashes */
   --fl-up: rgba(63,185,80,.22); --fl-dn: rgba(248,81,73,.22); --fl-sz: rgba(230,232,235,.10); --fl-warn: rgba(227,160,8,.35);
   /* type */
@@ -232,10 +235,10 @@ body.log #logdrawer { display: flex; }
   display: none; border-top: 1px solid var(--line2);
 }
 body.set #setdrawer { display: flex; }
-#setdrawer .set-body { display: grid; grid-template-columns: 420px 480px minmax(0, 1fr); gap: 1px; background: var(--bg0); overflow: hidden; }
+#setdrawer .set-body { display: grid; grid-template-columns: 420px 480px minmax(0, 1fr); gap: 1px; background: var(--line); overflow: hidden; }
 #setdrawer .set-col { background: var(--bg1); overflow: auto; min-width: 0; }
 table.set td.lbl { color: var(--tx1); }
-#keysheet { position: fixed; left: 0; right: 0; top: var(--hdr-h); bottom: var(--sbar-h); z-index: 30; display: none; background: rgba(11,13,16,.88); }
+#keysheet { position: fixed; left: 0; right: 0; top: var(--hdr-h); bottom: var(--sbar-h); z-index: 30; display: none; background: rgba(0,0,0,.86); }
 body.keys #keysheet { display: flex; align-items: flex-start; justify-content: center; padding-top: 40px; }
 #keysheet .sheet { width: 640px; max-height: 80%; border: 1px solid var(--line2); }
 table.keys td.kk { font-family: var(--font-num); color: var(--tx0); }
@@ -248,7 +251,7 @@ table.keys td.kk { font-family: var(--font-num); color: var(--tx0); }
    tab instead of laying it out from scratch, which took 25-35 ms with 200 fills. A hidden tab
    is not painted, hit-tested or focusable, and its renderers are skipped until it shows. */
 main#tabs { position: relative; min-height: 0; min-width: 0; overflow: hidden; }
-.tabroot { display: grid; visibility: hidden; position: absolute; inset: 0; gap: 1px; background: var(--bg0); min-height: 0; }
+.tabroot { display: grid; visibility: hidden; position: absolute; inset: 0; gap: 1px; background: var(--line); min-height: 0; }   /* the 1 px gaps are the hairlines */
 .tabroot:focus { outline: none; }        /* focusable (-1) so a click in a SPLIT half takes that tab's keys */
 body[data-tab="systematic"] #tab-systematic { visibility: visible; z-index: 1; }
 body[data-tab="manual"] #tab-manual { visibility: visible; z-index: 1; }

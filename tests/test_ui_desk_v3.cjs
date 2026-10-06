@@ -884,6 +884,29 @@ const flushMicro = () => new Promise(r => setImmediate(r));
     eq(await mk('http:', '?demo=1', 'tok-X'), 'live', 'a page the backend served (a token) is live even with ?demo=1');
   }
 
+  if (process.env.V) console.log('section 10');
+  // ---- 10. the palette: near-black surfaces, ink that still reads on every one -----------------
+  {
+    const css = fs.readFileSync(path.join(JS, '..', 'desk.css'), 'utf8');
+    const root = /:root\s*\{([\s\S]*?)\n\}/.exec(css)[1];
+    const tok = {};
+    for (const m of root.matchAll(/--([\w-]+):\s*(#[0-9A-Fa-f]{6})/g)) tok[m[1]] = m[2];
+    const lum = hex => {
+      const c = [1, 3, 5].map(i => parseInt(hex.slice(i, i + 2), 16) / 255).map(x => (x <= 0.03928 ? x / 12.92 : Math.pow((x + 0.055) / 1.055, 2.4)));
+      return 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+    };
+    const ratio = (a, b) => { const x = lum(tok[a]), y = lum(tok[b]); return (Math.max(x, y) + 0.05) / (Math.min(x, y) + 0.05); };
+    check(lum(tok.bg0) < 0.001, 'the gutters, header and status bar are near-black (#000)', tok.bg0);
+    check(lum(tok.bg1) < 0.004 && lum(tok.bg1) > lum(tok.bg0), 'panels sit one step above the black', tok.bg1);
+    check(lum(tok.bg0) < lum(tok.bg1) && lum(tok.bg1) < lum(tok.bg2) && lum(tok.bg2) < lum(tok.bg3), 'surfaces step up bg0 < bg1 < bg2 < bg3');
+    check(ratio('line', 'bg1') >= 1.25 && ratio('line', 'bg0') >= 1.3, 'hairlines still separate panels on black', [ratio('line', 'bg1').toFixed(2), ratio('line', 'bg0').toFixed(2)]);
+    check(/\.tabroot \{[^}]*background: var\(--line\)/.test(css), 'the 1 px gaps between panels are drawn in the hairline colour');
+    const bad = [];
+    ['tx0', 'tx1', 'tx2'].forEach(t => ['bg0', 'bg1', 'bg2', 'bg3', 'sel'].forEach(b => { if (ratio(t, b) < 4.5) bad.push(t + '/' + b + ' ' + ratio(t, b).toFixed(2)); }));
+    ['bid-tx', 'ask-tx', 'up', 'dn', 'warn', 'fair', 'espn'].forEach(t => ['bg0', 'bg1', 'bg2'].forEach(b => { if (ratio(t, b) < 4.5) bad.push(t + '/' + b + ' ' + ratio(t, b).toFixed(2)); }));
+    eq(bad.join(', '), '', 'every ink keeps at least 4.5:1 on every surface it sits on');
+  }
+
   console.log(fails ? `${fails} of ${checks} checks FAILED` : `ui desk v3: ${checks} checks, 0 failures`);
   process.exit(fails ? 1 : 0);
 })().catch(e => { console.log('FAIL: test crashed: ' + (e && e.stack || e)); process.exit(1); });
