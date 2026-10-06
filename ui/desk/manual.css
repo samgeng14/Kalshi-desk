@@ -1,5 +1,118 @@
 /* ui/desk/manual.css
  * Rules specific to the MANUAL tab (watchlist, ladders, ticket, blotters, positions).
  * Shared tokens, grid, ladder and order-state classes live in desk.css. Scope selectors under
- * #tab-manual so they cannot leak into the SYSTEMATIC tab.
+ * #tab-manual so they cannot leak into the SYSTEMATIC tab. Square, flat, colour for meaning only.
  */
+
+/* ------------------------------------------------------------------------------------------
+   Shared bits
+   ------------------------------------------------------------------------------------------ */
+#tab-manual .off { display: none !important; }
+#tab-manual .lb { flex: 0 0 auto; font: 10px/1 var(--font-ui); color: var(--tx2); text-transform: uppercase; letter-spacing: .04em; }
+#tab-manual .v { color: var(--tx0); }
+#tab-manual .v.up { color: var(--up); } #tab-manual .v.dn { color: var(--dn); }
+#tab-manual .tag.own { color: var(--tx0); box-shadow: inset 0 0 0 1px var(--line2); }
+#tab-manual .tag.own.dim { color: var(--tx2); }
+#tab-manual .tag.own:empty, #tab-manual .tag:empty { display: none; }
+#tab-manual input.zero { color: var(--warn); }
+#tab-manual button.on { background: var(--bg3); color: var(--tx0); box-shadow: inset 0 -2px 0 var(--tx0); }
+#tab-manual button:disabled { box-shadow: none; }
+
+/* ------------------------------------------------------------------------------------------
+   Ladder: 60 px header (3 lines), 18 px column header, rows, 56 px footer
+   ------------------------------------------------------------------------------------------ */
+#tab-manual .lad-rows { overflow: hidden; }                 /* the axis is ours: wheel and Space move it */
+#tab-manual .lad-head .ln { gap: 5px; }
+#tab-manual .lad-head .ln > * { flex: 0 0 auto; }
+#tab-manual .lad-head .ln.t .ttl { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#tab-manual .lad-head .vt { color: var(--tx0); box-shadow: inset 0 0 0 1px var(--line2); font: 700 10px/14px var(--font-num); padding: 0 3px; }
+#tab-manual .lad-head .clk { font: 11px/1 var(--font-num); color: var(--tx1); }
+#tab-manual .lad-head .src { font: 10px/1 var(--font-ui); color: var(--tx2); letter-spacing: .04em; }
+#tab-manual .lad-head button { height: 16px; padding: 0 4px; font: 600 10px/1 var(--font-ui); letter-spacing: .04em; }
+#tab-manual .lad-head .chg { margin-left: auto; color: var(--tx2); }
+#tab-manual .lad-head .fair { color: var(--fair); } #tab-manual .lad-head .espn { color: var(--espn); }
+#tab-manual .lad-foot .ln { gap: 2px; padding: 0 3px; }
+#tab-manual .lad-foot button { height: 22px; padding: 0 5px; font: 11px/1 var(--font-ui); }
+#tab-manual .lad-foot button.q { width: 36px; padding: 0; font-family: var(--font-num); }
+#tab-manual .lad-foot button.tt { width: 32px; padding: 0; font-family: var(--font-num); }
+#tab-manual .lad-foot button.cp { width: 20px; padding: 0; font-family: var(--font-num); }
+#tab-manual .lad-foot .lb { margin: 0 2px 0 6px; }
+#tab-manual .lad-foot input.qty { width: 56px; height: 22px; text-align: right; }
+#tab-manual .lad-foot button.del { margin-left: 6px; }
+#tab-manual .lad-foot button.hk { margin-left: auto; min-width: 48px; }
+#tab-manual .lad-foot button.hk.hkon { color: var(--warn); box-shadow: inset 0 0 0 1px var(--warn); }
+#tab-manual .lad-foot .ro-msg { display: none; height: 55px; align-items: center; justify-content: center; font: 700 12px/1 var(--font-ui); letter-spacing: .04em; }
+#tab-manual .panel.lad[data-ro="1"] .lad-foot .ln { display: none; }
+#tab-manual .panel.lad[data-ro="1"] .lad-foot .ro-msg { display: flex; }
+
+/* rows: our orders, Systematic's (grey 'S8'), armed guard cells, drag target */
+#tab-manual table.lad td.wb, #tab-manual table.lad td.ws { padding: 0 2px; text-align: center; }
+#tab-manual table.lad td.sys { color: var(--tx2); }
+#tab-manual table.lad td.my.ext { box-shadow: inset 0 0 0 1px var(--warn); }
+#tab-manual table.lad td.arm { box-shadow: inset 0 0 0 1px var(--warn); }
+#tab-manual table.lad td.drag { outline: 1px solid var(--tx0); outline-offset: -1px; }
+#tab-manual table.lad td.rf { cursor: default; }
+#tab-manual table.lad tr.be.inside > td.px { background: var(--be); }
+
+/* ------------------------------------------------------------------------------------------
+   Watchlist (288 px; 320 px wide): 11 px rows so Market keeps some room
+   ------------------------------------------------------------------------------------------ */
+#m-watch:focus { outline: none; }
+#m-watch .ptools button { height: 16px; min-width: 22px; padding: 0 4px; font: 600 10px/1 var(--font-ui); }
+#m-watch .ptools input.srch { width: 92px; height: 16px; }
+#tab-manual table.watch th { padding: 0 2px; }
+#tab-manual table.watch th:first-child { padding-left: 4px; }
+#tab-manual table.watch td { padding: 0 2px; font-size: 11px; }
+#tab-manual table.watch td.t { padding-left: 4px; font: 11px/1 var(--font-ui); }
+#tab-manual table.watch td.tcl { padding: 0 2px; font: 10px/1 var(--font-num); font-variant-numeric: tabular-nums; color: var(--tx1); }
+#tab-manual table.watch td.dim { color: var(--tx2); }
+#tab-manual table.watch td.fair { color: var(--fair); }
+#tab-manual table.watch td.espn { color: var(--espn); }
+#tab-manual table.watch td.warn { color: var(--warn); }
+#tab-manual table.watch tr.grp { cursor: pointer; }
+#tab-manual table.watch tr.closed > td { color: var(--tx2); }
+
+/* ------------------------------------------------------------------------------------------
+   Ticket (176 px: four 22 px rows, two 16 px lines, 32 px buttons)
+   ------------------------------------------------------------------------------------------ */
+#m-ticket:focus { outline: none; }
+#m-ticket-body { display: flex; flex-direction: column; padding: 0 4px; overflow: hidden; }
+#m-ticket-tools { font: 11px/1 var(--font-num); color: var(--tx2); }
+#tab-manual .tk-r { display: flex; align-items: center; gap: 2px; flex: 0 0 22px; height: 22px; white-space: nowrap; }
+#tab-manual .tk-r .lb { margin: 0 3px 0 2px; }
+#tab-manual .tk-r .lb.gap { margin-left: 10px; }
+#tab-manual .tk-r input { width: 72px; text-align: right; }
+#tab-manual .tk-r input.auto { color: var(--tx2); }
+#tab-manual .tk-r input.bad { outline: 1px solid var(--warn); outline-offset: -1px; color: var(--warn); }
+#tab-manual .tk-r button { padding: 0 6px; }
+#tab-manual .tk-r button.q, #tab-manual .tk-r button.cp, #tab-manual .tk-r button.stp { min-width: 26px; padding: 0 4px; font-family: var(--font-num); }
+#tab-manual .tk-r button.ty { min-width: 40px; }
+#tab-manual .tk-r button.tv { min-width: 40px; font-weight: 600; }
+#tab-manual .tk-r button.ts { min-width: 72px; font-weight: 600; }
+#tab-manual .tk-r button.ts.on-BUY { background: var(--buy); border-color: var(--buy); color: #fff; }
+#tab-manual .tk-r button.ts.on-SELL { background: var(--sell); border-color: var(--sell); color: #fff; }
+#tab-manual .tk-mkt { flex: 1 1 auto; min-width: 0; padding: 0 6px; overflow: hidden; text-overflow: ellipsis; font: 600 12px/22px var(--font-ui); color: var(--tx0); }
+#tab-manual .tk-blk { margin-right: 4px; }
+#tab-manual .tk-l { display: flex; align-items: center; gap: 5px; flex: 0 0 16px; height: 16px; padding: 0 2px; font: 11px/1 var(--font-num); color: var(--tx1); white-space: nowrap; overflow: hidden; }
+#tab-manual .tk-l .lb { text-transform: none; letter-spacing: 0; font-size: 11px; }
+#tab-manual .tk-l .fair { color: var(--fair); } #tab-manual .tk-l .espn { color: var(--espn); }
+#tab-manual .tk-l .tch { margin-left: auto; }
+#tab-manual .tk-b { display: flex; gap: 2px; flex: 0 0 32px; height: 32px; margin-top: 2px; }
+#tab-manual .tk-b button { flex: 1 1 50%; height: 32px; font: 600 13px/1 var(--font-num); letter-spacing: 0; }
+#tab-manual .tk-b button.confirm { font-weight: 700; }
+body[data-kstale="1"] #m-ticket[data-v="K"] .n, body[data-pstale="1"] #m-ticket[data-v="P"] .n { color: var(--tx2) !important; }
+
+/* ------------------------------------------------------------------------------------------
+   Working, fills, positions: tight cells so HH:MM:SS and 0.645 fit the specced widths
+   ------------------------------------------------------------------------------------------ */
+#tab-manual .m-right table.grid th, #tab-manual .m-right table.grid td { padding: 0 3px; }
+#tab-manual table.grid td.tm { font-size: 11px; }
+#tab-manual table.grid td.ext { color: var(--warn); }
+#tab-manual table.grid td.why { color: var(--dn); }
+#tab-manual table.grid tr.flat0 > td { color: var(--tx2); }
+#tab-manual table.grid td.flat {
+  padding: 0; text-align: center; cursor: pointer; font: 600 10px/1 var(--font-ui); letter-spacing: .04em;
+  color: var(--tx0); background: var(--bg2); box-shadow: inset 0 0 0 1px var(--line2);
+}
+#tab-manual table.grid td.flat:hover { background: var(--crit); color: #fff; }
+#tab-manual .ptools .pinfo { margin-right: 4px; }
