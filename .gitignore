@@ -1,6 +1,8 @@
 build/
 build-ci/
 build-deskd/
+# any other build directory: a reviewer's build-review/ nearly went into a commit (2026-10-06)
+build-*/
 data/
 config/desk.json*
 *.pem

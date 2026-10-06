@@ -19,19 +19,48 @@ set(CMAKE_JOB_POOL_COMPILE desk_compile)
 set(CMAKE_JOB_POOL_PRECOMPILE_HEADER desk_compile)
 set(CMAKE_JOB_POOL_LINK desk_link)
 
+# The compiler runs native on Apple Silicon, whatever drives it. /usr/local/bin/ninja and the
+# Intel cmake are x86_64 builds, and a universal clang started under them runs as x86_64 too,
+# under Rosetta 2 (/usr/bin/arch printed i386 through that chain). Measured 2026-10-06 at nice 15:
+# server.cpp 10.15 s under Rosetta against 3.64 s native (3.90 s with an x86 parent and
+# arch -arm64), lock.cpp 0.92 s against 0.08 s. Every compile and link therefore starts through
+# "arch -arm64" on an arm64 host; Intel Macs and Linux are untouched.
+set(DESK_NATIVE_PREFIX "")
+if(APPLE)
+  execute_process(COMMAND /usr/sbin/sysctl -n hw.optional.arm64
+                  OUTPUT_VARIABLE DESK_HOST_ARM64 OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+  if(DESK_HOST_ARM64 STREQUAL "1")
+    set(DESK_NATIVE_PREFIX /usr/bin/arch -arm64)
+  endif()
+endif()
+
 # ccache when it is installed (brew install ccache); the build works the same without it.
 # deskd precompiles json.hpp and httplib.h, and ccache misses on every file that uses a PCH
 # unless it ignores the PCH's defines and the header times (the PCH is rebuilt with a new mtime
 # and ctime) and clang leaves its build time out of the PCH (-fno-pch-timestamp, on deskd's
-# targets below). The sloppiness rides on the launcher, so no ~/.config/ccache edit is needed.
+# targets below). The sloppiness rides on the launcher, so no ~/.config/ccache edit is needed:
+# ccache 4.8 and later read KEY=VALUE settings before the compiler; older ones get them through
+# "cmake -E env" (one more process per compile, 0.84 s of it under Rosetta).
 find_program(CCACHE_EXE ccache)
+set(DESK_CCACHE_SLOPPINESS "pch_defines,time_macros,include_file_mtime,include_file_ctime")
 if(CCACHE_EXE AND NOT DEFINED CMAKE_CXX_COMPILER_LAUNCHER)
-  set(CMAKE_CXX_COMPILER_LAUNCHER
-      ${CMAKE_COMMAND} -E env "CCACHE_SLOPPINESS=pch_defines,time_macros,include_file_mtime,include_file_ctime"
-      ${CCACHE_EXE})
-  message(STATUS "ccache: ${CCACHE_EXE}")
+  execute_process(COMMAND ${CCACHE_EXE} --version OUTPUT_VARIABLE DESK_CCACHE_VERSION ERROR_QUIET)
+  string(REGEX MATCH "version ([0-9]+\\.[0-9]+)" _ "${DESK_CCACHE_VERSION}")
+  if(CMAKE_MATCH_1 AND CMAKE_MATCH_1 VERSION_GREATER_EQUAL 4.8)
+    set(CMAKE_CXX_COMPILER_LAUNCHER ${DESK_NATIVE_PREFIX} ${CCACHE_EXE} "sloppiness=${DESK_CCACHE_SLOPPINESS}")
+  else()
+    set(CMAKE_CXX_COMPILER_LAUNCHER
+        ${DESK_NATIVE_PREFIX} ${CMAKE_COMMAND} -E env "CCACHE_SLOPPINESS=${DESK_CCACHE_SLOPPINESS}" ${CCACHE_EXE})
+  endif()
+  message(STATUS "ccache: ${CCACHE_EXE} (${CMAKE_MATCH_1})")
 elseif(NOT CCACHE_EXE)
   message(STATUS "ccache: not found, building without it (brew install ccache)")
+  if(DESK_NATIVE_PREFIX AND NOT DEFINED CMAKE_CXX_COMPILER_LAUNCHER)
+    set(CMAKE_CXX_COMPILER_LAUNCHER ${DESK_NATIVE_PREFIX})
+  endif()
+endif()
+if(DESK_NATIVE_PREFIX AND NOT DEFINED CMAKE_CXX_LINKER_LAUNCHER)
+  set(CMAKE_CXX_LINKER_LAUNCHER ${DESK_NATIVE_PREFIX})   # CMake 3.21 and later; ignored before
 endif()
 
 # ---- dependencies -----------------------------------------------------------
@@ -48,11 +77,12 @@ endif()
 find_package(OpenSSL REQUIRED)
 find_package(CURL REQUIRED)
 find_package(SQLite3 REQUIRED)
-# CMake's FindSQLite3 exports SQLite::SQLite3; some newer/Homebrew configs export SQLite3::SQLite3.
-if(TARGET SQLite::SQLite3)
-  set(DESK_SQLITE_TARGET SQLite::SQLite3)
-elseif(TARGET SQLite3::SQLite3)
+# CMake's FindSQLite3 exports SQLite::SQLite3; some newer/Homebrew configs export SQLite3::SQLite3,
+# and CMake 4 marks the old name deprecated (a warning per target), so the new name goes first.
+if(TARGET SQLite3::SQLite3)
   set(DESK_SQLITE_TARGET SQLite3::SQLite3)
+elseif(TARGET SQLite::SQLite3)
+  set(DESK_SQLITE_TARGET SQLite::SQLite3)
 else()
   message(FATAL_ERROR "SQLite3 found but no imported target")
 endif()

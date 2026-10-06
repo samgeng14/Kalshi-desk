@@ -17,12 +17,22 @@ whether a model proposed it, you typed it, or a bot fired it.
 ## Build (macOS)
 
 ```sh
-brew install cmake openssl@3            # curl and sqlite3 come with the Xcode CLT
+brew install cmake ccache ninja openssl@3   # curl and sqlite3 come with the Xcode CLT
 git clone <this repo> ~/Code/kalshi-desk && cd ~/Code/kalshi-desk
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=arm64
-cmake --build build -j
-./build/desk-tests && ./build/systematic-tests && ./build/perps-tests && ./build/poly-tests && ./build/account-summary-tests
+/opt/homebrew/bin/cmake -S . -B build-deskd -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_OSX_ARCHITECTURES=arm64 -DOPENSSL_ROOT_DIR=/opt/homebrew/opt/openssl@3
+nice -n 15 ninja -C build-deskd -j 4 deskd-all            # deskd, deskctl, fake-kalshi, their tests
+cd build-deskd && ctest -R deskd --output-on-failure
 ```
+
+Never more than `-j 4`, always `nice -n 15`, one build at a time, and never in `build/` while a
+desk runs: an unbounded build (`cmake --build build -j`, ncpu + 2 jobs) stalled the live desk for
+18 minutes on 2026-09-24. Under Ninja the CMake job pools hold compiles to 4 and links to 2
+whatever `-j` says. On Apple Silicon every compile and link goes through `arch -arm64`, so an
+Intel ninja or cmake (`/usr/local/bin`) no longer runs clang under Rosetta (server.cpp 10.2 s
+there against 3.6 s native); the whole deskd build takes about 16 s at `-j 4` without ccache, and
+a strategy edit relinks deskd in under a second. The old desk's targets (`kalshi-desk`,
+`desk-tests` ...) build the same way, by name.
 
 Apple Silicon: pass `-DCMAKE_OSX_ARCHITECTURES=arm64` (or `conda deactivate` first). A conda
 `(base)` shell puts an Intel `cmake` first on PATH; under Rosetta it reports an x86_64 host, the
