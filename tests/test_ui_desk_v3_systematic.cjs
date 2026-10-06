@@ -1,0 +1,643 @@
+// The v3 screen's SYSTEMATIC tab (ui/desk/js/systematic.js), checked without a browser or any
+// package. Two parts:
+//   1. the pure maths in a plain vm: P(daily stop) against redesign v3's table, reservations,
+//      contract-weighted markouts, the amber "realized well under predicted" rule, equity,
+//      derived preflight rows, the St text of finished orders
+//   2. the whole page booted in a small fake DOM (index.html parsed into a tree, events that
+//      bubble, a fake clock driving the demo venues): the strip, START/STOP with a pending paint
+//      on the next frame, preflight failures disabling START with the reason, the lanes grid
+//      (toggle, kill, filter, amber), working and fills filtered to Systematic, the risk book
+//      grouped by outcome with the cash footer, markouts, row linking to the focused market,
+//      WIDE and narrow column sets, KILL, the stale rule, and no render errors.
+//   node tests/test_ui_desk_v3_systematic.cjs
+'use strict';
+const fs = require('fs'), path = require('path'), vm = require('vm');
+const DESK = path.join(__dirname, '..', 'ui', 'desk');
+const JS = path.join(DESK, 'js');
+
+let checks = 0, fails = 0;
+function check(cond, what, detail) {
+  checks++;
+  if (!cond) { fails++; console.log('FAIL: ' + what + (detail !== undefined ? '  ' + (typeof detail === 'string' ? detail : JSON.stringify(detail)) : '')); }
+}
+function eq(a, b, what) { check(a === b, what, { got: a, want: b }); }
+function near(a, b, tol, what) { check(typeof a === 'number' && Math.abs(a - b) <= tol, what, { got: a, want: b, tol }); }
+const M = '\u2212';
+
+// ---------------------------------------------------------------------------------------------
+// A small DOM: enough of Element/Document for the desk's code (keyedRows, closest, dataset,
+// classList, style, disabled, bubbling click/keydown events with capture).
+// ---------------------------------------------------------------------------------------------
+const VOID = new Set(['meta', 'link', 'input', 'br', 'img', 'col', 'hr']);
+class ClassList {
+  constructor(e) { this.e = e; }
+  get set() { return new Set((this.e._cls || '').split(/\s+/).filter(Boolean)); }
+  contains(c) { return this.set.has(c); }
+  add(c) { const s = this.set; s.add(c); this.e._cls = [...s].join(' '); }
+  remove(c) { const s = this.set; s.delete(c); this.e._cls = [...s].join(' '); }
+  toggle(c, on) { const want = on === undefined ? !this.contains(c) : !!on; if (want) this.add(c); else this.remove(c); return want; }
+}
+function dataKey(k) { return 'data-' + k.replace(/[A-Z]/g, m => '-' + m.toLowerCase()); }
+class Node_ {
+  constructor(tag, doc) {
+    this.tagName = tag.toUpperCase(); this.ownerDocument = doc;
+    this._children = []; this.parentNode = null; this._attrs = {}; this._cls = ''; this._text = ''; this._ls = [];
+    this.classList = new ClassList(this);
+    const self = this;
+    this.style = { _p: {}, setProperty(k, v) { this._p[k] = String(v); }, getPropertyValue(k) { return this._p[k] || ''; } };
+    this.dataset = new Proxy({}, {
+      get(t, k) { const v = self._attrs[dataKey(String(k))]; return v === undefined ? undefined : v; },
+      set(t, k, v) { self._attrs[dataKey(String(k))] = String(v); return true; },
+      has(t, k) { return dataKey(String(k)) in self._attrs; }
+    });
+  }
+  get id() { return this._attrs.id || ''; } set id(v) { this._attrs.id = String(v); }
+  get className() { return this._cls; } set className(v) { this._cls = String(v); }
+  get title() { return this._attrs.title || ''; } set title(v) { this._attrs.title = String(v); }
+  get disabled() { return 'disabled' in this._attrs; } set disabled(v) { if (v) this._attrs.disabled = ''; else delete this._attrs.disabled; }
+  get children() { return this._children; }
+  get firstChild() { return this._children[0] || null; }
+  get lastChild() { return this._children[this._children.length - 1] || null; }
+  get nextSibling() { if (!this.parentNode) return null; const a = this.parentNode._children; return a[a.indexOf(this) + 1] || null; }
+  get textContent() { return this._children.length ? this._children.map(c => c.textContent).join('') : this._text; }
+  set textContent(v) { this._children.forEach(c => { c.parentNode = null; }); this._children = []; this._text = String(v); }
+  get innerHTML() { return this._text; }
+  set innerHTML(v) { this.ownerDocument.innerHTMLWrites++; this._children = []; this._text = String(v).replace(/<[^>]*>/g, ''); }
+  appendChild(c) { return this.insertBefore(c, null); }
+  insertBefore(c, ref) {
+    if (c.parentNode) c.parentNode.removeChild(c);
+    c.parentNode = this; this._text = '';
+    const i = ref ? this._children.indexOf(ref) : -1;
+    if (i < 0) this._children.push(c); else this._children.splice(i, 0, c);
+    return c;
+  }
+  removeChild(c) { const i = this._children.indexOf(c); if (i >= 0) this._children.splice(i, 1); c.parentNode = null; return c; }
+  remove() { if (this.parentNode) this.parentNode.removeChild(this); }
+  getAttribute(k) { if (k === 'class') return this._cls; return k in this._attrs ? this._attrs[k] : null; }
+  setAttribute(k, v) { if (k === 'class') this._cls = String(v); else this._attrs[k] = String(v); }
+  removeAttribute(k) { if (k === 'class') this._cls = ''; else delete this._attrs[k]; }
+  hasAttribute(k) { return k === 'class' ? !!this._cls : k in this._attrs; }
+  addEventListener(t, fn, cap) { this._ls.push({ t, fn, cap: !!(cap && (cap === true || cap.capture)) }); }
+  removeEventListener(t, fn) { this._ls = this._ls.filter(l => !(l.t === t && l.fn === fn)); }
+  matches(sel) { return sel.split(',').some(s => simpleMatch(this, s.trim())); }
+  closest(sel) { let e = this; while (e && e.tagName) { if (e.matches(sel)) return e; e = e.parentNode; } return null; }
+  contains(x) { while (x) { if (x === this) return true; x = x.parentNode; } return false; }
+  animate() { return {}; } get offsetWidth() { return 0; } blur() {} focus() {} get isContentEditable() { return false; }
+  walk(fn) { fn(this); this._children.forEach(c => c.walk(fn)); }
+}
+function simpleMatch(e, s) {
+  const m = /^([a-zA-Z0-9]*)((?:\.[\w-]+|\[[^\]]+\])*)$/.exec(s);
+  if (!m) throw new Error('fake DOM: unsupported selector ' + s);
+  if (m[1] && e.tagName !== m[1].toUpperCase()) return false;
+  const parts = m[2].match(/\.[\w-]+|\[[^\]]+\]/g) || [];
+  return parts.every(p => {
+    if (p[0] === '.') return e.classList.contains(p.slice(1));
+    const a = /^\[([\w-]+)(?:="([^"]*)")?\]$/.exec(p);
+    if (!a) throw new Error('fake DOM: unsupported attribute selector ' + p);
+    return a[2] === undefined ? e.hasAttribute(a[1]) : e.getAttribute(a[1]) === a[2];
+  });
+}
+function makeDocument(html) {
+  const doc = { innerHTMLWrites: 0, readyState: 'interactive', _ls: [] };
+  const htmlEl = new Node_('html', doc), body = new Node_('body', doc);
+  htmlEl.appendChild(body);
+  const bm = /<body([^>]*)>([\s\S]*)<\/body>/.exec(html);
+  for (const a of bm[1].matchAll(/([\w-]+)="([^"]*)"/g)) body.setAttribute(a[1], a[2]);
+  const stack = [body];
+  const re = /<!--[\s\S]*?-->|<\/(\w+)\s*>|<(\w+)((?:\s+[\w-]+(?:="[^"]*")?)*)\s*\/?>|([^<]+)/g;
+  let m;
+  while ((m = re.exec(bm[2]))) {
+    if (m[0].startsWith('<!--')) continue;
+    if (m[1]) { const top = stack[stack.length - 1]; if (top.tagName === m[1].toUpperCase()) stack.pop(); else throw new Error('fake DOM: mismatched </' + m[1] + '>'); continue; }
+    if (m[2]) {
+      const e = new Node_(m[2], doc);
+      for (const a of (m[3] || '').matchAll(/([\w-]+)(?:="([^"]*)")?/g)) e.setAttribute(a[1], a[2] === undefined ? '' : a[2]);
+      stack[stack.length - 1].appendChild(e);
+      if (!VOID.has(m[2].toLowerCase()) && !m[0].endsWith('/>')) stack.push(e);
+      continue;
+    }
+    if (m[4] && m[4].trim()) { const top = stack[stack.length - 1]; if (!top._children.length) top._text += m[4].trim(); }
+  }
+  if (stack.length !== 1) throw new Error('fake DOM: unclosed ' + stack[stack.length - 1].tagName);
+  Object.assign(doc, {
+    documentElement: htmlEl, body, activeElement: body,
+    createElement: t => new Node_(t, doc),
+    getElementById: id => { let hit = null; htmlEl.walk(e => { if (!hit && e._attrs.id === id) hit = e; }); return hit; },
+    addEventListener: (t, fn, cap) => doc._ls.push({ t, fn, cap: !!cap }),
+    removeEventListener: () => {}
+  });
+  return doc;
+}
+// dispatch with a capture phase (document down) and a bubble phase (target up)
+function fire(doc, target, type, init) {
+  const ev = Object.assign({ type, target, bubbles: true, shiftKey: false, altKey: false, metaKey: false, ctrlKey: false,
+    timeStamp: performance.now(), defaultPrevented: false, _stop: false,
+    preventDefault() { this.defaultPrevented = true; }, stopPropagation() { this._stop = true; } }, init || {});
+  const pathUp = []; for (let e = target; e; e = e.parentNode) pathUp.push(e);
+  const call = (node, cap) => { const ls = node._ls.filter(l => l.t === type && l.cap === cap); for (const l of ls) { ev.currentTarget = node; l.fn(ev); } };
+  call(doc, true);
+  for (let i = pathUp.length - 1; i >= 0 && !ev._stop; i--) call(pathUp[i], true);
+  for (let i = 0; i < pathUp.length && !ev._stop; i++) call(pathUp[i], false);
+  if (!ev._stop) call(doc, false);
+  return ev;
+}
+const KEYCODE = k => (/^[a-z]$/i.test(k) ? 'Key' + k.toUpperCase() : /^[0-9]$/.test(k) ? 'Digit' + k : k === 'Escape' ? 'Escape' : '');
+
+// ---------------------------------------------------------------------------------------------
+// Boot the page: every script in index.html order, demo mode from file://, a fake clock.
+// ---------------------------------------------------------------------------------------------
+function bootPage(opts) {
+  opts = opts || {};
+  const html = fs.readFileSync(path.join(DESK, 'index.html'), 'utf8');
+  const doc = makeDocument(html);
+  const errors = [];
+  const media = {};
+  let vw = opts.width || 1512;
+  const mq = q => {
+    if (!media[q]) {
+      const o = { q, ls: [], addEventListener(t, f) { this.ls.push(f); }, addListener(f) { this.ls.push(f); } };
+      Object.defineProperty(o, 'matches', { get() {
+        let m;
+        if ((m = /min-width:\s*(\d+)px/.exec(q))) return vw >= +m[1];
+        if ((m = /max-width:\s*(\d+)px/.exec(q))) return vw <= +m[1];
+        return false;
+      } });
+      media[q] = o;
+    }
+    return media[q];
+  };
+  const clock = { t: opts.t0 || Date.UTC(2026, 9, 6, 17, 30, 0) };
+  const store = Object.assign({}, opts.storage || {});
+  const ctx = {
+    console: { log: console.log, warn: console.warn, info() {}, error: (...a) => { errors.push(a.map(x => (x && x.stack) || String(x)).join(' ')); } },
+    setTimeout, clearTimeout, setInterval, clearInterval, performance, document: doc, Promise, Uint8Array, Map, Set, JSON, Math,
+    location: { protocol: 'file:', search: opts.search || '?seed=11' },
+    localStorage: { getItem: k => (k in store ? store[k] : null), setItem: (k, v) => { store[k] = String(v); } },
+    matchMedia: mq, requestAnimationFrame: () => {}, confirm: () => true, crypto: require('crypto').webcrypto,
+    AbortController, fetch: () => Promise.reject(new Error('no network in the test')), __now: () => clock.t
+  };
+  ctx.window = ctx;
+  vm.createContext(ctx);
+  vm.runInContext('Date.now = function () { return __now(); };', ctx);
+  const order = [...html.matchAll(/<script defer src="js\/([\w.]+)"><\/script>/g)].map(x => x[1]);
+  for (const f of order) vm.runInContext(fs.readFileSync(path.join(JS, f), 'utf8'), ctx, { filename: f });
+  const D = ctx.Desk;
+  D.tick.stop();                                  // the test drives the 250 ms clock itself
+  const page = {
+    ctx, D, doc, errors, clock, media,
+    $: id => doc.getElementById(id),
+    sim: () => D.transport.sim(),
+    flush: () => D.render.flush(),
+    async settle() { for (let i = 0; i < 3; i++) { await new Promise(r => setTimeout(r, 0)); await new Promise(r => setImmediate(r)); } },
+    // advance the fake clock: pump the venues, tick 4/s, let promises settle, paint once a second
+    async advance(ms, paintEvery) {
+      paintEvery = paintEvery || 1000;
+      const end = clock.t + ms; let nextTick = clock.t + 250, nextPaint = clock.t + paintEvery;
+      while (clock.t < end) {
+        clock.t = Math.min(end, clock.t + 50);
+        const s = page.sim(); if (s) s.pump();
+        if (clock.t >= nextTick) { nextTick += 250; D.tick.run(); }
+        await new Promise(r => setImmediate(r));
+        if (clock.t >= nextPaint) { nextPaint += paintEvery; page.flush(); }
+      }
+      await page.settle();
+      page.flush();
+    },
+    click(el, init) { return fire(doc, el, 'click', init); },
+    key(k, init) { return fire(doc, doc.activeElement, 'keydown', Object.assign({ key: k, code: KEYCODE(k) }, init || {})); },
+    setWidth(w) { vw = w; Object.values(media).forEach(o => o.ls.forEach(f => f({ matches: o.matches }))); },
+    text: el => (el ? el.textContent : null),
+    rows: id => { const b = doc.getElementById(id); const tb = b && b._children[0] && b._children[0]._children.find(c => c.tagName === 'TBODY'); return tb ? tb._children : []; },
+    heads: id => { const b = doc.getElementById(id); const th = b && b._children[0] && b._children[0]._children.find(c => c.tagName === 'THEAD'); return th ? th._children[0]._children.map(c => c.textContent) : []; },
+    cell: (row, id, gridId) => { const h = page.heads(gridId); return row._children[h.indexOf(id)]; }
+  };
+  return page;
+}
+
+(async () => {
+  // ===========================================================================================
+  // 1. Pure maths
+  // ===========================================================================================
+  {
+    const ctx = { console, setTimeout, clearTimeout, setInterval, clearInterval, performance, localStorage: { getItem() { return null; }, setItem() {} } };
+    ctx.window = ctx; vm.createContext(ctx);
+    for (const f of ['contract.js', 'core.js', 'store.js', 'systematic.js']) vm.runInContext(fs.readFileSync(path.join(JS, f), 'utf8'), ctx, { filename: f });
+    const D = ctx.Desk, T = D.systematic._t, st = D.store;
+    check(D.systematic && typeof D.systematic.init === 'function' && typeof D.systematic.render === 'function', 'systematic.js registers {init, render}');
+    D.render.scheduled = true;
+    // normal CDF and the daily-stop chance against redesign v3's table (zero edge, whole day)
+    near(T.ncdf(0), 0.5, 1e-7, 'ncdf(0) = 0.5');
+    near(T.ncdf(-1.96), 0.0249979, 1e-6, 'ncdf(-1.96)');
+    near(T.ncdf(1.25) + T.ncdf(-1.25), 1, 1e-9, 'ncdf is symmetric');
+    const pct = x => Math.round(x * 100);
+    eq(pct(T.pStop(250000, 150000, 1)), 10, 'P(stop) $25 stop at $15 SD = 10% (redesign v3 table)');
+    eq(pct(T.pStop(250000, 200000, 1)), 21, 'P(stop) $25 stop at $20 SD = 21%');
+    eq(pct(T.pStop(250000, 250000, 1)), 32, 'P(stop) $25 stop at $25 SD = 32%');
+    eq(pct(T.pStop(300000, 200000, 1)), 13, 'P(stop) $30 stop at $20 SD = 13%');
+    eq(pct(T.pStop(400000, 250000, 1)), 11, 'P(stop) $40 stop at $25 SD = 11%');
+    eq(T.pStop(0, 200000, 1), 1, 'P(stop) is 1 once the stop is used up');
+    check(T.pStop(250000, 200000, 0.25) < T.pStop(250000, 200000, 1), 'P(stop) falls as the day runs out');
+    eq(T.pStop(250000, 200000, 0), 0, 'P(stop) at the end of the day is 0');
+    const noon = new Date(2026, 9, 6, 12, 0, 0).getTime();
+    near(T.dayLeft(noon), 0.5, 1e-9, 'dayLeft at local noon is a half');
+    // reservations: worst case of a working order; a reducing order reserves nothing
+    eq(T.reserve('BUY', 6000, 10, 0), 60000, 'a buy of 10 at 0.60 reserves 6.00');
+    eq(T.reserve('SELL', 6000, 10, 0), 40000, 'a sell of 10 at 0.60 (buy NO at 0.40) reserves 4.00');
+    eq(T.reserve('SELL', 6000, 10, 10), 0, 'a sell that only closes a long reserves nothing');
+    eq(T.reserve('BUY', 6000, 10, -4), 36000, 'a buy that closes 4 short reserves the other 6');
+    // markout and edge statistics, contract-weighted (u per contract)
+    const a = T.newAcc();
+    T.addFill(a, { qty: 10, side: 'BUY', px: 6000, fee: 0, mid: 6050, fair: 6200, mo: { '1s': 50, '10s': 100, '60s': 200 } });
+    T.addFill(a, { qty: 30, side: 'SELL', px: 6000, fee: 3000, mid: 5950, fair: 5900, mo: { '10s': -100, '60s': -100 } });
+    const s = T.stats(a);
+    eq(s.n, 2, 'stats count fills'); eq(s.ctr, 40, 'stats count contracts');
+    near(s.m10, (10 * 100 + 30 * -100) / 40, 1e-9, 'MO10 is contract-weighted');
+    near(s.m1, 50, 1e-9, 'MO1 averages only the fills where it matured');
+    near(s.pred, (10 * 200 + 30 * (100 - 100)) / 40, 1e-9, 'Pred = (fair - px) x side - fee per contract');
+    near(s.rlzd, (10 * 200 + 30 * (-100 - 100)) / 40, 1e-9, 'Rlzd = MO60 - fee per contract');
+    near(s.sprd, (10 * 50 + 30 * 50) / 40, 1e-9, 'spread paid is + when we traded better than the mid');
+    near(s.adv, 0.5, 1e-9, 'Adv% = share of fills with a negative 60 s markout');
+    near(s.feePer, 3000 / 40, 1e-9, 'fee per contract');
+    // the amber rule: realized well under predicted over >= 30 fills with both
+    const good = T.newAcc(), bad = T.newAcc(), few = T.newAcc();
+    for (let i = 0; i < 40; i++) {
+      T.addFill(good, { qty: 5, side: 'BUY', px: 5000, fee: 0, mid: 5000, fair: 5200, mo: { '60s': 150 } });
+      T.addFill(bad, { qty: 5, side: 'BUY', px: 5000, fee: 0, mid: 5000, fair: 5200, mo: { '60s': -100 } });
+      if (i < 20) T.addFill(few, { qty: 5, side: 'BUY', px: 5000, fee: 0, mid: 5000, fair: 5200, mo: { '60s': -100 } });
+    }
+    check(!T.stats(good).warn, 'realized slightly under predicted (2.0c vs 1.5c) is not amber');
+    check(T.stats(bad).warn, 'realized far under predicted (2.0c vs -1.0c) turns the lane amber');
+    check(!T.stats(few).warn, 'fewer than 30 fills never turn a lane amber');
+    // the store-driven pieces: lane rows with the amber flag, preflight rows
+    const C = D.contract;
+    st._handlers.hdr(C.examples.hdr);
+    st._handlers.lane(C.examples.lane);
+    st._handlers.lane(Object.assign({}, C.examples.lane, { id: 'M2', name: 'BAND', lip: '0.0000', day: '1.5400' }));
+    for (let i = 0; i < 40; i++) {
+      st._handlers.fill(Object.assign({}, C.examples.fill, { fid: 'F' + i, own: 'SYS', lane: 'M1', side: 'BUY', px: '0.6000', fair: '0.6200', qty: 5 }));
+      st._handlers.mo({ fid: 'F' + i, h: '60s', mo: '-0.0100', mid: '0.5900' });
+      st._handlers.fill(Object.assign({}, C.examples.fill, { fid: 'G' + i, own: 'SYS', lane: 'M2', side: 'BUY', px: '0.6000', fair: '0.6200', qty: 5 }));
+      st._handlers.mo({ fid: 'G' + i, h: '60s', mo: '0.0180', mid: '0.6180' });
+    }
+    st._handlers.fill(Object.assign({}, C.examples.fill, { fid: 'MAN1', own: 'MAN', lane: null }));
+    T.recompute();
+    const lr = T.laneRows();
+    eq(lr.map(r => r.label).join(','), 'M1 LIP-15,M2 BAND,TOTAL', 'one row per lane plus TOTAL');
+    check(lr[0].warn && !lr[1].warn, 'the lane with realized -1.0c against predicted +2.0c is amber; the one at +1.8c is not', lr.map(r => r.warn));
+    eq(lr[0].pnl, lr[0].real + lr[0].unrl, 'lane P&L = real + unrl (LIP kept in its own column)');
+    eq(lr[2].lip, 20000 + 0, 'TOTAL sums LIP (M1 2.00 + M2 0.00)');
+    check(lr[0].lip === 20000 && lr[1].lip === 0, 'LIP stays per lane');
+    eq(T.agg().all.n, 80, 'markouts count Systematic fills only (the manual fill is left out)');
+    const pf = T.preflightRows(st.hdr).map(r => r.id + ':' + r.ok);
+    eq(pf.join(' '), 'KEY:true CASH:true SHARD:true CLK:true DISK:true FEED:true PRIV:null GROUPS:null',
+      'preflight shows the plan set: PRIV unknown before any heartbeat, GROUPS unknown (not in contract 1.0.0)');
+    st.feeds = { KX: { up: true, gap: false, lag_ms: 1 }, KXP: { up: false, gap: false, lag_ms: null }, PM: { up: true, gap: false, lag_ms: 1 } };
+    const priv = T.preflightRows(st.hdr).find(r => r.id === 'PRIV');
+    check(priv.ok === false && priv.why === 'KXP down', 'PRIV derives from the private feed when the backend sends no PRIV row', priv);
+    st.hdr.preflight.push({ id: 'PRIV', ok: true, why: '' });
+    eq(T.preflightRows(st.hdr).find(r => r.id === 'PRIV').ok, true, 'a backend PRIV row wins over the derived one');
+    st.hdr.preflight.pop();
+    // St text of finished orders
+    eq(T.stText({ terminal: true, st: 'CXL', tif: 'IOC', why: 'IOC_REST', filled: 0, qty: 10 }), 'IOC 0/10', 'an IOC whose rest was killed reads IOC 0/10');
+    eq(T.stText({ terminal: true, st: 'REJ', tif: 'IOC', why: 'PRICE_BAND', filled: 0, qty: 1 }), 'REJ PRICE_BAND', 'a reject carries its reason');
+    eq(T.stText({ terminal: true, st: 'EXP', tif: 'POST', why: 'EXPIRY', filled: 2, qty: 5 }), 'EXP 2/5', 'an expiry shows what filled');
+    eq(T.stText({ terminal: false, st: 'WORK' }), 'WORK', 'live states read as themselves');
+    // equity: cash plus positions marked at the bid
+    st.books.clear(); st.pos.clear(); st.markets.clear();
+    st._handlers.mkt(C.examples.mkt); st._handlers.book(C.examples.book, null, true); st._handlers.pos(C.examples.pos);
+    eq(T.equity(), 1423100 + 987000 + 12 * 6300, 'equity = both venues\' cash + 12 long marked at the 0.63 bid');
+    // reservations share a position's reducing room across that side's orders, best price first
+    const key = 'K|' + C.examples.pos.tk, mk = (cid, side, px, left) => ({ cid, key, side, px, left, terminal: false });
+    st.orders.clear();
+    st.orders.set('a', mk('a', 'SELL', 6200, 10)); st.orders.set('b', mk('b', 'SELL', 6000, 10));
+    st.orders.set('c', mk('c', 'BUY', 5500, 4));
+    eq(T.reservations().get(key), 8 * (10000 - 6200) + 4 * 5500,
+      'with a +12 long and two sells of 10, the 0.60 sell reduces 10 and the 0.62 sell reduces 2, reserving 8 x 0.38; the buy reserves 4 x 0.55');
+    st.orders.clear();
+  }
+
+  // ===========================================================================================
+  // 2. The page in a fake DOM, demo venues on a fake clock
+  // ===========================================================================================
+  const P = bootPage();
+  const { D, $ } = P;
+  await P.settle();
+  P.sim().stop();                                  // drive the venues from the fake clock only
+  await P.advance(2000);
+  check(D.transport.mode === 'demo', 'file:// boots in demo mode');
+  check(!D.store.stale && D.store.hdr && D.store.lanes.size === 5, 'snapshot applied: header and 5 lanes', { stale: D.store.staleWhy, lanes: D.store.lanes.size });
+  D.tabs.set('systematic');
+  P.flush();
+  eq(P.doc.body.getAttribute('data-tab'), 'systematic', 'the SYSTEMATIC tab shows');
+
+  // ---- control strip
+  const start = $('s-start'), stop = $('s-stop');
+  check(start && stop && start.textContent === 'START' && stop.textContent === 'STOP', 'START and STOP are in the strip');
+  eq(P.text($('s-run')), 'STOPPED', 'state text STOPPED');
+  const tags = () => $('s-pf')._children.map(e => e.textContent + ':' + e.className);
+  eq(tags().map(x => x.split(':')[0]).join(' '), 'KEY CASH SHARD CLK DISK FEED PRIV GROUPS', 'preflight tags in the plan order (plus DISK)');
+  check(tags().slice(0, 7).every(x => x.endsWith(':ok')) && tags()[7] === 'GROUPS:na', 'passing tags are green; GROUPS unknown is grey', tags());
+  eq(start.disabled, false, 'START is enabled when stopped and every check passes');
+  eq(stop.disabled, true, 'STOP is disabled with nothing to stop');
+  const plan = P.text($('s-plan'));
+  check(/^budget 70% K \d+\.\d\d P \d+\.\d\d \| used \d+\.\d\d \| cost \d+\.\d\d\/4\.80 \| P\(stop\) \d+% \| stop 25\.00\/25\.00 \| floor 150\.00 eq \d+\.\d\d$/.test(plan),
+    'plan line: budget 70% K P | used | cost used/budget | P(stop) | stop | floor', plan);
+  const ceilK = D.store.hdr.sys.K.ceiling;
+  check(plan.indexOf(' K ' + D.fmt.money(ceilK)) > 0, 'plan shows Kalshi\'s 70% ceiling', [plan, ceilK]);
+  check(P.doc.innerHTMLWrites === 0, 'nothing writes innerHTML');
+
+  // ---- lanes grid
+  let lanes = P.rows('s-lanes-body');
+  eq(lanes.length, 6, 'lanes grid: 5 lanes + TOTAL');
+  eq(lanes[5].className, 'total', 'the last row is TOTAL, bold');
+  const LH = P.heads('s-lanes-body');
+  ['Lane', 'State', 'Budget', 'Used', 'Wrk', 'Fills', 'Ctrs', 'Pred', 'Rlzd', 'MO10', 'MO60', 'Fees', 'P&L', 'LIP', 'Reason'].forEach(h =>
+    check(LH.indexOf(h) >= 0, 'lanes grid has a ' + h + ' column at 1512 px', LH));
+  check(LH.indexOf('Style') < 0 && LH.indexOf('Last') < 0, 'WIDE-only lane columns are hidden at 1512 px', LH);
+  const laneRow = id => P.rows('s-lanes-body').find(r => r.getAttribute('data-lane') === id);
+  const tgOf = id => laneRow(id)._children[P.heads('s-lanes-body').length - 2];
+  const klOf = id => laneRow(id)._children[P.heads('s-lanes-body').length - 1];
+  eq(tgOf('M1').textContent, 'ON', 'M1 toggle reads ON');
+  eq(tgOf('X1').textContent, 'OFF', 'X1 (the ESPN experiment) starts OFF');
+  eq(P.cell(laneRow('M1'), 'State', 's-lanes-body').textContent, 'OFF', 'a lane reads OFF while Systematic is stopped');
+  eq(P.text($('s-lanes-tools')), 'ON 4/5', 'lanes title counts lanes switched on');
+
+  // ---- START: pending paints on the next frame, before the venue answers
+  D.lat.paint.v.length = 0; D.lat.paint.last = null;
+  P.click(start);
+  P.flush();
+  eq(P.text($('s-run')), 'STARTING', 'START paints STARTING on the next frame');
+  check(start.disabled && start.className.indexOf('pend') >= 0, 'START shows pending and is disabled while in flight');
+  check(D.lat.paint.last !== null && D.lat.paint.last < 50, 'the click-to-paint meter recorded the START click', D.lat.paint.last);
+  await P.advance(1000);
+  check(/^RUNNING \d\d:\d\d:\d\d \d+s$/.test(P.text($('s-run'))), 'state text RUNNING hh:mm:ss with the run time', P.text($('s-run')));
+  eq(start.disabled, true, 'START is disabled while running');
+  eq(stop.disabled, false, 'STOP is live while running');
+  eq(P.text($('tab-sys-st')), 'RUN', 'the header tab switch reads RUN');
+
+  // ---- let the lanes trade
+  await P.advance(4 * 60000);
+  const S = D.store;
+  const sysFills = S.fills.filter(f => f.own === 'SYS');
+  check(sysFills.length > 5, 'the lanes traded', sysFills.length);
+  lanes = P.rows('s-lanes-body');
+  check(/^\d+$/.test(P.cell(laneRow('M1'), 'Fills', 's-lanes-body').textContent) && +P.cell(laneRow('M1'), 'Fills', 's-lanes-body').textContent === S.lanes.get('M1').fills,
+    'lane Fills column shows the lane\'s fills');
+  eq(P.cell(laneRow('M1'), 'State', 's-lanes-body').textContent, S.lanes.get('M1').state, 'lane State follows the backend');
+  const tot = lanes[5];
+  const sumFills = [...S.lanes.values()].reduce((x, l) => x + l.fills, 0);
+  eq(P.cell(tot, 'Fills', 's-lanes-body').textContent, String(sumFills), 'TOTAL sums the lanes\' fills');
+  // a manual order never shows in the Systematic blotters
+  const wx = [...S.markets.values()].find(m => m.kind === 'WEATHER' && m.status === 'OPEN' && S.book(m.key) && S.book(m.key).bb !== null);
+  const manCid = D.act.order({ v: wx.v, tk: wx.tk, side: 'BUY', px: D.grid.step(wx.g, S.book(wx.key).bb, -3), qty: 1, tif: 'POST', ttl_s: 60, touch: S.book(wx.key).bb }, { timeStamp: performance.now() });
+  await P.advance(1000);
+  check(manCid && S.orders.get(manCid) && !S.orders.get(manCid).terminal, 'a manual order is working', manCid && S.orders.get(manCid) && S.orders.get(manCid).st);
+  // working: systematic only, every live SYS order listed
+  const workRows = () => P.rows('s-work-body').filter(r => r.className !== 'none');
+  const liveSys = S.working(o => o.own === 'SYS');
+  const shownCids = new Set(workRows().map(r => r.dataset.k));
+  check(!shownCids.has(manCid), 'manual orders stay out of the Systematic WORKING grid');
+  check(liveSys.every(o => shownCids.has(o.cid)), 'every live Systematic order is in WORKING', { live: liveSys.length, shown: shownCids.size });
+  check(workRows().every(r => S.orders.get(r.dataset.k).own === 'SYS'), 'WORKING lists only Systematic orders');
+  check(workRows().every(r => r.getAttribute('data-mkt') && r.getAttribute('data-v')), 'working rows carry data-mkt and data-v');
+  const WH = P.heads('s-work-body');
+  eq(WH.join('|'), 'Time|Lane|Market|Side|Px|Qty|Left|PIQ|TTL|Edge|St|', 'WORKING columns at 1512 px follow the spec');
+  // fills: systematic only, newest first
+  const fillRows = () => P.rows('s-fills-body').filter(r => r.className !== 'none' && r.className.indexOf('none') < 0);
+  check(fillRows().length === Math.min(200, S.fills.filter(f => f.own === 'SYS').length), 'FILLS lists the Systematic fills', fillRows().length);
+  check(fillRows().every(r => S.fillIdx.get(r.dataset.k).own === 'SYS'), 'FILLS lists only Systematic fills');
+  eq(P.heads('s-fills-body').join('|'), 'Time|Lane|Market|Side|Px|Qty|Liq|Fee|Fair|Edge|MO10|MO60|Real', 'FILLS columns at 1512 px follow the spec');
+  const f0 = S.fillIdx.get(fillRows()[0].dataset.k), f1 = S.fillIdx.get(fillRows()[fillRows().length - 1].dataset.k);
+  check(f0.ts_ms >= f1.ts_ms, 'FILLS newest first');
+  const matured = fillRows().map(r => S.fillIdx.get(r.dataset.k)).find(f => f.mo['10s'] !== undefined);
+  if (matured) {
+    const r = fillRows().find(x => x.dataset.k === matured.fid);
+    eq(P.cell(r, 'MO10', 's-fills-body').textContent, D.fmt.cents(matured.mo['10s']), 'a matured MO10 shows signed cents');
+  }
+  // markouts: one row per lane, ALL, then recent fills
+  const moRows = P.rows('s-mo-body');
+  eq(moRows.slice(0, 6).map(r => r._children[0].textContent.split(' ')[0]).join(','), 'M1,M2,S1,C1,X1,ALL', 'MARKOUTS: one row per lane, then ALL');
+  eq(P.heads('s-mo-body').join('|'), 'Lane|n|+1s|+10s|+60s|Settle|t60|Adv%|SprdPd', 'MARKOUTS columns follow the spec');
+  const allRow = moRows[5];
+  eq(allRow._children[1].textContent, String(S.fills.filter(f => f.own === 'SYS').length), 'ALL n counts Systematic fills');
+  check(allRow._children[1].className.indexOf('thin') >= 0 === (S.fills.filter(f => f.own === 'SYS').length < 30), 'n under 30 shows grey (thin)');
+  check(moRows.some(r => r.className === 'grp' && r.textContent.indexOf('RECENT') === 0), 'recent fills follow the lane rows');
+  // risk book: groups by outcome, members, total; cash footer
+  const riskRows = P.rows('s-risk-body');
+  const grpRows = riskRows.filter(r => r.className === 'grp');
+  eq(grpRows.length, S.risk.groups.length, 'one group row per real-world outcome');
+  if (S.risk.groups.length) {
+    const g = S.risk.groups[0];
+    eq(P.cell(grpRows[0], 'MaxL', 's-risk-body').textContent, D.fmt.money(Math.max(0, -g.worst)), 'a group row shows its worst-case loss');
+    check(riskRows[riskRows.length - 1].className === 'total', 'the risk book ends with TOTAL');
+    const mem = riskRows.find(r => r.className.indexOf('mem') === 0);
+    const p = S.position(mem.getAttribute('data-mkt'));
+    eq(P.cell(mem, 'Pos', 's-risk-body').textContent, D.fmt.ssize(p.pos), 'a member row shows its signed position');
+  }
+  eq(P.heads('s-risk-body').join('|'), 'Outcome / Market|V|Own|Pos|Avg|Mark|Unrl|IfYES|IfNO|MaxL', 'RISK BOOK columns follow the spec');
+  const foot = P.text($('s-risk-foot'));
+  check(/^K S0 \d+\.\d\d S1 \d+\.\d\d S2 \d+\.\d\d S3 \d+\.\d\d \| PM \d+\.\d\d$/.test(foot), 'cash footer: K S0..S3 | PM', foot);
+  const sum = P.text($('s-risk-sum'));
+  check(/^risk \d+\.\d\d open \d+\.\d\d rsv \d+\.\d\d \| stop \d+\.\d\d\/25\.00 \| floor 150\.00 eq \d+\.\d\d$/.test(sum), 'risk summary: risk, open, reserved, stop, floor', sum);
+  const rsvShown = +sum.split(' rsv ')[1].split(' ')[0];
+  let rsvWant = 0; D.systematic._t.reservations().forEach(u => { rsvWant += u; });
+  let rsvNaive = 0; S.orders.forEach(o => { if (!o.terminal && o.left > 0) rsvNaive += o.side === 'BUY' ? o.left * o.px : o.left * (10000 - o.px); });
+  near(rsvShown, Math.round(rsvWant / 100) / 100, 0.011, 'the summary shows the reservations of every working order (both owners)');
+  check(rsvWant <= rsvNaive && rsvWant > 0, 'reservations never exceed the orders\' full worst case', { rsvWant, rsvNaive });
+
+  if (process.env.V) console.log('  info: sys fills', sysFills.length, 'risk groups', S.risk.groups.length, 'matured', !!matured, 'live sys', liveSys.length, 'plan', plan);
+  // ---- linking: a fill row click focuses its market; Shift+click loads the other ladder
+  const fr = fillRows()[0];
+  P.click(fr._children[3]);
+  eq(D.focus.key, fr.getAttribute('data-mkt'), 'clicking a fill row sets the focused market');
+  P.flush();
+  check(fillRows()[0].className.indexOf('sel') >= 0, 'the focused market\'s rows are selected');
+  const other = D.focus.otherLadder();
+  const wr = workRows().find(r => r.getAttribute('data-mkt') !== D.focus.key) || workRows()[0];
+  if (wr) {
+    P.click(wr._children[3], { shiftKey: true });
+    eq(D.focus.ladders[other], wr.getAttribute('data-mkt'), 'Shift+click on a working row loads the other ladder');
+  }
+  const mem2 = P.rows('s-risk-body').find(r => r.className.indexOf('mem') === 0);
+  if (mem2) { P.click(mem2._children[0]); eq(D.focus.key, mem2.getAttribute('data-mkt'), 'clicking a risk book row sets the focused market'); }
+  const moFill = P.rows('s-mo-body').find(r => r.getAttribute('data-mkt'));
+  if (moFill) { P.click(moFill._children[0]); eq(D.focus.key, moFill.getAttribute('data-mkt'), 'clicking a recent markout row sets the focused market'); }
+
+  // ---- lane filter: click a lane row, the blotters narrow; again clears
+  const busy = ['M1', 'M2', 'S1', 'C1'].find(id => S.fills.some(f => f.own === 'SYS' && f.lane === id)) || 'M1';
+  P.click(laneRow(busy)._children[0]);
+  P.flush();
+  eq(D.systematic.filter, busy, 'clicking a lane row filters to that lane');
+  check(laneRow(busy).className.indexOf('sel') >= 0, 'the filtered lane row is selected');
+  check(fillRows().length > 0 && fillRows().every(r => S.fillIdx.get(r.dataset.k).lane === busy), 'FILLS narrows to the lane');
+  check(workRows().every(r => S.orders.get(r.dataset.k).lane === busy), 'WORKING narrows to the lane');
+  check(P.rows('s-mo-body').filter(r => r.getAttribute('data-mkt')).every(r => S.fillIdx.get(r.dataset.k.slice(2)).lane === busy), 'recent markouts narrow to the lane');
+  eq(P.text($('s-work-tools')).indexOf(busy + ' x'), 0, 'an amber filter tag shows in the WORKING title');
+  const laneKey = D.systematic._t.laneMarket(busy);
+  eq(D.focus.key, laneKey, 'a lane row click also focuses the lane\'s newest market');
+  P.click(laneRow(busy)._children[0]);
+  P.flush();
+  eq(D.systematic.filter, null, 'clicking the lane row again clears the filter');
+  P.key('2'); P.flush();
+  eq(D.systematic.filter, S.laneOrder[1], 'key 2 filters to the second lane');
+  P.key('Escape'); P.flush();
+  eq(D.systematic.filter, null, 'Esc clears the lane filter');
+  P.key('1'); P.flush();
+  const tagBtn = $('s-fills-tools')._children.find(e => e.getAttribute('data-act') === 'fclear');
+  P.click(tagBtn); P.flush();
+  eq(D.systematic.filter, null, 'the filter tag in a title clears the filter');
+
+  // ---- cancel one systematic order with x: CXL-PEND paints at once
+  const live1 = workRows().find(r => { const o = S.orders.get(r.dataset.k); return !o.terminal && o.tif === 'POST'; });
+  if (process.env.V) console.log('  info: live1', !!live1, 'wr', !!wr, 'mem2', !!mem2, 'moFill', !!moFill, 'busy', busy);
+  if (live1) {
+    const cid = live1.dataset.k;
+    const focusBefore = D.focus.key;
+    P.click(live1._children[live1._children.length - 1]);
+    P.flush();
+    check(S.orders.get(cid).terminal || S.orders.get(cid).local.cxlPend, 'x marks the order cancel-pending at once');
+    eq(D.focus.key, focusBefore, 'the x cell does not change the focused market');
+    const row = workRows().find(r => r.dataset.k === cid);
+    check(!row || row.className.indexOf('cxlpend') >= 0 || S.orders.get(cid).terminal, 'the row paints cxlpend', row && row.className);
+    await P.advance(500);
+    check(S.orders.get(cid) === undefined || S.orders.get(cid).terminal, 'the venue confirmed the cancel');
+  } else check(true, 'no resting systematic order to cancel at this moment (skipped)');
+
+  // ---- lane toggle: optimistic, then confirmed
+  // the pending look, as Desk.act.lane leaves it before the backend answers (the demo venue
+  // answers inside the click, so it is set here directly)
+  S.lanes.get('M2').pendOn = false; S.lanes.get('M2').pendAt = Date.now(); D.render.mark('lane');
+  P.flush();
+  check(tgOf('M2').textContent === 'OFF' && tgOf('M2').className.indexOf('pend') >= 0, 'a toggle in flight shows the new state, pending');
+  S.lanes.get('M2').pendOn = null; D.render.mark('lane'); P.flush();
+  eq(tgOf('M2').textContent, 'ON', 'clearing the pending toggle shows the backend state again');
+  P.click(tgOf('M2'));
+  P.flush();
+  eq(tgOf('M2').textContent, 'OFF', 'the M2 toggle shows OFF on the next frame');
+  await P.advance(500);
+  check(tgOf('M2').textContent === 'OFF' && tgOf('M2').className.indexOf('pend') < 0 && S.lanes.get('M2').on === false, 'the backend agreed: M2 off');
+  P.click(tgOf('M2'));
+  await P.advance(500);
+  eq(S.lanes.get('M2').on, true, 'M2 back on');
+
+  // ---- lane kill: off and its working orders cancel-pending in the same frame
+  await P.advance(3000);
+  const killId = ['M1', 'M2', 'S1', 'C1'].find(id => S.working(o => o.own === 'SYS' && o.lane === id).length) || 'M1';
+  const before = S.working(o => o.own === 'SYS' && o.lane === killId).map(o => o.cid);
+  P.click(klOf(killId));
+  P.flush();
+  eq(tgOf(killId).textContent, 'OFF', 'lane KILL turns the lane off at once');
+  check(before.every(c => S.orders.get(c).terminal || S.orders.get(c).local.cxlPend), 'lane KILL marks the lane\'s working orders cancel-pending', before.length);
+  await P.advance(1000);
+  eq(S.working(o => o.own === 'SYS' && o.lane === killId).length, 0, 'the killed lane has no working orders');
+  eq(klOf(killId).className, 'kl dis', 'the lane KILL greys once nothing is live');
+  P.click(tgOf(killId));
+  await P.advance(500);
+
+  // ---- STOP: pending, then STOPPED; Systematic orders cancelled
+  P.click(stop);
+  P.flush();
+  eq(P.text($('s-run')), 'STOPPING', 'STOP paints STOPPING on the next frame');
+  await P.advance(1000);
+  eq(P.text($('s-run')), 'STOPPED', 'STOPPED after the venue answers');
+  eq(S.working(o => o.own === 'SYS').length, 0, 'STOP cancelled Systematic\'s orders');
+  check(S.working(o => o.own === 'MAN').length >= 1, 'STOP left the manual order alone');
+
+  // ---- preflight failure disables START with the reason
+  P.sim().setFeed('KXP', false);
+  await P.advance(1500);
+  check(start.disabled, 'START is disabled while a check fails');
+  const why = P.text($('s-why'));
+  check(/FEED/.test(why) && /PRIV KXP down/.test(why), 'the failing checks and reasons show next to the tags', why);
+  check(tags().find(x => x.startsWith('PRIV')).endsWith(':bad') && tags().find(x => x.startsWith('FEED')).endsWith(':bad'), 'failing tags turn red', tags());
+  P.click(start); P.flush();
+  eq(P.text($('s-run')), 'STOPPED', 'a click on the disabled START does nothing');
+  P.sim().setFeed('KXP', true);
+  await P.advance(1500);
+  check(!start.disabled && P.text($('s-why')) === '', 'START comes back when the checks pass');
+
+  // ---- the stale rule: a silent stream (no heartbeat for 3 s) disables START with the reason;
+  // a dropped message is detected as a gap and healed from a snapshot
+  P.clock.t += 3500;                               // the venues say nothing for 3.5 s
+  D.tick.run();
+  P.flush();
+  check(S.stale && start.disabled && /^STALE SRV DOWN/.test(P.text($('s-why'))), 'a silent stream greys out and disables START with STALE SRV DOWN', { stale: S.staleWhy, why: P.text($('s-why')) });
+  eq(P.doc.body.className.indexOf('stale') >= 0, true, 'the body carries the stale class (numbers grey out)');
+  eq(stop.disabled, false, 'STOP stays live while stale (fail closed, cancels always go)');
+  await P.advance(3000);
+  check(!S.stale && !start.disabled, 'the stream heals and START is live again', { stale: S.staleWhy });
+  const gaps0 = S.gaps;
+  P.sim().dropNext();
+  await P.advance(3000);
+  check(S.gaps > gaps0 && !S.stale && !start.disabled, 'a dropped message is detected as a gap and healed', { gaps: S.gaps, stale: S.staleWhy });
+
+  // ---- KILL from the header: KILLED with the re-arm countdown, START disabled
+  P.click($('kill'));
+  P.flush();
+  check(/^KILLED re-arm 0:\d\d$/.test(P.text($('s-run'))) || /^KILLED re-arm 1:00$/.test(P.text($('s-run'))), 'KILL shows KILLED re-arm m:ss', P.text($('s-run')));
+  eq(start.disabled, true, 'START is disabled during the kill lockout');
+  await P.advance(61000, 5000);
+  eq(P.text($('s-run')), 'KILLED RE-ARM', 'after 60 s the strip asks for a re-arm');
+  P.click($('kill'));                              // RE-ARM (confirm() returns true in the test)
+  await P.advance(1000);
+  eq(P.text($('s-run')), 'STOPPED', 're-armed: STOPPED');
+  eq(start.disabled, false, 'START is live after the re-arm');
+
+  // ---- WIDE: more columns; narrow: fewer
+  P.setWidth(1920);
+  P.flush();
+  check(D.layout.wide && D.systematic._t.mode() === 'w', 'WIDE mode at 1920 px');
+  const LW = P.heads('s-lanes-body');
+  ['V', 'Style', 'Open', 'Unrl', 'Day', 'Last'].forEach(h => check(LW.indexOf(h) >= 0, 'WIDE adds the lane column ' + h, LW));
+  check(P.heads('s-work-body').indexOf('Touch') >= 0 && P.heads('s-work-body').indexOf('Ack') >= 0, 'WIDE adds Touch and Ack to WORKING');
+  check(P.heads('s-fills-body').indexOf('Mid') >= 0 && P.heads('s-fills-body').indexOf('Settle') >= 0, 'WIDE adds Mid and Settle to FILLS');
+  check(P.heads('s-risk-body').indexOf('Rsv') >= 0, 'WIDE adds reservations to the RISK BOOK');
+  check(P.heads('s-mo-body').indexOf('Net60') >= 0, 'WIDE adds Net60 to MARKOUTS');
+  check(/S0 \d+\.\d\d\/\d+\.\d\d/.test(P.text($('s-risk-foot'))), 'WIDE shows free cash per shard in the footer', P.text($('s-risk-foot')));
+  eq(P.rows('s-lanes-body').length, 6, 'the lanes grid keeps its rows across a layout change');
+  P.setWidth(1280);
+  P.flush();
+  const LN = P.heads('s-lanes-body');
+  check(D.layout.narrow && LN.indexOf('Ctrs') < 0 && LN.indexOf('Fees') >= 0 && LN.indexOf('LIP') >= 0 && LN.indexOf('P&L') >= 0, 'narrow keeps budget, fees, P&L and LIP and drops the rest', LN);
+  check(P.heads('s-work-body').indexOf('PIQ') < 0 && P.heads('s-fills-body').indexOf('Fee') < 0, 'narrow drops PIQ and Fee');
+  P.setWidth(1512);
+  P.flush();
+  eq(P.heads('s-lanes-body').join('|'), LH.join('|'), 'back to the 1512 px column set');
+
+  // ---- Polymarket key failing: P rows read '?' in the risk book, RO in the footer and plan
+  const pmk = [...S.markets.values()].find(m => m.v === 'P' && m.status === 'OPEN' && S.book(m.key) && S.book(m.key).ba !== null);
+  if (pmk) {
+    D.act.order({ v: 'P', tk: pmk.tk, side: 'BUY', px: D.grid.step(pmk.g, S.book(pmk.key).ba, 1), qty: 2, tif: 'IOC', touch: S.book(pmk.key).ba, override: false }, { timeStamp: performance.now() });
+    await P.advance(1500);
+    P.sim().state.pmRO = true;
+    await P.advance(2500);
+    const prow = P.rows('s-risk-body').find(r => r.getAttribute('data-v') === 'P');
+    if (process.env.V) console.log('  info: pm position', S.position(pmk.key) && S.position(pmk.key).pos, 'prow', !!prow);
+    check(S.hdr.cash.P.ro, 'the venue reports the PM key failing');
+    if (prow) eq(P.cell(prow, 'Pos', 's-risk-body').textContent, '?', 'a Polymarket row reads ? while the key fails');
+    else check(S.position(pmk.key) === null || !S.position(pmk.key).pos, 'no PM position to show (IOC did not fill)');
+    check(/\| PM \d+\.\d\d RO$/.test(P.text($('s-risk-foot'))), 'the cash footer tags PM RO', P.text($('s-risk-foot')));
+    check(/ RO \|/.test(P.text($('s-plan'))), 'the plan line tags P RO', P.text($('s-plan')));
+  }
+
+  // ---- the page stayed healthy
+  eq(D.render.errors, 0, 'no render errors' + (D.render.lastError ? ' (' + D.render.lastError + ')' : ''));
+  eq(S.invalid, 0, 'the store saw no contract violations');
+  eq(P.errors.length, 0, 'nothing logged to console.error' + (P.errors.length ? ': ' + P.errors[0].slice(0, 200) : ''));
+  eq(P.doc.innerHTMLWrites, 0, 'still no innerHTML writes');
+  const sheet = D.keys.sheetRows().filter(r => r.scope === 'systematic').map(r => r.key);
+  check(sheet.indexOf('Escape') >= 0 && sheet.indexOf('1-9') >= 0, 'the key sheet lists the tab\'s keys', sheet);
+
+  // a remembered filter for a lane the backend no longer has is dropped
+  {
+    const P2 = bootPage({ search: '?seed=5', storage: { 'desk3.sys.lane': 'ZZ9', 'desk3.tab': 'systematic' } });
+    await P2.settle(); P2.sim().stop();
+    await P2.advance(1500);
+    P2.D.tabs.set('systematic'); P2.flush();
+    check(P2.D.systematic.filter === null || P2.D.systematic.filter === undefined, 'an unknown remembered lane filter is cleared');
+    eq(P2.D.render.errors, 0, 'a second boot renders without errors');
+  }
+
+  console.log(fails ? `${fails} of ${checks} checks FAILED` : `ui desk v3 systematic: ${checks} checks, 0 failures`);
+  process.exit(fails ? 1 : 0);
+})().catch(e => { console.log('FAIL: test crashed: ' + (e && e.stack || e)); process.exit(1); });
