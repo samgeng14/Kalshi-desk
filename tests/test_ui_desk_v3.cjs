@@ -999,6 +999,28 @@ const flushMicro = () => new Promise(r => setImmediate(r));
     check(res.every(x => /^SETTLED:/.test(x)) && res.filter(x => /YES$/.test(x)).length <= 1, 'pinned brackets of one event settle at the close, at most one YES', res);
   }
 
+  if (process.env.V) console.log('section 12');
+  // ---- 12. Systematic trades all the time once started, inside its limits --------------------
+  {
+    let tf = Date.UTC(2026, 9, 6, 18, 7, 0);
+    const per = [], viol = { ceil: 0, budget: 0 };
+    let fills = 0;
+    const sf = D.sim.create({ now: () => tf, seed: 4, sid: 'lively01', emit: e => {
+      if (e.type === 'fill' && e.data.own === 'SYS') fills++;
+      if (e.type === 'hdr') ['K', 'P'].forEach(v => { if (+e.data.sys[v].used > +e.data.sys[v].eff + 0.5) viol.ceil++; });
+      if (e.type === 'lane' && +e.data.used > +e.data.budget + 1) viol.budget++;
+    } });
+    const runF = ms => { const end = tf + ms; while (tf < end) { tf = Math.min(end, Math.max(tf + 1, Math.min(sf.nextDue(), tf + 100))); sf.pump(); } };
+    runF(1000);
+    sf.request('POST', '/api/start', {}, () => {}, { 'X-Desk': sf.token });
+    runF(500);
+    for (let i = 0; i < 4; i++) { fills = 0; runF(5 * 60000); per.push(fills / 5); }
+    check(per.every(x => x >= 5), 'running, the lanes fill several times a minute in every 5-minute stretch (15-minute windows rolling included)', per);
+    eq(sf.state.run.state, 'RUN', 'and Systematic is still running after 20 minutes');
+    eq(viol.ceil, 0, 'Systematic never passes its 70% ceiling');
+    eq(viol.budget, 0, 'no lane passes its budget (a lane stays out of a market another lane holds)');
+  }
+
   if (process.env.V) console.log('section 10');
   // ---- 10. the palette: near-black surfaces, ink that still reads on every one -----------------
   {

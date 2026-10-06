@@ -89,7 +89,7 @@
     { id: 'X1', name: 'ESPN EXP', venue: 'K', style: 'REST', budget: 5, thr: null, on: false }
   ];
   var KIND = {
-    LIP15: { spread: 150, depth: 10, sz: 60, rate: 0.25, tau: 1.5, noise: 25, upd: 1.5, holes: 0.1 },
+    LIP15: { spread: 150, depth: 10, sz: 60, rate: 0.14, tau: 1.5, noise: 25, upd: 1.5, holes: 0.1 },
     WEATHER: { spread: 200, depth: 8, sz: 35, rate: 0.03, tau: 6, noise: 12, upd: 0.25, holes: 0.2 },
     GAME_K: { spread: 400, depth: 6, sz: 12, rate: 0.06, tau: 3, noise: 25, upd: 0.5, holes: 0.35 },
     GAME_P: { spread: 250, depth: 8, sz: 25, rate: 0.05, tau: 3, noise: 20, upd: 0.5, holes: 0.25 },
@@ -1171,7 +1171,9 @@
         var st = S.lip[s], m = S.markets.get(st.key); if (!m || m.status !== 'OPEN') return;
         st.S *= Math.exp(st.sig * Math.sqrt(dt) * gauss());
         m.pU = lipP(st, m.close_ms, now) * U;
-        st.bias = (st.bias || 0) * Math.exp(-dt / 40) + gauss() * 45 * Math.sqrt(dt);
+        // the model's error: a mean-reverting walk (one-sigma about 1.4c), so a lane quoting around
+        // it earns its spread and pays for being wrong now and then
+        st.bias = (st.bias || 0) * Math.exp(-dt / 40) + gauss() * 32 * Math.sqrt(dt);
         m.ref.fair = Math.max(10, Math.min(U - 10, m.pU + st.bias));
       });
       S.wx.forEach(function (w) {
@@ -1298,6 +1300,10 @@
     }
     function laneSubmit(L, m, side, pxU, qty, tif, ttl, touch) {
       if (pxU === null || !(qty > 0)) return null;
+      // a market another lane holds a position in is that lane's: its risk counts against that
+      // lane's budget, so a second lane stays out (it could not be held to its own budget)
+      var held = S.pos.get(m.key);
+      if (held && held.pos && held.lane && held.lane !== L.id && held.own.SYS) return null;
       var res = addedReserve(m.key, side, pxU, qty, function (o) { return o.lane === L.id; });
       var u = laneUse(L), cl = ceilings();
       if (u.used + res > L.budgetU) { L.capHit = 'budget ' + (u.used / U).toFixed(2) + '/' + (L.budgetU / U).toFixed(2); return null; }
@@ -1336,11 +1342,12 @@
         Object.keys(S.lip).forEach(function (s) {
           var m = S.markets.get(S.lip[s].key);
           if (!m || m.status !== 'OPEN' || m.manOwned) return;
-          var tau = m.close_ms - now, age = now - m.open_ms, q = posOf(m.key), mine = laneLive(m.key, 'M1');
+          var tau = m.close_ms - now, q = posOf(m.key), mine = laneLive(m.key, 'M1');
           var bbO = othersBest(m, 'bid'), baO = othersBest(m, 'ask');
           if (tau < 60000) {
+            // the last minute: no quotes, and what is left of the inventory goes (IOC, one tick through)
             if (mine.BUY) cancelOrder(mine.BUY, 'PULL'); if (mine.SELL) cancelOrder(mine.SELL, 'PULL');
-            if (Math.abs(q) > 10 && !m.m1Flat && bbO !== null && baO !== null) {
+            if (Math.abs(q) >= 3 && !m.m1Flat && bbO !== null && baO !== null) {
               m.m1Flat = true;
               if (q > 0) laneSubmit(L, m, 'SELL', G.step(m.g, bbO, -1), q, 'IOC', null, bbO);
               else laneSubmit(L, m, 'BUY', G.step(m.g, baO, 1), -q, 'IOC', null, baO);
@@ -1351,13 +1358,15 @@
           var fair = m.ref.fair, ticks = G.ticks(m.g, bbO, baO);
           var bid = ticks >= 2 ? G.step(m.g, bbO, 1) : bbO, ask = ticks >= 2 ? G.step(m.g, baO, -1) : baO;
           if (ticks === 2) { if (q > 0) bid = bbO; else ask = baO; }
-          var capB = G.snap(m.g, fair - 50 - 10 * q, -1), capA = G.snap(m.g, fair + 50 - 10 * q, 1);
+          // quotes at most half a cent through the model fair, skewed a quarter cent per contract
+          // held (inventory mean-reverts); both sides until 2.5 min before the close, then only
+          // the side that reduces; at most 10 contracts either way
+          var capB = G.snap(m.g, fair - 50 - 25 * q, -1), capA = G.snap(m.g, fair + 50 - 25 * q, 1);
           if (capB === null || bid > capB) bid = capB;
           if (capA === null || ask < capA) ask = capA;
-          var quoting = age < 600000, reducing = tau < 180000;
-          var wantB = bid !== null && bid < baO && q < 20 && (quoting || (reducing && q < 0));
-          var wantA = ask !== null && ask > bbO && q > -20 && (quoting || (reducing && q > 0));
-          if (!quoting && !reducing) { wantB = wantB && !!mine.BUY && mine.BUY.px === bid; wantA = wantA && !!mine.SELL && mine.SELL.px === ask; }
+          var quoting = tau >= 150000, reducing = !quoting;
+          var wantB = bid !== null && bid < baO && q < 10 && (quoting || (reducing && q < 0));
+          var wantA = ask !== null && ask > bbO && q > -10 && (quoting || (reducing && q > 0));
           manage(L, m, 'BUY', wantB ? bid : null, mine.BUY, 5, 15, now);
           manage(L, m, 'SELL', wantA ? ask : null, mine.SELL, 5, 15, now);
         });
