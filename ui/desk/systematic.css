@@ -3,3 +3,84 @@
  * markouts). Shared tokens, grid and order-state classes live in desk.css. Scope selectors
  * under #tab-systematic so they cannot leak into the MANUAL tab.
  */
+
+/* ------------------------------------------------------------------------------------------
+   Control strip (36 px): [START] [STOP] state | preflight tags | failing reasons | plan line
+   ------------------------------------------------------------------------------------------ */
+#tab-systematic #s-ctl-body { gap: 10px; white-space: nowrap; }
+#tab-systematic #s-start { flex: 0 0 88px; width: 88px; height: 28px; font-size: 12px; letter-spacing: .04em; }
+#tab-systematic #s-stop { flex: 0 0 72px; width: 72px; height: 28px; font-size: 12px; letter-spacing: .04em; }
+#tab-systematic #s-start.pend, #tab-systematic #s-stop.pend {
+  background: var(--bg3); border-color: var(--line2); color: var(--tx2);
+  outline: 1px dotted var(--tx2); outline-offset: -3px;
+}
+#tab-systematic .s-run { flex: 0 0 auto; min-width: 176px; font: 13px/1 var(--font-num); color: var(--tx1); }
+#tab-systematic .s-run.run { color: var(--up); }
+#tab-systematic .s-run.killed, #tab-systematic .s-run.halted { color: var(--dn); }
+#tab-systematic .s-run.pend { color: var(--tx2); }
+/* preflight tags: 40 px, green text passing, red fill failing, grey unknown */
+#tab-systematic .s-pf { flex: 0 0 auto; display: flex; gap: 1px; }
+#tab-systematic .s-pf > span {
+  display: inline-block; min-width: 40px; height: 18px; padding: 0 3px; text-align: center;
+  font: 600 11px/18px var(--font-ui); letter-spacing: .02em; background: var(--bg2); color: var(--tx2);
+}
+#tab-systematic .s-pf > span.ok { color: var(--up); }
+#tab-systematic .s-pf > span.bad { background: var(--crit); color: #fff; }
+#tab-systematic .s-pf > span.na { color: var(--tx2); }
+#tab-systematic .s-why { flex: 0 1 auto; min-width: 0; max-width: 320px; overflow: hidden; text-overflow: ellipsis; font: 11px/1 var(--font-num); color: var(--dn); }
+#tab-systematic .s-why:empty { display: none; }
+#tab-systematic .s-plan { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; text-align: right; font: 11px/1 var(--font-num); color: var(--tx1); }
+
+/* segmented one-line text (plan, risk summary, cash footer): spans keep their spaces */
+#tab-systematic .seg > span { white-space: pre; }
+#tab-systematic .seg > span.sep { color: var(--tx2); }
+#tab-systematic .pfoot.seg { gap: 0; }
+#tab-systematic .seg > span.crit-tx { color: var(--dn); font-weight: 700; }
+
+/* panel title tools */
+#tab-systematic .ftag { color: var(--warn); border-color: var(--warn); background: transparent; font-family: var(--font-num); }
+#tab-systematic .ftag.off { display: none; }
+#tab-systematic #s-cxlall:not(:disabled):hover { background: var(--crit); border-color: var(--crit); color: #fff; }
+
+/* ------------------------------------------------------------------------------------------
+   Lanes grid (164 px: title, header, up to 6 lanes, TOTAL bold)
+   ------------------------------------------------------------------------------------------ */
+#tab-systematic #s-lanes table.grid td, #tab-systematic #s-lanes table.grid th { height: 20px; }
+#tab-systematic #s-lanes tbody tr[data-lane] { cursor: pointer; }
+#tab-systematic #s-lanes tbody tr.total { cursor: pointer; }
+#tab-systematic td.ls-ON { color: var(--up); }
+#tab-systematic td.ls-OFF { color: var(--tx2); }
+#tab-systematic td.ls-BLOCKED { color: var(--dn); font-weight: 700; }
+#tab-systematic td.ls-CAPPED { color: var(--warn); }
+#tab-systematic td.ls-OVERLAY { color: var(--fair); }
+#tab-systematic td.ls-RUN { color: var(--up); }
+#tab-systematic td.ls-KILLED, #tab-systematic td.ls-HALTED { color: var(--dn); }
+#tab-systematic td.ls-STOP { color: var(--tx2); }
+/* a lane whose realized edge sits well under its predicted edge */
+#tab-systematic tr.lane-warn > td:first-child { box-shadow: inset 2px 0 0 var(--warn); }
+#tab-systematic tr.lane-warn > td.ln, #tab-systematic td.n.warn { color: var(--warn); }
+/* on/off toggle and the lane kill, drawn as cell buttons */
+#tab-systematic td.tg {
+  text-align: center; cursor: pointer; font: 600 11px/1 var(--font-ui); letter-spacing: .04em;
+  color: var(--tx2); box-shadow: inset 0 0 0 1px var(--line2); background: var(--bg2);
+}
+#tab-systematic td.tg.on { color: var(--up); }
+#tab-systematic td.tg.pend { color: var(--tx2); box-shadow: none; outline: 1px dotted var(--tx2); outline-offset: -2px; background: var(--bg3); }
+#tab-systematic table.grid tbody tr:hover > td.tg { background: var(--bg3); }
+#tab-systematic td.kl { text-align: center; cursor: pointer; font: 700 11px/1 var(--font-ui); letter-spacing: .04em; color: var(--dn); }
+#tab-systematic table.grid tbody tr:hover > td.kl:hover { background: var(--crit); color: #fff; }
+#tab-systematic td.kl.dis { color: var(--tx2); cursor: default; font-weight: 400; }
+#tab-systematic table.grid tbody tr:hover > td.kl.dis:hover { background: var(--bg3); color: var(--tx2); }
+
+/* ------------------------------------------------------------------------------------------
+   Working, fills, risk book, markouts
+   ------------------------------------------------------------------------------------------ */
+#tab-systematic td.st.why { text-decoration: none; }
+#tab-systematic table.grid tr.o-REJ > td.st { text-decoration: line-through; }
+#tab-systematic td.n.fair { color: var(--fair); }
+/* risk book: member rows indent under their outcome group; '?' while the PM key fails */
+#tab-systematic #s-risk td.mem { padding-left: 14px; }
+#tab-systematic #s-risk td.q { color: var(--warn); }
+#tab-systematic #s-risk tr.grp > td { cursor: pointer; }
+/* markouts: lane rows filter */
+#tab-systematic #s-mo tbody tr[data-lane] { cursor: pointer; }
