@@ -306,3 +306,18 @@ target_precompile_headers(deskd REUSE_FROM deskd_core)
 add_executable(deskctl src/deskd/app/deskctl.cpp)
 target_link_libraries(deskctl PRIVATE deskd_core)
 target_precompile_headers(deskctl REUSE_FROM deskd_core)
+
+# tests/deskd: the repo's CHECK style, one executable per area.
+#   bus      units, messages, the two-lane queue (priority overtakes, a full lane drops and marks a gap)
+#   ops      the account lock, the heartbeat rule, config, the subscription and send guards
+#   web      Host and token guards, SSE framing and seq, the stream limit and lifecycle, the
+#            snapshot and replies checked by contract.js itself (node), KILL with gw frozen
+#   process  the real binaries: a second deskd refused, SIGTERM, deskctl status and kill
+foreach(t bus ops web process)
+  add_executable(deskd-test-${t} tests/deskd/test_${t}.cpp)
+  target_link_libraries(deskd-test-${t} PRIVATE deskd_core)
+  target_precompile_headers(deskd-test-${t} REUSE_FROM deskd_core)
+  add_test(NAME deskd-${t} COMMAND deskd-test-${t})
+endforeach()
+add_dependencies(deskd-test-process deskd deskctl)
+add_custom_target(deskd-all DEPENDS deskd deskctl deskd-test-bus deskd-test-ops deskd-test-web deskd-test-process)
