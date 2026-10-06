@@ -259,6 +259,14 @@
       if (isNaN(x) || x < 0) return 0;
       return v === 'P' ? Math.floor(x) : Math.round(x * 100) / 100;
     },
+    // a position in at most 4 characters for the watchlist: '+12', '−1.6', '+.04' (exact on the title)
+    posShort: function (p) {
+      var F = Desk.fmt, a = Math.abs(p), sg = p < 0 ? MINUS : '+';
+      if (a >= 10 || a === Math.round(a)) return F.ssize(Math.round(p));
+      var d = Math.round(a * 10) / 10;
+      if (d > 0) return sg + (d % 1 === 0 ? String(d) : d.toFixed(1));
+      return sg + a.toFixed(2).replace(/^0/, '');
+    },
     // signed cents with two decimals: fee per contract 'T1.75'
     c2: function (u) { if (u === null || u === undefined || isNaN(u)) return ''; var s = Math.abs(u / 100).toFixed(2); return (u < 0 && +s !== 0 ? MINUS : '') + s; }
   };
@@ -1097,9 +1105,9 @@
       E.q.addEventListener('input', function () { W.q = E.q.value; W.dirty = true; mark('mwatch'); });
     }
     // 288 px: Bid/Ask fit '0.645', Fair/ESPN show cents (a model to 0.1c is false precision here),
-    // T fits 'Q4 12:59'; Market gets the rest (about 60 px, 92 px in WIDE mode)
-    W.tb = Desk.dom.table(body, [{ h: 'Market' }, { h: 'Bid', w: 38, cls: 'n' }, { h: 'Ask', w: 38, cls: 'n' }, { h: 'Fair', w: 32, cls: 'n' },
-                                 { h: 'ESPN', w: 32, cls: 'n' }, { h: 'Pos', w: 28, cls: 'n' }, { h: 'T', w: 54 }], 'watch');
+    // Pos fits '+1.6', T fits 'Q4 12:59'; Market gets the rest (about 56 px, 88 px in WIDE mode)
+    W.tb = Desk.dom.table(body, [{ h: 'Market' }, { h: 'Bid', w: 38, cls: 'n' }, { h: 'Ask', w: 38, cls: 'n' }, { h: 'Fair', w: 31, cls: 'n' },
+                                 { h: 'ESPN', w: 31, cls: 'n' }, { h: 'Pos', w: 32, cls: 'n' }, { h: 'T', w: 53 }], 'watch');
     W.tb.addEventListener('click', function (ev) {
       var tr = ev.target && ev.target.closest ? ev.target.closest('tr') : null; if (!tr) return;
       var grp = tr.getAttribute('data-grp');
@@ -1152,7 +1160,7 @@
         { t: b && b.ba !== null ? F.pxg(b.ba, g) : '', cls: 'n ask', fl: 'd' },
         { t: ref && ref.fair !== null ? logic.fmtRef(ref.fair, null) : '', cls: 'n ' + (amber ? 'warn' : 'fair'), title: ref && ref.fair !== null ? logic.fmtRef(ref.fair, g) + (ref.sd !== null ? ' \u00b1' + (ref.sd / U).toFixed(2) : '') : null },
         { t: ref && ref.espn !== null ? logic.fmtRef(ref.espn, null) : '', cls: 'n espn', title: ref && ref.espn !== null ? logic.fmtRef(ref.espn, g) + (ref.espn_ts_ms ? ' ' + F.age(nowS - ref.espn_ts_ms) : '') : null },
-        { t: P && P.pos ? F.ssize(P.pos) : '', cls: 'n' },
+        { t: P && P.pos ? logic.posShort(P.pos) : '', cls: 'n', title: P && P.pos ? F.ssize(P.pos) : null },
         { t: T, cls: Tc }
       ];
     }, function (x) {

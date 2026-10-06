@@ -336,6 +336,7 @@ function manOrders(P, key) { const a = []; P.D.store.orders.forEach(o => { if (o
     ci = L.costInfo(mk, null, 'BUY', 5800, 70, 'M');
     check(ci.fee === 0 && ci.cost === 406000 && ci.need === 406000 + D.fees.estimate('K', QUAD, 'BUY', 5800, 70, 'T'), 'a post: no maker fee, but the cash check (need) holds the taker fee as the gateway does', ci);
     eq(L.c2(175), '1.75', 'fee per contract in cents');
+    eq([12, -16.4, 1.6, -0.5, 0.04, 9.96, -100].map(L.posShort).join(' '), '+12 ' + M + '16 +1.6 ' + M + '0.5 +.04 +10 ' + M + '100', 'watchlist positions fit 4 characters');
     eq(L.c2(-31.25), M + '0.31', 'a rebate is negative with U+2212');
     eq(L.series('KXNATGAS15M-26OCT061930-30'), 'KXNATGAS15M', 'the 15-minute series of a ticker');
     // watchlist groups
@@ -919,6 +920,19 @@ function manOrders(P, key) { const a = []; P.D.store.orders.forEach(o => { if (o
   P.setWide(false);
   await run(300);
 
+  // ---- flashes: a changed size flashes, a pulled level (the cell empties) does not -------------
+  {
+    const tb = P.doc.createElement('tbody');
+    const draw = v => D.dom.keyedRows(tb, [1], String, () => [{ t: v, cls: 'bq', fl: 's' }]);
+    draw('5');
+    const td = tb.children[0].children[0];
+    let n = 0; td.animate = () => { n++; return {}; };
+    draw('7');
+    eq(n, 1, 'a size that changes flashes');
+    draw('');
+    eq(n, 1, 'a level that goes away does not flash (no grey box on an empty cell)');
+  }
+
   // ---- 2400 px and wider: a fourth ladder, and SPLIT ------------------------------------------
   P.setXWide(true);
   await run(500);
@@ -941,6 +955,10 @@ function manOrders(P, key) { const a = []; P.D.store.orders.forEach(o => { if (o
     D.keys.setHK(false);
     D.act.cancelAll('MAN', null); await run(300);
   }
+  P.$('tab-systematic').focus();
+  eq(D.keys.splitTab(), 'systematic', 'in SPLIT the half holding the focus gives the tab scope');
+  A.el.focus();
+  eq(D.keys.splitTab(), 'manual', 'and the MANUAL half when a ladder has it');
   eq(D.storage.get('split'), '1', 'SPLIT is remembered');
   click(P.$('tab-man')); await run(300);
   check(!D.layout.split && D.render.tab === 'manual' && P.doc.body.getAttribute('data-tab') === 'manual' && D.layout.ladders().length === 4, 'picking a tab leaves SPLIT');

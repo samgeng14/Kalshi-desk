@@ -117,10 +117,11 @@ input:focus { outline: 1px solid var(--tx0); outline-offset: -1px; }
 .tag.ro { display: none; } .tag.ro.on { display: inline-block; }
 
 /* value flash fallback (the renderer uses the Web Animations API when it can) */
-@keyframes fl-up { from { background-color: var(--fl-up); } to { background-color: transparent; } }
-@keyframes fl-dn { from { background-color: var(--fl-dn); } to { background-color: transparent; } }
-@keyframes fl-sz { from { background-color: var(--fl-sz); } to { background-color: transparent; } }
-@keyframes fl-warn { from { background-color: var(--fl-warn); } to { background-color: transparent; } }
+/* drawn as an inset shadow so a tinted cell (bid/ask, depth bar) keeps its colour under the flash */
+@keyframes fl-up { from { box-shadow: inset 0 0 0 64px var(--fl-up); } to { box-shadow: inset 0 0 0 64px transparent; } }
+@keyframes fl-dn { from { box-shadow: inset 0 0 0 64px var(--fl-dn); } to { box-shadow: inset 0 0 0 64px transparent; } }
+@keyframes fl-sz { from { box-shadow: inset 0 0 0 64px var(--fl-sz); } to { box-shadow: inset 0 0 0 64px transparent; } }
+@keyframes fl-warn { from { box-shadow: inset 0 0 0 64px var(--fl-warn); } to { box-shadow: inset 0 0 0 64px transparent; } }
 .fl-up { animation: fl-up .3s linear; } .fl-dn { animation: fl-dn .3s linear; }
 .fl-sz { animation: fl-sz .3s linear; } .fl-warn { animation: fl-warn .6s linear; }
 @media (prefers-reduced-motion: reduce) { .fl-up, .fl-dn, .fl-sz, .fl-warn { animation: none; } }
@@ -221,6 +222,7 @@ table.keys td.kk { font-family: var(--font-num); color: var(--tx0); }
    ------------------------------------------------------------------------------------------ */
 main#tabs { position: relative; min-height: 0; min-width: 0; overflow: hidden; }
 .tabroot { display: none; position: absolute; inset: 0; gap: 1px; background: var(--bg0); min-height: 0; }
+.tabroot:focus { outline: none; }        /* focusable (-1) so a click in a SPLIT half takes that tab's keys */
 body[data-tab="systematic"] #tab-systematic { display: grid; }
 body[data-tab="manual"] #tab-manual { display: grid; }
 

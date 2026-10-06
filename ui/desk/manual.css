@@ -60,10 +60,10 @@
 #m-watch:focus { outline: none; }
 #m-watch .ptools button { height: 16px; min-width: 22px; padding: 0 4px; font: 600 10px/1 var(--font-ui); }
 #m-watch .ptools input.srch { width: 92px; height: 16px; }
-#tab-manual table.watch th { padding: 0 2px; }
+#tab-manual table.watch th { padding: 0 1px; }
 #tab-manual table.watch th:first-child { padding-left: 4px; }
 #tab-manual table.watch td { padding: 0 2px; font-size: 11px; }
-#tab-manual table.watch td.t { padding-left: 4px; font: 11px/1 var(--font-ui); }
+#tab-manual table.watch td.t { padding-left: 3px; font: 11px/1 var(--font-ui); }
 #tab-manual table.watch td.tcl { padding: 0 2px; font: 10px/1 var(--font-num); font-variant-numeric: tabular-nums; color: var(--tx1); }
 #tab-manual table.watch td.dim { color: var(--tx2); }
 #tab-manual table.watch td.fair { color: var(--fair); }

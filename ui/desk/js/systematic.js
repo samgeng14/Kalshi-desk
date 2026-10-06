@@ -502,7 +502,7 @@
     } },
     { id: 'v', h: 'V', w: 30, f: function (r) { return txt(r.vtxt || '', 'dim'); } },
     { id: 'own', h: 'Own', w: 42, f: function (r) { return txt(r.own || ''); } },
-    { id: 'pos', h: 'Pos', w: 46, hc: 'n', f: function (r) { return r.kind !== 'mem' ? blank() : q(r, num(r.p ? F.ssize(r.p.pos) : '')); } },
+    { id: 'pos', h: 'Pos', w: 48, hc: 'n', f: function (r) { return r.kind !== 'mem' ? blank() : q(r, num(r.p ? F.ssize(r.p.pos) : '')); } },
     { id: 'avg', h: 'Avg', w: 50, hc: 'n', m: 'dw', f: function (r) { return r.kind !== 'mem' ? blank() : q(r, num(r.p ? pxOf(r.p.avg, r.mkey) : '')); } },
     { id: 'mark', h: 'Mark', w: 50, hc: 'n', m: 'dw', f: function (r) { return r.kind !== 'mem' ? blank() : q(r, num(r.p ? pxOf(r.p.mark, r.mkey) : '')); } },
     { id: 'unrl', h: 'Unrl', w: 56, hc: 'n', f: function (r) { return q(r, pnlC(r.unrl)); } },

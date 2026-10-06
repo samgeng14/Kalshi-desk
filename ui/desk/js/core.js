@@ -307,7 +307,8 @@
     if (!el || reduceMotion) return;
     var c = FLASH[kind] || FLASH.sz;
     if (el.animate) {
-      try { el.animate([{ backgroundColor: c }, { backgroundColor: 'transparent' }], { duration: kind === 'warn' ? 600 : 300, easing: 'linear' }); return; } catch (e) { /* fallthrough */ }
+      // an inset shadow over the cell, not its background: the bid/ask tint and depth bar stay put
+      try { el.animate([{ boxShadow: 'inset 0 0 0 64px ' + c }, { boxShadow: 'inset 0 0 0 64px transparent' }], { duration: kind === 'warn' ? 600 : 300, easing: 'linear' }); return; } catch (e) { /* fallthrough */ }
     }
     el.classList.remove('fl-' + kind); void el.offsetWidth; el.classList.add('fl-' + kind);
   }
@@ -329,7 +330,7 @@
    *   cellsFn    item -> array of cells; a cell is a string/number, or an object
    *              {t: text, cls: 'n up', fl: 'd'|'s', title: '...', attr: {k: v}, html: '...'}
    *              fl 'd' flashes green/red by the direction of a numeric change, 's' flashes grey
-   *              on any change. No flash on a row's first paint.
+   *              on any change. No flash on a row's first paint, nor when a cell empties.
    *   rowFn      item -> class string, or {cls, attr} (attr e.g. {'data-mkt': 'K|TK'})
    * Returns the number of rows. Rows that stay keep their DOM nodes (focus, selection, scroll and
    * click targets survive); only changed text is written.
@@ -365,7 +366,8 @@
           if (cell.title !== undefined) setAttr(td, 'title', cell.title);
           if (cell.attr) for (var ak in cell.attr) setAttr(td, ak, cell.attr[ak]);
           if (cell.style) for (var sk in cell.style) setStyleVar(td, sk, cell.style[sk]);
-          if (old && changed && before !== '' && cell.fl) {
+          // a value that changed flashes; one that appeared or went away (a level pulled) does not
+          if (old && changed && before !== '' && td.textContent !== '' && cell.fl) {
             if (cell.fl === 'd') { var a = numOf(before), b = numOf(td.textContent); flash(td, b > a ? 'up' : (b < a ? 'dn' : 'sz')); }
             else flash(td, cell.fl === 's' ? 'sz' : cell.fl);
           }

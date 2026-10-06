@@ -79,9 +79,11 @@
 #tab-systematic table.grid tr.o-REJ > td.st { text-decoration: line-through; }
 #tab-systematic td.n.fair { color: var(--fair); }
 /* risk book: member rows indent under their outcome group; '?' while the PM key fails */
-#tab-systematic #s-risk td.mem { padding-left: 14px; }
+#tab-systematic #s-risk td.mem { padding-left: 10px; }
 #tab-systematic #s-risk td.q { color: var(--warn); }
 #tab-systematic #s-risk tr.grp > td { cursor: pointer; }
 /* markouts: lane rows filter */
 #tab-systematic #s-mo tbody tr[data-lane] { cursor: pointer; }
 #s-held { color: var(--warn); margin-right: 6px; cursor: default; }
+/* the risk book packs ten columns into 607 px: tighter cell padding so '+4.37' and game names fit */
+#s-risk-body table.grid th, #s-risk-body table.grid td { padding: 0 4px; }
