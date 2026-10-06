@@ -9,7 +9,10 @@
  *   st.hdr                  header numbers (money fields in u) or null before the first snapshot
  *   st.markets  Map key -> {v, tk, key, ev, title, short, grp, kind, og, oc, open_ms, close_ms,
  *                           status, result, grid (contract ranges), g (Desk.grid), fee {type, mult},
- *                           shard, lip}
+ *                           shard, lip, cat, date, pin}: the LIVE SET (contract 1.4); the rest of
+ *                           the day's universe is paged in by Desk.universe, never stored here
+ *   st.today    hb.date / snapshot.date: today's ET date (T); st.dayOf(date) -> 'T' | 'T1'
+ *   st.pinPend  Map key -> {on, at}: a star clicked here, until the mkt echo agrees
  *   st.books    Map key -> {v, tk, key, depth 'FULL'|'TOP', bids [[px, size]] best first,
  *                           asks [[px, size]] best first, bb, ba, bbSz, baSz, mid (u, float) | null,
  *                           last {px, qty, side, ts_ms} | null, vol, prints [{px, qty, side, ts_ms, at}]
@@ -78,7 +81,7 @@
     fills: [], fillIdx: new Map(), moPending: new Map(),
     pos: new Map(), lanes: new Map(), laneOrder: [],
     risk: { groups: [], shards: [] },
-    alerts: [], feeds: null, subs: null,
+    alerts: [], feeds: null, subs: null, today: null, pinPend: new Map(),
     stale: true, staleWhy: 'SYNC', vstale: { K: '', P: '' },
     connected: false, resyncing: false, buffer: [], bufEpoch: null, inflight: false, needHb: false,
     lastHb: 0, srvOffset: 0, snapFails: 0, lastPrune: 0, killPend: false,
@@ -203,12 +206,12 @@
     // old ones put back if any record fails. It does not touch the stream's liveness: the screen
     // stays STALE (SYNC) until a stream hb newer than the snapshot is applied.
     applySnapshot: function (s) {
-      var KEYS = ['epoch', 'sid', 'seq', 'srvOffset', 'hdr', 'markets', 'books', 'orders', 'fills', 'fillIdx', 'moPending',
+      var KEYS = ['epoch', 'sid', 'seq', 'today', 'srvOffset', 'hdr', 'markets', 'books', 'orders', 'fills', 'fillIdx', 'moPending',
                   'pos', 'lanes', 'laneOrder', 'risk', 'alerts', 'feeds', 'subs', 'needHb'];
       var saved = {};
       KEYS.forEach(function (k) { saved[k] = st[k]; });
       try {
-        st.epoch = s.epoch; st.sid = s.sid; st.seq = s.seq;
+        st.epoch = s.epoch; st.sid = s.sid; st.seq = s.seq; st.today = s.date;
         st.srvOffset = s.srv_ms - nowMs();
         H.hdr(s.hdr);
         st.markets = new Map(); s.markets.forEach(function (m) { H.mkt(m, null, true, saved.markets); });
@@ -321,6 +324,16 @@
       return out.sort(byNewest);
     },
     manWorking: function () { var n = 0; st.orders.forEach(function (o) { if (!o.terminal && o.own === 'MAN') n++; }); return n; },
+    // THE UNIVERSE: the day a market belongs to ('T' today or before, 'T1' later) against hb.date
+    dayOf: function (date) { return !st.today || !date || date <= st.today ? 'T' : 'T1'; },
+    // a market's star as shown: an optimistic toggle in flight, else the backend's (mkt.pin, or a
+    // listing row's pin)
+    pinned: function (key, dflt) {
+      var p = st.pinPend.get(key);
+      if (p && Date.now() - p.at < 10000) return p.on;
+      var m = st.markets.get(key);
+      return m ? !!m.pin : !!dflt;
+    },
     // a crossing order more than 2 ticks through the touch is refused unless overridden
     priceGuard: function (key, side, p) {
       var m = st.markets.get(key), b = st.books.get(key);
@@ -440,9 +453,12 @@
         open_ms: d.open_ms, close_ms: d.close_ms, status: d.status, result: d.result, grid: d.grid,
         g: old && JSON.stringify(old.grid) === JSON.stringify(d.grid) ? old.g : Desk.grid.make(d.grid),
         fee: { type: d.fee.type, mult: d.fee.mult }, shard: d.shard, lip: d.lip, start_ms: d.start_ms, man: d.man,
+        cat: d.cat, date: d.date, pin: d.pin,
         settledAt: d.status !== 'SETTLED' ? null : (old && old.settledAt ? old.settledAt : nowMs())   // local ms first seen SETTLED
       };
       st.markets.set(key, m);
+      // an optimistic star gives way once the backend says the same
+      if (st.pinPend.has(key) && st.pinPend.get(key).on === m.pin) st.pinPend.delete(key);
       mark('mkt'); mark('mkt:' + key);
     },
     book: function (d, env, fromSnap) {
@@ -558,6 +574,7 @@
       mark('alert');
     },
     hb: function (d) {
+      if (d.date !== st.today) { st.today = d.date; mark('mkt'); }
       st.lastHb = nowMs();
       st.needHb = false;                   // a stream hb newer than the snapshot: the stream is live
       st.srvOffset = d.srv_ms - nowMs();

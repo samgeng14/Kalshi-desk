@@ -174,7 +174,7 @@ function bootPage(opts) {
   vm.createContext(ctx);
   vm.runInContext('Date.now = function () { return __clock.t; };', ctx);
   const load = f => vm.runInContext(fs.readFileSync(path.join(JS, f), 'utf8'), ctx, { filename: f });
-  ['contract.js', 'core.js', 'store.js', 'sim.js', 'transport.js', 'header.js', 'manual.js', 'systematic.js'].forEach(load);
+  ['contract.js', 'core.js', 'store.js', 'sim.js', 'transport.js', 'universe.js', 'header.js', 'manual.js', 'browse.js', 'systematic.js'].forEach(load);
   const D = ctx.Desk;
   let sim = null;
   const create = D.sim.create;
@@ -239,7 +239,7 @@ function manOrders(P, key) { const a = []; P.D.store.orders.forEach(o => { if (o
   {
     const ctx = { console, setTimeout, clearTimeout, setInterval, clearInterval, performance, localStorage: { getItem() { return null; }, setItem() {} } };
     ctx.window = ctx; vm.createContext(ctx);
-    for (const f of ['contract.js', 'core.js', 'store.js', 'manual.js']) vm.runInContext(fs.readFileSync(path.join(JS, f), 'utf8'), ctx, { filename: f });
+    for (const f of ['contract.js', 'core.js', 'store.js', 'universe.js', 'manual.js']) vm.runInContext(fs.readFileSync(path.join(JS, f), 'utf8'), ctx, { filename: f });
     const D = ctx.Desk, L = D.manual.logic, G = D.grid;
     check(typeof D.manual.init === 'function' && typeof D.manual.render === 'function', 'Desk.manual keeps the {init, render} contract');
     const lin = G.make([{ start: '0.0000', end: '1.0000', step: '0.0100' }]);
@@ -352,22 +352,37 @@ function manOrders(P, key) { const a = []; P.D.store.orders.forEach(o => { if (o
     eq([12, -16.4, 1.6, -0.5, 0.04, 9.96, -100].map(L.posShort).join(' '), '+12 ' + M + '16 +1.6 ' + M + '0.5 +.04 +10 ' + M + '100', 'watchlist positions fit 4 characters');
     eq(L.c2(-31.25), M + '0.31', 'a rebate is negative with U+2212');
     eq(L.series('KXNATGAS15M-26OCT061930-30'), 'KXNATGAS15M', 'the 15-minute series of a ticker');
-    // watchlist groups
-    const mm = (v, tk, grp, kind, close, short, status) => ({ v, tk, key: v + '|' + tk, grp, kind, close_ms: close, short: short || tk, title: tk, status: status || 'OPEN', og: grp, oc: short });
+    // watchlist order (THE UNIVERSE): category (SPORTS WEATHER FIN ECON OTHER), each category's
+    // groups by their best row under the sort, rows by the sort, ties by ticker
+    const UV = D.universe;
+    const mm = (v, tk, grp, kind, close, short, status, extra) => Object.assign({ v, tk, key: v + '|' + tk, grp, kind, close_ms: close, short: short || tk, title: tk, status: status || 'OPEN', og: grp, oc: short }, extra || {});
     const ms = new Map([
       ['K|W1', mm('K', 'W1', 'WX NYC', 'WEATHER', 9, 'NYC 64-65')], ['K|G1', mm('K', 'G1', 'NCAAF', 'GAME', 5, 'A@B A')],
       ['P|g1', mm('P', 'g1', 'NCAAF', 'GAME', 5, 'A@B A')], ['K|N1', mm('K', 'N1', '15M', 'LIP15', 3, 'NATGAS UP')],
       ['K|C1', mm('K', 'C1', '15M', 'LIP15', 3, 'COPPER UP')], ['K|S1', mm('K', 'S1', '15M', 'LIP15', 2, 'OLD', 'SETTLED')]
     ]);
-    let wl = L.watchList(ms, { venue: 'ALL' });
-    eq(wl.map(x => x.grp || x.m.tk).join(','), '15M,N1,C1,NCAAF A@B,G1,g1,WX NYC,W1', 'watchlist: LIP first, then games (one group per game), then weather; settled markets gone; listing order kept');
-    eq(wl[0].n, 2, 'group rows carry their count');
-    wl = L.watchList(ms, { venue: 'P' });
-    eq(wl.map(x => x.grp || x.m.tk).join(','), 'NCAAF A@B,g1', 'watchlist venue filter');
-    wl = L.watchList(ms, { venue: 'ALL', collapsed: { '15M': true } });
-    check(wl[0].collapsed && wl[1].grp === 'NCAAF A@B', 'a collapsed group hides its markets');
-    wl = L.watchList(ms, { venue: 'ALL', q: 'copper', collapsed: { '15M': true } });
-    eq(wl.map(x => x.grp || x.m.tk).join(','), '15M,C1', 'search finds markets inside collapsed groups');
+    const rowsOfMs = f => Array.from(ms.values()).filter(m => m.status !== 'SETTLED' && (!f || f(m))).map(m => UV.liveRow(m, null));
+    let o = UV.order(rowsOfMs(), 'close');
+    let wl = UV.layout(o.groups, {}).map(x => x.t === 'cat' ? x.cat : (x.t === 'grp' ? x.gk : o.rows[x.i].tk));
+    eq(wl.join(','), 'SPORTS,NCAAF A@B,G1,g1,WEATHER,WX NYC,W1,FIN,15M,C1,N1', 'watchlist: sports, weather, fin; a game is its own group; settled markets gone; ties by ticker');
+    eq(UV.layout(o.groups, {})[0].n, 2, 'category rows carry their count');
+    eq(o.cats.FIN, 2, 'and the counts per category');
+    o = UV.order(rowsOfMs(m => m.v === 'P'), 'close');
+    eq(UV.layout(o.groups, {}).map(x => x.t === 'row' ? o.rows[x.i].tk : (x.gk || x.cat)).join(','), 'SPORTS,NCAAF A@B,g1', 'watchlist venue filter');
+    o = UV.order(rowsOfMs(), 'close');
+    wl = UV.layout(o.groups, { '15M': true });
+    check(wl.find(x => x.gk === '15M').collapsed && !wl.some(x => x.t === 'row' && o.rows[x.i].grp === '15M'), 'a collapsed group hides its markets');
+    wl = UV.layout(o.groups, { 'c:SPORTS': true });
+    check(wl[0].collapsed && wl[1].cat === 'WEATHER', 'a collapsed category hides its groups');
+    wl = UV.layout(o.groups, { '15M': true }, { q: 'copper' });
+    check(!wl.find(x => x.gk === '15M').collapsed, 'a search shows inside collapsed groups');
+    const vr = [{ tk: 'a', gk: 'G', cat: 'FIN', vol: 5, bid: 4000, ask: 4600, close_ms: 9, edge: null }, { tk: 'b', gk: 'G', cat: 'FIN', vol: 50, bid: 4000, ask: 4100, close_ms: 7, edge: 120 },
+                { tk: 'c', gk: 'H', cat: 'FIN', vol: 20, bid: null, ask: 4100, close_ms: 1, edge: -50 }];
+    eq(UV.order(vr, 'vol').rows.map(r => r.tk).join(''), 'bac', 'sort by volume: the busiest group first, its busiest row first');
+    eq(UV.order(vr, 'sprd').rows.map(r => r.tk).join(''), 'bac', 'sort by spread: tightest first, a one-sided book last');
+    eq(UV.order(vr, 'close').rows.map(r => r.tk).join(''), 'cba', 'sort by time to close');
+    eq(UV.order(vr, 'edge').rows.map(r => r.tk).join(''), 'bac', 'sort by edge: the best take first, no model last');
+    eq(UV.catOf({ kind: 'LIP15' }) + UV.catOf({ kind: 'GAME' }) + UV.catOf({ cat: 'ECON', kind: 'OTHER' }), 'FINSPORTSECON', 'a market\'s category (mkt.cat, or from its kind)');
     eq(L.pairOf(ms, ms.get('K|G1')), 'P|g1', 'the same outcome on the other venue');
     eq(L.watchLabel(mm('K', 'X', 'NCAAF', 'GAME', 1, 'SOUMIS@TROY TROY')), 'TROY', 'a game row reads as its YES team');
     eq(L.watchLabel(mm('P', 'x', 'NCAAF', 'GAME', 1, 'SOUMIS@TROY SOUMIS')), 'SOUMIS P', 'a Polymarket row carries P');
@@ -699,33 +714,37 @@ function manOrders(P, key) { const a = []; P.D.store.orders.forEach(o => { if (o
   check(!D.keys.hk, 'H turns hotkeys off again');
   await run(45000, 250);       // ESPN runs ~41 s behind the play: give it a lag's worth of history
 
-  // ---- watchlist ------------------------------------------------------------------------------
-  const wtb = MS.watch.tb;
+  // ---- watchlist (THE UNIVERSE: T / T+1, categories, star, virtual rows) ---------------------
+  const wtb = MS.watch.tb, WE = MS.watch.el;
+  const wrows = () => wtb.children.filter(r => r.getAttribute('data-mkt'));
   const grps = wtb.children.filter(r => r.getAttribute('data-grp'));
-  check(grps.length >= 3 && grps[0].getAttribute('data-grp') === '15M' && /^15M 7$/.test(grps[0].textContent), 'watchlist groups, 15-minute series first with their count', grps.map(r => r.textContent));
+  eq(MS.cfg.watch.scope + ' ' + MS.cfg.watch.day, 'watch T', 'the watchlist opens on the starred markets settling today (T)');
+  check(grps.length >= 4 && grps[0].getAttribute('data-grp') === 'c:SPORTS' && /^SPORTS \d+$/.test(grps[0].textContent) && grps.some(r => /^15M 7$/.test(r.textContent)),
+    'category rows (SPORTS first) with their counts, then groups; the 15-minute series is one group', grps.map(r => r.textContent));
   const natRow = wtb.children.find(r => r.getAttribute('data-mkt') === natKey);
-  check(natRow && natRow.children[1].textContent === '0.62' && natRow.children[2].textContent === '0.64', 'watchlist bid / ask', natRow && natRow.children.map(c => c.textContent));
+  check(natRow && natRow.children[2].textContent === '0.62' && natRow.children[3].textContent === '0.64', 'watchlist bid / ask', natRow && natRow.children.map(c => c.textContent));
+  check(natRow && natRow.children[0].textContent === '★' && /\bon\b/.test(natRow.children[0].className), 'a desk market starts pinned (the star, white)');
   check(natRow && /\bsel\b/.test(natRow.className), 'the focused market is selected in the watchlist');
-  check(natRow && /^\d+m$|^\d+s$/.test(natRow.children[6].textContent), 'T is the time to close for a 15-minute market', natRow && natRow.children[6].textContent);
+  check(natRow && /^\d+m$|^\d+s$/.test(natRow.children[7].textContent), 'T is the time to close for a 15-minute market', natRow && natRow.children[7].textContent);
   const gRow = wtb.children.find(r => r.getAttribute('data-mkt') === gameKey);
-  check(gRow && /^(Q\d|OT) \d+:\d\d$/.test(gRow.children[6].textContent), 'T is the game clock for a live game', gRow && gRow.children[6].textContent);
+  check(gRow && /^(Q\d|OT) \d+:\d\d$/.test(gRow.children[7].textContent), 'T is the game clock for a live game', gRow && gRow.children[7].textContent);
   {
     const gm = st.market(gameKey), gg = D.manual.logic.watchGroup(gm);
     const gh = wtb.children.find(r => r.getAttribute('data-grp') === gg);
     check(gh && /^NCAAF [A-Z]+@[A-Z]+ \d+  \d+-\d+$/.test(gh.textContent), 'a live game is its own group row with the score', gh && gh.textContent);
-    eq(gRow.children[0].textContent, gm.oc, 'inside it the row reads as the YES team');
+    eq(gRow.children[1].textContent, gm.oc, 'inside it the row reads as the YES team');
   }
-  check(wtb.children.some(r => r.getAttribute('data-mkt') && r.children[4].textContent !== ''), 'ESPN shows on live games');
-  check(wtb.children.some(r => r.getAttribute('data-mkt') && /\b(fair|warn)\b/.test(r.children[3].className) && r.children[3].textContent !== ''), 'model fair shows in the watchlist');
+  check(wrows().some(r => r.children[5].textContent !== ''), 'ESPN shows on live games');
+  check(wrows().some(r => /\b(fair|warn)\b/.test(r.children[4].className) && r.children[4].textContent !== ''), 'model fair shows in the watchlist');
   // amber rule: a taker at the touch beats the model after the fee (never the mid)
   let amberN = 0;
-  const amberOk = wtb.children.filter(r => r.getAttribute('data-mkt')).every(r => {
+  const amberOk = wrows().every(r => {
     const k = r.getAttribute('data-mkt'), b = st.book(k), m = st.market(k);
     if (!b || b.ref.fair === null) return true;
     const f = b.ref.fair, buy = b.ba !== null ? f - b.ba - D.fees.takerPer(m.v, m.fee, b.ba) : -1, sell = b.bb !== null ? b.bb - f - D.fees.takerPer(m.v, m.fee, b.bb) : -1;
     const want = buy > 0 || sell > 0;
     if (want) amberN++;
-    return /\bwarn\b/.test(r.children[3].className) === want;
+    return /\bwarn\b/.test(r.children[4].className) === want;
   });
   check(amberOk, 'Fair is amber exactly when a take at the touch clears the taker fee', amberN);
   {
@@ -735,45 +754,140 @@ function manOrders(P, key) { const a = []; P.D.store.orders.forEach(o => { if (o
     check(te.side === 'BUY' && te.e > 0, 'fair 0.70 over an ask of 0.67: buying at the ask clears the fee', te);
   }
   // click loads into the focused ladder, Shift+click into the other
-  const wxRow = wtb.children.find(r => r.getAttribute('data-mkt') && st.market(r.getAttribute('data-mkt')).kind === 'WEATHER');
+  const wxRow = wrows().find(r => st.market(r.getAttribute('data-mkt')).kind === 'WEATHER');
   const wxKey = wxRow.getAttribute('data-mkt');
-  click(wxRow.children[0], { shiftKey: true });
+  click(wxRow.children[1], { shiftKey: true });
   check(D.focus.ladders.B === wxKey && D.focus.key === natKey, 'Shift+click loads the other ladder and keeps the focus');
   await run(300);
   eq(st.book(wxKey).depth, 'FULL', 'the newly loaded ladder subscribes at full depth');
   // keyboard: / search, arrows, Enter
   A.el.focus();
   key('Slash', '/');
-  eq(P.doc.activeElement, MS.watch.el.q, '/ focuses the watchlist search');
-  MS.watch.el.q.value = 'copper'; fire(MS.watch.el.q, 'input', {});
+  eq(P.doc.activeElement, WE.q, '/ focuses the watchlist search');
+  WE.q.value = 'copper'; fire(WE.q, 'input', {});
   await run(300);
-  const vis = wtb.children.filter(r => r.getAttribute('data-mkt'));
-  check(vis.length === 1 && /COPPER/.test(vis[0].children[0].textContent), 'search filters the watchlist', vis.map(r => r.children[0].textContent));
+  const vis = wrows();
+  check(vis.length === 1 && /COPPER/.test(vis[0].children[1].textContent), 'search filters the watchlist', vis.map(r => r.children[1].textContent));
   n0 = st.orders.size;
   key('KeyB', 'b');
   eq(st.orders.size, n0, 'typing in the search is never a command');
   key('Enter', 'Enter');
   const copperKey = vis[0].getAttribute('data-mkt');
   check(D.focus.key === copperKey && D.focus.ladders.A === copperKey, 'Enter loads the match into the focused ladder');
-  MS.watch.el.q.value = ''; fire(MS.watch.el.q, 'input', {});
+  WE.q.value = ''; fire(WE.q, 'input', {});
   key('Escape', 'Escape');
-  check(P.doc.activeElement !== MS.watch.el.q, 'Esc leaves the search');
+  check(P.doc.activeElement !== WE.q, 'Esc leaves the search');
   await run(300);
   P.$('m-watch').focus();
   key('ArrowDown', 'ArrowDown'); key('ArrowDown', 'ArrowDown'); key('Enter', 'Enter');
   check(D.focus.key && D.focus.key !== copperKey, 'Up/Down and Enter work with the list focused', D.focus.key);
-  // group collapse
-  click(grps[0].children[0]);
-  await run(300);
-  check(MS.cfg.watch.collapsed['15M'] && !wtb.children.some(r => r.getAttribute('data-mkt') && st.market(r.getAttribute('data-mkt')).grp === '15M'), 'a group row click collapses it');
+  // group and category collapse
   click(wtb.children.find(r => r.getAttribute('data-grp') === '15M').children[0]);
-  // venue filter
-  const vbP = MS.watch.el.vb.find(b => b.textContent === 'P');
-  click(vbP); await run(300);
-  check(wtb.children.filter(r => r.getAttribute('data-mkt')).every(r => r.getAttribute('data-mkt').charAt(0) === 'P'), 'the P filter shows Polymarket only');
-  click(MS.watch.el.vb.find(b => b.textContent === 'ALL')); await run(300);
-  D.focus.set(natKey); await run(300);
-
+  await run(300);
+  check(MS.cfg.watch.collapsed['15M'] && !wrows().some(r => st.market(r.getAttribute('data-mkt')).grp === '15M'), 'a group row click collapses it');
+  click(wtb.children.find(r => r.getAttribute('data-grp') === '15M').children[0]);
+  click(wtb.children.find(r => r.getAttribute('data-grp') === 'c:WEATHER').children[0]); await run(300);
+  check(!wrows().some(r => st.market(r.getAttribute('data-mkt')).kind === 'WEATHER') && wtb.children.some(r => r.getAttribute('data-grp') === 'c:WEATHER'), 'a category row click collapses the category to its header');
+  click(wtb.children.find(r => r.getAttribute('data-grp') === 'c:WEATHER').children[0]); await run(300);
+  // venue: K+P, K, P
+  eq(WE.ven.textContent, 'K+P', 'venue starts on both');
+  click(WE.ven); click(WE.ven); await run(300);
+  check(WE.ven.textContent === 'P' && wrows().length && wrows().every(r => r.getAttribute('data-mkt').charAt(0) === 'P'), 'the P filter shows Polymarket only');
+  click(WE.ven); await run(300);
+  // categories
+  const chip = c => WE.cats.find(b => b.getAttribute('data-v') === c);
+  click(chip('WEATHER')); await run(300);
+  check(wrows().length && wrows().every(r => st.market(r.getAttribute('data-mkt')).cat === 'WEATHER') && /\bon\b/.test(chip('WEATHER').className), 'a category chip shows that category only');
+  click(chip('')); await run(300);
+  // sort: CLOSE, VOL, SPRD, EDGE
+  click(WE.sort); await run(300);
+  eq(MS.cfg.watch.sort + ' ' + WE.sort.textContent, 'vol VOL', 'the sort cycles to volume');
+  {
+    const ks = wrows().map(r => r.getAttribute('data-mkt')), fin = ks.filter(k => st.market(k).grp === '15M').map(k => st.book(k).vol);
+    check(fin.every((v, i) => !i || v <= fin[i - 1]), 'inside a group the busiest market comes first', fin);
+  }
+  click(WE.sort); click(WE.sort); click(WE.sort); await run(300);
+  eq(MS.cfg.watch.sort, 'close', 'and round to time to close');
+  // T / T+1
+  click(WE.day[1]); await run(300);
+  check(MS.cfg.watch.day === 'T1' && wrows().length >= 1 && wrows().every(r => st.market(r.getAttribute('data-mkt')).date > st.today), 'T+1 shows the markets settling tomorrow only', wrows().map(r => r.getAttribute('data-mkt') + ' ' + st.market(r.getAttribute('data-mkt')).date));
+  click(WE.day[0]); await run(300);
+  check(wrows().every(r => st.market(r.getAttribute('data-mkt')).date <= st.today), 'T shows today\'s');
+  // the star: unpinning a market nothing holds takes it off the watchlist; the backend agrees
+  {
+    const wk = wrows().map(r => r.getAttribute('data-mkt')).find(k => st.market(k).kind === 'WEATHER' && !Object.values(D.focus.ladders).includes(k) && !(st.position(k) && st.position(k).pos));
+    const star = wrows().find(r => r.getAttribute('data-mkt') === wk).children[0];
+    fire(star, 'pointerdown', { button: 0 }); fire(star, 'click', {}); P.frame();
+    check(!wrows().some(r => r.getAttribute('data-mkt') === wk), 'unpinning takes it off at once');
+    await run(300);
+    check(P.sim().market(wk).pin === false && st.market(wk).pin === false && !st.pinPend.has(wk), 'the backend unpinned it (mkt.pin false)');
+    click(chip('')); click(WE.scope[1]);
+    WE.q.value = st.market(wk).tk; fire(WE.q, 'input', {}); await run(600);
+    const back = wrows().find(r => r.getAttribute('data-mkt') === wk);
+    check(back && back.children[0].textContent === '☆', 'ALL still lists it, unstarred', back && back.children[0].textContent);
+    click(back.children[0]); await run(300);
+    check(st.market(wk).pin === true, 'a star in ALL pins it again');
+    WE.q.value = ''; fire(WE.q, 'input', {});
+    click(WE.scope[0]); await run(300);
+    check(wrows().some(r => r.getAttribute('data-mkt') === wk), 'and it is back on the watchlist');
+  }
+  // ALL: the day's whole universe, paged and virtual
+  {
+    click(WE.scope[1]); await run(600);
+    const total = +WE.n.textContent;
+    // (this test's clock is late in the ET day: many of today's games and hours have closed)
+    check(MS.cfg.watch.scope === 'all' && total > 500, 'ALL lists the day\'s whole universe (both venues, every category)', WE.n.textContent);
+    const drawn = wtb.children.filter(r => !/\bvpad\b/.test(r.className)).length;
+    check(drawn <= 70, 'only the rows in view exist (virtual)', drawn);
+    const pads = wtb.children.filter(r => /\bvpad\b/.test(r.className)).map(r => parseInt(r.children[0].style.getPropertyValue('height'), 10));
+    const items = MS.watch.items.length;
+    check(Math.abs(pads.reduce((x, y) => x + y, 0) + (drawn) * 18 - items * 18) < 1, 'the spacer rows keep the whole list\'s height', { pads, drawn, items });
+    const gets0 = MS.watch.uni.gets;
+    MS.watch.body.scrollTop = 18 * 500; fire(MS.watch.body, 'scroll', {}); await run(600);
+    check(MS.watch.uni.gets > gets0 && wrows().length > 10 && wrows().every(r => r.children[1].textContent !== '…'), 'scrolling far down asks for the pages there and draws them', { gets: MS.watch.uni.gets - gets0 });
+    check(wtb.children.filter(r => !/\bvpad\b/.test(r.className)).length <= 70, 'still only the rows in view');
+    // a listing row (not live): load it into a ladder, its book arrives
+    const uniRow = wrows().find(r => /\buni\b/.test(r.className) && r.getAttribute('data-mkt').charAt(0) === 'K');
+    check(!!uniRow, 'ALL shows listing rows that are not live', wrows().slice(0, 3).map(r => r.className));
+    const uk = uniRow.getAttribute('data-mkt');
+    eq(st.market(uk), null, 'a listing row is not in the store');
+    click(uniRow.children[1], { shiftKey: true }); await run(600);
+    check(st.market(uk) && st.book(uk) && st.book(uk).depth === 'FULL' && D.focus.ladders.B === uk && rowsOf(B.tb).length > 5, 'loaded into a ladder it goes live: its market and full book arrive', { m: !!st.market(uk), b: st.book(uk) && st.book(uk).depth });
+    eq(st.market(uk).pin, false, 'a ladder brings it live without pinning it');
+    // T+1 in ALL
+    click(WE.day[1]); await run(600);
+    check(+WE.n.textContent > 500 && MS.watch.uni.res.date > st.today, 'T+1 in ALL lists tomorrow\'s universe', WE.n.textContent);
+    click(WE.day[0]); click(WE.scope[0]); await run(300);
+    MS.watch.body.scrollTop = 0; fire(MS.watch.body, 'scroll', {});
+    D.focus.set(natKey, { ladder: 'A' }); D.focus.set(gameKey, { ladder: 'B', other: true }); await run(300);
+  }
+  // THE MARKET BROWSER: u (or + on the watchlist)
+  {
+    const BR = D.browse.state(), BE = BR.el;
+    A.el.focus(); key('KeyU', 'u'); await run(600);
+    check(D.browse.isOpen && /\bbrowse\b/.test(P.doc.body.className) && P.doc.activeElement === BE.q, 'u opens the market browser with its search focused');
+    const btb = BR.V.tb, brows = () => btb.children.filter(r => r.getAttribute('data-mkt'));
+    check(+BE.n.textContent.split(' ')[0] > 500 && brows().length > 10 && btb.children.filter(r => !/\bvpad\b/.test(r.className)).length <= 70, 'it lists the day\'s universe, virtual', BE.n.textContent);
+    check(BE.cats.some(b => /^SPORTS \d+$/.test(b.textContent)) && BE.cats.some(b => /^WEATHER \d+$/.test(b.textContent)), 'the category chips carry their counts', BE.cats.map(b => b.textContent));
+    BE.q.value = 'denver'; fire(BE.q, 'input', {}); await run(800);
+    BE.q.value = 'den'; fire(BE.q, 'input', {}); await run(800);
+    const dr = brows().find(r => /^DEN /.test(r.children[2].textContent) && r.children[0].textContent === '☆');
+    check(!!dr, 'a search narrows it (the server matches tickers, titles and groups)', brows().map(r => r.children[2].textContent).slice(0, 5));
+    const dk = dr.getAttribute('data-mkt');
+    fire(dr.children[0], 'pointerdown', { button: 0 }); P.frame();
+    check(dr.children[0].textContent === '★', 'its star pins at once');
+    await run(400);
+    check(st.market(dk) && st.market(dk).pin === true && st.book(dk), 'pinned: the market joins the live set with its book');
+    key('ArrowDown', 'ArrowDown'); key('Enter', 'Enter'); await run(400);
+    check(!D.browse.isOpen && D.focus.key && D.focus.key === BR.cursor, 'Enter loads the cursor\'s market into the focused ladder and closes the browser', [D.focus.key, BR.cursor]);
+    click(WE.browse); await run(300);
+    check(D.browse.isOpen, '+ on the watchlist opens it too');
+    key('Escape', 'Escape');
+    check(!D.browse.isOpen, 'Esc closes it');
+    click(WE.scope[0]); await run(300);
+    check(wrows().some(r => r.getAttribute('data-mkt') === dk), 'the market pinned in the browser is on the watchlist');
+    D.focus.set(natKey, { ladder: 'A' }); await run(300);
+  }
   // ---- ticket ---------------------------------------------------------------------------------
   const E = MS.ticket.el;
   eq(E.mkt.textContent, nat.short, 'the ticket follows the focused market');
@@ -1188,7 +1302,7 @@ function manOrders(P, key) { const a = []; P.D.store.orders.forEach(o => { if (o
     // the dev check: handler and paint time per control
     D.perf.set(true);
     const ctls = [fb('1'), fb('5'), fb('60s'), fb('15s'), P.$('tab-sys'), P.$('tab-man'), E2.types.find(b => b.textContent === 'IOC'),
-                  E2.types.find(b => b.textContent === '15s'), MS.watch.el.vb[0], MS.watch.el.vb[2], P.$('sb-keys'), P.$('keysheet-close'), P.$('sb-set'), P.$('set-close')];
+                  E2.types.find(b => b.textContent === '15s'), MS.watch.el.cats[2], MS.watch.el.cats[0], MS.watch.el.day[1], MS.watch.el.day[0], P.$('sb-keys'), P.$('keysheet-close'), P.$('sb-set'), P.$('set-close')];
     for (const c of ctls) { press(c); up(c); fire(c, 'click', {}); P.frame(); }
     click(ladCell(P, 'A', 5800, 'bq')); P.frame();
     A.el.focus(); key('Space', ' '); P.frame();

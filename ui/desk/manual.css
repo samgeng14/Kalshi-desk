@@ -60,8 +60,39 @@
    ladder's marker letters; T and Close start 4 px in so they never touch the column before.
    ------------------------------------------------------------------------------------------ */
 #m-watch:focus { outline: none; }
-#m-watch .ptools button { height: 16px; min-width: 22px; padding: 0 4px; font: 600 10px/1 var(--font-ui); }
-#m-watch .ptools input.srch { width: 92px; height: 16px; }
+#m-watch .ptools button { height: 16px; min-width: 20px; padding: 0 4px; font: 600 10px/1 var(--font-ui); }
+#m-watch .ptools input.srch { width: 64px; height: 16px; }
+/* the filter bar: categories, venue, sort, the row count (THE UNIVERSE) */
+#tab-manual .wbar { flex: 0 0 20px; height: 20px; display: flex; align-items: center; gap: 1px; padding: 0 4px; background: var(--bg2); border-bottom: 1px solid var(--line); white-space: nowrap; overflow: hidden; }
+#tab-manual .wbar button { height: 16px; min-width: 0; padding: 0 4px; font: 600 10px/1 var(--font-ui); letter-spacing: .02em; }
+#tab-manual .wbar button.wv, #tab-manual .wbar button.wo { margin-left: 4px; font-family: var(--font-num); }
+#tab-manual .wbar .wn { margin-left: auto; font: 10px/1 var(--font-num); color: var(--tx2); }
+/* virtual rows: every row is 18 px exactly (the spacer rows count on it) */
+#tab-manual table.watch td, #tab-manual table.browse td { height: 18px; }
+table.grid tr.vpad > td { padding: 0; border: 0; }
+#tab-manual table.watch th.pin, #tab-manual table.browse th.pin { padding: 0; text-align: center; }
+#tab-manual table.watch td.pin, #tab-manual table.browse td.pin { padding: 0; text-align: center; color: var(--tx2); cursor: pointer; font: 11px/1 var(--font-ui); }
+#tab-manual table.watch td.pin.on, #tab-manual table.browse td.pin.on { color: var(--tx0); }
+#tab-manual table.watch tr.cat > td, #tab-manual table.browse tr.cat > td { color: var(--tx0); font-weight: 700; background: var(--bg2); cursor: pointer; }
+#tab-manual table.watch tr.uni > td.t, #tab-manual table.browse tr.uni > td.t { color: var(--tx1); }
+#tab-manual table.watch tr.ph > td, #tab-manual table.browse tr.ph > td { color: var(--tx2); }
+
+/* ------------------------------------------------------------------------------------------
+   THE MARKET BROWSER: an overlay over the watchlist and the first two ladders
+   ------------------------------------------------------------------------------------------ */
+#m-browse { display: none; position: absolute; left: 0; top: 0; bottom: 0; width: min(100%, calc(var(--watch-w) + 2 * var(--lad-w) + 2px)); z-index: 6;
+            border-right: 1px solid var(--line2); }
+body.browse #m-browse { display: flex; }
+#m-browse:focus { outline: none; }
+#m-browse .ptools button { height: 16px; min-width: 22px; padding: 0 5px; font: 600 10px/1 var(--font-ui); }
+#m-browse .ptools input.srch { width: 180px; height: 16px; }
+#m-browse .ptools .pinfo { min-width: 64px; text-align: right; }
+#tab-manual table.browse th, #tab-manual table.browse td { padding: 0 3px; }
+#tab-manual table.browse td { font-size: 11px; }
+#tab-manual table.browse td.t { font: 11px/1 var(--font-ui); }
+#tab-manual table.browse td.lbl { color: var(--tx1); }
+#tab-manual table.browse td.tcl { font: 10px/1 var(--font-num); color: var(--tx1); }
+#tab-manual table.browse tr.grp > td { cursor: pointer; }
 #tab-manual table.watch th { padding: 0 1px; }
 #tab-manual table.watch th:first-child { padding-left: 4px; }
 #tab-manual table.watch td { padding: 0 2px; font-size: 11px; }

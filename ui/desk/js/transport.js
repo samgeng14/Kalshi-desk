@@ -17,6 +17,7 @@
  *   Desk.transport.connect(onEnv(env), onState(state, isReconnect))   ('open' on every open)
  *   Desk.transport.snapshot() -> Promise<snapshot>
  *   Desk.transport.post(path, body) -> Promise<{status, json}>   (status 0 = no answer)
+ *   Desk.transport.get(path) -> Promise<{status, json}>          (GET /api/universe)
  *
  * Desk.token: the per-start X-Desk token the backend writes into the page
  * (<meta name="desk-token">). Every POST carries it. Live mode re-reads it from the page after
@@ -30,7 +31,7 @@
  *   Desk.act.order({v, tk, side, px (u), qty, tif, ttl_s, exp_ms, reduce_only, override, touch (u),
  *                   onReply(r, cid)}, ev) -> cid | null
  *   Desk.act.cancel(cids), Desk.act.cancelWhere({v, tk, own, side, px}), Desk.act.cancelAll(own, v)
- *   Desk.act.lane(id, on), Desk.act.start(), .stop(), .kill(), .rearm(), .release(v, tk),
+ *   Desk.act.lane(id, on), Desk.act.start(), .stop(), .kill(), .rearm(), .release(v, tk), .watch(v, tk, on),
  *   .transfer(from, to, amt (u)), .resync()
  *   Desk.act.killing          null, or {at, tries, failed} from the KILL click until the backend
  *                             confirms it. KILL retries by itself (1, 2 ... 5 s apart) until it
@@ -167,6 +168,7 @@
       return r.json;
     });
   };
+  Live.prototype.get = function (path) { return fetchJSON('GET', path, undefined, 5000); };
   Live.prototype.post = function (path, body) {
     return fetchJSON('POST', path, body, 5000).then(function (r) {
       if (r.status !== 403 || !(r.json && r.json.err && r.json.err.code === 'FORBIDDEN')) return r;
@@ -205,6 +207,7 @@
     return this.request('GET', '/api/snapshot?sid=' + this.sid).then(function (r) { return r.json; });
   };
   Demo.prototype.post = function (path, body) { return this.request('POST', path, body); };
+  Demo.prototype.get = function (path) { return this.request('GET', path); };
   Demo.prototype.close = function () { if (this.sim) this.sim.stop(); };
 
   // ---------------------------------------------------------------------------------------------
@@ -226,6 +229,7 @@
     connect: function (onEnv, onState) { T.impl.connect(onEnv, onState); },
     snapshot: function () { return T.impl.snapshot(); },
     post: function (path, body) { return T.impl.post(path, body); },
+    get: function (path) { return T.impl ? T.impl.get(path) : Promise.resolve({ status: 0, json: null }); },
     sim: function () { return T.impl && T.impl.sim ? T.impl.sim : null; }
   };
 
@@ -388,6 +392,18 @@
       return killSend();
     },
     rearm: function () { return T.post('/api/rearm', {}).then(runReply('rearm')); },
+    // the watchlist star: shown at once (store.pinPend), the backend's mkt echo confirms it; a
+    // refusal puts it back
+    watch: function (v, tk, on) {
+      var S = st(), key = v + '|' + tk;
+      S.pinPend.set(key, { on: !!on, at: Date.now() });
+      Desk.render.mark('mkt'); Desk.render.mark('uni');
+      return T.post('/api/watch', { v: v, tk: tk, on: !!on }).then(function (r) {
+        if (!(r.json && r.json.ok)) { S.pinPend.delete(key); Desk.render.mark('mkt'); Desk.render.mark('uni'); failAlert('watch ' + tk, r); }
+        else if (S.markets.has(key) && !!S.markets.get(key).pin === !!on) { S.pinPend.delete(key); }
+        return r;
+      });
+    },
     release: function (v, tk) { return T.post('/api/release', { v: v, tk: tk }).then(function (r) { if (!(r.json && r.json.ok)) failAlert('release', r); return r; }); },
     // move free cash between Kalshi shards; amt in u
     transfer: function (from, to, amt) {

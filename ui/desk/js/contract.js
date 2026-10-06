@@ -94,7 +94,30 @@
  * - Rates: hdr at most 4/s and only on change; book coalesced to at most 20/s per ticker;
  *   pos/risk at most 1/s on mark changes (immediately on fills); hb exactly 1/s.
  * - Event types: hdr, mkt, book, ord, fill, pos, lane, risk, mo, alert, hb (shapes below).
- *   "mkt" is the market universe (listings, rolls of the 15-minute windows, settlement).
+ *   "mkt" is the LIVE SET (listings, rolls of the 15-minute windows, settlement): the markets the
+ *   stream carries. Discovery of everything else is paged, never streamed (THE UNIVERSE below).
+ *
+ * ---------------------------------------------------------------------------------------------
+ * THE UNIVERSE (contract 1.4): everything that settles today (T) and tomorrow (T1)
+ * ---------------------------------------------------------------------------------------------
+ * Kalshi alone lists ~84,000 markets a day, most of them tiny brackets; no screen streams that.
+ * - The backend keeps the day's listing (both venues) in memory, refreshed from the venues'
+ *   REST listings, and serves it through GET /api/universe: filtered (day, category, venue,
+ *   text), sorted, and paged (at most 200 rows a request). Each row is compact: ticker, title,
+ *   category, group, close time, bid, ask, spread, volume, venue, fee type, the model's fair and
+ *   its take edge where the desk has a model, and whether it is pinned or live. A row is a
+ *   snapshot: the page re-asks for the rows on screen every few seconds while it shows them.
+ * - The LIVE SET (mkt events and books on the stream) is: the markets the desk's lanes trade,
+ *   the operator's watchlist (POST /api/watch pins a market; mkt.pin), every market with a
+ *   position or a working order, and the ladders' markets (POST /api/subscribe: a ladder on a
+ *   market outside the live set brings it in: its mkt event comes first, then its book).
+ * - Days and dates: mkt.date / row.date is the ET date the market's outcome is decided (a
+ *   15-minute window's close date, a weather day, a game's date, a release date); hb.date and
+ *   snapshot.date are today's ET date on the server clock. The page shows T (date <= today) and
+ *   T1 (date > today) apart.
+ * - Categories (CAT): SPORTS (grouped by league and game), WEATHER, FIN (15-minute and hourly
+ *   windows, daily index/crypto/FX/commodity closes), ECON (daily econ releases, gas, rates),
+ *   OTHER. Each market has a group: grp, or for a game grp + its matchup (gk on a row).
  *
  * ---------------------------------------------------------------------------------------------
  * SEMANTICS (what the numbers mean; the demo venues in sim.js compute exactly these)
@@ -149,6 +172,7 @@
  *   .validateEvent(envelope)     -> [error strings]
  *   .validateRequest(endpointKey, body)  e.g. ('POST /api/order', {...})
  *   .validateResponse(endpointKey, httpStatus, json)
+ *   .parseQuery(path) -> {k: v} (offset, limit as numbers), .validateQuery(endpointKey, query)
  *   .endpointFor(method, path) -> endpoint key or null ('/api/lane/M1' -> 'POST /api/lane/{id}')
  */
 (function (root) {
@@ -195,6 +219,7 @@
            ok: function (v) { return typeof v === 'string' && RE_CID.test(v); } },
     tk: { doc: 'venue ticker (Kalshi ticker or Polymarket US slug)',
           ok: function (v) { return typeof v === 'string' && RE_TK.test(v); } },
+    date: { doc: 'ET calendar date YYYY-MM-DD', ok: function (v) { return typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v); } },
     id: { doc: 'short identifier ^[A-Za-z0-9._:|-]{1,64}$',
           ok: function (v) { return typeof v === 'string' && RE_ID.test(v); } }
   };
@@ -237,6 +262,10 @@
     PREFLIGHT: ['KEY', 'CASH', 'SHARD', 'CLK', 'DISK', 'FEED', 'PRIV', 'GROUPS'],
     FEED: ['KX', 'KXP', 'PM'],             // Kalshi market data, Kalshi private (orders/fills), Polymarket
     MODE: ['DEMO', 'LIVE'],
+    // THE UNIVERSE: categories in display order, the two days, the sort keys of GET /api/universe
+    CAT: ['SPORTS', 'WEATHER', 'FIN', 'ECON', 'OTHER'],
+    UNI_DAY: ['T', 'T1'],
+    UNI_SORT: ['vol', 'sprd', 'close', 'edge'],
     // why an order is in its state. '' while PEND/WORK/PART/FILL.
     WHY: ['', 'USER', 'KILL', 'STOP', 'HALT', 'PULL', 'IOC_REST', 'FOK', 'POST_CROSS', 'STP', 'TAKEOVER',
           'MARKET_CLOSED', 'EXPIRY', 'BAD_REQUEST', 'OFF_GRID', 'BAD_QTY', 'UNKNOWN_MARKET',
@@ -347,8 +376,11 @@
     shard: 'id?',                   // Kalshi cash shard ('S0'..'S3'); null on Polymarket
     lip: 'bool',                    // pays Kalshi's Liquidity Incentive Program
     start_ms: 'ms?',                // GAME: scheduled start (the ticket's START expiry); null otherwise
-    man: 'bool'                     // held by Manual: a manual order here cancelled Systematic's
+    man: 'bool',                    // held by Manual: a manual order here cancelled Systematic's
                                     // orders (why TAKEOVER); lanes stay out until POST /api/release
+    cat: ['enum'].concat(enums.CAT),   // category (THE UNIVERSE)
+    date: 'date',                   // ET date the outcome is decided (T / T1 against hb.date)
+    pin: 'bool'                     // on the operator's watchlist (POST /api/watch)
   };
   S.book = {
     v: ['enum'].concat(enums.VENUE),
@@ -476,10 +508,45 @@
     epoch: 'id',                           // changes when the backend restarts -> resync
     sid: 'str',
     srv_ms: 'ms',
+    date: 'date',                          // today, ET (the T of THE UNIVERSE)
     feeds: { KX: FEED_OBJ, KXP: FEED_OBJ, PM: FEED_OBJ }
   };
 
   var SUBS = { ladders: ['arr', MKT_REF], tops: ['or', ['enum', 'ALL'], ['arr', MKT_REF]] };
+  // one row of GET /api/universe
+  S.uni = {
+    v: ['enum'].concat(enums.VENUE),
+    tk: 'tk',
+    ev: 'tk',
+    title: 'str',
+    short: 'str',                          // as mkt.short
+    cat: ['enum'].concat(enums.CAT),
+    grp: 'str',                            // as mkt.grp
+    gk: 'str',                             // the group the page shows it under: grp, or for a game grp + matchup
+    kind: ['enum'].concat(enums.KIND),
+    date: 'date',
+    close_ms: 'ms',
+    bid: 'price?',                         // best YES bid (null: none)
+    ask: 'price?',                         // best YES ask (null: none)
+    sprd: 'price?',                        // ask - bid (null when one side is empty)
+    vol: 'size',                           // contracts traded today
+    fee: { type: ['enum'].concat(enums.FEE_TYPE), mult: 'num' },
+    fair: 'price?',                        // model fair where the desk has a model
+    edge: 'money?',                        // the better take at the touch vs fair, after the taker fee, per contract
+    pin: 'bool',                           // on the watchlist
+    live: 'bool'                           // in the live set (its mkt and book are on the stream)
+  };
+  var UNI_RESP = {
+    ok: ['enum', true],
+    day: ['enum'].concat(enums.UNI_DAY),
+    date: 'date',                          // the ET date that day is
+    total: 'count',                        // rows matching the filters
+    offset: 'count',
+    rows: ['arr', S.uni],                  // rows offset .. offset + limit - 1 of the ordered result
+    groups: ['arr', { gk: 'str', cat: ['enum'].concat(enums.CAT), n: 'count' }],   // every group of the result, in order
+    cats: ['map', 'count'],                // rows per category for this day, venue and text (ignoring cat)
+    ts_ms: 'ms'
+  };
 
   // ---------------------------------------------------------------------------------------------
   // Examples (each validates against its schema; the node test checks this)
@@ -509,7 +576,8 @@
     kind: 'LIP15', og: 'KXNATGAS15M-26OCT061930', oc: 'UP',
     open_ms: T0 + 900000, close_ms: T0 + 1800000, status: 'OPEN', result: null,
     grid: [{ start: '0.0000', end: '1.0000', step: '0.0100' }],
-    fee: { type: 'QUAD', mult: 1 }, shard: 'S3', lip: true, start_ms: null, man: false
+    fee: { type: 'QUAD', mult: 1 }, shard: 'S3', lip: true, start_ms: null, man: false,
+    cat: 'FIN', date: '2026-10-06', pin: true
   };
   EX.book = {
     v: 'K', tk: 'KXNATGAS15M-26OCT061930-30', depth: 'FULL',
@@ -556,7 +624,13 @@
   };
   EX.mo = { fid: 'K-F-000231', h: '10s', mo: '0.0050', mid: '0.6350' };
   EX.alert = { id: 'a-912', lvl: 'WARN', src: 'PM', msg: 'PM key 401: positions unknown', ts_ms: T0 + 1200000 };
-  EX.hb = { epoch: 'e-1791300000', sid: 'k3f9x2ab', srv_ms: T0 + 1200000,
+  EX.uni = {
+    v: 'K', tk: 'KXHIGHDEN-26OCT06-B71.5', ev: 'KXHIGHDEN-26OCT06', title: 'Will the maximum temperature be 71-72\u00b0 on Oct 6, 2026?',
+    short: 'DEN 71-72', cat: 'WEATHER', grp: 'WX DEN 10/06', gk: 'WX DEN 10/06', kind: 'WEATHER', date: '2026-10-06',
+    close_ms: T0 + 6 * 3600000, bid: '0.3100', ask: '0.3500', sprd: '0.0400', vol: 412, fee: { type: 'QUAD', mult: 1 },
+    fair: '0.3600', edge: '-0.0074', pin: false, live: false
+  };
+  EX.hb = { epoch: 'e-1791300000', sid: 'k3f9x2ab', srv_ms: T0 + 1200000, date: '2026-10-06',
             feeds: { KX: { up: true, gap: false, lag_ms: 34 }, KXP: { up: true, gap: false, lag_ms: 21 },
                      PM: { up: true, gap: false, lag_ms: 210 } } };
 
@@ -597,7 +671,8 @@
     seq: 'count',          // last stream seq this snapshot includes; apply stream messages with seq > this
     srv_ms: 'ms',
     hdr: S.hdr,
-    markets: ['arr', S.mkt],          // every OPEN market, plus those that closed or settled in the last 30 min
+    date: 'date',                     // today, ET (as hb.date)
+    markets: ['arr', S.mkt],          // the live set (THE UNIVERSE), plus those that closed or settled in the last 30 min
     books: ['arr', S.book],           // the stream's current subscriptions (FULL and TOP)
     orders: ['arr', S.ord],           // every non-terminal order, plus terminal ones from the last 2 min
     fills: ['arr', S.fill],           // today's fills, the newest 5000 at most, oldest first
@@ -733,6 +808,23 @@
       errors: ['UNKNOWN_MARKET'],
       example: { request: { v: 'K', tk: 'KXNATGAS15M-26OCT061930-30' }, response: { ok: true } }
     },
+    'GET /api/universe': {
+      doc: 'THE UNIVERSE, paged. Query: day=T|T1 (required), cat= (a CAT, or empty for all), v= (K, P or empty), q= (text: matches tk, title, short and gk, case-insensitive), sort=vol|sprd|close|edge (default close), offset= (default 0), limit= (1 to 200, default 100). Order: category (CAT order), then group (each category\'s groups by their best row under the sort), then rows by the sort (vol most first, sprd and close least first, edge best first; a missing spread or edge last), ties by tk. groups lists every group of the result in that order with its row count, so the page can lay out the whole result and fetch only the pages it shows. A query outside this contract is refused BAD_REQUEST.',
+      query: { day: ['enum'].concat(enums.UNI_DAY), 'cat?': ['or', ['enum', ''], ['enum'].concat(enums.CAT)], 'v?': ['enum', '', 'K', 'P'], 'q?': 'str',
+               'sort?': ['enum'].concat(enums.UNI_SORT), 'offset?': 'count', 'limit?': 'count' },
+      response: UNI_RESP,
+      errors: ['BAD_REQUEST', 'FORBIDDEN', 'INTERNAL'],
+      example: { query: { day: 'T', cat: 'WEATHER', q: 'den', sort: 'vol', offset: 0, limit: 100 },
+                 response: { ok: true, day: 'T', date: '2026-10-06', total: 1, offset: 0, rows: [EX.uni], groups: [{ gk: 'WX DEN 10/06', cat: 'WEATHER', n: 1 }],
+                             cats: { SPORTS: 0, WEATHER: 1, FIN: 0, ECON: 0, OTHER: 0 }, ts_ms: T0 } }
+    },
+    'POST /api/watch': {
+      doc: 'Pin a market to the watchlist (on true) or unpin it (on false). Pinning brings it into the live set: its mkt event (pin true) and its book follow on the stream. Unpinning sends its mkt event with pin false; it stays live while a lane, a position, a working order or a ladder holds it. Idempotent.',
+      request: { v: ['enum'].concat(enums.VENUE), tk: 'tk', on: 'bool' },
+      response: { ok: ['enum', true], pin: 'bool' },
+      errors: ['UNKNOWN_MARKET'],
+      example: { request: { v: 'K', tk: 'KXHIGHDEN-26OCT06-B71.5', on: true }, response: { ok: true, pin: true } }
+    },
     'POST /api/transfer': {
       doc: 'Move free cash between two Kalshi shards (the ticket\'s one-click MOVE when a shard is short). amt must not exceed the source shard\'s free cash. The reply comes after the exchange confirms; hdr and risk then carry the new shard cash.',
       request: { from: 'id', to: 'id', amt: 'money' },
@@ -748,7 +840,7 @@
   // cancels and KILL are never rate-limited.
   Object.keys(endpoints).forEach(function (k) {
     var ep = endpoints[k];
-    if (ep.request !== undefined || k === 'GET /api/snapshot') ep.error = ERR_RESP;
+    if (ep.request !== undefined || k === 'GET /api/snapshot' || k === 'GET /api/universe') ep.error = ERR_RESP;
     if (k.indexOf('POST ') === 0) {
       ep.errors = ['FORBIDDEN', 'BAD_REQUEST'].concat((ep.errors || []).filter(function (c) { return c !== 'FORBIDDEN' && c !== 'BAD_REQUEST' && c !== 'INTERNAL'; }), ['INTERNAL']);
     }
@@ -839,6 +931,23 @@
     var h = String(host || '').toLowerCase();
     return h === '127.0.0.1:' + port || h === 'localhost:' + port;
   }
+  // GET /api/universe: the query string parsed into typed values ({} on garbage), and checked
+  function parseQuery(path) {
+    var out = {}, qs = String(path).split('?')[1] || '';
+    qs.split('&').forEach(function (kv) {
+      if (!kv) return;
+      var i = kv.indexOf('='), k = decodeURIComponent(i < 0 ? kv : kv.slice(0, i)), v = i < 0 ? '' : decodeURIComponent(kv.slice(i + 1).replace(/\+/g, ' '));
+      out[k] = (k === 'offset' || k === 'limit') && /^\d+$/.test(v) ? +v : v;
+    });
+    return out;
+  }
+  function validateQuery(key, q) {
+    var ep = endpoints[key];
+    if (!ep || !ep.query) return ['no query schema for ' + key];
+    var errs = validate(ep.query, q, '$', []);
+    if (key === 'GET /api/universe' && q.limit !== undefined && (q.limit < 1 || q.limit > 200)) errs.push('$.limit: 1 to 200');
+    return errs;
+  }
   function endpointFor(method, path) {
     var p = String(path).split('?')[0];
     if (/^\/api\/lane\/[A-Za-z0-9_-]+$/.test(p)) p = '/api/lane/{id}';
@@ -880,7 +989,7 @@
   }
 
   Desk.contract = {
-    version: '1.3.0',               // 1.3: exp_ms up to the market's close (CLOSE, until close)
+    version: '1.4.0',               // 1.3: exp_ms up to the market's close (CLOSE); 1.4: THE UNIVERSE
     TOKEN_META: 'desk-token',            // <meta name="desk-token" content="..."> in the served page
     hostOk: hostOk,
     types: types,
@@ -897,6 +1006,8 @@
     validateEvent: validateEvent,
     validateRequest: validateRequest,
     validateResponse: validateResponse,
+    validateQuery: validateQuery,
+    parseQuery: parseQuery,
     endpointFor: endpointFor
   };
 })(typeof window !== 'undefined' ? window : globalThis);

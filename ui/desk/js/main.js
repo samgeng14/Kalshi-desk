@@ -29,6 +29,7 @@
     Desk.press.attach();
     safe('header', function () { Desk.header.init(); });
     safe('manual', function () { if (Desk.manual && Desk.manual.init) Desk.manual.init(); });
+    safe('browse', function () { if (Desk.browse && Desk.browse.init) Desk.browse.init(); });
     safe('systematic', function () { if (Desk.systematic && Desk.systematic.init) Desk.systematic.init(); });
     Desk.render.add({ id: 'manual', tab: 'manual', fn: function (d) { if (Desk.manual && Desk.manual.render) Desk.manual.render(d); } });
     Desk.render.add({ id: 'systematic', tab: 'systematic', fn: function (d) { if (Desk.systematic && Desk.systematic.render) Desk.systematic.render(d); } });
