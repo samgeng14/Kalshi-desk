@@ -1,0 +1,81 @@
+#pragma once
+// deskd, composed: the owners of section 2's table, each on its own named thread.
+//
+//   md-k, priv-k     Kalshi market data and private feed (week 0: placeholders, feeds down)
+//   gw               the gateway: run state, inbox lanes and deletions
+//   send-k1          Manual's sender; send-k2, send-k3 Systematic's (week 0: placeholders)
+//   send-cx          cancels and KILL, on its own path
+//   strat, store     placeholders
+//   pub              the screen's streams, hb, hdr, snapshots
+//   ops              heartbeat file, disk, preflight rows
+//   web              cpp-httplib, 16 request threads of its own
+//
+// The app owns the account lock for its whole life and will not start without it.
+#include <memory>
+#include <nlohmann/json.hpp>
+#include <string>
+#include <vector>
+
+#include "deskd/app/config.h"
+#include "deskd/app/lock.h"
+#include "deskd/app/ops.h"
+#include "deskd/app/worker.h"
+#include "deskd/bus/queue.h"
+#include "deskd/gw/gateway.h"
+#include "deskd/gw/kill.h"
+#include "deskd/md/feed.h"
+#include "deskd/net/guard.h"
+#include "deskd/net/send.h"
+#include "deskd/store/store.h"
+#include "deskd/web/pub.h"
+#include "deskd/web/server.h"
+
+namespace deskd {
+
+class Deskd {
+ public:
+  Deskd(DeskdConfig cfg, std::unique_ptr<AccountLock> lock);
+  ~Deskd();
+  Deskd(const Deskd&) = delete;
+  Deskd& operator=(const Deskd&) = delete;
+
+  // binds the port (cfg.http_port; 0 = any free one) and starts every worker
+  bool start(std::string* err);
+  void stop();   // web first (streams end, no new requests), then every owner; idempotent
+
+  int port() const { return web_ ? web_->port() : 0; }
+  const std::string& token() const { return token_; }
+  const std::string& epoch() const { return epoch_; }
+  const DeskdConfig& config() const { return cfg_; }
+  nlohmann::json status() const;   // GET /ops/status, deskctl status
+
+  // the parts, for tests and status
+  Gateway& gw() { return *gw_; }
+  KillSwitch& kill_switch() { return kill_; }
+  Pub& pub() { return *pub_; }
+  Ops& ops() { return *ops_; }
+  Feeds& feeds() { return feeds_; }
+  const SenderStats& cx_stats() const { return cx_stats_; }
+  const SendGuard& send_guard() const { return guard_; }
+  const Worker* worker(const std::string& name) const;
+
+ private:
+  DeskdConfig cfg_;
+  std::unique_ptr<AccountLock> lock_;
+  std::string epoch_, token_;
+  std::int64_t started_ms_ = 0;
+  SendGuard guard_;
+  Feeds feeds_;
+  KillSwitch kill_;
+  BoundedQueue<SendJob> q_k1_{256, 64}, q_k2_{1024, 64}, q_k3_{1024, 64}, q_cx_{256, 256};
+  SenderStats k1_stats_, k2_stats_, k3_stats_, cx_stats_;
+  StoreWorker store_;
+  std::vector<std::unique_ptr<Worker>> workers_;   // in start order; web last
+  std::unique_ptr<Ops> ops_;
+  std::unique_ptr<Gateway> gw_;
+  std::unique_ptr<Pub> pub_;
+  std::unique_ptr<WebServer> web_;
+  bool started_ = false, stopped_ = false;
+};
+
+}  // namespace deskd
