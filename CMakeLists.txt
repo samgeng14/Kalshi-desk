@@ -320,4 +320,28 @@ foreach(t bus ops web process)
   add_test(NAME deskd-${t} COMMAND deskd-test-${t})
 endforeach()
 add_dependencies(deskd-test-process deskd deskctl)
-add_custom_target(deskd-all DEPENDS deskd deskctl deskd-test-bus deskd-test-ops deskd-test-web deskd-test-process)
+
+# ---- tests/fake_exchange: a fake Kalshi for deskd's tests (plan section 8) ---------------------
+# The Trade API v2 and its WebSocket on one loopback port, the venue's paths and shapes, a matching
+# engine, books from a recorded tape or a scenario, and faults on demand. It shares no code with
+# deskd_core (a fake that parsed with deskd's parsers would agree with deskd's mistakes); it only
+# reuses deskd_core's precompiled header. fake-kalshi runs it on its own for soak runs.
+find_package(ZLIB REQUIRED)
+add_library(fake_kalshi STATIC
+  tests/fake_exchange/wire.cpp
+  tests/fake_exchange/engine.cpp
+  tests/fake_exchange/net.cpp
+  tests/fake_exchange/rest.cpp
+  tests/fake_exchange/tape.cpp
+  tests/fake_exchange/fake_kalshi.cpp
+  tests/fake_exchange/client.cpp)
+target_include_directories(fake_kalshi PUBLIC tests/fake_exchange)
+target_link_libraries(fake_kalshi PUBLIC deskd_flags OpenSSL::Crypto ZLIB::ZLIB)
+target_precompile_headers(fake_kalshi REUSE_FROM deskd_core)
+
+add_executable(fake-kalshi tests/fake_exchange/main.cpp)
+target_link_libraries(fake-kalshi PRIVATE fake_kalshi)
+target_precompile_headers(fake-kalshi REUSE_FROM deskd_core)
+
+add_custom_target(deskd-all DEPENDS deskd deskctl deskd-test-bus deskd-test-ops deskd-test-web deskd-test-process
+                                    fake-kalshi)
