@@ -1,5 +1,6 @@
 build/
 build-ci/
+build-deskd/
 data/
 config/desk.json*
 *.pem
@@ -12,6 +13,9 @@ __pycache__/
 # Secrets live here, never in git. The desk reads them by path.
 .secrets/
 *.key
+# Config backups copy the key ID with everything else: config/desk.json.bak-20260906 was tracked
+# until 2026-10-06. Named on its own so no backup is tracked again, whatever its suffix.
+config/*.bak*
 
 # editor and runtime strays
 *.bak-*
