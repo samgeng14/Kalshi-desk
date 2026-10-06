@@ -8,6 +8,32 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 
+# ---- build speed and build safety (2026-10-06) --------------------------------
+# Configure with -G Ninja. Ninja runs ncpu + 2 jobs (12 on this Mac) when not told otherwise,
+# and an unbounded build once stalled the live desk for 18 minutes (2026-09-24). Under Ninja
+# every compile, PCH included, goes through a pool of DESK_BUILD_JOBS and every link through 2,
+# whatever -j says. Makefiles ignore pools: there, -j 4 is still on you.
+set(DESK_BUILD_JOBS 4 CACHE STRING "most compile jobs at once under Ninja (the live desk's limit)")
+set_property(GLOBAL APPEND PROPERTY JOB_POOLS desk_compile=${DESK_BUILD_JOBS} desk_link=2)
+set(CMAKE_JOB_POOL_COMPILE desk_compile)
+set(CMAKE_JOB_POOL_PRECOMPILE_HEADER desk_compile)
+set(CMAKE_JOB_POOL_LINK desk_link)
+
+# ccache when it is installed (brew install ccache); the build works the same without it.
+# deskd precompiles json.hpp and httplib.h, and ccache misses on every file that uses a PCH
+# unless it ignores the PCH's defines and the header times (the PCH is rebuilt with a new mtime
+# and ctime) and clang leaves its build time out of the PCH (-fno-pch-timestamp, on deskd's
+# targets below). The sloppiness rides on the launcher, so no ~/.config/ccache edit is needed.
+find_program(CCACHE_EXE ccache)
+if(CCACHE_EXE AND NOT DEFINED CMAKE_CXX_COMPILER_LAUNCHER)
+  set(CMAKE_CXX_COMPILER_LAUNCHER
+      ${CMAKE_COMMAND} -E env "CCACHE_SLOPPINESS=pch_defines,time_macros,include_file_mtime,include_file_ctime"
+      ${CCACHE_EXE})
+  message(STATUS "ccache: ${CCACHE_EXE}")
+elseif(NOT CCACHE_EXE)
+  message(STATUS "ccache: not found, building without it (brew install ccache)")
+endif()
+
 # ---- dependencies -----------------------------------------------------------
 # macOS: OpenSSL comes from Homebrew (brew install openssl@3). curl and sqlite3
 # ship with the Xcode command line tools.
