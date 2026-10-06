@@ -350,7 +350,7 @@
         local: { pend: true, cxlPend: false, prov: false, at: now, acked: false }
       };
       st.orders.set(o.cid, o);
-      mark('ord'); mark('ord:' + key);
+      mark('ord'); mark('ord:' + key); mark('mord:' + key);
       return o;
     },
     // the HTTP answer to POST /api/order; status 0 = no answer at all
@@ -372,7 +372,7 @@
             o.st = 'REJ'; o.why = Desk.contract && Desk.contract.enums.WHY.indexOf(e.code) >= 0 ? e.code : 'INTERNAL';
             o.left = 0; o.terminal = true; o.doneAt = nowMs();
             if (o.local) { o.local.pend = false; o.local.prov = true; }
-            mark('ord'); mark('ord:' + o.key);
+            mark('ord'); mark('ord:' + o.key); mark('mord:' + o.key);
           }
           st.localAlert('WARN', 'GW', 'REJ ' + e.code + ' ' + what + ': ' + e.msg);
         } else {
@@ -396,6 +396,7 @@
         if (!o.local) o.local = { pend: false, cxlPend: false, prov: false, at: nowMs(), acked: true };
         o.local.cxlPend = on !== false;
         mark('ord:' + o.key);
+        if (o.own !== 'SYS') mark('mord:' + o.key);
       });
       mark('ord');
     },
@@ -494,13 +495,14 @@
       st.orders.set(o.cid, o);
       if (o.st !== 'PEND' && !quiet) st.acked(o.cid);
       mark('ord'); mark('ord:' + o.key);
+      if (o.own !== 'SYS') mark('mord:' + o.key);      // a manual (or foreign) order: painted at once
     },
-    fill: function (d) {
+    fill: function (d, env, fromSnap) {
       if (st.fillIdx.has(d.fid)) return;
       var f = {
         fid: d.fid, cid: d.cid, oid: d.oid, v: d.v, tk: d.tk, key: d.v + '|' + d.tk, side: d.side, px: px(d.px), qty: d.qty,
         liq: d.liq, fee: money(d.fee), ts_ms: d.ts_ms, own: d.own, lane: d.lane, mid: px(d.mid), fair: px(d.fair),
-        real: money(d.real), mo: {}
+        real: money(d.real), mo: {}, at: fromSnap ? 0 : nowMs()       // at: local receive time (0 from a snapshot)
       };
       var pend = st.moPending.get(d.fid);
       if (pend) { pend.forEach(function (m) { f.mo[m.h] = m.mo; }); st.moPending.delete(d.fid); }

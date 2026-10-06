@@ -1015,6 +1015,67 @@ function manOrders(P, key) { const a = []; P.D.store.orders.forEach(o => { if (o
     draw('');
     eq(n, 1, 'a level that goes away does not flash (no grey box on an empty cell)');
   }
+  // ---- FLASH: calm by default (SUBTLE), routine book updates only with FULL, nothing with OFF ---
+  {
+    const proto = P.doc.createElement('td').constructor.prototype, anim0 = proto.animate;
+    let fl = [];
+    proto.animate = function (kf, o) { fl.push({ el: this, ms: o && o.duration, c: kf && kf[0] && kf[0].boxShadow }); return { cancel() {} }; };
+    const onLad = () => fl.filter(x => A.tb.contains(x.el));
+    const reset = () => { fl = []; rowsOf(A.tb).forEach(r => r.children.forEach(c => { c._flT = 0; })); };
+    eq(D.ui.flash, 'subtle', 'FLASH defaults to SUBTLE');
+    eq(P.doc.documentElement.getAttribute('data-flash'), 'subtle', 'and says so on <html> (the CSS fallback durations)');
+    D.focus.set(natKey, { ladder: 'A' });
+    P.sim().freeze(natKey, { bids: [[6300, 120], [6200, 85]], asks: [[6400, 80], [6500, 210]] }); await run(300);
+    reset();
+    P.sim().freeze(natKey, { bids: [[6300, 140], [6200, 60]], asks: [[6400, 95], [6500, 180]] }); await run(300);
+    eq(ladCell(P, 'A', 6300, 'bq').textContent, '140', 'the new sizes are drawn');
+    eq(onLad().length, 0, 'SUBTLE: a routine size change on the ladder does not flash (the depth bar shows size)');
+    reset();
+    P.sim().trade(natKey, 'BUY', 3); await run(300);
+    const lastPx = onLad().filter(x => /\bpx\b/.test(x.el.className));
+    check(lastPx.length === 1 && /\blast\b/.test(lastPx[0].el.className), 'a print gives the last-trade price row a short highlight', onLad().map(x => x.el.className));
+    check(lastPx.length && lastPx[0].ms >= 400 && lastPx[0].ms <= 600, 'SUBTLE fades over 400-600 ms', lastPx[0] && lastPx[0].ms);
+    check(!onLad().some(x => /\b(bq|aq|lt)\b/.test(x.el.className)), 'and nothing else on the ladder flashes for it');
+    reset();
+    click(ladCell(P, 'A', 6100, 'bq'));
+    const myCid = newest(P, x => x.own === 'MAN').cid;
+    P.frame();
+    check(onLad().some(x => x.el === ladCell(P, 'A', 6100, 'wb')), 'our own order flashes its cell when it is sent');
+    reset();
+    await run(300);
+    check(onLad().some(x => x.el === ladCell(P, 'A', 6100, 'wb')), 'and again when the venue acknowledges it (a state change)');
+    reset();
+    await run(2000, 250);
+    check(!onLad().some(x => x.el === ladCell(P, 'A', 6100, 'wb')), 'the countdown ticking is not a state change: no flash');
+    D.act.cancel([myCid]); await run(300);
+    D.ui.setFlash('full'); reset();
+    eq(D.storage.get('flash'), 'full', 'the FLASH choice is saved (safe storage)');
+    P.sim().freeze(natKey, { bids: [[6300, 100], [6200, 70]], asks: [[6400, 60], [6500, 150]] }); await run(300);
+    check(onLad().some(x => /\bbq\b/.test(x.el.className)) && onLad().every(x => x.ms === 300), 'FULL: size changes flash again, 300 ms', onLad().map(x => x.ms));
+    D.ui.setFlash('off'); reset();
+    P.sim().freeze(natKey, { bids: [[6300, 90], [6200, 75]], asks: [[6400, 66], [6500, 140]] }); P.sim().trade(natKey, 'SELL', 2); await run(300);
+    eq(fl.length, 0, 'OFF: nothing flashes anywhere');
+    key('KeyF', 'f');
+    eq(D.ui.flash, 'subtle', 'f cycles FLASH (OFF to SUBTLE)');
+    // a busy book repaints the ladder at most about 10 times a second
+    const bk = JSON.parse(JSON.stringify(D.contract.examples.book));
+    bk.tk = nat.tk; bk.trades = []; bk.last = null;
+    const p0 = A.paints;
+    for (let i = 0; i < 50; i++) {
+      bk.bids[0][1] = 100 + i; bk.ex_ms = P.clock.t;
+      st._handlers.book(JSON.parse(JSON.stringify(bk)));
+      P.clock.t += 20; P.frame();
+    }
+    const n10 = A.paints - p0;
+    check(n10 >= 8 && n10 <= 11, 'a book updating 50 times a second repaints its ladder about 10 times a second', n10);
+    click(ladCell(P, 'A', 6100, 'bq'));
+    const pp = A.paints; P.frame();
+    eq(A.paints, pp + 1, 'a click still paints on the very next frame');
+    D.act.cancelAll('MAN', null);
+    proto.animate = anim0;
+    P.sim().freeze(natKey, { bids: [[6300, 120], [6200, 85], [6100, 40]], asks: [[6400, 80], [6500, 210], [6700, 12]] });
+    await run(500);
+  }
 
   // ---- 2400 px and wider: a fourth ladder, and SPLIT ------------------------------------------
   P.setXWide(true);

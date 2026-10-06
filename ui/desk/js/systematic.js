@@ -254,7 +254,7 @@
     return true;
   };
   var FILLER = { t: '', cls: 'fill' };
-  Grid.prototype.draw = function (items, keyFn, rowFn, ctx) {
+  Grid.prototype.draw = function (items, keyFn, rowFn, ctx, opts) {
     var cols = this.cols, n = cols.length + (this.fill ? 1 : 0);
     if (!items.length) { D.emptyRow(this.tb, n); return 0; }
     return D.keyedRows(this.tb, items, keyFn, function (it) {
@@ -262,7 +262,7 @@
       for (var i = 0; i < cols.length; i++) out[i] = cols[i].f(it, ctx);
       if (n > cols.length) out[cols.length] = FILLER;
       return out;
-    }, rowFn);
+    }, rowFn, opts);
   };
   Grid.prototype.ids = function () { return this.cols.map(function (c) { return c.id; }); };
 
@@ -272,6 +272,10 @@
   function blank() { return num(''); }
   function signOf(u, unit) { var r = Math.round(u / unit); return r > 0 ? 'up' : (r < 0 ? 'dn' : ''); }
   function pnlC(u) { return has(u) ? num(F.pnl(u), signOf(u, 100)) : blank(); }
+  // P&L that flashes when it moves (green up, red down), at most once every 1.5 s per cell
+  function pnlF(u) { var c = pnlC(u); if (has(u)) { c.fl = 'd'; c.flg = 1500; } return c; }
+  // every cell of a new row (a fill that just arrived) flashes once
+  function nf(c) { c.nf = 'sz'; return c; }
   function moneyC(u, cls) { return has(u) ? num(F.money(u), cls) : blank(); }
   // u per contract as signed cents, coloured by direction, grey under thinN samples
   function centsC(u, n) {
@@ -332,13 +336,13 @@
     { id: 'mo10', h: 'MO10' + C, w: 52, hc: 'n', f: function (r) { return centsC(moOf(r).m10, moOf(r).c10); } },
     { id: 'mo60', h: 'MO60' + C, w: 52, hc: 'n', f: function (r) { return centsC(moOf(r).m60, moOf(r).c60); } },
     { id: 'fees', h: 'Fees', w: 52, hc: 'n', f: function (r) { return moneyC(r.fees, r.fees ? '' : 'dim'); } },
-    { id: 'real', h: 'Real', w: 60, hc: 'n', m: 'dw', f: function (r) { return pnlC(r.real); } },
-    { id: 'unrl', h: 'Unrl', w: 60, hc: 'n', m: 'w', f: function (r) { return pnlC(r.unrl); } },
+    { id: 'real', h: 'Real', w: 60, hc: 'n', m: 'dw', f: function (r) { return pnlF(r.real); } },
+    { id: 'unrl', h: 'Unrl', w: 60, hc: 'n', m: 'w', f: function (r) { return pnlF(r.unrl); } },
     // trading P&L (real + unrl) with LIP in its own column, so a reward cannot hide losing fills;
     // Day = P&L + LIP (what the header's DAY S adds up)
-    { id: 'pnl', h: 'P&L', w: 60, hc: 'n', f: function (r) { return pnlC(r.pnl); } },
+    { id: 'pnl', h: 'P&L', w: 60, hc: 'n', f: function (r) { return pnlF(r.pnl); } },
     { id: 'lip', h: 'LIP', w: 52, hc: 'n', f: function (r) { return r.lip ? num(F.money(r.lip), signOf(r.lip, 100)) : blank(); } },
-    { id: 'day', h: 'Day', w: 60, hc: 'n', m: 'dw', f: function (r) { return pnlC(r.day); } },
+    { id: 'day', h: 'Day', w: 60, hc: 'n', m: 'dw', f: function (r) { return pnlF(r.day); } },
     { id: 'last', h: 'Last', w: 74, hc: 'n', m: 'dw', title: 'time of the lane\'s last signal', f: function (r) { return num(F.time(r.last_ms), 'dim'); } },
     { id: 'why', h: 'Reason', ww: 360, f: function (r) { return txt(r.why, 'dim', r.why || null); } },
     // the lane KILL: grey, red while the lane has live orders (and under the pointer)
@@ -435,7 +439,7 @@
     { id: 'ack', h: 'Ack', w: 44, hc: 'n', m: 'w', f: function (o) { return num(o.t.ack && o.t.sent ? String(Math.max(0, o.t.ack - o.t.sent)) : '', 'dim'); } },
     { id: 'st', h: 'St', w: 80, f: function (o) {
       var t = stText(o);
-      return { t: t, cls: 't st st-' + o.st + (o.terminal && o.why ? ' why' : ''), title: o.terminal && t !== o.st ? t : null };
+      return { t: t, cls: 't st st-' + o.st + (o.terminal && o.why ? ' why' : ''), title: o.terminal && t !== o.st ? t : null, fl: 's', fk: o.st + '|' + o.filled };
     } },
     { id: 'x', h: '', w: 24, f: function (o) {
       if (o.terminal) return { t: '', cls: '', attr: NOLINK_X };
@@ -466,15 +470,17 @@
   // ---------------------------------------------------------------------------------------------
   // FILLS (systematic)
   // ---------------------------------------------------------------------------------------------
+  // a fill that arrived on the stream in the last 3 s (never one drawn at load or after a filter change)
+  function freshFill(f) { return !!f.at && Date.now() - f.at < 3000; }
   function fillEdge(f) { return !has(f.fair) || !(f.qty > 0) ? null : (f.fair - f.px) * sgn(f.side) - (f.fee || 0) / f.qty; }
   var FILL_COLS = [
-    { id: 'time', h: 'Time', w: 88, f: function (f) { return num(F.timeT(f.ts_ms)); } },
-    { id: 'lane', h: 'Lane', w: 56, f: function (f) { return txt(f.lane || ''); } },
+    { id: 'time', h: 'Time', w: 88, f: function (f) { return nf(num(F.timeT(f.ts_ms))); } },
+    { id: 'lane', h: 'Lane', w: 56, f: function (f) { return nf(txt(f.lane || '')); } },
     { id: 'v', h: 'V', w: 24, m: 'w', f: function (f) { return txt(f.v, 'dim'); } },
-    { id: 'mkt', h: 'Market', ww: 280, f: function (f) { return txt(mname(f.key, f.tk), '', f.tk); } },
-    { id: 'side', h: 'Side', w: 48, f: function (f) { return txt(f.side, 'side-' + f.side); } },
-    { id: 'px', h: 'Px', w: 52, hc: 'n', f: function (f) { return num(pxOf(f.px, f.key)); } },
-    { id: 'qty', h: 'Qty', w: 48, hc: 'n', f: function (f) { return num(F.size(f.qty)); } },
+    { id: 'mkt', h: 'Market', ww: 280, f: function (f) { return nf(txt(mname(f.key, f.tk), '', f.tk)); } },
+    { id: 'side', h: 'Side', w: 48, f: function (f) { return nf(txt(f.side, 'side-' + f.side)); } },
+    { id: 'px', h: 'Px', w: 52, hc: 'n', f: function (f) { return nf(num(pxOf(f.px, f.key))); } },
+    { id: 'qty', h: 'Qty', w: 48, hc: 'n', f: function (f) { return nf(num(F.size(f.qty))); } },
     { id: 'liq', h: 'Liq', w: 32, m: 'dw', f: function (f) { return txt(f.liq, 'dim'); } },
     { id: 'fee', h: 'Fee', w: 48, hc: 'n', m: 'dw', f: function (f) { return moneyC(f.fee, f.fee ? '' : 'dim'); } },
     { id: 'fair', h: 'Fair', w: 52, hc: 'n', m: 'dw', f: function (f) { return num(pxOf(f.fair, f.key), 'fair'); } },
@@ -495,7 +501,7 @@
     }
     g.draw(items, function (f) { return f.fid; }, function (f) {
       return { cls: focusCls('s-fills', f.fid, f.key), attr: { 'data-mkt': f.key, 'data-v': f.v } };
-    });
+    }, null, { isNew: freshFill });
     var a = filter ? (agg.lanes.get(filter) || EMPTY) : agg.all;
     D.setText(ui.fillsInfo, a.n ? 'n ' + a.n + ' ctr ' + F.size(Math.round(a.ctr * 100) / 100) : '');
     filterTag(ui.fillsTag);
@@ -521,7 +527,7 @@
     { id: 'pos', h: 'Pos', w: 54, hc: 'n', f: function (r) { if (r.kind !== 'mem') return blank(); var c = q(r, num(r.p ? F.pos6(r.p.pos) : '')); if (r.p && !r.unknown) c.title = F.ssize(r.p.pos); return c; } },
     { id: 'avg', h: 'Avg', w: 50, hc: 'n', m: 'dw', f: function (r) { return r.kind !== 'mem' ? blank() : q(r, num(r.p ? pxOf(r.p.avg, r.mkey) : '')); } },
     { id: 'mark', h: 'Mark', w: 50, hc: 'n', m: 'dw', f: function (r) { return r.kind !== 'mem' ? blank() : q(r, num(r.p ? pxOf(r.p.mark, r.mkey) : '')); } },
-    { id: 'unrl', h: 'Unrl', w: 56, hc: 'n', f: function (r) { return q(r, pnlC(r.unrl)); } },
+    { id: 'unrl', h: 'Unrl', w: 56, hc: 'n', f: function (r) { return q(r, pnlF(r.unrl)); } },
     { id: 'ify', h: 'IfYES', w: 56, hc: 'n', f: function (r) { return r.kind !== 'mem' ? blank() : q(r, pnlC(r.p ? r.p.if_yes : null)); } },
     { id: 'ifn', h: 'IfNO', w: 56, hc: 'n', f: function (r) { return r.kind !== 'mem' ? blank() : q(r, pnlC(r.p ? r.p.if_no : null)); } },
     { id: 'maxl', h: 'MaxL', w: 56, hc: 'n', f: function (r) { return q(r, moneyC(r.maxl, r.maxl ? '' : 'dim')); } },

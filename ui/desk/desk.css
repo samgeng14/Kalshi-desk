@@ -3,7 +3,8 @@
  * The desk's visual system. Rules: no rounded corners, no drop shadows, no gradients as
  * decoration, no emoji; colour only for meaning (bid/buy blue, ask/sell red, up/down, attention
  * amber, failure red, model fair purple); everything else grey. Panels tile edge to edge with
- * 1 px gaps; the page never scrolls, panels scroll inside. The only motion is a 300 ms flash.
+ * 1 px gaps; the page never scrolls, panels scroll inside. The only motion is a short value flash
+ * (FLASH: OFF / SUBTLE 500 ms fade, the default / FULL 300 ms; core.js).
  * Inset box-shadows below draw 1-2 px rules (selected row bar, touch outline, active tab), not
  * shadows. Tab-specific rules live in manual.css and systematic.css.
  */
@@ -122,15 +123,21 @@ input:focus { outline: 1px solid var(--tx0); outline-offset: -1px; }
 .tag.crit { background: var(--crit); color: #fff; } .tag.ok { color: var(--up); }
 .tag.ro { display: none; } .tag.ro.on { display: inline-block; }
 
-/* value flash fallback (the renderer uses the Web Animations API when it can) */
-/* drawn as an inset shadow so a tinted cell (bid/ask, depth bar) keeps its colour under the flash */
+/* value flash fallback (the renderer uses the Web Animations API when it can; core.js flash()).
+   Drawn as an inset shadow so a tinted cell (bid/ask, depth bar) keeps its colour under the flash.
+   Two identical classes per kind restart the animation without a reflow. FLASH SUBTLE (the
+   default) fades over 500 ms, FULL over 300 ms, OFF never flashes. */
 @keyframes fl-up { from { box-shadow: inset 0 0 0 64px var(--fl-up); } to { box-shadow: inset 0 0 0 64px transparent; } }
 @keyframes fl-dn { from { box-shadow: inset 0 0 0 64px var(--fl-dn); } to { box-shadow: inset 0 0 0 64px transparent; } }
 @keyframes fl-sz { from { box-shadow: inset 0 0 0 64px var(--fl-sz); } to { box-shadow: inset 0 0 0 64px transparent; } }
 @keyframes fl-warn { from { box-shadow: inset 0 0 0 64px var(--fl-warn); } to { box-shadow: inset 0 0 0 64px transparent; } }
-.fl-up { animation: fl-up .3s linear; } .fl-dn { animation: fl-dn .3s linear; }
-.fl-sz { animation: fl-sz .3s linear; } .fl-warn { animation: fl-warn .6s linear; }
-@media (prefers-reduced-motion: reduce) { .fl-up, .fl-dn, .fl-sz, .fl-warn { animation: none; } }
+.fl-up, .fl-up2 { animation: fl-up .5s ease-out; } .fl-dn, .fl-dn2 { animation: fl-dn .5s ease-out; }
+.fl-sz, .fl-sz2 { animation: fl-sz .5s ease-out; } .fl-warn, .fl-warn2 { animation: fl-warn .6s linear; }
+:root[data-flash="full"] .fl-up, :root[data-flash="full"] .fl-up2, :root[data-flash="full"] .fl-dn, :root[data-flash="full"] .fl-dn2,
+:root[data-flash="full"] .fl-sz, :root[data-flash="full"] .fl-sz2 { animation-duration: .3s; animation-timing-function: linear; }
+:root[data-flash="off"] .fl-up, :root[data-flash="off"] .fl-up2, :root[data-flash="off"] .fl-dn, :root[data-flash="off"] .fl-dn2,
+:root[data-flash="off"] .fl-sz, :root[data-flash="off"] .fl-sz2, :root[data-flash="off"] .fl-warn, :root[data-flash="off"] .fl-warn2 { animation: none; }
+@media (prefers-reduced-motion: reduce) { .fl-up, .fl-up2, .fl-dn, .fl-dn2, .fl-sz, .fl-sz2, .fl-warn, .fl-warn2 { animation: none; } }
 
 /* ------------------------------------------------------------------------------------------
    Header (28 px)
@@ -235,7 +242,15 @@ body.log #logdrawer { display: flex; }
   display: none; border-top: 1px solid var(--line2);
 }
 body.set #setdrawer { display: flex; }
-#setdrawer .set-body { display: grid; grid-template-columns: 420px 480px minmax(0, 1fr); gap: 1px; background: var(--line); overflow: hidden; }
+#setdrawer .set-body { display: grid; grid-template-columns: 360px 420px minmax(0, 1fr) 420px; gap: 1px; background: var(--line); overflow: hidden; }
+/* the per-viewer column: FLASH, ALERTS, sound, the PERF check (saved in this browser only) */
+#set-ui { padding: 4px 6px; }
+#set-ui .set-h { height: 20px; display: flex; align-items: center; font: 600 11px/1 var(--font-ui); color: var(--tx1); letter-spacing: .04em; text-transform: uppercase; }
+#set-ui .set-row { height: 24px; display: flex; align-items: center; gap: 2px; white-space: nowrap; }
+#set-ui .set-row .lb { flex: 0 0 64px; font: 10px/1 var(--font-ui); color: var(--tx2); text-transform: uppercase; letter-spacing: .04em; }
+#set-ui .set-row button { height: 20px; padding: 0 6px; font: 11px/1 var(--font-ui); }
+#set-ui .set-row .st { margin-left: 6px; font: 11px/1 var(--font-num); color: var(--tx2); }
+#set-ui .set-row .st.warn { color: var(--warn); } #set-ui .set-row .st.ok { color: var(--up); }
 #setdrawer .set-col { background: var(--bg1); overflow: auto; min-width: 0; }
 table.set td.lbl { color: var(--tx1); }
 #keysheet { position: fixed; left: 0; right: 0; top: var(--hdr-h); bottom: var(--sbar-h); z-index: 30; display: none; background: rgba(0,0,0,.86); }

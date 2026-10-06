@@ -360,15 +360,42 @@
       if (rm.addEventListener) rm.addEventListener('change', function (e) { reduceMotion = e.matches; });
     } catch (e) { /* old engine */ }
   }
-  var FLASH = { up: 'rgba(63,185,80,.22)', dn: 'rgba(248,81,73,.22)', sz: 'rgba(230,232,235,.10)', warn: 'rgba(227,160,8,.35)' };
-  function flash(el, kind) {
-    if (!el || reduceMotion) return;
-    var c = FLASH[kind] || FLASH.sz;
+  /* Flashes (the FLASH setting, Desk.ui.flash):
+   *   'off'     none at all
+   *   'subtle'  the default: a soft highlight that fades over 500 ms, only for what the operator
+   *             must notice (the last-trade price row, our own orders changing state, fills, P&L);
+   *             a cell that flashed less than 0.4 s ago does not flash again, so a busy level is
+   *             never a strobe
+   *   'full'    the old behaviour: 300 ms, stronger, and also the routine book updates (ladder
+   *             sizes, LTQ, watchlist prices), still at most one flash per cell per 0.25 s
+   * flash(el, kind, level, gap): kind 'up' | 'dn' | 'sz' | 'warn'; level 'full' = a routine update
+   * that flashes only in FULL; gap = a longer quiet time for this cell (P&L: 1.5 s). Returns true
+   * when it flashed. */
+  var FLASHES = {
+    subtle: { up: 'rgba(63,185,80,.16)', dn: 'rgba(248,81,73,.16)', sz: 'rgba(230,232,235,.08)', warn: 'rgba(227,160,8,.30)', ms: 500, gap: 400 },
+    full: { up: 'rgba(63,185,80,.22)', dn: 'rgba(248,81,73,.22)', sz: 'rgba(230,232,235,.10)', warn: 'rgba(227,160,8,.35)', ms: 300, gap: 250 }
+  };
+  function flash(el, kind, level, gap) {
+    if (!el || reduceMotion) return false;
+    var mode = Desk.ui && Desk.ui.flash ? Desk.ui.flash : 'subtle';
+    if (mode === 'off' || (level === 'full' && mode !== 'full')) return false;
+    var P = FLASHES[mode] || FLASHES.subtle, c = P[kind] || P.sz, now = perf.now();
+    if (kind !== 'warn' && el._flT && now - el._flT < Math.max(P.gap, gap || 0)) return false;
+    el._flT = now;
+    var dur = kind === 'warn' ? 600 : P.ms;
     if (el.animate) {
       // an inset shadow over the cell, not its background: the bid/ask tint and depth bar stay put
-      try { el.animate([{ boxShadow: 'inset 0 0 0 64px ' + c }, { boxShadow: 'inset 0 0 0 64px transparent' }], { duration: kind === 'warn' ? 600 : 300, easing: 'linear' }); return; } catch (e) { /* fallthrough */ }
+      try {
+        if (el._flA && el._flA.cancel) el._flA.cancel();
+        el._flA = el.animate([{ boxShadow: 'inset 0 0 0 64px ' + c }, { boxShadow: 'inset 0 0 0 64px transparent' }], { duration: dur, easing: 'ease-out' });
+        return true;
+      } catch (e) { /* fallthrough */ }
     }
-    el.classList.remove('fl-' + kind); void el.offsetWidth; el.classList.add('fl-' + kind);
+    // no Web Animations: alternate two identical keyframe classes to restart without a reflow
+    var flip = el._flip = !el._flip;
+    ['', '2'].forEach(function (s) { el.classList.remove('fl-' + kind + s); });
+    el.classList.add('fl-' + kind + (flip ? '2' : ''));
+    return true;
   }
   function numOf(s) { if (!s) return NaN; return parseFloat(String(s).replace(MINUS, '-').replace(/[^0-9.\-]/g, '')); }
   function setText(el, v) { if (!el) return false; v = (v === null || v === undefined) ? '' : String(v); if (el.textContent !== v) { el.textContent = v; return true; } return false; }
@@ -386,9 +413,16 @@
    *   items      array, in display order
    *   keyFn      item -> unique key (string/number); kept in row.dataset.k
    *   cellsFn    item -> array of cells; a cell is a string/number, or an object
-   *              {t: text, cls: 'n up', fl: 'd'|'s', title: '...', attr: {k: v}, html: '...'}
+   *              {t: text, cls: 'n up', fl: 'd'|'s', flv: 'full', flg: ms, fk: 'key', nf: 'sz',
+   *               title: '...', attr: {k: v}, html: '...'}
    *              fl 'd' flashes green/red by the direction of a numeric change, 's' flashes grey
    *              on any change. No flash on a row's first paint, nor when a cell empties.
+   *              flv 'full': a routine update, flashed only with FLASH FULL. flg: the cell's own
+   *              quiet time between flashes (P&L cells).
+   *              fk: flash when this key changes to a non-empty value, not when the text does (an
+   *              order's state, not its countdown; the newest print, not the row's price).
+   *              nf: the flash kind for a NEW row when opts.isNew(item) says it is news (a fill
+   *              that just arrived), never for rows drawn at load or after a filter change.
    *   rowFn      item -> class string, or {cls, attr} (attr e.g. {'data-mkt': 'K|TK'})
    * Returns the number of rows. Rows that stay keep their DOM nodes (focus, selection, scroll and
    * click targets survive); only changed text is written.
@@ -396,6 +430,7 @@
   function keyedRows(tbody, items, keyFn, cellsFn, rowFn, opts) {
     if (!tbody) return 0;
     var rowTag = (opts && opts.row) || 'tr', cellTag = (opts && opts.cell) || 'td';
+    var isNew = opts && opts.isNew;
     var existing = new Map();
     var ch = tbody.children;
     for (var i = 0; i < ch.length; i++) if (ch[i].dataset && ch[i].dataset.k !== undefined) existing.set(ch[i].dataset.k, ch[i]);
@@ -410,6 +445,7 @@
       else { tr = document.createElement(rowTag); tr.dataset.k = key; }
       while (tr.children.length < cells.length) tr.appendChild(document.createElement(cellTag));
       while (tr.children.length > cells.length) tr.removeChild(tr.lastChild);
+      var news = !old && !!isNew && !!isNew(item);
       for (var c = 0; c < cells.length; c++) {
         var cell = cells[c], td = tr.children[c];
         var isObj = cell !== null && typeof cell === 'object';
@@ -424,12 +460,18 @@
           if (cell.title !== undefined) setAttr(td, 'title', cell.title);
           if (cell.attr) for (var ak in cell.attr) setAttr(td, ak, cell.attr[ak]);
           if (cell.style) for (var sk in cell.style) setStyleVar(td, sk, cell.style[sk]);
-          // a value that changed flashes; one that appeared or went away (a level pulled) does not
-          if (old && changed && before !== '' && td.textContent !== '' && cell.fl) {
-            if (cell.fl === 'd') { var a = numOf(before), b = numOf(td.textContent); flash(td, b > a ? 'up' : (b < a ? 'dn' : 'sz')); }
-            else flash(td, cell.fl === 's' ? 'sz' : cell.fl);
+          if (cell.fk !== undefined) {
+            // keyed: the state it stands for changed (and is something), whatever the text did
+            var fk = cell.fk === null ? '' : String(cell.fk), was = td._fk;
+            td._fk = fk;
+            if (old && was !== undefined && fk !== '' && fk !== was && cell.fl) flash(td, cell.fl === 'd' || cell.fl === 's' ? 'sz' : cell.fl, cell.flv, cell.flg);
+          } else if (old && changed && before !== '' && td.textContent !== '' && cell.fl) {
+            // a value that changed flashes; one that appeared or went away (a level pulled) does not
+            if (cell.fl === 'd') { var a = numOf(before), b = numOf(td.textContent); flash(td, b > a ? 'up' : (b < a ? 'dn' : 'sz'), cell.flv, cell.flg); }
+            else flash(td, cell.fl === 's' ? 'sz' : cell.fl, cell.flv, cell.flg);
           }
-        }
+          if (news && cell.nf) flash(td, cell.nf);
+        } else if (old) td._fk = undefined;
       }
       if (rowFn) {
         var rf = rowFn(item);
@@ -567,7 +609,8 @@
   //                                     fn(d) with d.has(topic), d.any(prefix), d.all (full redraw)
   //   Desk.render.flush()               run a frame now (tests, boot)
   //
-  // Topics the store marks: hdr, mkt, book, book:<key>, ord, ord:<key>, fill, pos, lane, risk, mo,
+  // Topics the store marks: hdr, mkt, book, book:<key>, ord, ord:<key>, mord:<key> (a MAN or EXT
+  // order changed: the ladders paint it on the next frame, never coalesced), fill, pos, lane, risk, mo,
   // alert, feeds, stale, snapshot (with all of them). Others: clock (250 ms), focus, tab, hk,
   // layout, ui (density/colour), lat.
   // ---------------------------------------------------------------------------------------------
@@ -876,24 +919,34 @@
   };
 
   // ---------------------------------------------------------------------------------------------
-  // Density (d) and colour-blind palette (c), remembered.
+  // Density (d), colour-blind palette (c) and FLASH (f; OFF / SUBTLE / FULL), remembered.
   // ---------------------------------------------------------------------------------------------
+  var FLASH_MODES = ['off', 'subtle', 'full'];
   Desk.ui = {
     density: 'compact',
     cb: false,
+    flash: 'subtle',
+    FLASH_MODES: FLASH_MODES,
     apply: function () {
       if (!hasDoc) return;
       document.documentElement.setAttribute('data-density', Desk.ui.density);
       document.documentElement.setAttribute('data-cb', Desk.ui.cb ? '1' : '0');
+      document.documentElement.setAttribute('data-flash', Desk.ui.flash);
       R.mark('ui');
     },
     load: function () {
       var d = Desk.storage.get('density'); if (d === 'normal' || d === 'compact') Desk.ui.density = d;
       Desk.ui.cb = Desk.storage.get('cb') === '1';
+      var f = Desk.storage.get('flash'); if (FLASH_MODES.indexOf(f) >= 0) Desk.ui.flash = f;
       Desk.ui.apply();
     },
     cycleDensity: function () { Desk.ui.density = Desk.ui.density === 'compact' ? 'normal' : 'compact'; Desk.storage.set('density', Desk.ui.density); Desk.ui.apply(); },
-    toggleCB: function () { Desk.ui.cb = !Desk.ui.cb; Desk.storage.set('cb', Desk.ui.cb ? '1' : '0'); Desk.ui.apply(); }
+    toggleCB: function () { Desk.ui.cb = !Desk.ui.cb; Desk.storage.set('cb', Desk.ui.cb ? '1' : '0'); Desk.ui.apply(); },
+    setFlash: function (m) {
+      if (FLASH_MODES.indexOf(m) < 0 || m === Desk.ui.flash) return;
+      Desk.ui.flash = m; Desk.storage.set('flash', m); Desk.ui.apply(); R.mark('set');
+    },
+    cycleFlash: function () { Desk.ui.setFlash(FLASH_MODES[(FLASH_MODES.indexOf(Desk.ui.flash) + 1) % FLASH_MODES.length]); }
   };
 
   // Query string flags: Desk.qs.demo, Desk.qs.live, ...

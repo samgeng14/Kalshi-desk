@@ -74,6 +74,7 @@
   var LTQ_MS = 3000;                 // a print shows in LTQ this long
   var KEY_HOLD_MS = 10000;           // a keyboard scroll holds off the auto-recentre this long
   var HELD_MS = 3000;                // our send shows the market MAN until the mkt echo, at most this long
+  var LAD_MIN_MS = 100;              // routine book updates repaint a ladder at most 10 times a second
   // ticket order types; ttl 'START' = until the game starts
   var TK_TYPES = [
     { id: 'IOC', tif: 'IOC', ttl: null, label: 'IOC' }, { id: 'FOK', tif: 'FOK', ttl: null, label: 'FOK' },
@@ -449,7 +450,7 @@
       head: $(id + '-head'), cols: $(id + '-cols'), body: $(id + '-body'), foot: $(id + '-foot'),
       tb: null, h: {}, f: {}, rows: 38, top: 0, asc: null, rowsKey: null, rowsG: null,
       shownKey: undefined, needCenter: true, over: false, hold: 0, arm: null, drag: null, dragMovedAt: 0,
-      wacc: 0, dirty: true, rollAt: 0
+      wacc: 0, dirty: true, rollAt: 0, paintAt: 0, due: false, timer: null, paints: 0
     };
     // header: three 20 px lines
     var H = L.h;
@@ -771,12 +772,28 @@
       renderLadder(L, d, now);
     }
   }
+  // A ladder repaints at once for anything the operator did or must see now (a click, a key, our
+  // own order changing, the market changing, a stale feed); routine updates (the book, the clock,
+  // Systematic's orders, the header's cash) are coalesced to at most one paint per LAD_MIN_MS.
+  function ladUrgent(L, d, key, changed) {
+    return d.all || changed || L.dirty || d.has('focus') || d.has('layout') || d.has('stale') || d.has('hk') || d.has('ui') ||
+      (key !== null && (d.has('mord:' + key) || d.has('mkt:' + key)));
+  }
+  function ladRoutine(d, key) {
+    return d.has('clock') || d.has('hdr') || d.has('pos') || (key !== null && (d.has('book:' + key) || d.has('ord:' + key)));
+  }
+  function ladLater(L, ms) {
+    if (L.timer) return;
+    L.timer = setTimeout(function () { L.timer = null; mark('mlad'); }, Math.max(1, ms));
+  }
   function renderLadder(L, d, now) {
     var st = S(), key = Desk.focus.ladders[L.slot] || null;
     var changed = key !== L.shownKey;
-    var hit = d.all || changed || L.dirty || d.has('clock') || d.has('focus') || d.has('layout') || d.has('hdr') || d.has('stale') ||
-      d.has('hk') || d.has('pos') || d.has('ui') || (key !== null && (d.has('book:' + key) || d.has('ord:' + key) || d.has('mkt:' + key)));
-    if (!hit) return;
+    if (!ladUrgent(L, d, key, changed)) {
+      if (!ladRoutine(d, key) && !L.due) return;
+      if (now - L.paintAt < LAD_MIN_MS) { L.due = true; ladLater(L, L.paintAt + LAD_MIN_MS - now); return; }
+    }
+    L.due = false; L.paintAt = now; L.paints++;
     L.dirty = false;
     // a new market starts from fresh rows, so a reused price row never flashes the old sizes
     if (changed) { L.shownKey = key; L.arm = null; L.drag = null; L.needCenter = true; L.hold = 0; L.rowsKey = null; L.tb.textContent = ''; }
@@ -809,6 +826,7 @@
     var wo = ordersAt(key, asc), nowS = now + (st.srvOffset || 0);
     var bbRow = bb === null ? null : logic.floorRow(asc, bb), baRow = ba === null ? null : logic.ceilRow(asc, ba);
     var lastRow = b && b.last ? asc[logic.nearestIdx(asc, b.last.px)] : null;
+    var lastSig = b && b.last ? b.last.ts_ms + ':' + b.last.px + ':' + b.last.qty : '';
     var mk = new Map();
     var addMk = function (u, ch) { if (u === null || u === undefined) return; var r = asc[logic.nearestIdx(asc, u)]; var s = mk.get(r) || ''; if (s.length < 2) mk.set(r, s + ch); };
     var fair = b ? b.ref.fair : null, P = st.position(key);
@@ -826,23 +844,26 @@
       var dragCls = drag && drag.side === side && drag.over === p && drag.over !== drag.from ? ' drag' : '';
       if (e && e.nMan) {
         var secs = e.exp ? Math.max(0, Math.ceil((e.exp - nowS) / 1000)) : null;
+        // flashes when our order's state changes (sent, acknowledged, part-filled), never on the countdown
         return { t: e.pend && !e.man ? '' : logic.woText(e.man, e.filled, e.pend ? null : secs, e.part), cls: base + ' my' + (e.pend ? ' pend' : '') + (e.cxl ? ' cxlpend' : '') + (e.ext ? ' ext' : '') + dragCls,
-                 title: e.cids.join(' ') + (e.piq !== null ? ' piq ' + F.whole(e.piq) : '') };
+                 title: e.cids.join(' ') + (e.piq !== null ? ' piq ' + F.whole(e.piq) : ''), fl: 's', fk: (e.pend ? 'P' : 'W') + e.man + '/' + e.filled + (e.cxl ? 'x' : '') };
       }
-      if (e && e.sys) return { t: 'S' + F.size(e.sys), cls: base + ' sys' + dragCls, title: e.sysCids.join(' ') };
-      return { t: '', cls: base + dragCls, title: null };
+      if (e && e.sys) return { t: 'S' + F.size(e.sys), cls: base + ' sys' + dragCls, title: e.sysCids.join(' '), fl: 's', fk: '' };
+      return { t: '', cls: base + dragCls, title: null, fl: 's', fk: '' };
     };
     Desk.dom.keyedRows(L.tb, items, String, function (p) {
       var bs = bids.get(p), as = asks.get(p), mks = mk.get(p) || '';
       var ltq = lt.get(p), vq = vpr ? vpr.get(p) : undefined;
       return [
         woCell(wo.BUY.get(p), 'BUY', p),
-        { t: bs ? F.whole(bs) : '', title: bs ? F.size(bs) : null, cls: 'bq' + (bs ? ' has' : '') + (arm && arm.side === 'BUY' && arm.row === p ? ' arm' : ''), fl: 's', style: { '--d': bs && maxSz ? (bs / maxSz).toFixed(2) : '0' } },
+        // sizes: no flash on routine book updates (the depth bar shows the size), only with FLASH FULL
+        { t: bs ? F.whole(bs) : '', title: bs ? F.size(bs) : null, cls: 'bq' + (bs ? ' has' : '') + (arm && arm.side === 'BUY' && arm.row === p ? ' arm' : ''), fl: 's', flv: 'full', style: { '--d': bs && maxSz ? (bs / maxSz).toFixed(2) : '0' } },
         { t: mks, cls: 'rf' + (mks ? (mks.charAt(0) === 'F' ? ' mk-f' : mks.charAt(0) === 'E' ? ' mk-e' : ' mk-a') : '') },
-        { t: F.pxg(p, g), cls: 'px' + (p === bbRow ? ' bb' : '') + (p === baRow ? ' ba' : '') + (p === lastRow ? ' last' : '') },
-        { t: as ? F.whole(as) : '', title: as ? F.size(as) : null, cls: 'aq' + (as ? ' has' : '') + (arm && arm.side === 'SELL' && arm.row === p ? ' arm' : ''), fl: 's', style: { '--d': as && maxSz ? (as / maxSz).toFixed(2) : '0' } },
+        // the last-trade price row: a short highlight on each new print
+        { t: F.pxg(p, g), cls: 'px' + (p === bbRow ? ' bb' : '') + (p === baRow ? ' ba' : '') + (p === lastRow ? ' last' : ''), fl: 's', fk: p === lastRow ? lastSig : '' },
+        { t: as ? F.whole(as) : '', title: as ? F.size(as) : null, cls: 'aq' + (as ? ' has' : '') + (arm && arm.side === 'SELL' && arm.row === p ? ' arm' : ''), fl: 's', flv: 'full', style: { '--d': as && maxSz ? (as / maxSz).toFixed(2) : '0' } },
         woCell(wo.SELL.get(p), 'SELL', p),
-        ltq !== undefined ? { t: F.whole(ltq), title: F.size(ltq), cls: 'lt', fl: 's' } : { t: vq ? F.whole(vq) : '', title: vq ? F.size(vq) : null, cls: 'lt dim' }
+        ltq !== undefined ? { t: F.whole(ltq), title: F.size(ltq), cls: 'lt', fl: 's', flv: 'full' } : { t: vq ? F.whole(vq) : '', title: vq ? F.size(vq) : null, cls: 'lt dim' }
       ];
     }, function (p) {
       var inside = bbRow !== null && baRow !== null && p > bbRow && p < baRow;
@@ -1270,8 +1291,8 @@
       else T = F.left(m.close_ms - nowS);
       var cells = [
         { t: logic.watchLabel(m), cls: 't', title: m.short + ' | ' + m.title + ' | ' + m.tk },
-        { t: b && b.bb !== null ? F.pxg(b.bb, g) : '', cls: 'n bid', fl: 'd' },
-        { t: b && b.ba !== null ? F.pxg(b.ba, g) : '', cls: 'n ask', fl: 'd' },
+        { t: b && b.bb !== null ? F.pxg(b.bb, g) : '', cls: 'n bid', fl: 'd', flv: 'full' },
+        { t: b && b.ba !== null ? F.pxg(b.ba, g) : '', cls: 'n ask', fl: 'd', flv: 'full' },
         { t: ref && ref.fair !== null ? logic.fmtRef(ref.fair, null) : '', cls: 'n ' + (amber ? 'warn' : 'fair'), title: fairTitle },
         { t: ref && ref.espn !== null ? logic.fmtRef(ref.espn, null) : '', cls: 'n espn', title: ref && ref.espn !== null ? logic.fmtRef(ref.espn, g) + (ref.espn_ts_ms ? ' ' + F.age(nowS - ref.espn_ts_ms) : '') : null },
         { t: P && P.pos ? logic.posShort(P.pos) : '', cls: 'n', title: P && P.pos ? F.ssize(P.pos) : null },
@@ -1303,6 +1324,8 @@
   // Working (manual and foreign), fills (manual), positions
   // ---------------------------------------------------------------------------------------------
   function orderTime(o) { return o.t.click || o.t.recv || (o.local && o.local.at) || 0; }
+  // a fill that arrived on the stream in the last 3 s (not one drawn at load or after a filter change)
+  function freshFill(f) { return !!f.at && Date.now() - f.at < 3000; }
   function buildGrids() {
     var D = Desk.dom;
     var wb = $('m-work-body'), fb = $('m-fills-body'), pb = $('m-pos-body');
@@ -1366,7 +1389,7 @@
         { t: o.terminal ? '' : F.size(o.left), cls: 'n' },
         { t: exp, cls: 'n' + (o.tif === 'POST' ? '' : ' dim') },
         { t: o.piq !== null && o.piq !== undefined ? F.whole(o.piq) : '', cls: 'n', title: o.piq !== null && o.piq !== undefined ? F.size(o.piq) : null },
-        { t: why || stTxt, cls: 'st st-' + o.st + (why ? ' why' : ''), title: (o.why || '') + lat },
+        { t: why || stTxt, cls: 'st st-' + o.st + (why ? ' why' : ''), title: (o.why || '') + lat, fl: 's', fk: o.st + '|' + o.filled },
         o.terminal ? { t: '', cls: '', attr: { 'data-cid': null, 'data-nolink': null } } : { t: 'x', cls: 'x', attr: { 'data-cid': o.cid, 'data-nolink': '1' } }
       ];
     }, function (o) {
@@ -1383,17 +1406,17 @@
     Desk.dom.keyedRows(GR.fills, items, function (f) { return f.fid; }, function (f) {
       var m = st.market(f.key), g = m ? m.g : null, m10 = f.mo['10s'], m60 = f.mo['60s'];
       return [
-        { t: F.timeT(f.ts_ms), cls: 'n tm', title: f.fid + ' ' + f.cid },
-        { t: m ? m.short : f.tk, cls: 't', title: f.tk },
-        { t: f.side, cls: 't side-' + f.side },
-        { t: g ? F.pxg(f.px, g) : F.px(f.px), cls: 'n' },
-        { t: F.size(f.qty), cls: 'n' },
-        { t: f.liq, cls: 't' },
-        { t: F.money(f.fee), cls: 'n' },
+        { t: F.timeT(f.ts_ms), cls: 'n tm', title: f.fid + ' ' + f.cid, nf: 'sz' },
+        { t: m ? m.short : f.tk, cls: 't', title: f.tk, nf: 'sz' },
+        { t: f.side, cls: 't side-' + f.side, nf: 'sz' },
+        { t: g ? F.pxg(f.px, g) : F.px(f.px), cls: 'n', nf: 'sz' },
+        { t: F.size(f.qty), cls: 'n', nf: 'sz' },
+        { t: f.liq, cls: 't', nf: 'sz' },
+        { t: F.money(f.fee), cls: 'n', nf: 'sz' },
         { t: m10 === undefined ? '' : F.cents(m10), cls: 'n ' + (m10 === undefined ? '' : F.sign(m10)) },
         { t: m60 === undefined ? '' : F.cents(m60), cls: 'n ' + (m60 === undefined ? '' : F.sign(m60)) }
       ];
-    }, function (f) { return { cls: Desk.focus.rowCls('m-fills', f.fid, f.key), attr: { 'data-mkt': f.key, 'data-v': f.v } }; });
+    }, function (f) { return { cls: Desk.focus.rowCls('m-fills', f.fid, f.key), attr: { 'data-mkt': f.key, 'data-v': f.v } }; }, { isNew: freshFill });
   }
   function renderPos(d) {
     if (!GR.pos) return;
@@ -1424,8 +1447,8 @@
         { t: P.pos ? px(P.avg) : '', cls: 'n' },
         { t: b ? px(b.bb) : '', cls: 'n bid' },
         { t: b ? px(b.ba) : '', cls: 'n ask' },
-        { t: P.pos ? F.pnl(P.unrl) : '', cls: 'n ' + F.sign(P.unrl), fl: 'd' },
-        { t: F.pnl(P.real), cls: 'n ' + F.sign(P.real) },
+        { t: P.pos ? F.pnl(P.unrl) : '', cls: 'n ' + F.sign(P.unrl), fl: 'd', flg: 1500 },
+        { t: F.pnl(P.real), cls: 'n ' + F.sign(P.real), fl: 'd' },
         { t: P.pos ? F.money(P.maxl) : '', cls: 'n' },
         canFlat ? { t: 'FLAT', cls: 'flat', attr: { 'data-flat': P.key, 'data-nolink': '1' } } : { t: '', cls: '', attr: { 'data-flat': null, 'data-nolink': null } }
       ];
