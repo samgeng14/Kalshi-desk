@@ -84,3 +84,4 @@
 #tab-systematic #s-risk tr.grp > td { cursor: pointer; }
 /* markouts: lane rows filter */
 #tab-systematic #s-mo tbody tr[data-lane] { cursor: pointer; }
+#s-held { color: var(--warn); margin-right: 6px; cursor: default; }

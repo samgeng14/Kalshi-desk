@@ -549,7 +549,7 @@
   // data-mkt="K|TK": a click on such a row (not on a button or input inside it) focuses it;
   // Shift+click loads the other ladder.
   //   Desk.focus.key           the focused market key or null
-  //   Desk.focus.ladder        'A' | 'B' | 'C': the focused ladder
+  //   Desk.focus.ladder        'A' | 'B' | 'C' | 'D': the focused ladder
   //   Desk.focus.ladders       {A: key|null, B: key|null, C: key|null}
   //   Desk.focus.set(key, {other: bool, ladder: 'B', from: 'm-watch'})
   //   Desk.focus.setLadder('B')
@@ -559,13 +559,13 @@
   var F = Desk.focus = {
     key: null,
     ladder: 'A',
-    ladders: { A: null, B: null, C: null },
+    ladders: { A: null, B: null, C: null, D: null },
     from: null,
     on: function (fn) { focusFns.push(fn); },
     load: function () {
       var s = Desk.storage.getJSON('ladders', null);
-      if (s && typeof s === 'object') ['A', 'B', 'C'].forEach(function (k) { if (typeof s[k] === 'string') F.ladders[k] = s[k]; });
-      var l = Desk.storage.get('ladder'); if (l === 'A' || l === 'B' || l === 'C') F.ladder = l;
+      if (s && typeof s === 'object') ['A', 'B', 'C', 'D'].forEach(function (k) { if (typeof s[k] === 'string') F.ladders[k] = s[k]; });
+      var l = Desk.storage.get('ladder'); if (l === 'A' || l === 'B' || l === 'C' || l === 'D') F.ladder = l;
       F.key = F.ladders[F.ladder];
     },
     otherLadder: function () {
@@ -684,7 +684,7 @@
         if (typing) { target.blur(); ev.preventDefault(); return true; }
       }
       var es = K.elemScope();
-      var tab = R.tab;
+      var tab = R.tab || K.splitTab();
       var pre = (K.prefix && Date.now() - K.prefixAt < 1000) ? K.prefix : null;
       K.prefix = null;
       var cands = [];
@@ -720,6 +720,13 @@
       return false;
     },
     attach: function () { if (hasDoc) document.addEventListener('keydown', K.handle); },
+    // SPLIT shows both tabs: the tab scope is the half holding the keyboard focus (MANUAL when
+    // nothing in either half has it)
+    splitTab: function () {
+      if (!hasDoc) return null;
+      var a = document.activeElement, root2 = a && a.closest ? a.closest('.tabroot') : null;
+      return root2 && root2.id === 'tab-systematic' ? 'systematic' : 'manual';
+    },
     // the key sheet: rows of [key, scope, desc] from the bindings
     sheetRows: function () {
       var order = { global: 0, manual: 1, systematic: 2 };
@@ -735,20 +742,41 @@
   // ---------------------------------------------------------------------------------------------
   // Layout flags mirrored from CSS media queries.
   // ---------------------------------------------------------------------------------------------
+  // Ladders on screen: 1 under 1400 px, 2 to 1919, 3 from 1920 (WIDE), 4 from 2400 (the most a
+  // stream subscribes at FULL depth).
+  // SPLIT (>= 2400 px, the operator's choice, remembered): SYSTEMATIC on the left half, MANUAL
+  // on the right half, both live. Each half then lays out as a window under 1400 px: one ladder,
+  // the narrow column sets. Desk.render.tab is null while split (every renderer draws).
   Desk.layout = {
-    wide: false, narrow: false,
+    wide: false, narrow: false, splitOK: false, splitOn: false, split: false,
     // the ladder slots on screen now
-    ladders: function () { return Desk.layout.wide ? ['A', 'B', 'C'] : (Desk.layout.narrow ? ['A'] : ['A', 'B']); },
+    ladders: function () {
+      var L = Desk.layout;
+      return L.split || L.narrow ? ['A'] : (L.splitOK ? ['A', 'B', 'C', 'D'] : (L.wide ? ['A', 'B', 'C'] : ['A', 'B']));
+    },
+    // the systematic column set: d ~1512 px, w WIDE, n narrow (and each half of SPLIT)
+    sysMode: function () { var L = Desk.layout; return L.split || L.narrow ? 'n' : (L.wide ? 'w' : 'd'); },
+    upd: null,
+    setSplit: function (on) {
+      Desk.layout.splitOn = !!on;
+      Desk.storage.set('split', on ? '1' : '0');
+      if (Desk.layout.upd) Desk.layout.upd();
+    },
     init: function () {
       if (!hasDoc || !root.matchMedia) return;
-      var w = root.matchMedia('(min-width: 1920px)'), n = root.matchMedia('(max-width: 1399px)');
-      var upd = function () {
-        Desk.layout.wide = w.matches; Desk.layout.narrow = n.matches;
+      var w = root.matchMedia('(min-width: 1920px)'), n = root.matchMedia('(max-width: 1399px)'), s = root.matchMedia('(min-width: 2400px)');
+      Desk.layout.splitOn = Desk.storage.get('split') === '1';
+      var upd = Desk.layout.upd = function () {
+        var L = Desk.layout;
+        L.wide = w.matches; L.narrow = n.matches; L.splitOK = !!s.matches; L.split = L.splitOK && L.splitOn;
         document.body.setAttribute('data-wide', w.matches ? '1' : '0');
-        if (Desk.layout.ladders().indexOf(F.ladder) < 0) F.setLadder('A');
-        R.mark('layout'); R.force(null);
+        document.body.setAttribute('data-splitok', L.splitOK ? '1' : '0');
+        document.body.setAttribute('data-split', L.split ? '1' : '0');
+        R.tab = L.split ? null : (Desk.tabs && Desk.tabs.cur) || R.tab;
+        if (L.ladders().indexOf(F.ladder) < 0) F.setLadder('A');
+        R.mark('layout'); R.mark('tab'); R.force(null);
       };
-      [w, n].forEach(function (m) { if (m.addEventListener) m.addEventListener('change', upd); else if (m.addListener) m.addListener(upd); });
+      [w, n, s].forEach(function (m) { if (m.addEventListener) m.addEventListener('change', upd); else if (m.addListener) m.addListener(upd); });
       upd();
     }
   };

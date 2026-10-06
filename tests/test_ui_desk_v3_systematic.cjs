@@ -587,6 +587,21 @@ function bootPage(opts) {
   await P.advance(1500);
   eq(start.disabled, false, 'START is live once the groups reset');
 
+  // ---- markets Manual holds (mkt.man) show in the LANES title
+  {
+    const heldN = () => Array.from(S.markets.values()).filter(m => m.man && m.status === 'OPEN').length;
+    const n0 = heldN();
+    const lk = Array.from(S.markets.values()).find(m => m.kind === 'LIP15' && m.status === 'OPEN' && !m.man);
+    const g = lk.g, bk = S.book(lk.key);
+    D.act.order({ v: lk.v, tk: lk.tk, side: 'BUY', px: g.levels[0], qty: 1, tif: 'POST', ttl_s: 60, override: false, touch: bk ? bk.bb : null }, null);
+    await P.advance(500);
+    check(S.market(lk.key).man === true && P.text($('s-held')) === 'MAN ' + (n0 + 1) && ($('s-held').getAttribute('title') || '').indexOf(lk.short) >= 0, 'a market Manual took over counts in MAN n in the LANES title, named on its title', P.text($('s-held')));
+    D.act.cancelAll('MAN', null);
+    D.act.release(lk.v, lk.tk);
+    await P.advance(500);
+    eq(P.text($('s-held')), n0 ? 'MAN ' + n0 : '', 'released: it leaves the count');
+  }
+
   // ---- WIDE: more columns; narrow: fewer
   P.setWidth(1920);
   P.flush();

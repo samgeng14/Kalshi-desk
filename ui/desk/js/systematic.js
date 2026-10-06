@@ -20,12 +20,11 @@
  * the lane (click again: clear) and focuses the lane's newest market; Shift+click loads it into
  * the other ladder.
  *
- * Extensions this file makes on its own, because contract 1.0.0 does not carry them (to settle at
- * the merge step):
- *   - Preflight tags in the plan's set KEY CASH SHARD CLK FEED PRIV GROUPS, plus the contract's
- *     DISK. PRIV (Kalshi private socket) is derived from hb.feeds.KXP when the backend sends no
- *     PRIV row; GROUPS (order groups reset) shows grey and does not block START until the backend
- *     sends a GROUPS row. A backend row always wins over the derived one.
+ * Preflight tags: the plan's set KEY CASH SHARD CLK FEED PRIV GROUPS plus DISK, as contract 1.1
+ * sends them. Against an older backend without PRIV and GROUPS rows, PRIV is derived from
+ * hb.feeds.KXP and GROUPS shows grey (unknown, not blocking); a backend row always wins.
+ *
+ * Computed here from the store (the contract carries the inputs, not these figures):
  *   - Per-lane markouts and edges, P(daily stop), the equity floor line and per-market
  *     reservations are computed here from the store. All edges and markouts are contract-weighted,
  *     in cents per contract, + = in our favour:
@@ -245,7 +244,7 @@
   // grid plumbing: column sets per layout (d = default ~1512 px, w = WIDE >= 1920, n = < 1400).
   // A column with no m shows everywhere; m lists the layouts it shows in.
   // ---------------------------------------------------------------------------------------------
-  function mode() { var L = Desk.layout; return L && L.wide ? 'w' : (L && L.narrow ? 'n' : 'd'); }
+  function mode() { var L = Desk.layout; return L && L.sysMode ? L.sysMode() : (L && L.wide ? 'w' : (L && L.narrow ? 'n' : 'd')); }
   function Grid(hostId, cls, cols) { this.hostId = hostId; this.cls = cls; this.all = cols; this.sig = null; this.tb = null; this.cols = []; }
   Grid.prototype.ensure = function () {
     var m = mode();
@@ -386,6 +385,13 @@
     D.setText(ui.lanesInfo, n ? 'ON ' + on + '/' + n : '');
   }
 
+  function renderHeld() {
+    var names = [];
+    Desk.store.markets.forEach(function (m) { if (m.man && m.status === 'OPEN') names.push(m.short); });
+    D.setText(ui.held, names.length ? 'MAN ' + names.length : '');
+    D.setAttr(ui.held, 'title', names.length ? 'held by Manual (REL on its ladder): ' + names.join(', ') : null);
+  }
+
   // ---------------------------------------------------------------------------------------------
   // WORKING (systematic orders, plus the last 3 s of finished ones)
   // ---------------------------------------------------------------------------------------------
@@ -461,7 +467,7 @@
     { id: 'fee', h: 'Fee', w: 48, hc: 'n', m: 'dw', f: function (f) { return moneyC(f.fee, f.fee ? '' : 'dim'); } },
     { id: 'fair', h: 'Fair', w: 52, hc: 'n', m: 'dw', f: function (f) { return num(pxOf(f.fair, f.key), 'fair'); } },
     { id: 'mid', h: 'Mid', w: 52, hc: 'n', m: 'w', f: function (f) { return num(pxOf(f.mid, f.key), 'dim'); } },
-    { id: 'edge', h: 'Edge', w: 48, hc: 'n', f: function (f) { return centsC(fillEdge(f)); } },
+    { id: 'edge', h: 'Edge', w: 54, hc: 'n', f: function (f) { return centsC(fillEdge(f)); } },
     { id: 'mo1', h: 'MO1', w: 52, hc: 'n', m: 'w', f: function (f) { return centsC(f.mo['1s']); } },
     { id: 'mo10', h: 'MO10', w: 52, hc: 'n', f: function (f) { return centsC(f.mo['10s']); } },
     { id: 'mo60', h: 'MO60', w: 52, hc: 'n', f: function (f) { return centsC(f.mo['60s']); } },
@@ -494,15 +500,15 @@
       if (r.kind === 'tot') return txt('TOTAL');
       return txt(r.m ? r.m.short : r.tk, 'mem', r.tk);
     } },
-    { id: 'v', h: 'V', w: 24, f: function (r) { return txt(r.vtxt || '', 'dim'); } },
+    { id: 'v', h: 'V', w: 30, f: function (r) { return txt(r.vtxt || '', 'dim'); } },
     { id: 'own', h: 'Own', w: 42, f: function (r) { return txt(r.own || ''); } },
-    { id: 'pos', h: 'Pos', w: 56, hc: 'n', f: function (r) { return r.kind !== 'mem' ? blank() : q(r, num(r.p ? F.ssize(r.p.pos) : '')); } },
-    { id: 'avg', h: 'Avg', w: 52, hc: 'n', m: 'dw', f: function (r) { return r.kind !== 'mem' ? blank() : q(r, num(r.p ? pxOf(r.p.avg, r.mkey) : '')); } },
-    { id: 'mark', h: 'Mark', w: 52, hc: 'n', m: 'dw', f: function (r) { return r.kind !== 'mem' ? blank() : q(r, num(r.p ? pxOf(r.p.mark, r.mkey) : '')); } },
-    { id: 'unrl', h: 'Unrl', w: 60, hc: 'n', f: function (r) { return q(r, pnlC(r.unrl)); } },
-    { id: 'ify', h: 'IfYES', w: 60, hc: 'n', f: function (r) { return r.kind !== 'mem' ? blank() : q(r, pnlC(r.p ? r.p.if_yes : null)); } },
-    { id: 'ifn', h: 'IfNO', w: 60, hc: 'n', f: function (r) { return r.kind !== 'mem' ? blank() : q(r, pnlC(r.p ? r.p.if_no : null)); } },
-    { id: 'maxl', h: 'MaxL', w: 60, hc: 'n', f: function (r) { return q(r, moneyC(r.maxl, r.maxl ? '' : 'dim')); } },
+    { id: 'pos', h: 'Pos', w: 46, hc: 'n', f: function (r) { return r.kind !== 'mem' ? blank() : q(r, num(r.p ? F.ssize(r.p.pos) : '')); } },
+    { id: 'avg', h: 'Avg', w: 50, hc: 'n', m: 'dw', f: function (r) { return r.kind !== 'mem' ? blank() : q(r, num(r.p ? pxOf(r.p.avg, r.mkey) : '')); } },
+    { id: 'mark', h: 'Mark', w: 50, hc: 'n', m: 'dw', f: function (r) { return r.kind !== 'mem' ? blank() : q(r, num(r.p ? pxOf(r.p.mark, r.mkey) : '')); } },
+    { id: 'unrl', h: 'Unrl', w: 56, hc: 'n', f: function (r) { return q(r, pnlC(r.unrl)); } },
+    { id: 'ify', h: 'IfYES', w: 56, hc: 'n', f: function (r) { return r.kind !== 'mem' ? blank() : q(r, pnlC(r.p ? r.p.if_yes : null)); } },
+    { id: 'ifn', h: 'IfNO', w: 56, hc: 'n', f: function (r) { return r.kind !== 'mem' ? blank() : q(r, pnlC(r.p ? r.p.if_no : null)); } },
+    { id: 'maxl', h: 'MaxL', w: 56, hc: 'n', f: function (r) { return q(r, moneyC(r.maxl, r.maxl ? '' : 'dim')); } },
     { id: 'rsv', h: 'Rsv', w: 56, hc: 'n', m: 'w', f: function (r) { return num(r.rsv ? F.money(r.rsv) : ''); } }
   ];
   function ownOf(set) { var k = Object.keys(set); if (!k.length) return ''; if (k.length > 1 || set.MIX) return 'MIX'; return k[0]; }
@@ -831,6 +837,8 @@
     var info = function (host) { var s = el('span', 'pinfo n', ''); if (host) host.appendChild(s); return s; };
     var lt = $('s-lanes-tools'), wt = $('s-work-tools'), ft = $('s-fills-tools'), rt = $('s-risk-tools'), mt = $('s-mo-tools');
     [lt, wt, ft, rt, mt].forEach(function (h) { if (h) h.textContent = ''; });
+    // markets Manual holds (mkt.man): the lanes stay out of them until REL on the ladder
+    ui.held = el('span', 'pinfo n warn', '', { id: 's-held' }); if (lt) lt.appendChild(ui.held);
     ui.lanesInfo = info(lt);
     ui.workTag = tag(wt); ui.workInfo = info(wt);
     ui.cxlAll = el('button', '', 'CXL ALL', { type: 'button', 'data-act': 'cxlall', id: 's-cxlall' });
@@ -891,6 +899,7 @@
     var eq = stripDirty || sumDirty ? equity() : null;
     if (stripDirty) renderStrip(now, eq);
     if (lay || d.has('lane') || fills || sys || d.has('hdr') || d.has('ord')) renderLanes();
+    if (lay || d.has('mkt')) renderHeld();
     if (lay || d.has('ord') || clock || d.has('mkt') || focus || sys) renderWorking(now);
     if (lay || fills || d.has('mkt') || focus || sys) renderFills();
     if (lay || d.has('risk') || d.has('pos') || d.has('hdr') || d.has('ord') || d.has('mkt') || focus) { renderRisk(); cashLine(); }

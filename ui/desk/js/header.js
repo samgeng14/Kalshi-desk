@@ -19,10 +19,13 @@
   // ---------------------------------------------------------------------------------------------
   // tabs: one data attribute on <body>; CSS swaps display; nothing is fetched
   // ---------------------------------------------------------------------------------------------
+  // SPLIT (>= 2400 px): [SPLIT] shows both tabs side by side; picking one tab (click or `) leaves it
   var tabs = Desk.tabs = {
     cur: null,
     set: function (name) {
       if (name !== 'manual' && name !== 'systematic') return;
+      var L = Desk.layout;
+      if (L && L.split) { tabs.cur = name; document.body.setAttribute('data-tab', name); Desk.storage.set('tab', name); L.setSplit(false); return; }
       if (tabs.cur === name) return;
       tabs.cur = name;
       document.body.setAttribute('data-tab', name);
@@ -31,7 +34,8 @@
       R.force(name);
       R.mark('tab');
     },
-    toggle: function () { tabs.set(tabs.cur === 'manual' ? 'systematic' : 'manual'); }
+    toggle: function () { tabs.set(tabs.cur === 'manual' ? 'systematic' : 'manual'); },
+    split: function () { if (Desk.layout && Desk.layout.splitOK) Desk.layout.setSplit(!Desk.layout.split); }
   };
 
   // ---------------------------------------------------------------------------------------------
@@ -107,10 +111,12 @@
       cell('h-kal', F.money(h.cash.K.total));
       cell('h-kal-free', 'free ' + F.money(h.cash.K.free));
       cell('h-pm', F.money(h.cash.P.total));
-      cell('h-pm-free', h.cash.P.ro ? '' : 'free ' + F.money(h.cash.P.free));
+      // PM has no shards: its free cash shows only while orders hold some of it
+      cell('h-pm-free', h.cash.P.ro || Math.abs(h.cash.P.total - h.cash.P.free) < 100 ? '' : 'free ' + F.money(h.cash.P.free));
       D.setClass($('h-pm-ro'), 'on', h.cash.P.ro);
       cell('h-day', F.pnl(h.day.total), 'hv ' + F.sign(h.day.total));
       cell('h-day-split', 'S ' + F.pnl(h.day.sys) + ' M ' + F.pnl(h.day.man));
+      D.setAttr($('hc-day'), 'title', 'S ' + F.pnl(h.day.sys) + ' M ' + F.pnl(h.day.man) + ' LIP ' + F.pnl(h.day.lip));
       cell('h-risk', F.money(h.risk));
       var stopCls = h.stop.hit ? 'hc crit' : (h.stop.left < h.stop.limit / 2 ? 'hc warn' : 'hc');
       cell('h-stop', F.money(h.stop.left) + '/' + F.money(h.stop.limit));
@@ -206,10 +212,14 @@
   // init
   // ---------------------------------------------------------------------------------------------
   function init() {
-    var saved = Desk.storage.get('tab');
-    tabs.set(saved === 'systematic' ? 'systematic' : 'manual');
+    // ?tab=systematic|manual opens that tab (a link or a bookmark); otherwise the remembered one
+    var q = Desk.qs && Desk.qs.tab;
+    var saved = (q === 'systematic' || q === 'manual' ? q : Desk.storage.get('tab')) === 'systematic' ? 'systematic' : 'manual';
+    if (Desk.layout && Desk.layout.split) { tabs.cur = saved; document.body.setAttribute('data-tab', saved); R.tab = null; R.mark('tab'); }
+    else tabs.set(saved);
     $('tab-sys').addEventListener('click', function () { tabs.set('systematic'); });
     $('tab-man').addEventListener('click', function () { tabs.set('manual'); });
+    var sp = $('tab-split'); if (sp) sp.addEventListener('click', function () { tabs.split(); });
     $('kill').addEventListener('click', onKill);
     $('sb-alert').addEventListener('click', function () { H.openLog(); });
     $('sb-keys').addEventListener('click', function () { H.openKeys(); });
@@ -222,6 +232,7 @@
 
     var K = Desk.keys;
     K.bind({ key: '`', desc: 'switch SYSTEMATIC / MANUAL', fn: function () { tabs.toggle(); } });
+    K.bind({ key: '~', desc: 'SPLIT: both tabs side by side (2400 px and wider)', fn: function () { tabs.split(); } });
     K.bind({ key: 's', after: 'g', desc: 'go to SYSTEMATIC', fn: function () { tabs.set('systematic'); } });
     K.bind({ key: 'm', after: 'g', desc: 'go to MANUAL', fn: function () { tabs.set('manual'); } });
     K.bind({ key: 'h', desc: 'hotkeys on/off (order keys need ON)', fn: function () { K.setHK(!K.hk); } });

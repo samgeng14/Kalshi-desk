@@ -1,6 +1,6 @@
 /* ui/desk/js/manual.js
  *
- * The MANUAL tab: watchlist, price ladders A/B (C in WIDE mode), the ticket, and the manual
+ * The MANUAL tab: watchlist, price ladders A/B (C from 1920 px, D from 2400), the ticket, and the manual
  * working orders, fills and positions grids. Everything links through Desk.focus: a market picked
  * anywhere loads into the focused ladder and the ticket.
  *
@@ -51,7 +51,7 @@
   var U = 10000;
   var MINUS = '\u2212';
   var ROW_PX = 18;
-  var SLOTS = ['A', 'B', 'C'];
+  var SLOTS = ['A', 'B', 'C', 'D'];
   var PRESETS = [1, 5, 10, 25, 50, 100];
   var LAD_TTLS = [5, 15, 60];
   var CAPS = [0, 1, 2];
@@ -189,7 +189,9 @@
         else navg = np > 0 ? avg : (np < 0 ? px : 0);
       }
       var maxl = np > 0 ? np * navg : (np < 0 ? -np * (U - navg) : 0);
-      return { reserve: reserve, fee: fee, cost: reserve + Math.max(0, fee), pos: np, avg: navg, maxl: maxl };
+      // the gateway's cash check: the reservation plus the fee as if the order took (contract)
+      var need = reserve + Math.max(0, Desk.fees.estimate(m.v, m.fee, side, px, qty, 'T'));
+      return { reserve: reserve, fee: fee, cost: reserve + Math.max(0, fee), need: need, pos: np, avg: navg, maxl: maxl };
     },
     // the same outcome on the other venue (game pairs), or null
     pairOf: function (markets, m) {
@@ -818,7 +820,15 @@
   // ---------------------------------------------------------------------------------------------
   // Ticket
   // ---------------------------------------------------------------------------------------------
-  function tkType() { var id = cfg.tk.type; for (var i = 0; i < TK_TYPES.length; i++) if (TK_TYPES[i].id === id) return TK_TYPES[i]; return TK_TYPES[3]; }
+  // the ticket's order type for the market loaded: the chosen one, except that START on a market
+  // with no start ahead (a 15-minute window, a game under way) acts as the 15 s default, so the
+  // buttons never sit disabled on a choice made for another market (the choice is kept)
+  function tkType(m) {
+    var id = cfg.tk.type, t = TK_TYPES[3];
+    for (var i = 0; i < TK_TYPES.length; i++) if (TK_TYPES[i].id === id) t = TK_TYPES[i];
+    if (t.ttl === 'START' && m !== undefined && !typeOK(t, m)) return TK_TYPES[3];
+    return t;
+  }
   function typeOK(t, m) {
     if (t.tif !== 'POST') return true;
     if (t.ttl === 'START') return logic.startExp(m, Date.now() + (S().srvOffset || 0)) !== null;
@@ -827,7 +837,7 @@
   function tkLoad(key) { TK.key = key; TK.px = null; TK.pxBad = false; TK.arm = null; }
   // the order a ticket button would send now: {px, tif, ttl_s, touch, liq}; px null = no price
   function tkOrder(side, m, b) {
-    var t = tkType(), g = m.g, bb = b ? b.bb : null, ba = b ? b.ba : null, px = TK.px, buy = side === 'BUY';
+    var t = tkType(m), g = m.g, bb = b ? b.bb : null, ba = b ? b.ba : null, px = TK.px, buy = side === 'BUY';
     var touch = t.tif === 'POST' ? (buy ? bb : ba) : (buy ? ba : bb);
     if (px === null) {
       if (t.tif === 'POST') px = buy ? bb : ba;
@@ -847,7 +857,7 @@
     var st = S(), key = TK.key, m = key ? st.market(key) : null, b = key ? st.book(key) : null;
     if (!m) return null;
     var btnEl = side === 'BUY' ? TK.el.buy : TK.el.sell;
-    var why = blockReason(m) || qtyReason(m, cfg.tk.qty) || (TK.pxBad ? 'PRICE OFF GRID' : '') || (typeOK(tkType(), m) ? '' : (tkType().ttl === 'START' ? 'NO START TIME' : 'EXPIRY NOT IN CONTRACT'));
+    var why = blockReason(m) || qtyReason(m, cfg.tk.qty) || (TK.pxBad ? 'PRICE OFF GRID' : '') || (typeOK(tkType(m), m) ? '' : 'EXPIRY NOT IN CONTRACT');
     if (why) { refuse(null, btnEl, why); return null; }
     var o = tkOrder(side, m, b);
     if (o.px === null) { refuse(null, btnEl, 'NO PRICE: empty book side'); return null; }
@@ -999,7 +1009,7 @@
     D.setClass(E.qty, 'zero', !(cfg.tk.qty > 0));
     E.q.forEach(function (x, i) { D.setClass(x, 'on', cfg.tk.qty === PRESETS[i]); });
     E.cap.forEach(function (x, i) { D.setClass(x, 'on', cfg.cap === CAPS[i]); });
-    var t = tkType();
+    var t = tkType(m);
     E.types.forEach(function (x, i) {
       var tt = TK_TYPES[i], ok = typeOK(tt, m);
       D.setClass(x, 'on', tt.id === t.id); setDisabled(x, !ok);
@@ -1029,10 +1039,10 @@
       if (m.v === 'K') { var sh = st.hdr && m.shard ? st.hdr.cash.K.shards.filter(function (s) { return s.id === m.shard; })[0] : null; free = sh ? sh.free : null; lbl = (m.shard || 'K') + ' free'; }
       else { free = st.hdr && !st.hdr.cash.P.ro ? st.hdr.cash.P.free : null; lbl = 'PM free'; }
       D.setText(E.shL, lbl); D.setText(E.sh, free === null ? '?' : F.money(free));
-      var short = free !== null && ci.cost > free;
-      D.setText(E.shOk, free === null ? '' : (short ? 'SHORT ' + F.money(ci.cost - free) : 'OK'));
+      var short = free !== null && ci.need > free;
+      D.setText(E.shOk, free === null ? '' : (short ? 'SHORT ' + F.money(ci.need - free) : 'OK'));
       setCls(E.shOk, 'tag ' + (short ? 'warn' : 'ok'));
-      var mv = short && m.v === 'K' && m.shard && st.hdr ? logic.moveFor(st.hdr.cash.K.shards, m.shard, ci.cost - free) : null;
+      var mv = short && m.v === 'K' && m.shard && st.hdr ? logic.moveFor(st.hdr.cash.K.shards, m.shard, ci.need - free) : null;
       if (mv) TK.move = { from: mv.from, to: m.shard, amt: mv.amt };
       D.setText(E.move, mv ? (TK.movePend ? 'MOVING' : 'MOVE ' + F.money(mv.amt, 0) + ' ' + mv.from + '>' + m.shard) : '');
       D.setClass(E.move, 'off', !mv); D.setClass(E.move, 'pend', !!TK.movePend); D.setClass(E.move, 'part', !!mv && !mv.full);
@@ -1055,7 +1065,7 @@
     var lab = function (sd, x) {
       var q = F.size(cfg.tk.qty);
       if (x.px === null) return sd + ' ' + q;
-      if (x.tif === 'POST') return sd + ' ' + q + ' @' + F.pxg(x.px, g) + ' ' + (tkType().label);
+      if (x.tif === 'POST') return sd + ' ' + q + ' @' + F.pxg(x.px, g) + ' ' + t.label;
       return sd + ' ' + q + ' ' + (x.tif === 'FOK' ? 'FOK ' : '') + '\u2264' + F.pxg(x.px, g);
     };
     var blocked = !!(why || qtyReason(m, cfg.tk.qty) || TK.pxBad || !typeOK(t, m));
@@ -1187,9 +1197,9 @@
                                     { h: 'Liq', w: 28 }, { h: 'Fee', w: 40, cls: 'n' }, { h: 'MO10', w: 44, cls: 'n' }, { h: 'MO60', w: 44, cls: 'n' }], 'fills');
     var ft = $('m-fills-tools'); if (ft) { GR.fillsN = el('span', 'pinfo'); ft.textContent = ''; ft.appendChild(GR.fillsN); }
     if (pb) {
-      GR.pos = D.table(pb, [{ h: 'Mkt' }, { h: 'V', w: 20 }, { h: 'Own', w: 36 }, { h: 'Pos', w: 44, cls: 'n' }, { h: 'Avg', w: 44, cls: 'n' },
+      GR.pos = D.table(pb, [{ h: 'Mkt' }, { h: 'V', w: 18 }, { h: 'Own', w: 36 }, { h: 'Pos', w: 42, cls: 'n' }, { h: 'Avg', w: 44, cls: 'n' },
                             { h: 'Bid', w: 44, cls: 'n' }, { h: 'Ask', w: 44, cls: 'n' }, { h: 'Unrl', w: 52, cls: 'n' }, { h: 'Real', w: 52, cls: 'n' },
-                            { h: 'MaxL', w: 52, cls: 'n' }, { h: '', w: 40 }], 'pos');
+                            { h: 'MaxL', w: 50, cls: 'n' }, { h: '', w: 36 }], 'pos');
       GR.pos.addEventListener('click', function (ev) {
         var td = ev.target && ev.target.closest ? ev.target.closest('td') : null;
         var k = td ? td.getAttribute('data-flat') : null;
@@ -1213,7 +1223,7 @@
         mkt = o.tif + ' ' + F.size(o.filled) + '/' + F.size(o.qty) + ' killed ' + (m ? m.short : o.tk);
       if (o.st === 'REJ') why = o.why || 'REJ';
       var expLeft = o.exp_ms && !o.terminal ? o.exp_ms - nowS : null;
-      var exp = o.tif === 'POST' ? (expLeft === null ? (ext && !o.terminal ? 'GTC' : '') : (expLeft >= 100000 ? F.dur(expLeft) : F.secs(expLeft))) : o.tif;
+      var exp = o.tif === 'POST' ? (expLeft === null ? (ext && !o.terminal ? 'GTC' : '') : (expLeft >= 100000 ? F.left(expLeft) : F.secs(expLeft))) : o.tif;
       var lat = o.t.click && o.t.ack ? ' ack ' + (o.t.ack - o.t.click) + 'ms' : '';
       return [
         { t: F.time(orderTime(o)), cls: 'n tm', title: o.cid + lat },
@@ -1313,6 +1323,7 @@
     var k = null;
     if (slot === 'A') k = pick(function (m) { return m.kind === 'LIP15' && /^KXNATGAS/.test(m.tk); }) || pick(function (m) { return m.kind === 'LIP15'; });
     else if (slot === 'B') k = pick(function (m) { return m.kind === 'GAME' && m.v === 'K' && inPlay(m); }) || pick(function (m) { return m.kind === 'GAME'; });
+    else if (slot === 'D') k = pick(function (m) { return m.kind === 'LIP15' && /^KXPLATINUM/.test(m.tk); }) || pick(function (m) { return m.kind === 'GAME' && m.v === 'P'; }) || pick(function (m) { return m.kind === 'LIP15'; });
     else {
       // the most likely weather bracket with a two-sided book
       var best = null;
@@ -1366,7 +1377,7 @@
     var s = ctx && ctx.el && ctx.el.getAttribute ? ctx.el.getAttribute('data-ladder') : null;
     return LAD[s || Desk.focus.ladder] || null;
   }
-  function onManual() { return Desk.render.tab === 'manual'; }
+  function onManual() { return Desk.render.tab === 'manual' || !!(Desk.layout && Desk.layout.split); }
   function hotOrder(L, kind, side, ev) {
     var x = ladMarket(L), m = x.m, b = x.b;
     if (!m) return null;

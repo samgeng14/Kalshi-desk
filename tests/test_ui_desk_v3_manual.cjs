@@ -155,7 +155,7 @@ function bootPage(opts) {
   const clock = { t: opts.t0 || Date.UTC(2026, 9, 6, 23, 31, 0) };
   const mq = {};
   const matchMedia = q => {
-    if (!mq[q]) mq[q] = { matches: q.indexOf('1920') >= 0 ? !!opts.wide : false, ls: [], addEventListener(t, f) { this.ls.push(f); } };
+    if (!mq[q]) mq[q] = { matches: q.indexOf('1920') >= 0 ? !!opts.wide : (q.indexOf('2400') >= 0 ? !!opts.xwide : false), ls: [], addEventListener(t, f) { this.ls.push(f); } };
     return mq[q];
   };
   const rafs = [];
@@ -213,7 +213,12 @@ function bootPage(opts) {
     const q = mq['(min-width: 1920px)'];
     q.matches = on; q.ls.forEach(f => f());
   }
-  return { ctx, D, doc, $, fire, click, key, run, frame, flush, clock, errors, sim: () => sim, setWide, mem };
+  // an external monitor: 2400 px and wider (WIDE as well)
+  function setXWide(on) {
+    const w = mq['(min-width: 1920px)'], x = mq['(min-width: 2400px)'];
+    w.matches = on; x.matches = on; w.ls.forEach(f => f());
+  }
+  return { ctx, D, doc, $, fire, click, key, run, frame, flush, clock, errors, sim: () => sim, setWide, setXWide, mem };
 }
 
 // helpers on the rendered DOM
@@ -328,6 +333,8 @@ function manOrders(P, key) { const a = []; P.D.store.orders.forEach(o => { if (o
     check(ci.reserve === 0 && ci.pos === 6 && ci.maxl === 30000, 'a reducing sell ties up no cash; max loss of what stays', ci);
     ci = L.costInfo(mk, { pos: 3, avg: 5000 }, 'SELL', 6000, 5, 'M');
     check(ci.reserve === 2 * 4000 && ci.pos === -2 && ci.maxl === 2 * 4000, 'a sell through flat: NO cost on the excess', ci);
+    ci = L.costInfo(mk, null, 'BUY', 5800, 70, 'M');
+    check(ci.fee === 0 && ci.cost === 406000 && ci.need === 406000 + D.fees.estimate('K', QUAD, 'BUY', 5800, 70, 'T'), 'a post: no maker fee, but the cash check (need) holds the taker fee as the gateway does', ci);
     eq(L.c2(175), '1.75', 'fee per contract in cents');
     eq(L.c2(-31.25), M + '0.31', 'a rebate is negative with U+2212');
     eq(L.series('KXNATGAS15M-26OCT061930-30'), 'KXNATGAS15M', 'the 15-minute series of a ticker');
@@ -714,6 +721,8 @@ function manOrders(P, key) { const a = []; P.D.store.orders.forEach(o => { if (o
     check(o.st === 'WORK' && o.exp_ms === Math.floor(gm.start_ms / 1000) * 1000, 'the venue keeps that expiry', { st: o.st, exp: o.exp_ms });
     D.act.cancel([o.cid]); await run(300);
     D.focus.set(natKey); await run(300);
+    check(MS.cfg.tk.type === 'PSTART' && / 15s$/.test(E.buy.textContent) && !E.buy.disabled && /\bon\b/.test(tyBtn('15s').className),
+      'START chosen on a market with no start acts as 15 s (the buttons stay live)', [E.buy.textContent, E.buy.disabled]);
     click(tyBtn('IOC')); P.frame();
   }
   check(E.eM.textContent !== '' && /c/.test(E.eM.textContent), 'edge vs model shown', E.eM.textContent);
@@ -908,6 +917,34 @@ function manOrders(P, key) { const a = []; P.D.store.orders.forEach(o => { if (o
   check(rowsOf(MS.ladders.C.tb).length === 38 && MS.ladders.C.shownKey === D.focus.ladders.C, 'ladder C renders its rows');
   eq(st.book(D.focus.ladders.C).depth, 'FULL', 'ladder C streams full depth');
   P.setWide(false);
+  await run(300);
+
+  // ---- 2400 px and wider: a fourth ladder, and SPLIT ------------------------------------------
+  P.setXWide(true);
+  await run(500);
+  check(D.layout.ladders().length === 4 && D.focus.ladders.D && MS.ladders.D.shownKey === D.focus.ladders.D && rowsOf(MS.ladders.D.tb).length > 0,
+    'from 2400 px a fourth ladder shows a market', D.focus.ladders);
+  eq(P.sim().state.subs.ladders.length, 4, 'the stream carries all four ladders at full depth');
+  eq(P.doc.body.getAttribute('data-splitok'), '1', 'the SPLIT button is offered');
+  click(P.$('tab-split')); await run(300);
+  check(D.layout.split && P.doc.body.getAttribute('data-split') === '1' && D.render.tab === null, 'SPLIT shows both tabs, every renderer live');
+  check(D.layout.ladders().join() === 'A' && P.sim().state.subs.ladders.length === 1, 'each half lays out narrow: one ladder', D.layout.ladders());
+  check(D.systematic._t.mode() === 'n', 'SYSTEMATIC uses its narrow columns in its half');
+  st.lanes.get('M1').pendOn = null; D.render.mark('lane'); await run(300);
+  check(P.$('s-lanes-body').children[0] && P.$('s-lanes-body').children[0].children[2].children.length > 0, 'the SYSTEMATIC half renders while MANUAL is live too');
+  {
+    A.el.focus();
+    D.keys.setHK(true);
+    const n1 = st.orders.size;
+    key('KeyB', 'b');
+    check(st.orders.size === n1 + 1, 'MANUAL hotkeys work in SPLIT (B with the ladder focused)');
+    D.keys.setHK(false);
+    D.act.cancelAll('MAN', null); await run(300);
+  }
+  eq(D.storage.get('split'), '1', 'SPLIT is remembered');
+  click(P.$('tab-man')); await run(300);
+  check(!D.layout.split && D.render.tab === 'manual' && P.doc.body.getAttribute('data-tab') === 'manual' && D.layout.ladders().length === 4, 'picking a tab leaves SPLIT');
+  P.setXWide(false);
   await run(300);
 
   // ---- zoom on a 0.1c grid --------------------------------------------------------------------

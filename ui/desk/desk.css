@@ -132,19 +132,29 @@ input:focus { outline: 1px solid var(--tx0); outline-offset: -1px; }
   display: flex; align-items: stretch; height: var(--hdr-h); min-width: 0;
   background: var(--bg0); border-bottom: 1px solid var(--line2); white-space: nowrap; overflow: hidden;
 }
-.tabsw { display: flex; flex: 0 0 184px; }
+/* The data cells take their text's width, at least the spec's width from 1400 px up (so the
+   header does not jump as numbers change), and may shrink below it (clipping their own text)
+   when the window is too narrow; the health cells, the clock and KILL never shrink, so KILL
+   stays on screen at any width. At 1512 px everything fits. */
+.tabsw { display: flex; flex: 0 0 auto; }
 .tabsw button {
   height: 27px; border: 0; background: transparent; color: var(--tx2); padding: 0 6px;
-  font: 600 11px/1 var(--font-ui); letter-spacing: .04em; text-align: left;
+  font: 600 11px/1 var(--font-ui); letter-spacing: .02em; text-align: left;
 }
-#tab-sys { width: 104px; } #tab-man { width: 80px; }
+#tab-sys { min-width: 118px; } #tab-man { min-width: 80px; } #tab-split { display: none; min-width: 52px; }
+body[data-splitok="1"] #tab-split { display: block; }
+body[data-split="1"] #tab-split { background: var(--bg3); color: var(--tx0); box-shadow: inset 0 -2px 0 var(--tx0); }
 .tabsw button:hover { background: var(--bg2); }
-body[data-tab="systematic"] #tab-sys, body[data-tab="manual"] #tab-man { background: var(--bg3); color: var(--tx0); box-shadow: inset 0 -2px 0 var(--tx0); }
+body[data-split="0"][data-tab="systematic"] #tab-sys, body[data-split="0"][data-tab="manual"] #tab-man,
+body:not([data-split])[data-tab="systematic"] #tab-sys, body:not([data-split])[data-tab="manual"] #tab-man { background: var(--bg3); color: var(--tx0); box-shadow: inset 0 -2px 0 var(--tx0); }
 .tst { font: 700 11px/1 var(--font-num); margin-left: 2px; }
 .tst.up { color: var(--up); } .tst.dn { color: var(--dn); } .tst.dim { color: var(--tx2); }
-.hc { display: flex; align-items: center; gap: 5px; padding: 0 8px; border-left: 1px solid var(--line); flex: 0 0 auto; overflow: hidden; }
-#hc-kal { width: 150px; } #hc-pm { width: 112px; } #hc-day { width: 160px; } #hc-risk { width: 96px; }
-#hc-stop { width: 124px; } #hc-sys { width: 112px; } #hc-mode { width: 52px; justify-content: center; }
+.hc { display: flex; align-items: center; gap: 5px; padding: 0 6px; border-left: 1px solid var(--line); flex: 0 1 auto; min-width: 0; overflow: hidden; }
+@media (min-width: 1400px) {
+  #hc-kal { min-width: 150px; } #hc-pm { min-width: 112px; } #hc-day { min-width: 160px; } #hc-risk { min-width: 88px; }
+  #hc-stop { min-width: 124px; } #hc-sys { min-width: 112px; }
+}
+#hc-mode { flex: 0 0 48px; justify-content: center; padding: 0 2px; }
 .hl { font: 10px/1 var(--font-ui); color: var(--tx2); text-transform: uppercase; letter-spacing: .04em; }
 .hv { font: 13px/1 var(--font-num); font-variant-numeric: tabular-nums slashed-zero; color: var(--tx0); }
 .hv.up { color: var(--up); } .hv.dn { color: var(--dn); }
@@ -163,6 +173,13 @@ body[data-tab="systematic"] #tab-sys, body[data-tab="manual"] #tab-man { backgro
   background: var(--crit); color: #fff; font: 700 12px/1 var(--font-ui); letter-spacing: .04em; padding: 0;
 }
 #kill:hover { background: #B42121; }
+/* under 1400 px (an unusual window for this desk): the clock goes and the health cells narrow,
+   so the money cells keep their digits */
+@media (max-width: 1399px) {
+  .hclock { display: none; }
+  #h-day-split { display: none; }          /* on the DAY cell's title instead */
+  .hh { flex-basis: 56px; width: 56px; font-size: 10px; }
+}
 #kill.locked { background: var(--bg3); color: var(--dn); font: 700 11px/1 var(--font-num); }
 #kill.rearm { background: var(--bg3); color: var(--warn); }
 #kill.rearm.confirm { background: var(--warn); color: #000; }
@@ -215,7 +232,7 @@ body[data-tab="manual"] #tab-manual { display: grid; }
 
 /* MANUAL: 288 | 340 | 340 | 1fr (about 541 px at 1512); right column 176 / 180 / 200 / rest */
 #tab-manual { grid-template-columns: var(--watch-w) var(--lad-w) var(--lad-w) minmax(0, 1fr); grid-template-rows: minmax(0, 1fr); }
-#m-lad-c { display: none; }
+#m-lad-c, #m-lad-d { display: none; }
 .m-right { display: grid; grid-template-rows: 176px 180px 200px minmax(0, 1fr); gap: 1px; min-height: 0; min-width: 0; }
 
 /* WIDE (external monitor, >= 1920 px): a third ladder, a wider watchlist and right column */
@@ -228,12 +245,24 @@ body[data-tab="manual"] #tab-manual { display: grid; }
   .s-left { grid-template-rows: 320px minmax(0, 1fr); }
   .s-right { grid-template-rows: 400px minmax(0, 1fr); }
 }
+/* 2400 px and wider: a fourth ladder (the stream carries at most four at full depth) */
+@media (min-width: 2400px) {
+  #tab-manual { grid-template-columns: var(--watch-w) var(--lad-w) var(--lad-w) var(--lad-w) var(--lad-w) minmax(0, 1fr); }
+  #m-lad-d { display: flex; }
+}
 /* NARROW (< 1400 px): one ladder; the right column takes the room */
 @media (max-width: 1399px) {
   #tab-manual { grid-template-columns: var(--watch-w) var(--lad-w) minmax(0, 1fr); }
   #m-lad-b { display: none; }
   .s-lower { grid-template-columns: minmax(0, 1fr) 520px; }
 }
+/* SPLIT (>= 2400 px, operator's choice): SYSTEMATIC left half, MANUAL right half, each laid out
+   as a window under 1400 px */
+body[data-split="1"] .tabroot { display: grid; }
+body[data-split="1"] #tab-systematic { right: calc(50% + 1px); }
+body[data-split="1"] #tab-manual { left: 50%; grid-template-columns: var(--watch-w) var(--lad-w) minmax(0, 1fr); }
+body[data-split="1"] #m-lad-b, body[data-split="1"] #m-lad-c, body[data-split="1"] #m-lad-d { display: none; }
+body[data-split="1"] .s-lower { grid-template-columns: minmax(0, 1fr) 560px; }
 /* short windows */
 @media (max-height: 759px) {
   .m-right { grid-template-rows: 176px 150px 160px minmax(0, 1fr); }
@@ -333,6 +362,7 @@ table.lad col.wb, table.lad col.ws { width: 48px; } table.lad col.bq, table.lad 
 table.lad col.rf { width: 20px; } table.lad col.px { width: 56px; } table.lad col.lt { width: 48px; }
 table.lad th { height: 18px; padding: 0 4px; font: 400 11px/1 var(--font-ui); color: var(--tx2); text-align: right; background: var(--bg2); }
 table.lad th.px, table.lad th.rf { text-align: center; }
+table.lad th.rf { padding: 0; }
 table.lad td {
   height: var(--lad-row); padding: 0 4px; border-bottom: 1px solid var(--bg1);
   font: 13px/1 var(--font-num); font-variant-numeric: tabular-nums slashed-zero; color: var(--tx0);

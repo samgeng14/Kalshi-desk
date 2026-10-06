@@ -29,6 +29,7 @@
   <div class="tabsw" role="tablist">
     <button id="tab-sys" type="button" role="tab" data-tab="systematic"><span>SYSTEMATIC</span> <b id="tab-sys-st" class="tst dim"></b></button>
     <button id="tab-man" type="button" role="tab" data-tab="manual"><span>MANUAL</span> <b id="tab-man-n" class="tst dim">0</b></button>
+    <button id="tab-split" type="button" role="tab">SPLIT</button>
   </div>
   <div class="hc" id="hc-kal"><span class="hl">KAL</span><span class="hv" id="h-kal"></span><span class="hs" id="h-kal-free"></span></div>
   <div class="hc" id="hc-pm"><span class="hl">PM</span><span class="hv" id="h-pm"></span><span class="hs" id="h-pm-free"></span><span class="tag warn ro" id="h-pm-ro">RO</span></div>
@@ -83,7 +84,7 @@
     </div>
   </div>
 
-  <!-- MANUAL: watchlist 288 | ladder A 340 | ladder B 340 | (ladder C 340, wide) | right column -->
+  <!-- MANUAL: watchlist 288 | ladder A 340 | ladder B 340 | (ladder C 340 from 1920 px, D from 2400) | right column -->
   <div class="tabroot" id="tab-manual">
     <section class="panel" id="m-watch" data-kscope="watch">
       <div class="ptitle"><span class="pname">MARKETS</span><span class="ptools" id="m-watch-tools"></span></div>
@@ -106,6 +107,12 @@
       <div class="lad-cols" id="m-lad-c-cols"></div>
       <div class="pbody lad-rows" id="m-lad-c-body"></div>
       <div class="lad-foot" id="m-lad-c-foot"></div>
+    </section>
+    <section class="panel lad" id="m-lad-d" data-ladder="D" data-kscope="ladder" tabindex="0">
+      <div class="lad-head" id="m-lad-d-head"></div>
+      <div class="lad-cols" id="m-lad-d-cols"></div>
+      <div class="pbody lad-rows" id="m-lad-d-body"></div>
+      <div class="lad-foot" id="m-lad-d-foot"></div>
     </section>
     <div class="m-right">
       <section class="panel" id="m-ticket" data-kscope="ticket">

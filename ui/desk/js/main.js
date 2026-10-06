@@ -35,7 +35,7 @@
     // the focused ladder carries data-focused="1" (1 px outline in desk.css)
     Desk.render.add({ id: 'ladfocus', tab: 'manual', fn: function (d) {
       if (!d.has('focus') && !d.has('layout') && !d.all) return;
-      ['A', 'B', 'C'].forEach(function (s) { Desk.dom.setAttr(Desk.dom.$('m-lad-' + s.toLowerCase()), 'data-focused', Desk.focus.ladder === s ? '1' : null); });
+      ['A', 'B', 'C', 'D'].forEach(function (s) { Desk.dom.setAttr(Desk.dom.$('m-lad-' + s.toLowerCase()), 'data-focused', Desk.focus.ladder === s ? '1' : null); });
     } });
 
     Desk.store.begin();
