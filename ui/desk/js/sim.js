@@ -546,7 +546,9 @@
         return err('BAD_QTY', 'qty ' + req.qty);
       var hasTtl = req.ttl_s !== null && req.ttl_s !== undefined, hasExp = req.exp_ms !== null && req.exp_ms !== undefined;
       if (own !== 'EXT' && (req.tif === 'POST' ? hasTtl === hasExp : (hasTtl || hasExp))) return err('BAD_REQUEST', 'POST needs one of ttl_s and exp_ms; IOC and FOK neither');
-      if (hasExp && (req.exp_ms % 1000 !== 0 || req.exp_ms < now + 5000 || req.exp_ms > now + 86400000)) return err('BAD_REQUEST', 'exp_ms must be a whole second 5 s to 24 h ahead');
+      // an absolute expiry: a whole second, 5 s ahead at least, never past the market's close
+      // ("until close" sends the close itself: Kalshi expiration_ts / Polymarket US GTD at the close)
+      if (hasExp && (req.exp_ms % 1000 !== 0 || req.exp_ms < now + 5000 || (own !== 'EXT' && req.exp_ms > m.close_ms))) return err('BAD_REQUEST', 'exp_ms must be a whole second, 5 s ahead at least and no later than the close');
       if (req.reduce_only && req.tif !== 'IOC') return err('BAD_REQUEST', 'reduce_only is IOC only');
       if (req.reduce_only) { var rp = posOf(m.key); if (req.side === 'BUY' ? rp >= 0 : rp <= 0) return err('REDUCE', rp === 0 ? 'no position' : 'would increase the position'); }
       if (S.run.state === 'KILLED' && own !== 'EXT') return err('KILLED', 'kill lockout');

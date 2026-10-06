@@ -296,6 +296,17 @@ function manOrders(P, key) { const a = []; P.D.store.orders.forEach(o => { if (o
     eq(L.woText(100, 0, 59, false), '100 59', 'working cell drops the s when tight');
     eq(L.woText(1000, 0, 59, false), '1000', 'working cell keeps the size when nothing else fits');
     eq(L.woText(5, 0, null, false), '5', 'IOC or pending: size only');
+    eq(L.woText(8, 0, 840, false), '8 14m', 'a long expiry (until close) counts in minutes');
+    eq(L.woText(8, 0, 3 * 3600 + 300, false), '8 3h', 'and in hours past 100 minutes');
+    eq(L.woText(1000, 0, 840, false), '1000', 'it still never overflows the cell');
+    {
+      const T = Date.UTC(2026, 9, 6, 23, 0, 0);
+      eq(L.closeExp({ status: 'OPEN', close_ms: T + 3600500 }, T), T + 3600000, 'CLOSE: the market close, cut to a whole second');
+      eq(L.closeExp({ status: 'OPEN', close_ms: T + 4000 }, T), null, 'CLOSE: refused under 5 s before the close');
+      eq(L.closeExp({ status: 'CLOSED', close_ms: T + 600000 }, T), null, 'CLOSE: only on an open market');
+      eq(L.expShort(12000), '12s', 'a short expiry counts in seconds');
+      eq(L.expShort(3 * 3600e3 + 5 * 60e3), '3h05m', 'a long one reads as time to close');
+    }
     // break-even band: Kalshi taker 0.07 p(1-p) = 1.75c at 0.50
     const QUAD = { type: 'QUAD', mult: 1 };
     check(L.inBand('K', QUAD, 5000, 5100) && !L.inBand('K', QUAD, 5000, 5200), 'break-even band is the taker fee around the model fair');
@@ -579,6 +590,17 @@ function manOrders(P, key) { const a = []; P.D.store.orders.forEach(o => { if (o
   click(ladCell(P, 'A', 6100, 'bq'));
   o = newest(P, x => x.own === 'MAN');
   check(o.qty === 5 && o.tif === 'POST' && o.exp_ms - P.clock.t > 55000 && o.exp_ms - P.clock.t <= 61000, 'posts carry the ladder size and expiry', { qty: o.qty, exp: o.exp_ms - P.clock.t });
+  {
+    click(fbtn('CL'));
+    eq(A.cfg.ttl, 'CLOSE', 'the ladder offers CL: post until the market closes');
+    click(ladCell(P, 'A', 6000, 'bq'));
+    const oc = newest(P, x => x.own === 'MAN');
+    check(oc.tif === 'POST' && oc.exp_ms === Math.floor(nat.close_ms / 1000) * 1000, 'a CL click posts with the market close as its expiry', { exp: oc.exp_ms, close: nat.close_ms });
+    await run(300);
+    check(/^5 \d+m$/.test(ladCell(P, 'A', 6000, 'wb').textContent), 'the ladder counts it down to the close in minutes', ladCell(P, 'A', 6000, 'wb').textContent);
+    D.act.cancel([oc.cid]); await run(300);
+    click(fbtn('60s'));
+  }
   click(fbtn('5'), { shiftKey: true });
   eq(A.cfg.qty, 10, 'Shift+preset adds');
   click(fbtn('CLR'));
@@ -762,7 +784,7 @@ function manOrders(P, key) { const a = []; P.D.store.orders.forEach(o => { if (o
   check(/auto/.test(E.px.className) && E.px.value === '0.63', 'the price field shows AUTO in grey');
   const tyBtn = t => E.types.find(b => b.textContent === t);
   check(!tyBtn('30m').disabled && tyBtn('START').disabled && !tyBtn('5m').disabled, '5m and 30m are there; START needs a game start time (a 15-minute window has none)');
-  check(['IOC', 'FOK', '5s', '15s', '60s', '5m', '30m', 'START'].every(t => tyBtn(t)), 'IOC FOK POST 5s 15s 60s 5m 30m START, no GTC');
+  check(['IOC', 'FOK', '5s', '15s', '60s', '5m', '30m', 'START', 'CLOSE'].every(t => tyBtn(t)), 'IOC FOK POST 5s 15s 60s 5m 30m START CLOSE, no open-ended GTC');
   click(tyBtn('IOC')); P.frame();
   check(/^BUY 1 ≤0\.65$/.test(E.buy.textContent), 'IOC shows how far it may fill (the cap)', E.buy.textContent);
   check(/cost/.test(E.costL.textContent) && E.cost.textContent === '0.67' && E.shL.textContent === 'S3 free' && E.shOk.textContent === 'OK', 'check line: cost (0.65 plus the 0.02 taker fee), shard free cash, OK', [E.cost.textContent, E.shL.textContent, E.sh.textContent, E.shOk.textContent]);
@@ -796,6 +818,29 @@ function manOrders(P, key) { const a = []; P.D.store.orders.forEach(o => { if (o
     D.focus.set(natKey); await run(300);
     check(MS.cfg.tk.type === 'PSTART' && / 15s$/.test(E.buy.textContent) && !E.buy.disabled && /\bon\b/.test(tyBtn('15s').className),
       'START chosen on a market with no start acts as 15 s (the buttons stay live)', [E.buy.textContent, E.buy.disabled]);
+    click(tyBtn('IOC')); P.frame();
+  }
+  // CLOSE: an order that rests until the market closes (Kalshi expiration_ts / PM GTD at the close)
+  {
+    check(!!tyBtn('CLOSE') && !tyBtn('CLOSE').disabled, 'the ticket offers CLOSE (until close) next to START');
+    const wxm = Array.from(st.markets.values()).find(m => m.kind === 'WEATHER' && m.status === 'OPEN' && m.close_ms - P.clock.t > 3 * 3600e3 && st.book(m.key) && st.book(m.key).bb !== null);
+    D.focus.set(wxm.key); await run(300);
+    click(tyBtn('CLOSE')); P.frame();
+    check(/@\d\.\d+ CLOSE \d+h\d\dm$/.test(E.buy.textContent), 'the button says CLOSE and the time to close', E.buy.textContent);
+    check(/until the market closes at/.test(tyBtn('CLOSE').getAttribute('title')), 'CLOSE carries the close time on its title');
+    D.manual.ticketPrice(wxm.key, D.grid.step(wxm.g, st.book(wxm.key).bb, -2)); P.frame();
+    n0 = st.orders.size;
+    click(E.buy);
+    o = newest(P, x => x.own === 'MAN');
+    const closeS = Math.floor(wxm.close_ms / 1000) * 1000;
+    check(st.orders.size === n0 + 1 && o.tif === 'POST' && o.exp_ms === closeS, 'CLOSE sends a post whose exchange expiry is the market close', { exp: o.exp_ms, close: wxm.close_ms });
+    await run(300);
+    o = st.orders.get(o.cid);
+    check(o.st === 'WORK' && o.exp_ms === closeS, 'the venue rests it until the close (more than 24 h is allowed when the close is)', { st: o.st, why: o.why });
+    const wr = P.$('m-work-body').children[0].children[2].children.find(r => r.getAttribute('data-k') === o.cid);
+    check(wr && /^\d+h\d\dm$/.test(wr.children[7].textContent) && /until close/.test(wr.children[7].getAttribute('title')), 'WORKING counts it down as the time to close', wr && wr.children[7].textContent);
+    D.act.cancel([o.cid]); await run(300);
+    D.focus.set(natKey); await run(300);
     click(tyBtn('IOC')); P.frame();
   }
   check(E.eM.textContent !== '' && /c/.test(E.eM.textContent), 'edge vs model shown', E.eM.textContent);

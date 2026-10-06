@@ -432,7 +432,9 @@
     { id: 'ttl', h: 'TTL', w: 40, hc: 'n', f: function (o, c) {
       if (o.terminal) return blank();
       if (o.tif !== 'POST') return num(o.tif, 'dim');
-      return num(o.exp_ms ? F.secs(o.exp_ms - c.srv) : '');
+      if (!o.exp_ms) return blank();
+      var left = o.exp_ms - c.srv;
+      return num(left < 100000 ? F.secs(left) : F.left(left));      // a long expiry (until close) in minutes / hours
     } },
     { id: 'edge', h: 'Edge' + C, w: 50, hc: 'n', m: 'dw', title: 'edge vs model fair at send, cents per contract', f: function (o) { return centsC(o.edge); } },
     { id: 'touch', h: 'Touch', w: 52, hc: 'n', m: 'w', f: function (o) { return num(pxOf(o.touch, o.key), 'dim'); } },

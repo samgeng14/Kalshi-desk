@@ -286,8 +286,8 @@
     if (sc) { kv('equity floor, Systematic', F.money(sc.floorU)); kv('P(stop) daily sigma', F.money(sc.sigmaDayU)); kv('lane amber, Rlzd under Pred', (sc.edgeWarnU / 100).toFixed(1) + '\u00a2 at n ' + sc.edgeWarnN); }
     kv('price guard, Manual', '2 ticks through the touch');
     if (mc) kv('slippage cap, Manual', mc.cap + ' tick' + (mc.cap === 1 ? '' : 's'));
-    kv('ladder expiries', '5 15 60 s');
-    kv('ticket types', 'IOC FOK 5s 15s 60s 5m 30m START');
+    kv('ladder expiries', '5 15 60 s, CL (until close)');
+    kv('ticket types', 'IOC FOK 5s 15s 60s 5m 30m START CLOSE');
     kv('KILL lockout', '60 s');
     kv('contract', (Desk.contract ? Desk.contract.version : '') + ' ' + (Desk.transport.mode || ''));
     var tk = setGrid('set-limits', [{ h: 'Limit' }, { h: 'Value' }]);

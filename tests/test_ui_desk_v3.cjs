@@ -609,6 +609,33 @@ const flushMicro = () => new Promise(r => setImmediate(r));
     check(r.s === 400 && r.j.err.code === 'BAD_REQUEST', 'an expiry under 5 s ahead is a bad request');
     r = order(ng, 'BUY', 6000, 1, 'IOC', null, { exp_ms: e1 + 60000 });
     check(r.s === 400 && r.j.err.code === 'BAD_REQUEST', 'an IOC carries no expiry');
+    // until close: exp_ms = the market's close, however far (a T+1 weather market closes > 24 h out)
+    const far = sim.markets().filter(x => x.kind === 'WEATHER' && x.status === 'OPEN').sort((a, b) => b.close_ms - a.close_ms)[0];
+    sim.freeze(far.key, { bids: [[2000, 30]], asks: [[2600, 30]] });
+    const fc = Math.floor(far.close_ms / 1000) * 1000;
+    check(fc - t > 86400000, 'the demo lists a market closing more than 24 h ahead', (fc - t) / 3600e3);
+    r = order(far, 'BUY', 2100, 1, 'POST', null, { ttl_s: null, exp_ms: fc });
+    check(r.s === 200 && r.j.ord.st === 'WORK' && r.j.ord.exp_ms === fc, 'a post until the close rests with the close as its venue expiry', r.j);
+    D.contract.validateResponse('POST /api/order', r.s, r.j).forEach(e => check(false, 'until-close reply: ' + e));
+    r = order(far, 'BUY', 2100, 1, 'POST', null, { ttl_s: null, exp_ms: fc + 1000 });
+    check(r.s === 400 && r.j.err.code === 'BAD_REQUEST' && /close/.test(r.j.err.msg), 'an expiry past the market\'s close is a bad request', r.j);
+    {
+      // on a sim of its own (its clock runs to a 15-minute close)
+      let tc = t;
+      const simC = D.sim.create({ now: () => tc, emit: () => {}, seed: 21, sid: 'closes01' });
+      const runC = ms => { const end = tc + ms; while (tc < end) { tc = Math.min(end, Math.max(tc + 1, Math.min(simC.nextDue(), tc + 100))); simC.pump(); } };
+      runC(500);
+      const lk = simC.markets().find(x => x.kind === 'LIP15' && x.status === 'OPEN' && x.close_ms - tc > 20000);
+      simC.freeze(lk.key, { bids: [[5000, 40]], asks: [[5200, 40]] });
+      const lc = Math.floor(lk.close_ms / 1000) * 1000;
+      let rc = null;
+      simC.request('POST', '/api/order', { cid: 'Mclose0001', v: 'K', tk: lk.tk, side: 'BUY', px: '0.4800', qty: 1, tif: 'POST', ttl_s: null, exp_ms: lc, override: false, touch: null, t_click_ms: null },
+        (st2, j2) => { rc = { s: st2, j: j2 }; }, { 'X-Desk': simC.token });
+      runC(300);
+      check(rc && rc.s === 200 && rc.j.ord.st === 'WORK', 'a 15-minute window takes an until-close post', rc && rc.j);
+      runC(lk.close_ms - tc + 500);
+      check(simC.order('Mclose0001').st === 'EXP' && simC.order('Mclose0001').why === 'EXPIRY', 'it ends EXP at the close', { st: simC.order('Mclose0001').st, why: simC.order('Mclose0001').why });
+    }
     const game = sim.markets().find(x => x.kind === 'GAME');
     check(sim.markets().every(x => x.kind === 'GAME' ? x.game && typeof x.game.start === 'number' : true), 'games carry their start');
     const gev = evs.filter(e => e.type === 'mkt').map(e => e.data).concat(sim.snapshot().markets).find(x => x.tk === game.tk);

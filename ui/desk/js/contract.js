@@ -30,8 +30,11 @@
  * - TIF: "IOC" = immediate-or-cancel (never rests; px is the slippage cap, i.e. the worst
  *   acceptable price), "FOK" = fill-or-kill (all or nothing, never rests), "POST" = post-only
  *   with an exchange-side expiry: ttl_s of 5, 15, 60, 300 or 1800 seconds, or an absolute
- *   exp_ms (the ticket's START: a game's start_ms). There is no GTC. A POST that would cross
- *   is cancelled by the exchange (st CXL, why POST_CROSS).
+ *   exp_ms: the ticket's START (a game's start_ms) or CLOSE ("until close": exp_ms = the
+ *   market's close_ms, cut to the second; the order rests until the market closes). The venue
+ *   always holds the expiry: on Kalshi a resting order with expiration_ts (GTC with an expiry;
+ *   at the close for CLOSE), on Polymarket US a GTD order. There is no open-ended GTC. A POST
+ *   that would cross is cancelled by the exchange (st CXL, why POST_CROSS).
  * - ORDER STATES: PEND (sent, not acknowledged), WORK (resting, nothing filled), PART (resting,
  *   partly filled), and the terminal states FILL (fully filled), CXL (cancelled; filled may be
  *   > 0, e.g. an IOC that filled 6 of 10), REJ (rejected; filled is 0), EXP (exchange expiry
@@ -639,12 +642,12 @@
                  response: { ok: true, subs: { ladders: [{ v: 'K', tk: 'KXNATGAS15M-26OCT061930-30' }], tops: 'ALL' } } }
     },
     'POST /api/order': {
-      doc: 'Place one order. The reply comes after the venue\'s acknowledgement and carries the order\'s state then (WORK, PART, FILL or CXL; IOC/FOK fills are in it), with its rev. A refusal returns the error and, when the cid was valid, the order: REJ when it never reached the venue or the venue rejected it, PEND when the venue did not answer in time (EXCHANGE; the private feed then settles it, on the stream). An error reply WITHOUT ord means the order was never sent to a venue (a 4xx check); a 5xx without ord means the page cannot know, so it keeps the order PEND and resyncs. The gateway checks risk in memory: no pre-check request is ever needed. The price guard refuses a crossing order more than 2 ticks through the touch unless override is true. A manual order in a market Systematic is quoting cancels those Systematic orders (why TAKEOVER) and keeps the market manual (mkt.man true) until POST /api/release. POST needs exactly one of ttl_s and exp_ms (a whole second, 5 s to 24 h ahead, e.g. a game\'s start_ms); IOC and FOK carry neither. reduce_only (IOC only, as Kalshi allows) never increases the position: qty is cut to the open position, and an order on a flat position or on the increasing side is refused REDUCE (FLAT sends it).',
+      doc: 'Place one order. The reply comes after the venue\'s acknowledgement and carries the order\'s state then (WORK, PART, FILL or CXL; IOC/FOK fills are in it), with its rev. A refusal returns the error and, when the cid was valid, the order: REJ when it never reached the venue or the venue rejected it, PEND when the venue did not answer in time (EXCHANGE; the private feed then settles it, on the stream). An error reply WITHOUT ord means the order was never sent to a venue (a 4xx check); a 5xx without ord means the page cannot know, so it keeps the order PEND and resyncs. The gateway checks risk in memory: no pre-check request is ever needed. The price guard refuses a crossing order more than 2 ticks through the touch unless override is true. A manual order in a market Systematic is quoting cancels those Systematic orders (why TAKEOVER) and keeps the market manual (mkt.man true) until POST /api/release. POST needs exactly one of ttl_s and exp_ms (a whole second, at least 5 s ahead and no later than the market\'s close_ms: a game\'s start_ms for START, the close itself for CLOSE, "until close"); IOC and FOK carry neither; an exp_ms past the close is refused BAD_REQUEST. An order resting until the close ends EXP (why EXPIRY) at the close. reduce_only (IOC only, as Kalshi allows) never increases the position: qty is cut to the open position, and an order on a flat position or on the increasing side is refused REDUCE (FLAT sends it).',
       request: {
         cid: 'cid', v: ['enum'].concat(enums.VENUE), tk: 'tk', side: ['enum'].concat(enums.SIDE),
         px: 'price', qty: 'size', tif: ['enum'].concat(enums.TIF),
         ttl_s: ['enum?'].concat(enums.TTL_S),     // POST: this or exp_ms; IOC/FOK: null
-        'exp_ms?': 'ms?',                         // POST: absolute exchange-side expiry instead of ttl_s
+        'exp_ms?': 'ms?',                         // POST: absolute exchange-side expiry instead of ttl_s (START: start_ms; CLOSE: close_ms)
         'reduce_only?': 'bool',                   // IOC only: never increase the position
         override: 'bool',                         // true = skip the 2-tick price guard
         touch: 'price?',                          // the touch shown at click (logging, slippage)
@@ -877,7 +880,7 @@
   }
 
   Desk.contract = {
-    version: '1.2.0',
+    version: '1.3.0',               // 1.3: exp_ms up to the market's close (CLOSE, until close)
     TOKEN_META: 'desk-token',            // <meta name="desk-token" content="..."> in the served page
     hostOk: hostOk,
     types: types,
