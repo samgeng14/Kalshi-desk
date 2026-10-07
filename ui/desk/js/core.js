@@ -33,17 +33,26 @@
   // or with site data blocked, and an unhandled SecurityError would blank the screen. Kept from
   // ui/index.html (the safe wrapper), with JSON helpers. Keys are prefixed 'desk3.'.
   // ---------------------------------------------------------------------------------------------
-  var mem = Object.create(null);
+  // Writes land in memory at once and reach localStorage 250 ms later, coalesced (a click never
+  // waits on Safari's synchronous storage); reads see the pending value. pagehide flushes.
+  var mem = Object.create(null), dirtyKeys = Object.create(null), storeTimer = null;
+  function flushStore() {
+    storeTimer = null;
+    var ks = Object.keys(dirtyKeys); dirtyKeys = Object.create(null);
+    ks.forEach(function (k) { try { root.localStorage.setItem(k, mem[k]); } catch (e) { /* blocked or full */ } });
+  }
   Desk.storage = {
     get: function (k) {
       k = 'desk3.' + k;
+      if (k in dirtyKeys) return mem[k];
       try { var v = root.localStorage.getItem(k); if (v !== null) return v; } catch (e) { /* blocked */ }
       return k in mem ? mem[k] : null;
     },
     set: function (k, v) {
-      k = 'desk3.' + k; v = String(v); mem[k] = v;
-      try { root.localStorage.setItem(k, v); } catch (e) { /* blocked or full */ }
+      k = 'desk3.' + k; v = String(v); mem[k] = v; dirtyKeys[k] = 1;
+      if (!storeTimer) storeTimer = setTimeout(flushStore, 250);
     },
+    flush: function () { if (storeTimer) clearTimeout(storeTimer); flushStore(); },
     getJSON: function (k, dflt) {
       var s = this.get(k);
       if (s === null) return dflt;
@@ -360,15 +369,42 @@
       if (rm.addEventListener) rm.addEventListener('change', function (e) { reduceMotion = e.matches; });
     } catch (e) { /* old engine */ }
   }
-  var FLASH = { up: 'rgba(63,185,80,.22)', dn: 'rgba(248,81,73,.22)', sz: 'rgba(230,232,235,.10)', warn: 'rgba(227,160,8,.35)' };
-  function flash(el, kind) {
-    if (!el || reduceMotion) return;
-    var c = FLASH[kind] || FLASH.sz;
+  /* Flashes (the FLASH setting, Desk.ui.flash):
+   *   'off'     none at all
+   *   'subtle'  the default: a soft highlight that fades over 500 ms, only for what the operator
+   *             must notice (the last-trade price row, our own orders changing state, fills, P&L);
+   *             a cell that flashed less than 0.4 s ago does not flash again, so a busy level is
+   *             never a strobe
+   *   'full'    the old behaviour: 300 ms, stronger, and also the routine book updates (ladder
+   *             sizes, LTQ, watchlist prices), still at most one flash per cell per 0.25 s
+   * flash(el, kind, level, gap): kind 'up' | 'dn' | 'sz' | 'warn'; level 'full' = a routine update
+   * that flashes only in FULL; gap = a longer quiet time for this cell (P&L: 1.5 s). Returns true
+   * when it flashed. */
+  var FLASHES = {
+    subtle: { up: 'rgba(63,185,80,.16)', dn: 'rgba(248,81,73,.16)', sz: 'rgba(230,232,235,.08)', warn: 'rgba(227,160,8,.30)', ms: 500, gap: 400 },
+    full: { up: 'rgba(63,185,80,.22)', dn: 'rgba(248,81,73,.22)', sz: 'rgba(230,232,235,.10)', warn: 'rgba(227,160,8,.35)', ms: 300, gap: 250 }
+  };
+  function flash(el, kind, level, gap) {
+    if (!el || reduceMotion) return false;
+    var mode = Desk.ui && Desk.ui.flash ? Desk.ui.flash : 'subtle';
+    if (mode === 'off' || (level === 'full' && mode !== 'full')) return false;
+    var P = FLASHES[mode] || FLASHES.subtle, c = P[kind] || P.sz, now = perf.now();
+    if (kind !== 'warn' && el._flT && now - el._flT < Math.max(P.gap, gap || 0)) return false;
+    el._flT = now;
+    var dur = kind === 'warn' ? 600 : P.ms;
     if (el.animate) {
       // an inset shadow over the cell, not its background: the bid/ask tint and depth bar stay put
-      try { el.animate([{ boxShadow: 'inset 0 0 0 64px ' + c }, { boxShadow: 'inset 0 0 0 64px transparent' }], { duration: kind === 'warn' ? 600 : 300, easing: 'linear' }); return; } catch (e) { /* fallthrough */ }
+      try {
+        if (el._flA && el._flA.cancel) el._flA.cancel();
+        el._flA = el.animate([{ boxShadow: 'inset 0 0 0 64px ' + c }, { boxShadow: 'inset 0 0 0 64px transparent' }], { duration: dur, easing: 'ease-out' });
+        return true;
+      } catch (e) { /* fallthrough */ }
     }
-    el.classList.remove('fl-' + kind); void el.offsetWidth; el.classList.add('fl-' + kind);
+    // no Web Animations: alternate two identical keyframe classes to restart without a reflow
+    var flip = el._flip = !el._flip;
+    ['', '2'].forEach(function (s) { el.classList.remove('fl-' + kind + s); });
+    el.classList.add('fl-' + kind + (flip ? '2' : ''));
+    return true;
   }
   function numOf(s) { if (!s) return NaN; return parseFloat(String(s).replace(MINUS, '-').replace(/[^0-9.\-]/g, '')); }
   function setText(el, v) { if (!el) return false; v = (v === null || v === undefined) ? '' : String(v); if (el.textContent !== v) { el.textContent = v; return true; } return false; }
@@ -386,9 +422,16 @@
    *   items      array, in display order
    *   keyFn      item -> unique key (string/number); kept in row.dataset.k
    *   cellsFn    item -> array of cells; a cell is a string/number, or an object
-   *              {t: text, cls: 'n up', fl: 'd'|'s', title: '...', attr: {k: v}, html: '...'}
+   *              {t: text, cls: 'n up', fl: 'd'|'s', flv: 'full', flg: ms, fk: 'key', nf: 'sz',
+   *               title: '...', attr: {k: v}, html: '...'}
    *              fl 'd' flashes green/red by the direction of a numeric change, 's' flashes grey
    *              on any change. No flash on a row's first paint, nor when a cell empties.
+   *              flv 'full': a routine update, flashed only with FLASH FULL. flg: the cell's own
+   *              quiet time between flashes (P&L cells).
+   *              fk: flash when this key changes to a non-empty value, not when the text does (an
+   *              order's state, not its countdown; the newest print, not the row's price).
+   *              nf: the flash kind for a NEW row when opts.isNew(item) says it is news (a fill
+   *              that just arrived), never for rows drawn at load or after a filter change.
    *   rowFn      item -> class string, or {cls, attr} (attr e.g. {'data-mkt': 'K|TK'})
    * Returns the number of rows. Rows that stay keep their DOM nodes (focus, selection, scroll and
    * click targets survive); only changed text is written.
@@ -396,6 +439,7 @@
   function keyedRows(tbody, items, keyFn, cellsFn, rowFn, opts) {
     if (!tbody) return 0;
     var rowTag = (opts && opts.row) || 'tr', cellTag = (opts && opts.cell) || 'td';
+    var isNew = opts && opts.isNew;
     var existing = new Map();
     var ch = tbody.children;
     for (var i = 0; i < ch.length; i++) if (ch[i].dataset && ch[i].dataset.k !== undefined) existing.set(ch[i].dataset.k, ch[i]);
@@ -410,6 +454,7 @@
       else { tr = document.createElement(rowTag); tr.dataset.k = key; }
       while (tr.children.length < cells.length) tr.appendChild(document.createElement(cellTag));
       while (tr.children.length > cells.length) tr.removeChild(tr.lastChild);
+      var news = !old && !!isNew && !!isNew(item);
       for (var c = 0; c < cells.length; c++) {
         var cell = cells[c], td = tr.children[c];
         var isObj = cell !== null && typeof cell === 'object';
@@ -424,12 +469,23 @@
           if (cell.title !== undefined) setAttr(td, 'title', cell.title);
           if (cell.attr) for (var ak in cell.attr) setAttr(td, ak, cell.attr[ak]);
           if (cell.style) for (var sk in cell.style) setStyleVar(td, sk, cell.style[sk]);
-          // a value that changed flashes; one that appeared or went away (a level pulled) does not
-          if (old && changed && before !== '' && td.textContent !== '' && cell.fl) {
-            if (cell.fl === 'd') { var a = numOf(before), b = numOf(td.textContent); flash(td, b > a ? 'up' : (b < a ? 'dn' : 'sz')); }
-            else flash(td, cell.fl === 's' ? 'sz' : cell.fl);
+          if (cell.fk !== undefined) {
+            // keyed: the state it stands for changed (and is something), whatever the text did;
+            // fl 'd' on a numeric key flashes by the key's direction (P&L keyed on its realized part)
+            var fk = cell.fk === null ? '' : String(cell.fk), was = td._fk;
+            td._fk = fk;
+            if (old && was !== undefined && fk !== '' && fk !== was && cell.fl) {
+              var kk = cell.fl === 's' ? 'sz' : cell.fl;
+              if (cell.fl === 'd') { var ka = numOf(was), kb = numOf(fk); kk = isNaN(ka) || isNaN(kb) || ka === kb ? 'sz' : (kb > ka ? 'up' : 'dn'); }
+              flash(td, kk, cell.flv, cell.flg);
+            }
+          } else if (old && changed && before !== '' && td.textContent !== '' && cell.fl) {
+            // a value that changed flashes; one that appeared or went away (a level pulled) does not
+            if (cell.fl === 'd') { var a = numOf(before), b = numOf(td.textContent); flash(td, b > a ? 'up' : (b < a ? 'dn' : 'sz'), cell.flv, cell.flg); }
+            else flash(td, cell.fl === 's' ? 'sz' : cell.fl, cell.flv, cell.flg);
           }
-        }
+          if (news && cell.nf) flash(td, cell.nf);
+        } else if (old) td._fk = undefined;
       }
       if (rowFn) {
         var rf = rowFn(item);
@@ -451,10 +507,23 @@
     }, function () { return 'none'; });
   }
   var byId = function (id) { return hasDoc ? document.getElementById(id) : null; };
+  // a grid row's height in px (--row: 18 compact, 20 normal, 16 under 760 px of height), read
+  // once from the computed style and cached until the density or the window height changes
+  // (Desk.ui.apply, Desk.layout); a virtual list needs it to place its rows
+  var rowPxC = 0;
+  function rowPx() {
+    if (rowPxC) return rowPxC;
+    var v = 18;
+    try {
+      if (hasDoc && root.getComputedStyle) { var s = parseFloat(root.getComputedStyle(document.documentElement).getPropertyValue('--row')); if (s > 0) v = s; }
+    } catch (e) { /* the default */ }
+    return (rowPxC = v);
+  }
   Desk.dom = {
     $: byId,
     setText: setText, setHTML: setHTML, setClass: setClass, setAttr: setAttr, setVar: setStyleVar,
     keyedRows: keyedRows, emptyRow: emptyRow, flash: flash,
+    rowPx: rowPx, rowPxReset: function () { rowPxC = 0; },
     // build a <table> with a <thead> from column specs [{h:'Px', w:44, cls:'n'}]; returns tbody
     table: function (host, cols, cls) {
       if (!host) return null;
@@ -469,6 +538,161 @@
       var tb = document.createElement('tbody'); t.appendChild(tb);
       host.textContent = ''; host.appendChild(t);
       return tb;
+    }
+  };
+
+  // ---------------------------------------------------------------------------------------------
+  // Instant controls (2026-10-06: "every button must feel instant").
+  //   Desk.press.attach()   at boot: every pressable control (a button, a [data-act]/[data-a]
+  //                         control, a ladder or grid cell that does something, a linked row) gets
+  //                         the class 'prs' on pointerdown, in the same event, so the next frame
+  //                         shows it pressed whatever the action; pointerup anywhere clears it.
+  //   Desk.dom.onPress(host, fn, fastFn)
+  //                         one delegated handler for a panel's controls. fastFn(ev) returns true for
+  //                         a control that is safe to act on at pointerdown (a tab, a filter, a
+  //                         preset, a cancel): fn runs then, and the click that follows is swallowed.
+  //                         Everything else (an order button, KILL, START, a lane ON) keeps the
+  //                         click, so a press dragged off the control never sends. A keyboard
+  //                         "click" (Enter, Space) or el.click() always runs fn.
+  //   Desk.later(fn)        non-urgent work (the simulated backend in demo mode, storage) runs
+  //                         after the next frame has been painted, never inside the handler.
+  // ---------------------------------------------------------------------------------------------
+  var PRESSABLE = 'button, [data-act], [data-a], [data-cid], [data-flat], td.bq, td.aq, td.wb, td.ws, td.px, tr[data-mkt], tr[data-grp], tr[data-lane], tr[data-uk]';
+  var pressed = null;
+  function unpress() { if (pressed) { pressed.classList.remove('prs'); pressed = null; } }
+  Desk.press = {
+    sel: PRESSABLE,
+    attach: function () {
+      if (!hasDoc || Desk.press.attached) return;
+      Desk.press.attached = true;
+      document.addEventListener('pointerdown', function (ev) {
+        unpress();
+        if (ev.button !== 0) return;
+        var t = ev.target, el = t && t.closest ? t.closest(PRESSABLE) : null;
+        if (!el || el.disabled || (el.classList && el.classList.contains('dis'))) return;
+        pressed = el; el.classList.add('prs');
+      }, true);
+      document.addEventListener('pointerup', unpress, true);
+      document.addEventListener('pointercancel', unpress, true);
+      if (root.addEventListener) root.addEventListener('pagehide', function () { Desk.storage.flush(); });
+    }
+  };
+  Desk.dom.onPress = function (host, fn, fast) {
+    if (!host) return;
+    var done = null;                 // the control a pointerdown acted on; its click is swallowed
+    host.addEventListener('pointerdown', function (ev) {
+      done = null;
+      if (ev.button !== 0 || !fast) return;
+      var el = fast(ev);
+      if (!el) return;
+      done = el === true ? ev.target : el;
+      fn(ev, 'down');
+    });
+    host.addEventListener('click', function (ev) {
+      var d = done; done = null;
+      if (d && ev.target && (d === ev.target || (d.contains && d.contains(ev.target)) || (ev.target.contains && ev.target.contains(d)))) return;
+      fn(ev, 'click');
+    });
+  };
+  var laterQ = [], laterArmed = false, laterMc = null;
+  function runLater() {
+    laterArmed = false;
+    var q = laterQ; laterQ = [];
+    for (var i = 0; i < q.length; i++) { try { q[i](); } catch (e) { if (root.console) console.error('[desk later]', e); } }
+  }
+  try {
+    if (hasDoc && typeof root.MessageChannel === 'function') { laterMc = new root.MessageChannel(); laterMc.port1.onmessage = runLater; }
+  } catch (e) { laterMc = null; }
+  // a frame is coming: run after it (R.frame posts the message once it has drawn); else next task
+  Desk.later = function (fn) {
+    laterQ.push(fn);
+    if (laterArmed) return;
+    laterArmed = true;
+    // a hidden tab gets no frames (Safari pauses them): never wait more than 100 ms for one
+    if (R && R.scheduled && laterMc) setTimeout(function () { if (laterArmed) runLater(); }, 100);
+    else setTimeout(runLater, 0);
+  };
+  function laterAfterFrame() {
+    if (!laterArmed || !laterQ.length || !laterMc) return;
+    try { laterMc.port2.postMessage(0); } catch (e) { setTimeout(runLater, 0); }
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // The dev check (?perf=1, or PERF in the settings drawer): for every pointerdown, click and
+  // key, the time the page's handlers took and the time until the frame they caused was on
+  // screen, per control. Anything over one frame (Desk.lat.budget(), ~21 ms at 60 Hz) is SLOW
+  // and logged with console.warn; the rest with console.debug.
+  //   Desk.perf.on, .set(bool), .report() -> [{ctl, n, h (max handler ms), p (max paint ms),
+  //   hLast, pLast, slow}] worst first, .slow (count), .recs (the last 200)
+  // ---------------------------------------------------------------------------------------------
+  function ctlName(ev) {
+    var t = ev.target;
+    if (ev.type === 'keydown') return 'key:' + (Desk.keys ? Desk.keys.combo(ev) : ev.key);
+    if (!t || !t.closest) return '?';
+    var panelOf = function (e) { var p = e.closest('.panel'); return p && p.id ? p.id : (e.closest('#hdr') ? 'hdr' : (e.closest('#sbar') ? 'sbar' : '')); };
+    var c = t.closest('[data-act]'); if (c) return panelOf(c) + ':' + c.getAttribute('data-act');
+    c = t.closest('[data-a]'); if (c) return panelOf(c) + ':' + c.getAttribute('data-a');
+    c = t.closest('button'); if (c) return c.id ? '#' + c.id : panelOf(c) + ':' + String(c.textContent).slice(0, 10);
+    c = t.closest('td'); if (c) return panelOf(c) + ':' + String(c.className).split(' ')[0];
+    c = t.closest('tr'); if (c) return panelOf(c) + ':row';
+    c = t.closest('[id]'); return c ? '#' + c.getAttribute('id') : String(t.tagName || '?');
+  }
+  var perfCur = null, perfWait = [], perfMc = null;
+  try {
+    if (hasDoc && typeof root.MessageChannel === 'function') { perfMc = new root.MessageChannel(); perfMc.port1.onmessage = function () { P.stampPaint(); }; }
+  } catch (e) { perfMc = null; }
+  var P = Desk.perf = {
+    on: false, slow: 0, recs: [], rows: new Map(), frameMs: 0,
+    set: function (on) { P.on = !!on; Desk.storage.set('perf', P.on ? '1' : '0'); if (R) R.mark('set'); },
+    load: function () { P.on = (Desk.qs && Desk.qs.perf === '1') || Desk.storage.get('perf') === '1'; },
+    begin: function (ev) { if (!P.on) return; perfCur = { ctl: ctlName(ev), type: ev.type, t0: lat.t0(ev), h: null, f: null, p: null }; },
+    end: function (ev) {
+      var r = perfCur;
+      if (!r || r.type !== ev.type) return;
+      perfCur = null;
+      r.h = perf.now() - r.t0;
+      perfWait.push(r);
+      if (R) R.mark('perf');               // make sure a frame follows, so the paint is timed
+    },
+    // end of a render pass: its records get their frame time; the paint is stamped next task
+    framed: function () {
+      if (!perfWait.length) return;
+      var n = perf.now(), batch = perfWait; perfWait = [];
+      batch.forEach(function (r) { r.f = n - r.t0; });
+      P._painting = (P._painting || []).concat(batch);
+      if (perfMc) { try { perfMc.port2.postMessage(0); return; } catch (e) { /* fall through */ } }
+      P.stampPaint();
+    },
+    stampPaint: function () {
+      var batch = P._painting || []; P._painting = [];
+      var n = perf.now(), budget = lat.budget();
+      batch.forEach(function (r) {
+        r.p = n - r.t0;
+        P.recs.push(r); if (P.recs.length > 200) P.recs.shift();
+        var row = P.rows.get(r.ctl);
+        if (!row) { row = { ctl: r.ctl, n: 0, h: 0, p: 0, hLast: 0, pLast: 0, slow: 0 }; P.rows.set(r.ctl, row); }
+        row.n++; row.hLast = r.h; row.pLast = r.p; if (r.h > row.h) row.h = r.h; if (r.p > row.p) row.p = r.p;
+        var slow = r.h > budget || r.p - r.h > budget * 2;
+        if (slow) { row.slow++; P.slow++; }
+        if (root.console) (slow ? console.warn : (console.debug || console.log)).call(console, '[desk perf] ' + (slow ? 'SLOW ' : '') + r.type + ' ' + r.ctl +
+          ' handler ' + r.h.toFixed(1) + 'ms frame ' + (r.f === null ? '-' : r.f.toFixed(1)) + 'ms painted ' + r.p.toFixed(1) + 'ms');
+      });
+      if (batch.length && R) R.mark('set');
+    },
+    report: function () {
+      return Array.from(P.rows.values()).sort(function (a, b) { return b.p - a.p; }).map(function (r) {
+        return { ctl: r.ctl, n: r.n, h: Math.round(r.h * 10) / 10, p: Math.round(r.p * 10) / 10, hLast: Math.round(r.hLast * 10) / 10, pLast: Math.round(r.pLast * 10) / 10, slow: r.slow };
+      });
+    },
+    attach: function () {
+      if (!hasDoc || P.attached) return;
+      P.attached = true;
+      // begin: the first capture listener on document; end: a bubble listener on document added
+      // after every other one (main.js attaches it last), so it runs after all the page's handlers
+      ['pointerdown', 'click', 'keydown'].forEach(function (t) {
+        document.addEventListener(t, P.begin, true);
+        document.addEventListener(t, P.end);
+      });
     }
   };
 
@@ -567,7 +791,8 @@
   //                                     fn(d) with d.has(topic), d.any(prefix), d.all (full redraw)
   //   Desk.render.flush()               run a frame now (tests, boot)
   //
-  // Topics the store marks: hdr, mkt, book, book:<key>, ord, ord:<key>, fill, pos, lane, risk, mo,
+  // Topics the store marks: hdr, mkt, book, book:<key>, ord, ord:<key>, mord:<key> (a MAN or EXT
+  // order changed: the ladders paint it on the next frame, never coalesced), fill, pos, lane, risk, mo,
   // alert, feeds, stale, snapshot (with all of them). Others: clock (250 ms), focus, tab, hk,
   // layout, ui (density/colour), lat.
   // ---------------------------------------------------------------------------------------------
@@ -579,6 +804,7 @@
     scheduled: false,
     errors: 0,
     lastError: null,
+    lastMs: 0, maxMs: 0,              // the render pass's own work, ms (the last one, the worst)
     mark: function (t) { R.dirty.add(t); if (!R.scheduled) { R.scheduled = true; raf(R.frame); } },
     add: function (spec) {
       var r = { id: spec.id, tab: spec.tab || null, fn: spec.fn, missed: true };
@@ -600,6 +826,7 @@
           var hit = false; set.forEach(function (t) { if (!hit && t.indexOf(p) === 0) hit = true; }); return hit;
         }
       };
+      var f0 = perf.now();
       for (var i = 0; i < R.renderers.length; i++) {
         var r = R.renderers[i];
         if (r.tab && R.tab && r.tab !== R.tab) { if (set.size) r.missed = true; continue; }
@@ -610,7 +837,11 @@
           if (root.console) console.error('[desk render]', r.id, e);
         }
       }
+      R.lastMs = perf.now() - f0;
+      if (R.lastMs > R.maxMs) R.maxMs = R.lastMs;
       lat.painted();
+      P.framed();
+      laterAfterFrame();
     },
     flush: function () { R.frame(); }
   };
@@ -688,16 +919,22 @@
       var ladderOf = function (ev) { var t = ev.target; var l = t && t.closest ? t.closest('[data-ladder]') : null; if (l) F.setLadder(l.getAttribute('data-ladder')); };
       document.addEventListener('mousedown', ladderOf, true);
       document.addEventListener('focusin', ladderOf);
-      document.addEventListener('click', function (ev) {
+      // a linked row: the market loads at pointerdown (linking only changes what is shown)
+      var rowOf = function (ev) {
         var t = ev.target;
-        if (!t || !t.closest) return;
+        if (!t || !t.closest) return null;
         var row = t.closest('[data-mkt]');
-        if (!row) return;
+        if (!row || !row.getAttribute('data-mkt')) return null;
         var ctl = t.closest('button, input, select, a, [data-nolink]');
-        if (ctl && row.contains(ctl) && ctl !== row) return;
+        if (ctl && row.contains(ctl) && ctl !== row) return null;
+        return row;
+      };
+      Desk.dom.onPress(document, function (ev) {
+        var row = rowOf(ev);
+        if (!row) return;
         var panel = row.closest('.panel'), pid = panel ? panel.id : null;
         F.set(row.getAttribute('data-mkt'), { other: ev.shiftKey, from: pid, row: { panel: pid, k: row.getAttribute('data-k') } });
-      });
+      }, rowOf);
     }
   };
 
@@ -859,9 +1096,11 @@
     init: function () {
       if (!hasDoc || !root.matchMedia) return;
       var w = root.matchMedia('(min-width: 1920px)'), n = root.matchMedia('(max-width: 1399px)'), s = root.matchMedia('(min-width: 2400px)');
+      var sh = root.matchMedia('(max-height: 759px)');      // short windows: 16 px grid rows
       Desk.layout.splitOn = Desk.storage.get('split') === '1';
       var upd = Desk.layout.upd = function () {
         var L = Desk.layout;
+        Desk.dom.rowPxReset();
         L.wide = w.matches; L.narrow = n.matches; L.splitOK = !!s.matches; L.split = L.splitOK && L.splitOn;
         document.body.setAttribute('data-wide', w.matches ? '1' : '0');
         document.body.setAttribute('data-splitok', L.splitOK ? '1' : '0');
@@ -870,30 +1109,41 @@
         if (L.ladders().indexOf(F.ladder) < 0) F.setLadder('A');
         R.mark('layout'); R.mark('tab'); R.force(null);
       };
-      [w, n, s].forEach(function (m) { if (m.addEventListener) m.addEventListener('change', upd); else if (m.addListener) m.addListener(upd); });
+      [w, n, s, sh].forEach(function (m) { if (!m) return; if (m.addEventListener) m.addEventListener('change', upd); else if (m.addListener) m.addListener(upd); });
       upd();
     }
   };
 
   // ---------------------------------------------------------------------------------------------
-  // Density (d) and colour-blind palette (c), remembered.
+  // Density (d), colour-blind palette (c) and FLASH (f; OFF / SUBTLE / FULL), remembered.
   // ---------------------------------------------------------------------------------------------
+  var FLASH_MODES = ['off', 'subtle', 'full'];
   Desk.ui = {
     density: 'compact',
     cb: false,
+    flash: 'subtle',
+    FLASH_MODES: FLASH_MODES,
     apply: function () {
       if (!hasDoc) return;
       document.documentElement.setAttribute('data-density', Desk.ui.density);
       document.documentElement.setAttribute('data-cb', Desk.ui.cb ? '1' : '0');
+      document.documentElement.setAttribute('data-flash', Desk.ui.flash);
+      Desk.dom.rowPxReset();
       R.mark('ui');
     },
     load: function () {
       var d = Desk.storage.get('density'); if (d === 'normal' || d === 'compact') Desk.ui.density = d;
       Desk.ui.cb = Desk.storage.get('cb') === '1';
+      var f = Desk.storage.get('flash'); if (FLASH_MODES.indexOf(f) >= 0) Desk.ui.flash = f;
       Desk.ui.apply();
     },
     cycleDensity: function () { Desk.ui.density = Desk.ui.density === 'compact' ? 'normal' : 'compact'; Desk.storage.set('density', Desk.ui.density); Desk.ui.apply(); },
-    toggleCB: function () { Desk.ui.cb = !Desk.ui.cb; Desk.storage.set('cb', Desk.ui.cb ? '1' : '0'); Desk.ui.apply(); }
+    toggleCB: function () { Desk.ui.cb = !Desk.ui.cb; Desk.storage.set('cb', Desk.ui.cb ? '1' : '0'); Desk.ui.apply(); },
+    setFlash: function (m) {
+      if (FLASH_MODES.indexOf(m) < 0 || m === Desk.ui.flash) return;
+      Desk.ui.flash = m; Desk.storage.set('flash', m); Desk.ui.apply(); R.mark('set');
+    },
+    cycleFlash: function () { Desk.ui.setFlash(FLASH_MODES[(FLASH_MODES.indexOf(Desk.ui.flash) + 1) % FLASH_MODES.length]); }
   };
 
   // Query string flags: Desk.qs.demo, Desk.qs.live, ...

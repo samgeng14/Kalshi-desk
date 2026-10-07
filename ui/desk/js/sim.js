@@ -22,6 +22,11 @@
  *               market(key), order(cid), position(key), cash(), state
  *
  * What is simulated:
+ *  - THE UNIVERSE (contract 1.4): a generated listing of a few thousand markets settling today
+ *    and tomorrow on both venues (sports by league and game with spreads, totals and props;
+ *    weather highs, lows and rain; 15-minute and hourly crypto, daily index, FX and commodity
+ *    closes; gas and rates; mentions, approval, charts), served paged by GET /api/universe. A
+ *    row pinned (POST /api/watch) or loaded into a ladder becomes a live market with a book.
  *  - Kalshi 15-minute LIP windows (copper, platinum, palladium, natgas, EURUSD, GBPUSD, USDJPY):
  *    fee type QUAD (takers pay, makers free), one market per series, rolled every 15 minutes,
  *    fair = Phi(ln(S/S0)/(sigma sqrt tau)).
@@ -84,10 +89,11 @@
     { id: 'X1', name: 'ESPN EXP', venue: 'K', style: 'REST', budget: 5, thr: null, on: false }
   ];
   var KIND = {
-    LIP15: { spread: 150, depth: 10, sz: 60, rate: 0.25, tau: 1.5, noise: 25, upd: 1.5, holes: 0.1 },
+    LIP15: { spread: 150, depth: 10, sz: 60, rate: 0.14, tau: 1.5, noise: 25, upd: 1.5, holes: 0.1 },
     WEATHER: { spread: 200, depth: 8, sz: 35, rate: 0.03, tau: 6, noise: 12, upd: 0.25, holes: 0.2 },
     GAME_K: { spread: 400, depth: 6, sz: 12, rate: 0.06, tau: 3, noise: 25, upd: 0.5, holes: 0.35 },
-    GAME_P: { spread: 250, depth: 8, sz: 25, rate: 0.05, tau: 3, noise: 20, upd: 0.5, holes: 0.25 }
+    GAME_P: { spread: 250, depth: 8, sz: 25, rate: 0.05, tau: 3, noise: 20, upd: 0.5, holes: 0.25 },
+    MISC: { spread: 300, depth: 6, sz: 20, rate: 0.02, tau: 10, noise: 8, upd: 0.2, holes: 0.3 }
   };
 
   function mulberry32(a) {
@@ -147,7 +153,9 @@
       groups: { ok: true, why: '' },
       oidN: 0, fidN: 0, alertN: 0, cidN: 0, gameN: 0,
       lanes: [], laneById: {},
-      lastHdrJson: '', lastHdrEmit: 0, lastRiskJson: '', teamIdx: 0
+      lastHdrJson: '', lastHdrEmit: 0, lastRiskJson: '', teamIdx: 0,
+      // THE UNIVERSE: the day's listing (T and T1), kept apart from the live markets above
+      uni: new Map(), uniDay: '', uniCache: null, wxPin: {}, ogResult: {}, nextDrift: T0 + 1000
     };
     var EPS = S.epoch.slice(-4);
     // the per-start token the backend writes into the page (never from the seeded generator, so
@@ -207,8 +215,11 @@
         bids: new Map(), asks: new Map(), ours: [], prints: [], last: null, vol: Math.round(R(150, 3500)),
         ref: { fair: null, sd: null, espn: null, espn_ts_ms: null, game: null },
         bookDirty: true, lastBookEmit: 0, topSig: '', exMs: clock(), frozen: false, dislocate: null,
-        game: spec.game || null, manOwned: false, lastRegenMid: spec.p * U, m1Flat: false, c1Shot: -1, s1Cool: 0
+        game: spec.game || null, manOwned: false, lastRegenMid: spec.p * U, m1Flat: false, c1Shot: -1, s1Cool: 0,
+        cat: spec.cat || 'OTHER', date: spec.date || isoET(spec.close_ms), pin: spec.pin !== false, start: spec.start || null, uni: !!spec.uni
       };
+      if (spec.mid !== undefined) { m.mid = spec.mid; m.lastRegenMid = spec.mid; }
+      if (spec.spreadU) m.spreadU = spec.spreadU;
       regen(m);
       S.markets.set(m.key, m);
       if (!quiet) emit('mkt', mktData(m));
@@ -218,7 +229,7 @@
       return { v: m.v, tk: m.tk, ev: m.ev, title: m.title, short: m.short, grp: m.grp, kind: m.kind, og: m.og, oc: m.oc,
                open_ms: m.open_ms, close_ms: m.close_ms, status: m.status, result: m.result, grid: m.grid,
                fee: { type: m.fee.type, mult: m.fee.mult }, shard: m.shard, lip: m.lip,
-               start_ms: m.game ? m.game.start : null, man: !!m.manOwned };
+               start_ms: m.game ? m.game.start : (m.start || null), man: !!m.manOwned, cat: m.cat, date: m.date, pin: !!m.pin };
     }
 
     // 15-minute LIP windows
@@ -231,7 +242,8 @@
         v: 'K', tk: ev + '-' + pad2(etD(close).getUTCMinutes()), ev: ev, bk: 'LIP15',
         title: spec.full + ' price up in next 15 mins?', short: spec.name + ' ' + hmET(close) + ' UP', grp: '15M',
         kind: 'LIP15', og: ev, oc: 'UP', open_ms: openMs, close_ms: close, grid: spec.grid,
-        fee: { type: 'QUAD', mult: 1 }, shard: spec.shard, lip: true, p: lipP(st, close, clock())
+        fee: { type: 'QUAD', mult: 1 }, shard: spec.shard, lip: true, p: lipP(st, close, clock()),
+        cat: 'FIN', date: isoET(close), pin: st.pin !== false
       }, quiet);
       st.key = m.key;
       m.ref.fair = m.pU; m.ref.sd = 200;
@@ -259,7 +271,8 @@
           title: 'Will the maximum temperature be ' + b.title + ' on ' + longDate(day + 12 * 3600000) + '?',
           short: city.city + ' ' + b.lbl, grp: 'WX ' + city.city + ' ' + mdET(day + 12 * 3600000), kind: 'WEATHER',
           og: ev, oc: b.lbl, open_ms: day - 14 * 3600000, close_ms: w.close, grid: GRID_LINEAR,
-          fee: { type: 'QUAD', mult: 1 }, shard: i % 2 ? 'S0' : 'S2', lip: false, p: bracketP(w.mu, sig, b)
+          fee: { type: 'QUAD', mult: 1 }, shard: i % 2 ? 'S0' : 'S2', lip: false, p: bracketP(w.mu, sig, b),
+          cat: 'WEATHER', date: isoET(day + 12 * 3600000), pin: S.wxPin[city.s] !== false
         }, quiet);
         w.keys.push(m.key);
       });
@@ -297,16 +310,16 @@
         var fee = opts2.free ? { type: 'QUAD', mult: 1 } : { type: 'QUAD_MAKER', mult: 1 };
         g.keys.K_A = addMarket({ v: 'K', tk: evK + '-' + g.away, ev: evK, bk: 'GAME_K', title: g.awayName + ' wins', short: label + ' ' + g.away,
           grp: lg, kind: 'GAME', og: evK, oc: g.away, open_ms: start - 7 * 86400000, close_ms: close, grid: GRID_LINEAR, fee: fee,
-          shard: 'S2', lip: false, p: 1 - ph, game: g }, quiet).key;
+          shard: 'S2', lip: false, p: 1 - ph, game: g, cat: 'SPORTS', date: isoET(start) }, quiet).key;
         g.keys.K_H = addMarket({ v: 'K', tk: evK + '-' + g.home, ev: evK, bk: 'GAME_K', title: g.homeName + ' wins', short: label + ' ' + g.home,
           grp: lg, kind: 'GAME', og: evK, oc: g.home, open_ms: start - 7 * 86400000, close_ms: close, grid: GRID_LINEAR, fee: fee,
-          shard: 'S2', lip: false, p: ph, game: g }, quiet).key;
+          shard: 'S2', lip: false, p: ph, game: g, cat: 'SPORTS', date: isoET(start) }, quiet).key;
       }
       if (venues.indexOf('P') >= 0) {
         var slug = 'aec-' + (lg === 'NFL' ? 'nfl' : 'cfb') + '-' + g.away.toLowerCase() + '-' + g.home.toLowerCase() + '-' + isoET(start);
         g.keys.P = addMarket({ v: 'P', tk: slug, ev: slug, bk: 'GAME_P', title: g.awayName + ' vs. ' + g.homeName + ': ' + g.awayName,
           short: label + ' ' + g.away, grp: lg, kind: 'GAME', og: evK, oc: g.away, open_ms: start - 7 * 86400000, close_ms: close,
-          grid: opts2.deci ? GRID_DECI : GRID_LINEAR, fee: { type: 'PM', mult: 1 }, shard: null, lip: false, p: 1 - ph, game: g }, quiet).key;
+          grid: opts2.deci ? GRID_DECI : GRID_LINEAR, fee: { type: 'PM', mult: 1 }, shard: null, lip: false, p: 1 - ph, game: g, cat: 'SPORTS', date: isoET(start) }, quiet).key;
       }
       S.games.push(g);
       gameRefs(g, clock());
@@ -342,7 +355,339 @@
       });
     }
 
-    // the universe at boot
+    // ------------------------------------------------------------------------------------------
+    // THE UNIVERSE: everything listed that settles today (T) and tomorrow (T1), both venues, a few
+    // thousand markets (contract 1.4). It lives apart from the live markets above: a row is a
+    // listing (a touch, a volume, a close), not a book. Pinning a row (POST /api/watch) or loading
+    // it into a ladder (POST /api/subscribe) brings it into the live set with a book of its own.
+    // A separate random stream, so a seed replays the same live markets with or without it.
+    // ------------------------------------------------------------------------------------------
+    var urnd = mulberry32((((opts.seed >>> 0) || 20261006) ^ 0x5bd1e995) >>> 0);
+    function UR(a, b) { return a + (b - a) * urnd(); }
+    function ugauss() { var u = 1 - urnd(), v = urnd(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); }
+    var QM = { type: 'QUAD_MAKER', mult: 1 }, QD = { type: 'QUAD', mult: 1 }, PMF = { type: 'PM', mult: 1 };
+    var NAMES = ['JAMES', 'CURRY', 'TATUM', 'DONCIC', 'BROWN', 'BOOKER', 'EDWARDS', 'MORANT', 'YOUNG', 'MITCHELL', 'BANE', 'HALIBUR',
+                 'OHTANI', 'JUDGE', 'SOTO', 'HARPER', 'BETTS', 'RAMIREZ', 'TUCKER', 'ALVAREZ', 'MCDAVID', 'MATTHEWS', 'KUCHEROV',
+                 'PASTRNAK', 'MAKAR', 'HUGHES', 'EICHEL', 'CLARK', 'WILSON', 'STEWART', 'COLLIER', 'IONESCU', 'GABRIEL', 'DART'];
+    var UNI_SPORTS = [
+      { lg: 'MLB', ser: 'MLB', pm: 'mlb', n: [2, 2], ml: true, spr: [1.5, 2.5], tot: [6.5, 7.5, 8.5, 9.5, 10.5], props: [['HR', [1]], ['HITS', [2]], ['KS', [6, 8]]],
+        nprops: 8, hours: [16.1, 20.1], dur: 4, fee: QM, pmx: true,
+        teams: ['LAD', 'PHI', 'NYY', 'CLE', 'SD', 'CHC', 'DET', 'SEA', 'MIL', 'TOR'] },
+      { lg: 'NHL', ser: 'NHL', pm: 'nhl', n: [4, 9], ml: true, spr: [1.5], tot: [5.5, 6.5], props: [['GOALS', [1]], ['PTS', [1, 2]], ['SOG', [3, 4]]],
+        nprops: 8, hours: [19, 19.5, 20, 22], dur: 3, fee: QM, pmx: true,
+        teams: ['BOS', 'FLA', 'TOR', 'NYR', 'CAR', 'NJ', 'TB', 'DAL', 'COL', 'EDM', 'VGK', 'WPG', 'MIN', 'LA', 'VAN', 'OTT', 'DET', 'PIT', 'NSH', 'STL'] },
+      { lg: 'NBA', ser: 'NBA', pm: 'nba', n: [6, 5], ml: true, spr: [2.5, 5.5, 8.5, 11.5], tot: [212.5, 218.5, 224.5, 230.5], props: [['PTS', [20, 25, 30]], ['REB', [8, 10]], ['AST', [6, 8]]],
+        nprops: 10, hours: [19, 19.5, 20, 22, 22.5], dur: 3, fee: QM, pmx: true,
+        teams: ['BOS', 'NYK', 'MIL', 'PHI', 'CLE', 'MIA', 'ATL', 'CHI', 'DEN', 'LAL', 'GSW', 'PHX', 'DAL', 'MEM', 'MIN', 'OKC', 'SAC', 'NOP'] },
+      { lg: 'WNBA', ser: 'WNBA', pm: 'wnba', n: [1, 0], ml: true, spr: [2.5, 5.5], tot: [158.5, 162.5, 166.5], props: [['PTS', [15, 20]], ['REB', [8]]],
+        nprops: 8, hours: [20], dur: 3, fee: QM, pmx: true, teams: ['NYL', 'MIN'] },
+      { lg: 'NCAAF', ser: 'NCAAF', pm: 'cfb', n: [2, 3], ml: true, spr: [3.5, 7.5, 10.5], tot: [44.5, 51.5, 58.5], props: [['PASSYD', [250]], ['RUSHYD', [100]]],
+        nprops: 4, hours: [19.5, 20], dur: 4, fee: QD, pmx: false,
+        teams: ['BALL', 'KENT', 'BGSU', 'TOL', 'NIU', 'WMU', 'EMU', 'CMU', 'AKR', 'BUFF'] },
+      { lg: 'UCL', ser: 'UCL', pm: 'ucl', n: [9, 9], ml: true, three: true, spr: [1.5], tot: [1.5, 2.5, 3.5], props: [['GOAL', [1]]],
+        nprops: 4, hours: [12.75, 15], dur: 2.5, fee: QM, pmx: false,
+        teams: ['RMA', 'MCI', 'BAY', 'PSG', 'ARS', 'BAR', 'INT', 'LIV', 'BVB', 'ATM', 'JUV', 'MIL', 'LEV', 'PSV', 'BEN', 'POR', 'CEL', 'NAP', 'AJA', 'ATA', 'CHE', 'TOT', 'NEW', 'ASV', 'SCP', 'FEY', 'MON', 'LIL', 'BRU', 'GIR', 'SHK', 'RBL', 'STU', 'SLA', 'CZV', 'YB'] },
+      { lg: 'ATP', ser: 'ATP', pm: 'atp', n: [16, 16], ml: true, spr: [2.5, 4.5], tot: [20.5, 22.5, 24.5], props: [], nprops: 0, hours: [1, 3, 5, 7, 9], dur: 3, fee: QD, pmx: false,
+        teams: ['SINNER', 'ALCARAZ', 'ZVEREV', 'FRITZ', 'DRAPER', 'DJOKOVI', 'MEDVED', 'RUUD', 'DEMINAU', 'RUNE', 'TIAFOE', 'PAUL', 'SHELTON', 'HURKACZ', 'DIMITRO', 'TSITSIP',
+                'MUSETTI', 'HUMBERT', 'RUBLEV', 'KHACHAN', 'FILS', 'LEHECKA', 'MENSIK', 'COBOLLI', 'BUBLIK', 'MACHAC', 'KORDA', 'NAKASHI', 'FONSECA', 'MPETSHI', 'ARNALDI', 'NORRIE'] }
+    ];
+    var UNI_WX = [['DEN', 71], ['LAX', 78], ['PHIL', 68], ['HOU', 86], ['SEA', 62], ['SFO', 70], ['ATL', 79], ['BOS', 63], ['DAL', 84], ['PHX', 92],
+                  ['LV', 88], ['DC', 72], ['MSP', 60], ['NOLA', 85], ['OKC', 80], ['SATX', 87]];
+    var UNI_LOW = [['NYC', 54], ['CHI', 49], ['DEN', 45], ['LAX', 62], ['MIA', 75], ['AUS', 66], ['SEA', 50], ['BOS', 51], ['ATL', 60], ['DAL', 64]];
+    var UNI_RAIN = ['NYC', 'CHI', 'SEA', 'MIA', 'HOU', 'BOS', 'ATL', 'PHIL', 'DC', 'SFO', 'NOLA', 'DEN'];
+    var UNI_PMWX = [['NYC', 66], ['CHI', 61], ['LAX', 78], ['MIA', 86], ['SEA', 62], ['DAL', 84], ['ATL', 79], ['BOS', 63]];
+    var UNI_CRYPTO = [['BTC', 'Bitcoin', 0.45], ['ETH', 'Ethereum', 0.6], ['SOL', 'Solana', 0.8], ['XRP', 'XRP', 0.8], ['DOGE', 'Dogecoin', 0.9]];
+
+    // one listing row; p the outcome's probability, liq 0..1 how much the market trades
+    function uniRow(o) {
+      var p = Math.max(0.004, Math.min(0.996, o.p)), liq = Math.max(0.02, Math.min(1, o.liq));
+      var half = (liq > 0.75 ? UR(0.5, 1.5) : liq > 0.45 ? UR(1, 3) : liq > 0.2 ? UR(2, 6) : UR(3, 12)) / 100;
+      var bid = p - half >= 0.01 ? Math.floor((p - half) * 100) * 100 : null;
+      var ask = p + half <= 0.99 ? Math.ceil((p + half) * 100) * 100 : null;
+      if (liq < 0.25 && urnd() < 0.35) { if (p < 0.5) bid = null; else ask = null; }
+      if (bid !== null && ask !== null && ask <= bid) ask = bid + 100;
+      if (ask !== null && ask > 9900) ask = null;
+      var vol = Math.round(Math.exp(Math.log(20 + 6000 * liq * liq) + ugauss() * 0.9));
+      if (liq < 0.2 && urnd() < 0.4) vol = Math.round(UR(0, 30));
+      var r = {
+        key: o.v + '|' + o.tk, v: o.v, tk: o.tk, ev: o.ev, title: o.title, short: o.short, cat: o.cat, grp: o.grp, kind: o.kind || 'OTHER',
+        date: isoET(o.day + 12 * 3600000), open_ms: o.open_ms || o.day - 86400000, close_ms: o.close_ms, start: o.start || null,
+        p: p, half: half * U, bid: bid, ask: ask, vol: vol, fee: o.fee || (o.v === 'P' ? PMF : QD),
+        fair: o.model ? Math.max(10, Math.min(U - 10, Math.round((p + ugauss() * 0.02) * U))) : null,
+        og: o.og || o.tk, oc: o.oc || 'YES', outs: o.outs || null, grid: o.grid || GRID_LINEAR, pin: false
+      };
+      var mu = String(r.short).split(' ')[0];
+      r.gk = r.kind === 'GAME' && mu.indexOf('@') > 0 ? r.grp + ' ' + mu : r.grp;
+      if (!S.uni.has(r.key) && !S.markets.has(r.key)) S.uni.set(r.key, r);
+      return r;
+    }
+    // mutually exclusive brackets around mu (sd): an event's outcomes, one row each
+    function uniBrackets(o, mu, sd, lo, step, n, fmt) {
+      var outs = [], specs = [];
+      for (var i = 0; i < n; i++) {
+        var a = lo + i * step, b = a + step, first = i === 0, last = i === n - 1;
+        var pa = first ? 0 : ncdf((a - mu) / sd), pb = last ? 1 : ncdf((b - mu) / sd);
+        var lbl = first ? '<' + fmt(b) : (last ? '>' + fmt(a) : fmt(a) + '-' + fmt(b));
+        outs.push(lbl); specs.push({ lbl: lbl, p: pb - pa, sfx: first ? 'T' + fmt(b) : (last ? 'T' + fmt(a) : 'B' + fmt(a)) });
+      }
+      specs.forEach(function (x) {
+        uniRow(Object.assign({}, o, { tk: o.ev + '-' + x.sfx, title: o.title.replace('%', x.lbl), short: o.short + ' ' + x.lbl, p: x.p,
+                                       liq: o.liq * (0.35 + 1.3 * Math.min(0.5, x.p)), og: o.ev, oc: x.lbl, outs: outs }));
+      });
+    }
+    // independent thresholds: "above k?"
+    function uniAbove(o, mu, sd, ks, fmt) {
+      ks.forEach(function (k) {
+        var p = 1 - ncdf((k - mu) / sd);
+        uniRow(Object.assign({}, o, { tk: o.ev + '-' + fmt(k).replace(/[^0-9.]/g, ''), title: o.title.replace('%', fmt(k)), short: o.short + ' >' + fmt(k), p: p,
+                                       liq: o.liq * (0.3 + 1.4 * Math.min(p, 1 - p)) }));
+      });
+    }
+    function uniGames(sp, day, isToday) {
+      var n = sp.n[isToday ? 0 : 1], pool = sp.teams.slice(), date = evDate(day + 12 * 3600000);
+      for (var g = 0; g < n && pool.length >= 2; g++) {
+        var a = pool.splice(Math.floor(urnd() * pool.length), 1)[0], h = pool.splice(Math.floor(urnd() * pool.length), 1)[0];
+        var start = day + Math.round(sp.hours[g % sp.hours.length] * 3600000), close = start + sp.dur * 3600000, mu = a + '@' + h;
+        var ph = Math.max(0.15, Math.min(0.85, 0.55 + ugauss() * 0.15)), pd = sp.three ? UR(0.22, 0.3) : 0;
+        var ev = 'KX' + sp.ser + 'GAME-' + date + a + h, base = { v: 'K', cat: 'SPORTS', grp: sp.lg, kind: 'GAME', day: day, close_ms: close, start: start, fee: sp.fee, model: sp.lg === 'NCAAF' };
+        var outs = sp.three ? [a, h, 'TIE'] : [a, h];
+        uniRow(Object.assign({}, base, { tk: ev + '-' + a, ev: ev, title: a + ' at ' + h + ': ' + a + ' wins', short: mu + ' ' + a, p: (1 - ph) * (1 - pd), liq: UR(0.75, 1), og: ev, oc: a, outs: outs }));
+        uniRow(Object.assign({}, base, { tk: ev + '-' + h, ev: ev, title: a + ' at ' + h + ': ' + h + ' wins', short: mu + ' ' + h, p: ph * (1 - pd), liq: UR(0.75, 1), og: ev, oc: h, outs: outs }));
+        if (sp.three) uniRow(Object.assign({}, base, { tk: ev + '-TIE', ev: ev, title: a + ' at ' + h + ': draw', short: mu + ' TIE', p: pd, liq: UR(0.5, 0.8), og: ev, oc: 'TIE', outs: outs }));
+        var fav = ph >= 0.5 ? h : a, margin = (Math.abs(ph - 0.5) * 2) * sp.spr[sp.spr.length - 1];
+        sp.spr.forEach(function (x) {
+          var evs = 'KX' + sp.ser + 'SPREAD-' + date + a + h;
+          uniRow(Object.assign({}, base, { tk: evs + '-' + fav + String(x).replace('.', ''), ev: evs, title: fav + ' wins by more than ' + x + '?', short: mu + ' ' + fav + ' -' + x,
+                                            p: 1 - ncdf((x - margin) / (sp.spr[sp.spr.length - 1] * 0.6 + 1)), liq: UR(0.35, 0.7) }));
+        });
+        var tmu = sp.tot[Math.floor(sp.tot.length / 2)] + ugauss() * (sp.tot[1] - sp.tot[0] || 1) * 0.5;
+        sp.tot.forEach(function (x) {
+          var evt = 'KX' + sp.ser + 'TOTAL-' + date + a + h;
+          uniRow(Object.assign({}, base, { tk: evt + '-' + String(x).replace('.', ''), ev: evt, title: 'Over ' + x + ' in ' + a + ' at ' + h + '?', short: mu + ' O' + x,
+                                            p: 1 - ncdf((x - tmu) / ((sp.tot[sp.tot.length - 1] - sp.tot[0]) * 0.45 + 1)), liq: UR(0.3, 0.65) }));
+        });
+        for (var k = 0; k < sp.nprops && sp.props.length; k++) {
+          var pr = sp.props[k % sp.props.length], nm = NAMES[Math.floor(urnd() * NAMES.length)], th = pr[1][Math.floor(k / sp.props.length) % pr[1].length];
+          var evp = 'KX' + sp.ser + pr[0] + '-' + date + a + h;
+          uniRow(Object.assign({}, base, { tk: evp + '-' + nm + th, ev: evp, title: nm + ': ' + th + '+ ' + pr[0].toLowerCase() + ' (' + a + ' at ' + h + ')?', short: mu + ' ' + nm + ' ' + th + '+',
+                                            p: UR(0.08, 0.7), liq: UR(0.08, 0.4) }));
+        }
+        // Polymarket US: the game (YES = the away team), and a spread and a total where it lists them
+        var slug = 'aec-' + sp.pm + '-' + a.toLowerCase() + '-' + h.toLowerCase() + '-' + isoET(start);
+        var pb = { v: 'P', cat: 'SPORTS', grp: sp.lg, kind: 'GAME', day: day, close_ms: close, start: start, fee: PMF, grid: urnd() < 0.5 ? GRID_DECI : GRID_LINEAR };
+        uniRow(Object.assign({}, pb, { tk: slug, ev: slug, title: a + ' vs. ' + h + ': ' + a, short: mu + ' ' + a, p: 1 - ph, liq: UR(0.6, 0.95) }));
+        if (sp.pmx) {
+          uniRow(Object.assign({}, pb, { tk: 'asc-' + slug.slice(4), ev: 'asc-' + slug.slice(4), title: fav + ' covers ' + sp.spr[0] + '?', short: mu + ' ' + fav + ' -' + sp.spr[0], p: UR(0.4, 0.6), liq: UR(0.3, 0.6) }));
+          uniRow(Object.assign({}, pb, { tk: 'tsc-' + slug.slice(4), ev: 'tsc-' + slug.slice(4), title: 'Over ' + sp.tot[1] + '?', short: mu + ' O' + sp.tot[1], p: UR(0.4, 0.6), liq: UR(0.3, 0.6) }));
+        }
+      }
+    }
+    function genUniverse(now) {
+      S.uni.clear(); S.uniCache = null;
+      var today = etMidnight(now);
+      S.uniDay = isoET(now);
+      [today, today + 86400000].forEach(function (day, di) {
+        var isToday = di === 0, ds = evDate(day + 12 * 3600000), md = mdET(day + 12 * 3600000), ld = longDate(day + 12 * 3600000);
+        UNI_SPORTS.forEach(function (sp) { uniGames(sp, day, isToday); });
+        // weather: Kalshi highs, lows and rain; Polymarket US highs (the cities the live set does not list)
+        UNI_WX.forEach(function (c) {
+          var mu = c[1] + ugauss() * 2, ev = 'KXHIGH' + c[0] + '-' + ds, lo = Math.round(mu) - 5;
+          uniBrackets({ v: 'K', ev: ev, title: 'Will the maximum temperature be %° on ' + ld + '?', short: c[0], cat: 'WEATHER', grp: 'WX ' + c[0] + ' ' + md, kind: 'WEATHER',
+                        day: day, close_ms: day + 25 * 3600000, liq: UR(0.3, 0.7), model: true }, mu, isToday ? 1.8 : 2.8, lo, 2, 6, String);
+        });
+        UNI_LOW.forEach(function (c) {
+          var mu = c[1] + ugauss() * 2, ev = 'KXLOWT' + c[0] + '-' + ds, lo = Math.round(mu) - 5;
+          uniBrackets({ v: 'K', ev: ev, title: 'Will the minimum temperature be %° on ' + ld + '?', short: c[0] + ' LOW', cat: 'WEATHER', grp: 'WX LOW ' + md, kind: 'WEATHER',
+                        day: day, close_ms: day + 25 * 3600000, liq: UR(0.15, 0.45), model: true }, mu, 2.2, lo, 2, 6, String);
+        });
+        UNI_RAIN.forEach(function (c) {
+          uniRow({ v: 'K', tk: 'KXRAIN' + c + '-' + ds, ev: 'KXRAIN' + c + '-' + ds, title: 'Will it rain in ' + c + ' on ' + ld + '?', short: c + ' RAIN', cat: 'WEATHER', grp: 'WX RAIN ' + md,
+                   kind: 'WEATHER', day: day, close_ms: day + 25 * 3600000, p: UR(0.05, 0.7), liq: UR(0.15, 0.5), model: true });
+        });
+        UNI_PMWX.forEach(function (c) {
+          var mu = c[1] + ugauss() * 2, ev = 'wx-' + c[0].toLowerCase() + '-high-' + isoET(day + 12 * 3600000), lo = Math.round(mu) - 7;
+          uniBrackets({ v: 'P', ev: ev, title: c[0] + ' high temperature %°F on ' + ld + '?', short: c[0] + ' P', cat: 'WEATHER', grp: 'WX PM ' + md, kind: 'WEATHER',
+                        day: day, close_ms: day + 25 * 3600000, liq: UR(0.3, 0.6), fee: PMF, model: true }, mu, 2.5, lo, 2, 8, String);
+        });
+        // FIN: daily closes (both days); today also every 15-minute crypto window (listed while
+        // open) and the hourly BTC / ETH events
+        [['INX', 'S&P 500', 6740, 45, 25, 16, 16], ['NASDAQ100', 'Nasdaq-100', 24850, 210, 100, 16, 16], ['BTCD', 'Bitcoin', 124500, 1800, 500, 20, 17],
+         ['ETHD', 'Ethereum', 4480, 90, 25, 20, 17], ['EURUSD', 'EUR/USD', 1.1042, 0.004, 0.001, 10, 10], ['WTI', 'WTI crude', 61.8, 1.2, 0.5, 10, 14.5],
+         ['GOLD', 'Gold', 3950, 30, 10, 10, 13.5]].forEach(function (x) {
+          var ev = 'KX' + x[0] + '-' + ds + 'H' + Math.floor(x[6]) + '00', dp = x[4] < 1 ? 3 : 0, mu = x[2] + ugauss() * x[3] * 0.3;
+          var lo = Math.round((mu - x[4] * x[5] / 2) / x[4]) * x[4];
+          uniBrackets({ v: 'K', ev: ev, title: x[1] + ' at ' + Math.floor(x[6]) + ':00 on ' + ld + ' in %?', short: x[0], cat: 'FIN', grp: x[0] + ' CLOSE ' + md, kind: 'OTHER',
+                        day: day, close_ms: day + x[6] * 3600000, liq: UR(0.3, 0.7), model: true }, mu, x[3], lo, x[4], x[5], function (v) { return v.toFixed(dp); });
+        });
+        if (isToday) {
+          UNI_CRYPTO.forEach(function (c) {
+            for (var w = 0; w < 96; w++) {
+              var op = day + w * Q15, cl = op + Q15, ev = 'KX' + c[0] + '15M-' + evDate(cl) + evTime(cl);
+              uniRow({ v: 'K', tk: ev + '-' + pad2(etD(cl).getUTCMinutes()), ev: ev, title: c[1] + ' price up in next 15 mins?', short: c[0] + ' ' + hmET(cl) + ' UP', cat: 'FIN', grp: '15M',
+                       kind: 'OTHER', day: day, open_ms: op, close_ms: cl, p: UR(0.35, 0.65), liq: UR(0.5, 0.85), model: true, og: ev, oc: 'UP', outs: ['UP', 'DOWN'] });
+            }
+          });
+          [['BTC', 'Bitcoin', 124500, 1200, 250], ['ETH', 'Ethereum', 4480, 60, 10]].forEach(function (c) {
+            for (var hr = 1; hr <= 23; hr++) {
+              var cl2 = day + hr * 3600000, ev2 = 'KX' + c[0] + '-' + ds + pad2(hr), mu2 = c[2] + ugauss() * c[3] * 0.4;
+              var gk = c[0] + ' 1H ' + pad2(hr) + ':00', sd2 = c[3] * Math.sqrt(Math.max(0.2, hr / 24));
+              uniBrackets({ v: 'K', ev: ev2, title: c[1] + ' price at ' + pad2(hr) + ':00 in %?', short: c[0], cat: 'FIN', grp: gk, kind: 'OTHER', day: day, open_ms: day, close_ms: cl2,
+                            liq: UR(0.25, 0.6), model: true }, mu2, sd2, Math.round((mu2 - c[4] * 5) / c[4]) * c[4], c[4], 10, String);
+              uniAbove({ v: 'K', ev: 'KX' + c[0] + 'D-' + ds + pad2(hr), title: c[1] + ' above % at ' + pad2(hr) + ':00?', short: c[0], cat: 'FIN', grp: gk, kind: 'OTHER', day: day, open_ms: day,
+                         close_ms: cl2, liq: UR(0.3, 0.6), model: true }, mu2, sd2, [-4, -3, -2, -1, 0, 1, 2, 3, 4, 5].map(function (j) { return Math.round(mu2 / c[4]) * c[4] + j * c[4] * 1.5; }), String);
+            }
+          });
+        }
+        // ECON: daily gas, rates; the week's releases on their day
+        uniAbove({ v: 'K', ev: 'KXAAAGASD-' + ds, title: 'US average gas price above $% on ' + ld + '?', short: 'GAS', cat: 'ECON', grp: 'GAS ' + md, day: day, close_ms: day + 23.5 * 3600000, liq: UR(0.2, 0.5) },
+                 3.142 + ugauss() * 0.01, 0.012, [3.10, 3.11, 3.12, 3.13, 3.14, 3.15, 3.16, 3.17, 3.18, 3.19], function (v) { return v.toFixed(2); });
+        [['TNOTE10', '10-year Treasury yield', 4.12, 0.04, 0.02, 10], ['TNOTE2', '2-year Treasury yield', 3.58, 0.04, 0.02, 8], ['MORT30', '30-year mortgage rate', 6.31, 0.03, 0.02, 8]].forEach(function (x) {
+          var mu3 = x[2] + ugauss() * x[3] * 0.3, ks = [];
+          for (var j = 0; j < x[5]; j++) ks.push(Math.round((mu3 - x[4] * x[5] / 2 + j * x[4]) * 100) / 100);
+          uniAbove({ v: 'K', ev: 'KX' + x[0] + '-' + ds, title: x[1] + ' above %% on ' + ld + '?', short: x[0], cat: 'ECON', grp: 'RATES ' + md, day: day, close_ms: day + 16 * 3600000, liq: UR(0.15, 0.45) },
+                   mu3, x[3], ks, function (v) { return v.toFixed(2); });
+        });
+        var wd = etD(day + 12 * 3600000).getUTCDay();
+        if (wd === 2) uniBrackets({ v: 'K', ev: 'KXREDBOOK-' + ds, title: 'Redbook retail sales y/y %%?', short: 'REDBOOK', cat: 'ECON', grp: 'RELEASES ' + md, day: day, close_ms: day + 8.9 * 3600000, liq: 0.25 },
+                                  5.6, 0.5, 4.8, 0.3, 6, function (v) { return v.toFixed(1); });
+        if (wd === 3) {
+          uniBrackets({ v: 'K', ev: 'KXEIACRUDE-' + ds, title: 'EIA crude inventory change % M barrels?', short: 'EIA CRUDE', cat: 'ECON', grp: 'RELEASES ' + md, day: day, close_ms: day + 10.5 * 3600000, liq: 0.35 },
+                       -0.8, 2.5, -4, 1, 8, function (v) { return v.toFixed(0); });
+          uniBrackets({ v: 'K', ev: 'KXMBAAPPS-' + ds, title: 'MBA mortgage applications w/w %%?', short: 'MBA APPS', cat: 'ECON', grp: 'RELEASES ' + md, day: day, close_ms: day + 7 * 3600000, liq: 0.2 },
+                       0.5, 3, -4, 2, 6, function (v) { return v.toFixed(0); });
+        }
+        // OTHER: mentions, approval, charts, posts
+        ['TARIFF', 'INFLATION', 'BITCOIN', 'CHINA', 'RECESSION', 'AI', 'FED', 'JOBS'].forEach(function (w, i) {
+          var who = i % 2 ? 'POWELL' : 'POTUS', ev = 'KXMENTION' + who + '-' + ds;
+          uniRow({ v: 'K', tk: ev + '-' + w, ev: ev, title: 'Will ' + (i % 2 ? 'Powell' : 'the President') + ' say "' + w.toLowerCase() + '" on ' + ld + '?', short: who + ' SAYS ' + w,
+                   cat: 'OTHER', grp: 'MENTIONS ' + md, day: day, close_ms: day + 23.98 * 3600000, p: UR(0.1, 0.9), liq: UR(0.1, 0.4) });
+        });
+        uniBrackets({ v: 'K', ev: 'KXAPRPOTUS-' + ds, title: 'Presidential approval % on ' + ld + '?', short: 'APPROVAL', cat: 'OTHER', grp: 'APPROVAL ' + md, day: day, close_ms: day + 23 * 3600000, liq: 0.3 },
+                     43.6, 0.6, 42, 0.5, 8, function (v) { return v.toFixed(1); });
+        uniBrackets({ v: 'K', ev: 'KXTWEETS-' + ds, title: 'Posts by @elonmusk on ' + ld + ': %?', short: 'POSTS', cat: 'OTHER', grp: 'POSTS ' + md, day: day, close_ms: day + 23.98 * 3600000, liq: 0.25 },
+                     95, 18, 50, 15, 8, String);
+        var songs = ['GOLDEN', 'MANCHILD', 'ORDINARY', 'DAISIES', 'BIRDS', 'GABRIELA', 'SAPPHIRE', 'TEXAS', 'APT', 'LUTHER'], ps = [0.42, 0.21, 0.11, 0.07, 0.05, 0.04, 0.03, 0.03, 0.02, 0.02];
+        songs.forEach(function (sg, i) {
+          var ev = 'KXSPOTIFYD-' + ds;
+          uniRow({ v: 'K', tk: ev + '-' + sg, ev: ev, title: sg + ' the top song on Spotify on ' + ld + '?', short: 'SPOTIFY ' + sg, cat: 'OTHER', grp: 'SPOTIFY ' + md, day: day,
+                   close_ms: day + 23.98 * 3600000, p: ps[i], liq: UR(0.1, 0.35), og: ev, oc: sg, outs: songs });
+        });
+      });
+      S.uniArr = Array.from(S.uni.values());
+      return S.uni.size;
+    }
+    // a listing drifts a little (a few rows a second), as the venue's REST listing would
+    function driftUniverse(now) {
+      if (now < S.nextDrift || !S.uniArr || !S.uniArr.length) return;
+      S.nextDrift = now + 1000;
+      for (var i = 0; i < 40; i++) {
+        var r = S.uniArr[Math.floor(urnd() * S.uniArr.length)];
+        if (S.markets.has(r.key)) continue;
+        r.p = Math.max(0.004, Math.min(0.996, r.p + ugauss() * 0.006));
+        if (r.bid !== null) r.bid = r.p - r.half / U >= 0.01 ? Math.floor((r.p * U - r.half) / 100) * 100 : null;
+        if (r.ask !== null) r.ask = r.p + r.half / U <= 0.99 ? Math.ceil((r.p * U + r.half) / 100) * 100 : null;
+        if (r.bid !== null && r.ask !== null && r.ask <= r.bid) r.ask = r.bid + 100;
+        if (urnd() < 0.3) r.vol += Math.round(UR(1, 20));
+      }
+      S.uniCache = null;
+    }
+    // a row brought into the live set: a market of its own with a book around the row's touch
+    function activate(r, pin) {
+      var have = S.markets.get(r.key);
+      if (have) return have;
+      var bk = r.cat === 'SPORTS' ? (r.v === 'P' ? 'GAME_P' : 'GAME_K') : (r.cat === 'WEATHER' ? 'WEATHER' : (r.cat === 'FIN' ? 'LIP15' : 'MISC'));
+      if (!S.ogOutcomes[r.og]) S.ogOutcomes[r.og] = r.outs || ['YES', 'NO'];
+      var mid = r.bid !== null && r.ask !== null ? (r.bid + r.ask) / 2 : r.p * U;
+      var m = addMarket({ v: r.v, tk: r.tk, ev: r.ev, bk: bk, title: r.title, short: r.short, grp: r.grp, kind: r.kind, og: r.og, oc: r.outs ? r.oc : 'YES',
+                          open_ms: Math.min(r.open_ms, clock()), close_ms: r.close_ms, grid: r.grid, fee: r.fee,
+                          shard: r.v === 'K' ? (r.tk.length % 2 ? 'S0' : 'S2') : null, lip: false, p: r.p, mid: mid,
+                          spreadU: r.bid !== null && r.ask !== null ? Math.max(100, r.ask - r.bid) : null, cat: r.cat, date: r.date, pin: !!pin, start: r.start, uni: true }, false);
+      m.ref.fair = r.fair; m.ref.sd = r.fair === null ? null : 300; m.vol = r.vol;
+      S.uni.delete(r.key);
+      S.forceBook.add(m.key); S.uniCache = null;
+      return m;
+    }
+    // a live market as a listing row
+    function liveRow(m) {
+      var mu = String(m.short).split(' ')[0];
+      return { key: m.key, v: m.v, tk: m.tk, ev: m.ev, title: m.title, short: m.short, cat: m.cat, grp: m.grp, kind: m.kind,
+               gk: m.kind === 'GAME' && mu.indexOf('@') > 0 ? m.grp + ' ' + mu : m.grp, date: m.date, close_ms: m.close_ms,
+               bid: bestLevel(m, 'BUY'), ask: bestLevel(m, 'SELL'), vol: m.vol, fee: m.fee, fair: m.ref.fair === null ? null : Math.round(m.ref.fair), pin: !!m.pin, live: true };
+    }
+    function edgeOf(r) {
+      if (r.fair === null || r.fair === undefined) return null;
+      var best = null;
+      if (r.ask !== null) best = r.fair - r.ask - FEES.takerPer(r.v, r.fee, r.ask);
+      if (r.bid !== null) { var e2 = r.bid - r.fair - FEES.takerPer(r.v, r.fee, r.bid); if (best === null || e2 > best) best = e2; }
+      return best;
+    }
+    var SORTK = {
+      vol: function (r) { return -r.vol; },
+      sprd: function (r) { return r.bid !== null && r.ask !== null ? r.ask - r.bid : Infinity; },
+      close: function (r) { return r.close_ms; },
+      edge: function (r) { return r._e === null ? Infinity : -r._e; }
+    };
+    // GET /api/universe: filter, order (category, group by its best row, row), page
+    function universe(q, now) {
+      var day = q.day, sort = q.sort || 'close', off = q.offset || 0, lim = q.limit === undefined ? 100 : q.limit;
+      var today = isoET(now), date = day === 'T1' ? isoET(etMidnight(now) + 36 * 3600000) : today;
+      var sig = [day, q.cat || '', q.v || '', (q.q || '').toLowerCase(), sort].join('|'), cache = S.uniCache;
+      if (!cache || cache.sig !== sig || now - cache.at > 1000) {
+        var ql = (q.q || '').toLowerCase(), all = [];
+        var want = function (d) { return day === 'T1' ? d > today : d <= today; };
+        S.uni.forEach(function (r) { if (want(r.date) && r.open_ms <= now && now < r.close_ms) all.push(r); });
+        S.markets.forEach(function (m) { if (m.status === 'OPEN' && want(m.date)) all.push(liveRow(m)); });
+        var base = all.filter(function (r) { return (!q.v || r.v === q.v) && (!ql || (r.tk + ' ' + r.title + ' ' + r.short + ' ' + r.gk).toLowerCase().indexOf(ql) >= 0); });
+        var cats = {}; C.enums.CAT.forEach(function (c) { cats[c] = 0; });
+        base.forEach(function (r) { cats[r.cat]++; });
+        var rows = q.cat ? base.filter(function (r) { return r.cat === q.cat; }) : base, kf = SORTK[sort], gs = new Map();
+        rows.forEach(function (r) {
+          r._e = edgeOf(r); r._k = kf(r);
+          var g = gs.get(r.gk);
+          if (!g) { g = { gk: r.gk, cat: r.cat, rows: [], best: Infinity }; gs.set(r.gk, g); }
+          g.rows.push(r); if (r._k < g.best) g.best = r._k;
+        });
+        var CI = {}; C.enums.CAT.forEach(function (c, i) { CI[c] = i; });
+        var cmpR = function (a, b) { return a._k - b._k || (a._k === Infinity && b._k === Infinity ? 0 : 0) || (a.tk < b.tk ? -1 : a.tk > b.tk ? 1 : 0); };
+        var glist = Array.from(gs.values()).sort(function (a, b) {
+          return CI[a.cat] - CI[b.cat] || (a.best === b.best ? 0 : (a.best < b.best ? -1 : 1)) || (a.gk < b.gk ? -1 : a.gk > b.gk ? 1 : 0);
+        });
+        var flat = [];
+        glist.forEach(function (g) { g.rows.sort(cmpR); Array.prototype.push.apply(flat, g.rows); });
+        cache = S.uniCache = { sig: sig, at: now, flat: flat, groups: glist.map(function (g) { return { gk: g.gk, cat: g.cat, n: g.rows.length }; }), cats: cats, date: date };
+      }
+      var page = cache.flat.slice(off, off + lim).map(function (r) {
+        return { v: r.v, tk: r.tk, ev: r.ev, title: r.title, short: r.short, cat: r.cat, grp: r.grp, gk: r.gk, kind: r.kind, date: r.date, close_ms: r.close_ms,
+                 bid: r.bid === null ? null : pxs(r.bid), ask: r.ask === null ? null : pxs(r.ask), sprd: r.bid !== null && r.ask !== null ? pxs(r.ask - r.bid) : null,
+                 vol: r2(r.vol), fee: { type: r.fee.type, mult: r.fee.mult }, fair: r.fair === null ? null : pxs(r.fair), edge: r._e === null ? null : ms(r._e),
+                 pin: !!r.pin, live: !!r.live };
+      });
+      return { ok: true, day: day, date: cache.date, total: cache.flat.length, offset: off, rows: page, groups: cache.groups, cats: cache.cats, ts_ms: now };
+    }
+    // an activated market that closed settles: an exclusive event once (one outcome YES, drawn by
+    // the listing's probabilities), an independent one by its own
+    function settleUni(now) {
+      S.markets.forEach(function (m) {
+        if (!m.uni || m.status !== 'OPEN' || now < m.close_ms) return;
+        var outs = S.ogOutcomes[m.og] || ['YES', 'NO'], res;
+        if (outs[0] !== 'YES') {
+          if (!S.ogResult[m.og]) {
+            var w = outs.map(function (oc) {
+              var p = 0;
+              S.uni.forEach(function (r) { if (r.og === m.og && r.oc === oc) p = r.p; });
+              S.markets.forEach(function (x) { if (x.og === m.og && x.oc === oc) p = x.pU / U; });
+              return p;
+            }), tot = w.reduce(function (a, b) { return a + b; }, 0), x = rnd() * (tot || 1), acc = 0;
+            S.ogResult[m.og] = outs[outs.length - 1];
+            for (var i = 0; i < outs.length; i++) { acc += w[i]; if (x <= acc) { S.ogResult[m.og] = outs[i]; break; } }
+          }
+          res = S.ogResult[m.og] === m.oc ? 'YES' : 'NO';
+        } else res = rnd() < m.pU / U ? 'YES' : 'NO';
+        settle(m, res, now);
+      });
+    }
+
+    // the live set at boot (the desk's own markets) and the day's listing
     (function boot() {
       var now = clock();
       var q0 = Math.floor(now / Q15) * Q15;
@@ -366,7 +711,8 @@
                   last_ms: null, lastJson: '', lastEmit: 0 };
         S.lanes.push(L); S.laneById[L.id] = L;
       });
-      S.alerts.push({ id: 'a-' + (++S.alertN), lvl: 'INFO', src: 'SIM', msg: 'demo venues up: ' + S.markets.size + ' markets', ts_ms: now });
+      genUniverse(now);
+      S.alerts.push({ id: 'a-' + (++S.alertN), lvl: 'INFO', src: 'SIM', msg: 'demo venues up: ' + S.markets.size + ' live markets, ' + (S.uni.size + S.markets.size) + ' listed for today and tomorrow', ts_ms: now });
     })();
 
     // ------------------------------------------------------------------------------------------
@@ -546,7 +892,9 @@
         return err('BAD_QTY', 'qty ' + req.qty);
       var hasTtl = req.ttl_s !== null && req.ttl_s !== undefined, hasExp = req.exp_ms !== null && req.exp_ms !== undefined;
       if (own !== 'EXT' && (req.tif === 'POST' ? hasTtl === hasExp : (hasTtl || hasExp))) return err('BAD_REQUEST', 'POST needs one of ttl_s and exp_ms; IOC and FOK neither');
-      if (hasExp && (req.exp_ms % 1000 !== 0 || req.exp_ms < now + 5000 || req.exp_ms > now + 86400000)) return err('BAD_REQUEST', 'exp_ms must be a whole second 5 s to 24 h ahead');
+      // an absolute expiry: a whole second, 5 s ahead at least, never past the market's close
+      // ("until close" sends the close itself: Kalshi expiration_ts / Polymarket US GTD at the close)
+      if (hasExp && (req.exp_ms % 1000 !== 0 || req.exp_ms < now + 5000 || (own !== 'EXT' && req.exp_ms > m.close_ms))) return err('BAD_REQUEST', 'exp_ms must be a whole second, 5 s ahead at least and no later than the close');
       if (req.reduce_only && req.tif !== 'IOC') return err('BAD_REQUEST', 'reduce_only is IOC only');
       if (req.reduce_only) { var rp = posOf(m.key); if (req.side === 'BUY' ? rp >= 0 : rp <= 0) return err('REDUCE', rp === 0 ? 'no position' : 'would increase the position'); }
       if (S.run.state === 'KILLED' && own !== 'EXT') return err('KILLED', 'kill lockout');
@@ -780,6 +1128,7 @@
         var st = S.lip[s], m = S.markets.get(st.key);
         if (!m || now < m.close_ms) return;
         var res = st.S >= st.S0 ? 'YES' : 'NO';
+        st.pin = m.pin;                       // the next window is on the watchlist if this one was
         settle(m, res, now);
         lipWindow(st.spec, m.close_ms, st.S, false);
         if (S.run.state === 'RUN' && S.laneById.M1.on) alert('INFO', 'M1', 'roll ' + st.spec.name + ' ' + hmET(m.close_ms + Q15) + ' (' + st.spec.name + ' ' + hmET(m.close_ms) + ' ' + res + ')');
@@ -789,6 +1138,8 @@
         var x = Math.round(w.mu + gauss() * 0.5);
         w.keys.forEach(function (k, i) { var b = w.br[i], m = S.markets.get(k); if (m) settle(m, x >= b.lo && x <= b.hi ? 'YES' : 'NO', now); });
         S.wx.splice(S.wx.indexOf(w), 1);
+        var anyPin = false; w.keys.forEach(function (k) { var mm = S.markets.get(k); if (mm && mm.pin) anyPin = true; });
+        S.wxPin[w.city.s] = anyPin;
         wxEvent(w.city, w.day + 2 * 86400000, false, false);
       });
       S.games.slice().forEach(function (g) {
@@ -820,7 +1171,9 @@
         var st = S.lip[s], m = S.markets.get(st.key); if (!m || m.status !== 'OPEN') return;
         st.S *= Math.exp(st.sig * Math.sqrt(dt) * gauss());
         m.pU = lipP(st, m.close_ms, now) * U;
-        st.bias = (st.bias || 0) * Math.exp(-dt / 40) + gauss() * 45 * Math.sqrt(dt);
+        // the model's error: a mean-reverting walk (one-sigma about 1.4c), so a lane quoting around
+        // it earns its spread and pays for being wrong now and then
+        st.bias = (st.bias || 0) * Math.exp(-dt / 40) + gauss() * 32 * Math.sqrt(dt);
         m.ref.fair = Math.max(10, Math.min(U - 10, m.pU + st.bias));
       });
       S.wx.forEach(function (w) {
@@ -947,6 +1300,10 @@
     }
     function laneSubmit(L, m, side, pxU, qty, tif, ttl, touch) {
       if (pxU === null || !(qty > 0)) return null;
+      // a market another lane holds a position in is that lane's: its risk counts against that
+      // lane's budget, so a second lane stays out (it could not be held to its own budget)
+      var held = S.pos.get(m.key);
+      if (held && held.pos && held.lane && held.lane !== L.id && held.own.SYS) return null;
       var res = addedReserve(m.key, side, pxU, qty, function (o) { return o.lane === L.id; });
       var u = laneUse(L), cl = ceilings();
       if (u.used + res > L.budgetU) { L.capHit = 'budget ' + (u.used / U).toFixed(2) + '/' + (L.budgetU / U).toFixed(2); return null; }
@@ -985,11 +1342,12 @@
         Object.keys(S.lip).forEach(function (s) {
           var m = S.markets.get(S.lip[s].key);
           if (!m || m.status !== 'OPEN' || m.manOwned) return;
-          var tau = m.close_ms - now, age = now - m.open_ms, q = posOf(m.key), mine = laneLive(m.key, 'M1');
+          var tau = m.close_ms - now, q = posOf(m.key), mine = laneLive(m.key, 'M1');
           var bbO = othersBest(m, 'bid'), baO = othersBest(m, 'ask');
           if (tau < 60000) {
+            // the last minute: no quotes, and what is left of the inventory goes (IOC, one tick through)
             if (mine.BUY) cancelOrder(mine.BUY, 'PULL'); if (mine.SELL) cancelOrder(mine.SELL, 'PULL');
-            if (Math.abs(q) > 10 && !m.m1Flat && bbO !== null && baO !== null) {
+            if (Math.abs(q) >= 3 && !m.m1Flat && bbO !== null && baO !== null) {
               m.m1Flat = true;
               if (q > 0) laneSubmit(L, m, 'SELL', G.step(m.g, bbO, -1), q, 'IOC', null, bbO);
               else laneSubmit(L, m, 'BUY', G.step(m.g, baO, 1), -q, 'IOC', null, baO);
@@ -1000,13 +1358,15 @@
           var fair = m.ref.fair, ticks = G.ticks(m.g, bbO, baO);
           var bid = ticks >= 2 ? G.step(m.g, bbO, 1) : bbO, ask = ticks >= 2 ? G.step(m.g, baO, -1) : baO;
           if (ticks === 2) { if (q > 0) bid = bbO; else ask = baO; }
-          var capB = G.snap(m.g, fair - 50 - 10 * q, -1), capA = G.snap(m.g, fair + 50 - 10 * q, 1);
+          // quotes at most half a cent through the model fair, skewed a quarter cent per contract
+          // held (inventory mean-reverts); both sides until 2.5 min before the close, then only
+          // the side that reduces; at most 10 contracts either way
+          var capB = G.snap(m.g, fair - 50 - 25 * q, -1), capA = G.snap(m.g, fair + 50 - 25 * q, 1);
           if (capB === null || bid > capB) bid = capB;
           if (capA === null || ask < capA) ask = capA;
-          var quoting = age < 600000, reducing = tau < 180000;
-          var wantB = bid !== null && bid < baO && q < 20 && (quoting || (reducing && q < 0));
-          var wantA = ask !== null && ask > bbO && q > -20 && (quoting || (reducing && q > 0));
-          if (!quoting && !reducing) { wantB = wantB && !!mine.BUY && mine.BUY.px === bid; wantA = wantA && !!mine.SELL && mine.SELL.px === ask; }
+          var quoting = tau >= 150000, reducing = !quoting;
+          var wantB = bid !== null && bid < baO && q < 10 && (quoting || (reducing && q < 0));
+          var wantA = ask !== null && ask > bbO && q > -10 && (quoting || (reducing && q > 0));
           manage(L, m, 'BUY', wantB ? bid : null, mine.BUY, 5, 15, now);
           manage(L, m, 'SELL', wantA ? ask : null, mine.SELL, 5, 15, now);
         });
@@ -1312,7 +1672,7 @@
       S.lastTick = now;
       if (now >= S.nextHb) {
         S.nextHb = now + 1000 - ((now - S.nextHb) % 1000);
-        emit('hb', { epoch: S.epoch, sid: S.sid, srv_ms: now, feeds: feedsData() });
+        emit('hb', { epoch: S.epoch, sid: S.sid, srv_ms: now, date: isoET(now), feeds: feedsData() });
       }
       if (dt > 0) {
         stepWorld(now, dt);
@@ -1321,6 +1681,9 @@
         if (S.run.state === 'RUN' && now >= S.nextLane) { S.nextLane = now + 500; runLanes(now); }
         else if (now >= S.nextLane) { S.nextLane = now + 500; S.lanes.forEach(function (L) { var s = laneState(L, now); L.state = s.st; L.why = s.why; }); }
         rolls(now);
+        settleUni(now);
+        driftUniverse(now);
+        if (isoET(now) !== S.uniDay) genUniverse(now);       // a new day: a new listing
         if (S.run.state === 'KILLED' && S.run.rearm_ms && now >= S.run.rearm_ms && !S.run.rearmNoted) { S.run.rearmNoted = true; alert('INFO', 'KILL', 're-arm available'); }
         if (S.chaos && now >= S.nextChaos) { S.nextChaos = now + R(120000, 240000); S.drop = true; }
       }
@@ -1344,7 +1707,7 @@
       var fl = S.fills.filter(function (f) { return f.emitted; }).slice(-SNAP_FILLS), fids = new Set();
       fl.forEach(function (f) { fids.add(f.fid); });
       return {
-        epoch: S.epoch, sid: S.sid, seq: S.seq, srv_ms: now, hdr: hdrData(), markets: mkts, books: books, orders: orders,
+        epoch: S.epoch, sid: S.sid, seq: S.seq, srv_ms: now, date: isoET(now), hdr: hdrData(), markets: mkts, books: books, orders: orders,
         fills: fl.map(fillData), mos: S.mos.filter(function (x) { return fids.has(x.fid); }), pos: pos,
         lanes: S.lanes.map(laneData), risk: riskData(), alerts: S.alerts.slice(-200), feeds: feedsData(),
         subs: { ladders: S.subs.ladders.slice(), tops: S.subs.tops === 'ALL' ? 'ALL' : S.subs.tops.slice() }
@@ -1369,8 +1732,23 @@
           if (sidOf(path) !== S.sid) { reply2(reply, 409, { ok: false, err: err('BAD_STATE', 'no open stream for sid ' + sidOf(path)) }); return; }
           reply2(reply, 200, snapshot(), 3); return;
         case 'GET /api/health': reply2(reply, 200, { ok: true, epoch: S.epoch, srv_ms: now }, 1); return;
+        case 'GET /api/universe':
+          var uq = C.parseQuery(path), ubad = C.validateQuery(key, uq);
+          if (ubad.length) { reply2(reply, 400, { ok: false, err: err('BAD_REQUEST', ubad[0]) }); return; }
+          reply2(reply, 200, universe(uq, now), 2);
+          return;
+        case 'POST /api/watch':
+          var wk = body.v + '|' + body.tk, wm = S.markets.get(wk), wr = S.uni.get(wk);
+          if (!wm && !wr) { reply2(reply, 404, { ok: false, err: err('UNKNOWN_MARKET', wk) }); return; }
+          if (wm) { if (!!wm.pin !== body.on) { wm.pin = body.on; emit('mkt', mktData(wm)); } }
+          else if (body.on) activate(wr, true);
+          S.uniCache = null;
+          reply2(reply, 200, { ok: true, pin: body.on }, 3);
+          return;
         case 'POST /api/subscribe':
           if (body.sid !== S.sid) { reply2(reply, 409, { ok: false, err: err('BAD_STATE', 'no open stream for sid ' + body.sid) }); return; }
+          // a ladder on a listed market outside the live set brings it in (its mkt event first)
+          body.ladders.slice(0, 4).forEach(function (l) { var ur = S.uni.get(l.v + '|' + l.tk); if (ur && !S.markets.has(ur.key)) activate(ur, false); });
           var before = {}; S.markets.forEach(function (m) { before[m.key] = depthOf(m); });
           S.subs = { ladders: body.ladders.slice(0, 4), tops: body.tops === 'ALL' ? 'ALL' : body.tops.slice() };
           S.markets.forEach(function (m) { var d = depthOf(m); if (d && d !== before[m.key]) S.forceBook.add(m.key); });
@@ -1531,6 +1909,8 @@
       setFeed: function (name, up) { if (S.feeds[name]) { S.feeds[name].up = !!up; alert(up ? 'INFO' : 'CRIT', name, up ? 'feed up' : 'feed down'); } },
       market: function (key) { return S.markets.get(key); },
       markets: function () { return Array.from(S.markets.values()); },
+      universe: function () { return Array.from(S.uni.values()); },
+      listing: function (key) { return S.uni.get(key) || null; },
       order: function (cid) { return S.orders.get(cid); },
       position: function (key) { return S.pos.get(key); },
       cash: function () { return S.cash; },

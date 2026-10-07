@@ -169,7 +169,7 @@ function bootPage(opts) {
   const clock = { t: opts.t0 || Date.UTC(2026, 9, 6, 17, 30, 0) };
   const store = Object.assign({}, opts.storage || {});
   const ctx = {
-    console: { log: console.log, warn: console.warn, info() {}, error: (...a) => { errors.push(a.map(x => (x && x.stack) || String(x)).join(' ')); } },
+    console: { log: console.log, warn: console.warn, info() {}, debug() {}, error: (...a) => { errors.push(a.map(x => (x && x.stack) || String(x)).join(' ')); } },
     setTimeout, clearTimeout, setInterval, clearInterval, performance, document: doc, Promise, Uint8Array, Map, Set, JSON, Math,
     location: { protocol: 'file:', search: opts.search || '?seed=11' },
     localStorage: { getItem: k => (k in store ? store[k] : null), setItem: (k, v) => { store[k] = String(v); } },
@@ -413,9 +413,22 @@ function bootPage(opts) {
   check(workRows().every(r => { const o = S.orders.get(r.dataset.k); return !o.terminal || !(o.st === 'FILL' || o.st === 'EXP' || (o.st === 'CXL' && (o.why === 'PULL' || o.why === 'MARKET_CLOSED'))); }),
     'WORKING drops routine endings at once (requote pulls, expiries, fills)');
   // fills: systematic only, newest first
-  const fillRows = () => P.rows('s-fills-body').filter(r => r.className !== 'none' && r.className.indexOf('none') < 0);
-  check(fillRows().length === Math.min(200, S.fills.filter(f => f.own === 'SYS').length), 'FILLS lists the Systematic fills', fillRows().length);
+  const fillRows = () => P.rows('s-fills-body').filter(r => r.className !== 'none' && r.className.indexOf('none') < 0 && r.className !== 'vpad');
+  // FILLS is a virtual list (2026-10-06 browser pass: 200 grid rows relaid out on every fill): all
+  // the fills scroll, only the rows in view and a few around them exist
+  const FV = D.systematic._t.grids.fills.V, nSysF = S.fills.filter(f => f.own === 'SYS').length;
+  check(FV && FV.n === Math.min(D.systematic.cfg.fillsMax, nSysF), 'FILLS lists the Systematic fills (a virtual list over all of them)', [FV && FV.n, nSysF]);
+  check(fillRows().length === Math.min(FV.b - FV.a, nSysF) && fillRows().length <= 64, 'only the rows in view (and a few around them) exist in the DOM', fillRows().length);
   check(fillRows().every(r => S.fillIdx.get(r.dataset.k).own === 'SYS'), 'FILLS lists only Systematic fills');
+  if (nSysF > 80) {
+    const host = $('s-fills-body'), sysF = S.fills.filter(f => f.own === 'SYS');
+    host.scrollTop = 40 * D.dom.rowPx(); fire(P.doc, host, 'scroll'); P.flush();
+    check(fillRows()[0].dataset.k === sysF[32].fid && fillRows().some(r => r.dataset.k === sysF[40].fid), 'scrolling FILLS draws the fills further down (the window moves 8 rows at a time)', [fillRows()[0].dataset.k, sysF[32].fid]);
+    const a0 = FV.a; host.scrollTop = 43 * D.dom.rowPx(); fire(P.doc, host, 'scroll'); P.flush();
+    eq(FV.a, a0, 'a scroll inside the drawn window redraws nothing');
+    host.scrollTop = 0; fire(P.doc, host, 'scroll'); P.flush();
+    eq(fillRows()[0].dataset.k, sysF[0].fid, 'and back at the top, the newest fill first');
+  } else check(true, 'too few fills to scroll FILLS (skipped)');
   eq(P.heads('s-fills-body').join('|'), 'Time|Lane|Market|Side|Px|Qty|Liq|Fee|Fair|Edge\u00a2|MO10\u00a2|MO60\u00a2|Real', 'FILLS columns at 1512 px follow the spec (cents marked)');
   const f0 = S.fillIdx.get(fillRows()[0].dataset.k), f1 = S.fillIdx.get(fillRows()[fillRows().length - 1].dataset.k);
   check(f0.ts_ms >= f1.ts_ms, 'FILLS newest first');
@@ -423,6 +436,29 @@ function bootPage(opts) {
   if (matured) {
     const r = fillRows().find(x => x.dataset.k === matured.fid);
     eq(P.cell(r, 'MO10\u00a2', 's-fills-body').textContent, D.fmt.cents(matured.mo['10s']), 'a matured MO10 shows signed cents');
+  }
+  // ACTIVITY: the lanes' tape (sent, filled, cancelled, expired, exits), newest first
+  {
+    const arows = () => P.rows('s-act-body').filter(r => /^a-/.test(r.className));
+    eq(P.heads('s-act-body').join('|'), 'Time|Lane|Ev|Side|Qty|Market|Px|Info', 'SYSTEMATIC has an ACTIVITY tape with the lane');
+    const evs = new Set(arows().map(r => r._children[2].textContent));
+    check(arows().length > 20 && evs.has('SUB') && (evs.has('FILL') || evs.has('PART')) && evs.has('CXL'), 'it shows the lanes\' orders sent, filled and cancelled', [...evs]);
+    check(arows().every(r => /^[A-Z]\d$/.test(r._children[1].textContent) || r._children[2].textContent === 'EXIT'), 'every order row names its lane');
+    check(arows().every(r => r.getAttribute('data-mkt')), 'every row links to its market');
+    const subInfos = arows().filter(r => r._children[2].textContent === 'SUB').map(r => r._children[7].textContent);
+    check(subInfos.length && subInfos.every(t => /^(IOC|FOK|POST (5s|15s|60s|5m|30m|CL|ST))$/.test(t)), 'a sent lane order says what it rests for (the venue rounds an expiry up to the second: still POST 15s)', [...new Set(subInfos)]);
+    const ts = arows().map(r => r._children[0].textContent);
+    check(ts.every((x, i) => !i || x <= ts[i - 1]), 'newest first');
+    const fb = $('s-act-tools')._children.find(b => b.textContent === 'FILLS');
+    P.click(fb); P.flush();
+    check(arows().length && arows().every(r => /^(FILL|PART|EXIT)$/.test(r._children[2].textContent)), 'FILLS keeps fills and exits');
+    P.click($('s-act-tools')._children.find(b => b.textContent === 'ORDERS')); P.flush();
+    check(arows().length && arows().every(r => /^(SUB|CXL|EXP|REJ)$/.test(r._children[2].textContent)), 'ORDERS keeps the order events');
+    P.click($('s-act-tools')._children.find(b => b.textContent === 'ALL')); P.flush();
+    D.systematic.setFilter('M1'); await P.advance(300);
+    check(arows().length && arows().every(r => r._children[1].textContent === 'M1' || r._children[2].textContent === 'EXIT'), 'the lane filter narrows the tape too');
+    D.systematic.setFilter(null); await P.advance(300);
+    eq(D.activity.unseen.SYS, 0, 'nothing counts unseen while SYSTEMATIC is on screen');
   }
   // markouts: one row per lane, ALL, then recent fills
   const moRows = P.rows('s-mo-body');
@@ -688,6 +724,91 @@ function bootPage(opts) {
   check(P.rows('set-lanes').find(r => r.dataset.k === 'S1')._children[5].textContent === '2.0', 'it shows a lane\'s threshold in cents');
   P.key('Escape'); P.flush();
   check(P.doc.body.className.indexOf('set') < 0, 'Esc closes it');
+
+  // ---- instant controls: pressed at pointerdown; STOP, cancels and the lane filter act there,
+  // START and the lane toggle keep the click
+  {
+    const pd = el => fire(P.doc, el, 'pointerdown', { button: 0, pointerType: 'mouse' });
+    const pu = el => fire(P.doc, el, 'pointerup', { button: 0 });
+    D.tabs.set('systematic'); P.flush();
+    pd(start); P.flush();
+    check(/\bprs\b/.test(start.className) && P.text($('s-run')) === 'STOPPED', 'START shows pressed at pointerdown and does not start yet', [start.className, P.text($('s-run'))]);
+    pu(start);
+    check(!/\bprs\b/.test(start.className), 'pointerup clears it');
+    P.click(start); P.flush();
+    eq(P.text($('s-run')), 'STARTING', 'START acts on the click');
+    await P.advance(1500);
+    const cell0 = laneRow('M1')._children[0];
+    pd(cell0); P.flush();
+    eq(D.systematic.filter, 'M1', 'a lane row filters at pointerdown');
+    P.click(cell0); P.flush();
+    eq(D.systematic.filter, 'M1', 'the click that follows does not toggle it back');
+    const tg = tgOf('M2'), on0 = D.store.lanes.get('M2').on;
+    pd(tg); P.flush();
+    check(D.store.lanes.get('M2').pendOn === null && tgOf('M2').textContent === (on0 ? 'ON' : 'OFF'), 'the lane toggle does nothing at pointerdown');
+    pd(stop); P.flush();
+    eq(P.text($('s-run')), 'STOPPING', 'STOP acts at pointerdown (it only takes risk off)');
+    P.click(stop);
+    await P.advance(1500);
+    eq(P.text($('s-run')), 'STOPPED', 'stopped once');
+    // the dev check over the tab's controls
+    D.perf.set(true);
+    const ctl = [P.$('tab-man'), P.$('tab-sys'), laneRow('M2')._children[0], laneRow('M2')._children[0], P.$('s-cxlall'), P.$('sb-set'), P.$('set-close')];
+    for (const c of ctl) { pd(c); pu(c); P.click(c); P.flush(); }
+    D.systematic.setFilter(null); P.flush();
+    const rep = D.perf.report();
+    check(rep.some(r => r.ctl === '#tab-sys') && rep.some(r => /s-lanes:/.test(r.ctl)), 'the dev check times the tab\'s controls', rep.map(r => r.ctl));
+    const over = rep.filter(r => r.h > 16.7 || r.p > 16.7);
+    eq(over.map(r => r.ctl + ' ' + r.h + '/' + r.p).join(', '), '', 'every control inside one frame here (handler and the frame it caused)');
+    D.perf.set(false);
+  }
+
+  // ---- FLASH SUBTLE on a busy Systematic tab (2026-10-06 browser pass: ~100 cells a second
+  // flashed with the lanes quoting): only fills, exits, rejects and realized P&L flash; the
+  // quoting churn (sent / working / cancelled), unrealized P&L and the risk book's marks only
+  // with FULL
+  {
+    const proto = Object.getPrototypeOf(P.$('kill')), anim0 = proto.animate, flush0 = D.render.flush;
+    const tapeOf0 = tr => { const k = tr && tr.dataset.k; const e = k && D.activity.lists.SYS.find(x => 'a' + x.id === k); return e ? e.type : null; };
+    // where a flashed cell sits, read right after the frame that flashed it (a new row's cells
+    // flash before the row is inserted; a tape row may scroll out of the window later)
+    const where = el => { const tr = el.parentNode; let host = tr && tr.parentNode; while (host && !/-body$/.test(host.id)) host = host.parentNode; const hid = host ? host.id : '';
+      return { tr, host: hid, col: tr ? tr._children.indexOf(el) : -1, ev: hid === 's-act-body' ? tapeOf0(tr) : null }; };
+    let pend = [], fl = [];
+    proto.animate = function () { pend.push(this); return {}; };
+    D.render.flush = function () { flush0(); while (pend.length) fl.push(where(pend.shift())); };
+    D.tabs.set('systematic'); D.ui.setFlash('subtle');
+    D.act.start(); await P.advance(5000, 250);
+    const id0 = D.activity.n, f0n = S.fills.length;
+    fl = [];
+    await P.advance(30000, 250);
+    const got = fl, newEv = D.activity.lists.SYS.filter(e => e.id > id0);
+    const tapeOf = w => w.ev;
+    const tapeTypes = got.filter(w => w.host === 's-act-body').map(tapeOf);
+    const churn = newEv.filter(e => e.type === 'SUB' || e.type === 'CXL').length;
+    check(churn > 20 && !tapeTypes.some(t => t === 'SUB' || t === 'CXL' || t === 'EXP'), 'SUBTLE: the tape\'s quoting churn (sent, cancelled) never flashes', { churn, flashed: [...new Set(tapeTypes)] });
+    const newFills = newEv.filter(e => e.type === 'FILL' || e.type === 'PART').length;
+    check(!newFills || tapeTypes.some(t => t === 'FILL' || t === 'PART'), 'a fill on the tape does', { newFills });
+    const WHs = P.heads('s-work-body'), stCol = WHs.indexOf('St');
+    const workSt = got.filter(w => w.host === 's-work-body' && w.col === stCol).map(w => S.orders.get(w.tr.dataset.k)).filter(Boolean);
+    check(workSt.every(o => o.filled > 0 || o.st === 'REJ'), 'WORKING flashes a lane order only when it fills or is rejected', workSt.map(o => o.st + '/' + o.filled).slice(0, 5));
+    const unrlCol = P.heads('s-risk-body').indexOf('Unrl');
+    eq(got.filter(w => w.host === 's-risk-body' && w.col === unrlCol).length, 0, 'the risk book\'s unrealized P&L (marks) does not flash');
+    const LHs = P.heads('s-lanes-body'), pnlCols = ['P&L', 'Day'].map(h => LHs.indexOf(h)).filter(i => i >= 0);
+    const laneFl = got.filter(w => w.host === 's-lanes-body' && pnlCols.indexOf(w.col) >= 0).length, sysNews = newEv.filter(e => e.type !== 'SUB' && e.type !== 'CXL' && e.type !== 'EXP').length;
+    check(laneFl <= 2 * sysNews + 4, 'a lane\'s P&L and Day flash when its realized part moves (fills, exits), not on every mark', { laneFl, sysNews });
+    const perSec = got.length / 30;
+    check(perSec < 15, 'SUBTLE stays calm: under 15 cells a second with the lanes trading', { perSec: Math.round(perSec * 10) / 10, fills: S.fills.length - f0n });
+    D.ui.setFlash('full'); fl = [];
+    await P.advance(10000, 250);
+    const got2 = fl;
+    check(got2.filter(w => w.host === 's-act-body').map(tapeOf).some(t => t === 'SUB' || t === 'CXL'), 'FULL: the tape\'s new rows all flash');
+    check(got2.some(w => w.host === 's-work-body' && w.col === stCol && (S.orders.get(w.tr.dataset.k) || { filled: 1 }).filled === 0), 'FULL: every lane order state change flashes');
+    check(got2.length > got.length / 3, 'FULL flashes far more than SUBTLE', { full10s: got2.length, subtle30s: got.length });
+    D.ui.setFlash('subtle');
+    D.act.stop(); await P.advance(1500);
+    proto.animate = anim0; D.render.flush = flush0;
+  }
 
   // ---- the page stayed healthy
   eq(D.render.errors, 0, 'no render errors' + (D.render.lastError ? ' (' + D.render.lastError + ')' : ''));

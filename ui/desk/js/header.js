@@ -1,9 +1,10 @@
 /* ui/desk/js/header.js
  *
  * The 28 px header, the 20 px status bar, the tab switch, KILL, the ? key sheet, the LOG drawer
- * (and the always-open LOG panel of SYSTEMATIC from 2400 px), and the read-only settings drawer.
+ * (and the always-open LOG panel of SYSTEMATIC from 2400 px), and the settings drawer (the desk's
+ * limits read-only; the per-viewer display and alert settings editable).
  * Also the global keys: ` (tab), g s / g m, h (hotkeys), l (log), p (settings), ? (keys),
- * y (resync), d (density), c (colour-blind palette).
+ * y (resync), d (density), c (colour-blind palette), f (FLASH off / subtle / full).
  *
  *   Desk.tabs.cur                'manual' | 'systematic'
  *   Desk.tabs.set(name), .toggle()
@@ -32,6 +33,7 @@
       document.body.setAttribute('data-tab', name);
       R.tab = name;
       Desk.storage.set('tab', name);
+      if (Desk.activity) Desk.activity.seen(name === 'systematic' ? 'SYS' : 'MAN');
       R.force(name);
       R.mark('tab');
     },
@@ -43,7 +45,7 @@
   // overlays
   // ---------------------------------------------------------------------------------------------
   var H = Desk.header = {
-    logOpen: false, keysOpen: false, setOpen: false, rearmAt: 0, rearmPend: false,
+    logOpen: false, keysOpen: false, setOpen: false, rearmAt: 0, rearmPend: false, dayCents: null,
     openLog: function (on) {
       H.logOpen = on === undefined ? !H.logOpen : !!on;
       D.setClass(document.body, 'log', H.logOpen);
@@ -113,6 +115,16 @@
 
   function renderHeader(d) {
     var S = Desk.store, h = S.hdr, now = Date.now();
+    if (d.has('act') || d.has('tab') || d.all) {
+      // ACT: events (by the alert filters) not seen yet; amber while any
+      var A = Desk.activity, na = A ? A.total() : 0, hca = $('hc-act');
+      cell('h-act', String(na));
+      if (hca) {
+        var ca = 'hc' + (na ? ' warn' : '');
+        if (hca.className !== ca) hca.className = ca;
+        D.setAttr(hca, 'title', A ? 'not seen: SYS ' + A.unseen.SYS + ', MAN ' + A.unseen.MAN + '; desktop alerts ' + (A.cfg.on ? 'on' : 'off') : null);
+      }
+    }
     if (d.has('hdr') || d.has('snapshot') || d.has('ord') || d.has('clock') || d.all) {
       // the tab's run state: RUN, OFF (stopped: STOP is the button's word), KILL, HALT
       var run = h ? h.run.state : null;
@@ -129,6 +141,10 @@
       cell('h-pm-free', h.cash.P.ro || Math.abs(h.cash.P.total - h.cash.P.free) < 100 ? '' : 'free ' + F.money(h.cash.P.free));
       D.setAttr($('hc-pm'), 'title', h.cash.P.ro ? 'read-only: PM key failing' : 'free ' + F.money(h.cash.P.free));
       D.setClass($('h-pm-ro'), 'on', h.cash.P.ro);
+      // the day's P&L flashes when it moves by a cent or more (green up, red down), calmly
+      var dayCents = Math.round(h.day.total / 100);
+      if (H.dayCents !== null && dayCents !== H.dayCents) D.flash($('hc-day'), dayCents > H.dayCents ? 'up' : 'dn', null, 1500);
+      H.dayCents = dayCents;
       cell('h-day', F.pnl(h.day.total), 'hv ' + F.sign(h.day.total));
       cell('h-day-split', 'S ' + F.pnl(h.day.sys) + ' M ' + F.pnl(h.day.man));
       D.setAttr($('hc-day'), 'title', 'S ' + F.pnl(h.day.sys) + ' M ' + F.pnl(h.day.man) + ' LIP ' + F.pnl(h.day.lip));
@@ -281,12 +297,94 @@
     if (sc) { kv('equity floor, Systematic', F.money(sc.floorU)); kv('P(stop) daily sigma', F.money(sc.sigmaDayU)); kv('lane amber, Rlzd under Pred', (sc.edgeWarnU / 100).toFixed(1) + '\u00a2 at n ' + sc.edgeWarnN); }
     kv('price guard, Manual', '2 ticks through the touch');
     if (mc) kv('slippage cap, Manual', mc.cap + ' tick' + (mc.cap === 1 ? '' : 's'));
-    kv('ladder expiries', '5 15 60 s');
-    kv('ticket types', 'IOC FOK 5s 15s 60s 5m 30m START');
+    kv('ladder expiries', '5 15 60 s, CL (until close)');
+    kv('ticket types', 'IOC FOK 5s 15s 60s 5m 30m START CLOSE');
     kv('KILL lockout', '60 s');
     kv('contract', (Desk.contract ? Desk.contract.version : '') + ' ' + (Desk.transport.mode || ''));
     var tk = setGrid('set-limits', [{ h: 'Limit' }, { h: 'Value' }]);
     if (tk) D.keyedRows(tk, rows, function (r) { return r.k; }, function (r) { return [{ t: r.k, cls: 't lbl' }, { t: r.v, title: r.v }]; });
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // the drawer's per-viewer column (saved in this browser only): FLASH and the alerts
+  // ---------------------------------------------------------------------------------------------
+  var SU = H.su = {};
+  function mk(tag, cls, text, attrs) {
+    var e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text) e.textContent = text;
+    if (attrs) for (var k in attrs) e.setAttribute(k, attrs[k]);
+    return e;
+  }
+  function setHead(host, text) { host.appendChild(mk('div', 'set-h', text)); }
+  // a row of choice buttons: [[value, label], ...] sending data-a=act data-v=value
+  function setRow(host, label, items, act) {
+    var row = mk('div', 'set-row');
+    row.appendChild(mk('span', 'lb', label));
+    var btns = items.map(function (it) { var b = mk('button', '', it[1], { type: 'button', 'data-a': act, 'data-v': String(it[0]) }); row.appendChild(b); return b; });
+    host.appendChild(row);
+    return { row: row, btns: btns };
+  }
+  function buildSetUi() {
+    var host = $('set-ui'); if (!host) return;
+    host.textContent = '';
+    setHead(host, 'Display');
+    SU.flash = setRow(host, 'Flash', [['off', 'OFF'], ['subtle', 'SUBTLE'], ['full', 'FULL']], 'flash');
+    SU.perf = setRow(host, 'Perf', [['0', 'OFF'], ['1', 'ON']], 'perf');
+    SU.perfSt = mk('span', 'st'); SU.perf.row.appendChild(SU.perfSt);
+    // ALERTS: desktop notifications (Web Notifications), a short sound, when, and which events
+    // per mode; at most one alert per mode every 4 s, the rest batched into it
+    var T = Desk.activity ? Desk.activity.TYPES : [];
+    setHead(host, 'Alerts');
+    SU.desk = setRow(host, 'Desktop', [['on', 'ON'], ['off', 'OFF']], 'alerts');
+    SU.deskSt = mk('span', 'st'); SU.desk.row.appendChild(SU.deskSt);
+    SU.sound = setRow(host, 'Sound', [['1', 'ON'], ['0', 'OFF']], 'sound');
+    SU.when = setRow(host, 'When', [['hidden', 'HIDDEN'], ['always', 'ALWAYS']], 'when');
+    SU.sys = setRow(host, 'SYS', T.map(function (t) { return [t, t]; }), 'tsys');
+    SU.man = setRow(host, 'MAN', T.map(function (t) { return [t, t]; }), 'tman');
+    SU.test = setRow(host, 'Test', [['SYS', 'SYS'], ['MAN', 'MAN']], 'atest');
+    SU.rate = mk('span', 'st', 'max 1 per mode per 4 s'); SU.test.row.appendChild(SU.rate);
+    // choices act on pointerdown; the permission request (Desktop ON) and the sound keep the click:
+    // Safari shows its prompt, and starts audio, only for a click
+    D.onPress(host, onSetUi, function (ev) {
+      var b = ev.target && ev.target.closest ? ev.target.closest('button') : null, a = b ? b.getAttribute('data-a') : null;
+      return b && !b.disabled && a !== 'alerts' && a !== 'sound' && a !== 'atest' ? b : null;
+    });
+  }
+  function onSetUi(ev) {
+    var b = ev.target && ev.target.closest ? ev.target.closest('button') : null;
+    if (!b || b.disabled) return;
+    var a = b.getAttribute('data-a'), v = b.getAttribute('data-v');
+    var A = Desk.activity;
+    if (a === 'flash') Desk.ui.setFlash(v);
+    else if (a === 'perf') Desk.perf.set(v === '1');
+    else if (a === 'alerts' && A) { if (v === 'on') A.enable().then(function () { R.mark('set'); R.mark('act'); }); else A.disable(); }
+    else if (a === 'sound' && A) A.setSound(v === '1');
+    else if (a === 'when' && A) A.setWhen(v);
+    else if (a === 'tsys' && A) A.toggleType('SYS', v);
+    else if (a === 'tman' && A) A.toggleType('MAN', v);
+    else if (a === 'atest' && A) A.test(v);
+    R.mark('set'); R.mark('act');
+  }
+  function onOf(r, v) { if (r) r.btns.forEach(function (b) { D.setClass(b, 'on', b.getAttribute('data-v') === String(v)); }); }
+  function renderSetUi(d) {
+    if (!H.setOpen || !(d.has('set') || d.has('ui') || d.all)) return;
+    onOf(SU.flash, Desk.ui.flash);
+    onOf(SU.perf, Desk.perf.on ? '1' : '0');
+    var A = Desk.activity;
+    if (A && SU.desk) {
+      var perm = A.permission();
+      onOf(SU.desk, A.cfg.on ? 'on' : 'off');
+      D.setText(SU.deskSt, perm === 'granted' ? 'allowed' : perm === 'denied' ? 'blocked (Safari settings)' : perm === 'default' ? 'not asked' : 'not in this browser');
+      SU.deskSt.className = 'st' + (perm === 'denied' || perm === 'unsupported' ? ' warn' : (perm === 'granted' ? ' ok' : ''));
+      onOf(SU.sound, A.cfg.sound ? '1' : '0');
+      onOf(SU.when, A.cfg.when);
+      [[SU.sys, 'SYS'], [SU.man, 'MAN']].forEach(function (x) { x[0].btns.forEach(function (b) { D.setClass(b, 'on', A.cfg[x[1]].indexOf(b.getAttribute('data-v')) >= 0); }); });
+    }
+    // the dev check's worst control: handler / painted, ms
+    var w = Desk.perf.on ? Desk.perf.report()[0] : null;
+    D.setText(SU.perfSt, w ? 'worst ' + w.ctl + ' ' + w.h + '/' + w.p + 'ms' + (Desk.perf.slow ? ' SLOW ' + Desk.perf.slow : '') : '');
+    if (SU.perfSt) SU.perfSt.className = 'st' + (Desk.perf.slow ? ' warn' : '');
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -298,17 +396,27 @@
     var saved = (q === 'systematic' || q === 'manual' ? q : Desk.storage.get('tab')) === 'systematic' ? 'systematic' : 'manual';
     if (Desk.layout && Desk.layout.split) { tabs.cur = saved; document.body.setAttribute('data-tab', saved); R.tab = null; R.mark('tab'); }
     else tabs.set(saved);
-    $('tab-sys').addEventListener('click', function () { tabs.set('systematic'); });
-    $('tab-man').addEventListener('click', function () { tabs.set('manual'); });
-    var sp = $('tab-split'); if (sp) sp.addEventListener('click', function () { tabs.split(); });
+    // the tab switch, the drawers and the status-bar buttons act on pointerdown (safe: they change
+    // only what the screen shows); KILL keeps the click (pressed state on pointerdown)
+    var now = function () { return true; }, press = D.onPress;
+    press($('tab-sys'), function () { tabs.set('systematic'); }, now);
+    press($('tab-man'), function () { tabs.set('manual'); }, now);
+    press($('tab-split'), function () { tabs.split(); }, now);
+    // ACT: show the tab with the events not seen yet, and count them seen
+    press($('hc-act'), function () {
+      var A = Desk.activity; if (!A || !A.total()) return;
+      var mode = A.unseen.SYS >= A.unseen.MAN ? 'SYS' : 'MAN';
+      tabs.set(mode === 'SYS' ? 'systematic' : 'manual'); A.seen(mode); R.mark('act');
+    }, now);
     $('kill').addEventListener('click', onKill);
-    $('sb-alert').addEventListener('click', function () { H.openLog(); });
-    $('sb-keys').addEventListener('click', function () { H.openKeys(); });
-    var sbSet = $('sb-set'); if (sbSet) sbSet.addEventListener('click', function () { H.openSet(); });
-    var setClose = $('set-close'); if (setClose) setClose.addEventListener('click', function () { H.openSet(false); });
-    $('sb-hk').addEventListener('click', function () { Desk.keys.setHK(!Desk.keys.hk); });
-    var closeBtn = $('keysheet-close'); if (closeBtn) closeBtn.addEventListener('click', function () { H.openKeys(false); });
-    var logClose = $('log-close'); if (logClose) logClose.addEventListener('click', function () { H.openLog(false); });
+    press($('sb-alert'), function () { H.openLog(); }, now);
+    press($('sb-keys'), function () { H.openKeys(); }, now);
+    press($('sb-set'), function () { H.openSet(); }, now);
+    press($('set-close'), function () { H.openSet(false); }, now);
+    press($('sb-hk'), function () { Desk.keys.setHK(!Desk.keys.hk); }, now);
+    press($('keysheet-close'), function () { H.openKeys(false); }, now);
+    press($('log-close'), function () { H.openLog(false); }, now);
+    buildSetUi();
 
     Desk.keys.overlays.push(function () { if (H.keysOpen) { H.openKeys(false); return true; } return false; });
     Desk.keys.overlays.push(function () { if (H.logOpen) { H.openLog(false); return true; } return false; });
@@ -321,16 +429,18 @@
     K.bind({ key: 'm', after: 'g', desc: 'go to MANUAL', fn: function () { tabs.set('manual'); } });
     K.bind({ key: 'h', desc: 'hotkeys on/off (order keys need ON)', fn: function () { K.setHK(!K.hk); } });
     K.bind({ key: 'l', desc: 'log drawer', fn: function () { H.openLog(); } });
-    K.bind({ key: 'p', desc: 'settings (read-only): lanes, fees, limits', fn: function () { H.openSet(); } });
+    K.bind({ key: 'p', desc: 'settings: lanes, fees, limits (read-only); flash, alerts', fn: function () { H.openSet(); } });
     K.bind({ key: '?', desc: 'this sheet', fn: function () { H.openKeys(); } });
     K.bind({ key: 'y', desc: 'resync from snapshot', fn: function () { Desk.act.resync(); } });
     K.bind({ key: 'd', desc: 'density compact/normal', fn: function () { Desk.ui.cycleDensity(); } });
     K.bind({ key: 'c', desc: 'colour-blind palette', fn: function () { Desk.ui.toggleCB(); } });
+    K.bind({ key: 'f', desc: 'FLASH off / subtle / full (also in settings)', fn: function () { Desk.ui.cycleFlash(); } });
     K.bind({ key: 'Escape', desc: 'close sheet/drawer, leave a field', doc: true });
 
     R.add({ id: 'header', tab: null, fn: renderHeader });
     R.add({ id: 'status', tab: null, fn: renderStatus });
     R.add({ id: 'set', tab: null, fn: renderSet });
+    R.add({ id: 'set-ui', tab: null, fn: renderSetUi });
     R.add({ id: 's-log', tab: 'systematic', fn: renderSysLog });
   }
 })(typeof window !== 'undefined' ? window : globalThis);

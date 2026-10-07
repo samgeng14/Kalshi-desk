@@ -162,19 +162,21 @@ function bootPage(opts) {
   const errors = [];
   const mem = {};
   const ctx = {
-    console: { log: console.log, warn: console.warn, error: (...a) => { errors.push(a.map(x => (x && x.stack) || String(x)).join(' ')); } },
+    console: { log: console.log, warn: console.warn, debug() {}, error: (...a) => { errors.push(a.map(x => (x && x.stack) || String(x)).join(' ')); } },
     setTimeout, clearTimeout, setInterval, clearInterval, setImmediate, performance, Promise, Map, Set, WeakSet, Uint8Array,
     document: doc, location: { protocol: 'file:', search: opts.search || '' },
     localStorage: { getItem(k) { return k in mem ? mem[k] : null; }, setItem(k, v) { mem[k] = String(v); } },
     matchMedia, requestAnimationFrame: f => { rafs.push(f); }, confirm: () => true, crypto: require('crypto').webcrypto,
     AbortController, fetch: () => Promise.reject(new Error('no network in tests')), __clock: clock
   };
+  if (opts.Notification) ctx.Notification = opts.Notification;
+  if (opts.AudioContext) ctx.AudioContext = opts.AudioContext;
   ctx.window = ctx;
   ctx.addEventListener = () => {};
   vm.createContext(ctx);
   vm.runInContext('Date.now = function () { return __clock.t; };', ctx);
   const load = f => vm.runInContext(fs.readFileSync(path.join(JS, f), 'utf8'), ctx, { filename: f });
-  ['contract.js', 'core.js', 'store.js', 'sim.js', 'transport.js', 'header.js', 'manual.js', 'systematic.js'].forEach(load);
+  ['contract.js', 'core.js', 'store.js', 'sim.js', 'transport.js', 'universe.js', 'activity.js', 'header.js', 'manual.js', 'browse.js', 'systematic.js'].forEach(load);
   const D = ctx.Desk;
   let sim = null;
   const create = D.sim.create;
@@ -239,7 +241,7 @@ function manOrders(P, key) { const a = []; P.D.store.orders.forEach(o => { if (o
   {
     const ctx = { console, setTimeout, clearTimeout, setInterval, clearInterval, performance, localStorage: { getItem() { return null; }, setItem() {} } };
     ctx.window = ctx; vm.createContext(ctx);
-    for (const f of ['contract.js', 'core.js', 'store.js', 'manual.js']) vm.runInContext(fs.readFileSync(path.join(JS, f), 'utf8'), ctx, { filename: f });
+    for (const f of ['contract.js', 'core.js', 'store.js', 'universe.js', 'manual.js']) vm.runInContext(fs.readFileSync(path.join(JS, f), 'utf8'), ctx, { filename: f });
     const D = ctx.Desk, L = D.manual.logic, G = D.grid;
     check(typeof D.manual.init === 'function' && typeof D.manual.render === 'function', 'Desk.manual keeps the {init, render} contract');
     const lin = G.make([{ start: '0.0000', end: '1.0000', step: '0.0100' }]);
@@ -296,6 +298,19 @@ function manOrders(P, key) { const a = []; P.D.store.orders.forEach(o => { if (o
     eq(L.woText(100, 0, 59, false), '100 59', 'working cell drops the s when tight');
     eq(L.woText(1000, 0, 59, false), '1000', 'working cell keeps the size when nothing else fits');
     eq(L.woText(5, 0, null, false), '5', 'IOC or pending: size only');
+    eq(L.woText(8, 0, 840, false), '8 14m', 'a long expiry (until close) counts in minutes');
+    eq(L.woText(1, 0, 402, false), '1 ' + D.fmt.left(402000), 'in whole minutes, as the ticket and WORKING count time to close (6m42s: 6m, not 7m)');
+    eq(L.woText(8, 0, 100, false), '8 1m', 'from 100 s');
+    eq(L.woText(8, 0, 3 * 3600 + 300, false), '8 3h', 'and in hours past 100 minutes');
+    eq(L.woText(1000, 0, 840, false), '1000', 'it still never overflows the cell');
+    {
+      const T = Date.UTC(2026, 9, 6, 23, 0, 0);
+      eq(L.closeExp({ status: 'OPEN', close_ms: T + 3600500 }, T), T + 3600000, 'CLOSE: the market close, cut to a whole second');
+      eq(L.closeExp({ status: 'OPEN', close_ms: T + 4000 }, T), null, 'CLOSE: refused under 5 s before the close');
+      eq(L.closeExp({ status: 'CLOSED', close_ms: T + 600000 }, T), null, 'CLOSE: only on an open market');
+      eq(L.expShort(12000), '12s', 'a short expiry counts in seconds');
+      eq(L.expShort(3 * 3600e3 + 5 * 60e3), '3h05m', 'a long one reads as time to close');
+    }
     // break-even band: Kalshi taker 0.07 p(1-p) = 1.75c at 0.50
     const QUAD = { type: 'QUAD', mult: 1 };
     check(L.inBand('K', QUAD, 5000, 5100) && !L.inBand('K', QUAD, 5000, 5200), 'break-even band is the taker fee around the model fair');
@@ -341,22 +356,37 @@ function manOrders(P, key) { const a = []; P.D.store.orders.forEach(o => { if (o
     eq([12, -16.4, 1.6, -0.5, 0.04, 9.96, -100].map(L.posShort).join(' '), '+12 ' + M + '16 +1.6 ' + M + '0.5 +.04 +10 ' + M + '100', 'watchlist positions fit 4 characters');
     eq(L.c2(-31.25), M + '0.31', 'a rebate is negative with U+2212');
     eq(L.series('KXNATGAS15M-26OCT061930-30'), 'KXNATGAS15M', 'the 15-minute series of a ticker');
-    // watchlist groups
-    const mm = (v, tk, grp, kind, close, short, status) => ({ v, tk, key: v + '|' + tk, grp, kind, close_ms: close, short: short || tk, title: tk, status: status || 'OPEN', og: grp, oc: short });
+    // watchlist order (THE UNIVERSE): category (SPORTS WEATHER FIN ECON OTHER), each category's
+    // groups by their best row under the sort, rows by the sort, ties by ticker
+    const UV = D.universe;
+    const mm = (v, tk, grp, kind, close, short, status, extra) => Object.assign({ v, tk, key: v + '|' + tk, grp, kind, close_ms: close, short: short || tk, title: tk, status: status || 'OPEN', og: grp, oc: short }, extra || {});
     const ms = new Map([
       ['K|W1', mm('K', 'W1', 'WX NYC', 'WEATHER', 9, 'NYC 64-65')], ['K|G1', mm('K', 'G1', 'NCAAF', 'GAME', 5, 'A@B A')],
       ['P|g1', mm('P', 'g1', 'NCAAF', 'GAME', 5, 'A@B A')], ['K|N1', mm('K', 'N1', '15M', 'LIP15', 3, 'NATGAS UP')],
       ['K|C1', mm('K', 'C1', '15M', 'LIP15', 3, 'COPPER UP')], ['K|S1', mm('K', 'S1', '15M', 'LIP15', 2, 'OLD', 'SETTLED')]
     ]);
-    let wl = L.watchList(ms, { venue: 'ALL' });
-    eq(wl.map(x => x.grp || x.m.tk).join(','), '15M,N1,C1,NCAAF A@B,G1,g1,WX NYC,W1', 'watchlist: LIP first, then games (one group per game), then weather; settled markets gone; listing order kept');
-    eq(wl[0].n, 2, 'group rows carry their count');
-    wl = L.watchList(ms, { venue: 'P' });
-    eq(wl.map(x => x.grp || x.m.tk).join(','), 'NCAAF A@B,g1', 'watchlist venue filter');
-    wl = L.watchList(ms, { venue: 'ALL', collapsed: { '15M': true } });
-    check(wl[0].collapsed && wl[1].grp === 'NCAAF A@B', 'a collapsed group hides its markets');
-    wl = L.watchList(ms, { venue: 'ALL', q: 'copper', collapsed: { '15M': true } });
-    eq(wl.map(x => x.grp || x.m.tk).join(','), '15M,C1', 'search finds markets inside collapsed groups');
+    const rowsOfMs = f => Array.from(ms.values()).filter(m => m.status !== 'SETTLED' && (!f || f(m))).map(m => UV.liveRow(m, null));
+    let o = UV.order(rowsOfMs(), 'close');
+    let wl = UV.layout(o.groups, {}).map(x => x.t === 'cat' ? x.cat : (x.t === 'grp' ? x.gk : o.rows[x.i].tk));
+    eq(wl.join(','), 'SPORTS,NCAAF A@B,G1,g1,WEATHER,WX NYC,W1,FIN,15M,C1,N1', 'watchlist: sports, weather, fin; a game is its own group; settled markets gone; ties by ticker');
+    eq(UV.layout(o.groups, {})[0].n, 2, 'category rows carry their count');
+    eq(o.cats.FIN, 2, 'and the counts per category');
+    o = UV.order(rowsOfMs(m => m.v === 'P'), 'close');
+    eq(UV.layout(o.groups, {}).map(x => x.t === 'row' ? o.rows[x.i].tk : (x.gk || x.cat)).join(','), 'SPORTS,NCAAF A@B,g1', 'watchlist venue filter');
+    o = UV.order(rowsOfMs(), 'close');
+    wl = UV.layout(o.groups, { '15M': true });
+    check(wl.find(x => x.gk === '15M').collapsed && !wl.some(x => x.t === 'row' && o.rows[x.i].grp === '15M'), 'a collapsed group hides its markets');
+    wl = UV.layout(o.groups, { 'c:SPORTS': true });
+    check(wl[0].collapsed && wl[1].cat === 'WEATHER', 'a collapsed category hides its groups');
+    wl = UV.layout(o.groups, { '15M': true }, { q: 'copper' });
+    check(!wl.find(x => x.gk === '15M').collapsed, 'a search shows inside collapsed groups');
+    const vr = [{ tk: 'a', gk: 'G', cat: 'FIN', vol: 5, bid: 4000, ask: 4600, close_ms: 9, edge: null }, { tk: 'b', gk: 'G', cat: 'FIN', vol: 50, bid: 4000, ask: 4100, close_ms: 7, edge: 120 },
+                { tk: 'c', gk: 'H', cat: 'FIN', vol: 20, bid: null, ask: 4100, close_ms: 1, edge: -50 }];
+    eq(UV.order(vr, 'vol').rows.map(r => r.tk).join(''), 'bac', 'sort by volume: the busiest group first, its busiest row first');
+    eq(UV.order(vr, 'sprd').rows.map(r => r.tk).join(''), 'bac', 'sort by spread: tightest first, a one-sided book last');
+    eq(UV.order(vr, 'close').rows.map(r => r.tk).join(''), 'cba', 'sort by time to close');
+    eq(UV.order(vr, 'edge').rows.map(r => r.tk).join(''), 'bac', 'sort by edge: the best take first, no model last');
+    eq(UV.catOf({ kind: 'LIP15' }) + UV.catOf({ kind: 'GAME' }) + UV.catOf({ cat: 'ECON', kind: 'OTHER' }), 'FINSPORTSECON', 'a market\'s category (mkt.cat, or from its kind)');
     eq(L.pairOf(ms, ms.get('K|G1')), 'P|g1', 'the same outcome on the other venue');
     eq(L.watchLabel(mm('K', 'X', 'NCAAF', 'GAME', 1, 'SOUMIS@TROY TROY')), 'TROY', 'a game row reads as its YES team');
     eq(L.watchLabel(mm('P', 'x', 'NCAAF', 'GAME', 1, 'SOUMIS@TROY SOUMIS')), 'SOUMIS P', 'a Polymarket row carries P');
@@ -579,6 +609,17 @@ function manOrders(P, key) { const a = []; P.D.store.orders.forEach(o => { if (o
   click(ladCell(P, 'A', 6100, 'bq'));
   o = newest(P, x => x.own === 'MAN');
   check(o.qty === 5 && o.tif === 'POST' && o.exp_ms - P.clock.t > 55000 && o.exp_ms - P.clock.t <= 61000, 'posts carry the ladder size and expiry', { qty: o.qty, exp: o.exp_ms - P.clock.t });
+  {
+    click(fbtn('CL'));
+    eq(A.cfg.ttl, 'CLOSE', 'the ladder offers CL: post until the market closes');
+    click(ladCell(P, 'A', 6000, 'bq'));
+    const oc = newest(P, x => x.own === 'MAN');
+    check(oc.tif === 'POST' && oc.exp_ms === Math.floor(nat.close_ms / 1000) * 1000, 'a CL click posts with the market close as its expiry', { exp: oc.exp_ms, close: nat.close_ms });
+    await run(300);
+    check(/^5 \d+m$/.test(ladCell(P, 'A', 6000, 'wb').textContent), 'the ladder counts it down to the close in minutes', ladCell(P, 'A', 6000, 'wb').textContent);
+    D.act.cancel([oc.cid]); await run(300);
+    click(fbtn('60s'));
+  }
   click(fbtn('5'), { shiftKey: true });
   eq(A.cfg.qty, 10, 'Shift+preset adds');
   click(fbtn('CLR'));
@@ -677,33 +718,37 @@ function manOrders(P, key) { const a = []; P.D.store.orders.forEach(o => { if (o
   check(!D.keys.hk, 'H turns hotkeys off again');
   await run(45000, 250);       // ESPN runs ~41 s behind the play: give it a lag's worth of history
 
-  // ---- watchlist ------------------------------------------------------------------------------
-  const wtb = MS.watch.tb;
+  // ---- watchlist (THE UNIVERSE: T / T+1, categories, star, virtual rows) ---------------------
+  const wtb = MS.watch.tb, WE = MS.watch.el;
+  const wrows = () => wtb.children.filter(r => r.getAttribute('data-mkt'));
   const grps = wtb.children.filter(r => r.getAttribute('data-grp'));
-  check(grps.length >= 3 && grps[0].getAttribute('data-grp') === '15M' && /^15M 7$/.test(grps[0].textContent), 'watchlist groups, 15-minute series first with their count', grps.map(r => r.textContent));
+  eq(MS.cfg.watch.scope + ' ' + MS.cfg.watch.day, 'watch T', 'the watchlist opens on the starred markets settling today (T)');
+  check(grps.length >= 4 && grps[0].getAttribute('data-grp') === 'c:SPORTS' && /^SPORTS \d+$/.test(grps[0].textContent) && grps.some(r => /^15M 7$/.test(r.textContent)),
+    'category rows (SPORTS first) with their counts, then groups; the 15-minute series is one group', grps.map(r => r.textContent));
   const natRow = wtb.children.find(r => r.getAttribute('data-mkt') === natKey);
-  check(natRow && natRow.children[1].textContent === '0.62' && natRow.children[2].textContent === '0.64', 'watchlist bid / ask', natRow && natRow.children.map(c => c.textContent));
+  check(natRow && natRow.children[2].textContent === '0.62' && natRow.children[3].textContent === '0.64', 'watchlist bid / ask', natRow && natRow.children.map(c => c.textContent));
+  check(natRow && natRow.children[0].textContent === '★' && /\bon\b/.test(natRow.children[0].className), 'a desk market starts pinned (the star, white)');
   check(natRow && /\bsel\b/.test(natRow.className), 'the focused market is selected in the watchlist');
-  check(natRow && /^\d+m$|^\d+s$/.test(natRow.children[6].textContent), 'T is the time to close for a 15-minute market', natRow && natRow.children[6].textContent);
+  check(natRow && /^\d+m$|^\d+s$/.test(natRow.children[7].textContent), 'T is the time to close for a 15-minute market', natRow && natRow.children[7].textContent);
   const gRow = wtb.children.find(r => r.getAttribute('data-mkt') === gameKey);
-  check(gRow && /^(Q\d|OT) \d+:\d\d$/.test(gRow.children[6].textContent), 'T is the game clock for a live game', gRow && gRow.children[6].textContent);
+  check(gRow && /^(Q\d|OT) \d+:\d\d$/.test(gRow.children[7].textContent), 'T is the game clock for a live game', gRow && gRow.children[7].textContent);
   {
     const gm = st.market(gameKey), gg = D.manual.logic.watchGroup(gm);
     const gh = wtb.children.find(r => r.getAttribute('data-grp') === gg);
     check(gh && /^NCAAF [A-Z]+@[A-Z]+ \d+  \d+-\d+$/.test(gh.textContent), 'a live game is its own group row with the score', gh && gh.textContent);
-    eq(gRow.children[0].textContent, gm.oc, 'inside it the row reads as the YES team');
+    eq(gRow.children[1].textContent, gm.oc, 'inside it the row reads as the YES team');
   }
-  check(wtb.children.some(r => r.getAttribute('data-mkt') && r.children[4].textContent !== ''), 'ESPN shows on live games');
-  check(wtb.children.some(r => r.getAttribute('data-mkt') && /\b(fair|warn)\b/.test(r.children[3].className) && r.children[3].textContent !== ''), 'model fair shows in the watchlist');
+  check(wrows().some(r => r.children[5].textContent !== ''), 'ESPN shows on live games');
+  check(wrows().some(r => /\b(fair|warn)\b/.test(r.children[4].className) && r.children[4].textContent !== ''), 'model fair shows in the watchlist');
   // amber rule: a taker at the touch beats the model after the fee (never the mid)
   let amberN = 0;
-  const amberOk = wtb.children.filter(r => r.getAttribute('data-mkt')).every(r => {
+  const amberOk = wrows().every(r => {
     const k = r.getAttribute('data-mkt'), b = st.book(k), m = st.market(k);
     if (!b || b.ref.fair === null) return true;
     const f = b.ref.fair, buy = b.ba !== null ? f - b.ba - D.fees.takerPer(m.v, m.fee, b.ba) : -1, sell = b.bb !== null ? b.bb - f - D.fees.takerPer(m.v, m.fee, b.bb) : -1;
     const want = buy > 0 || sell > 0;
     if (want) amberN++;
-    return /\bwarn\b/.test(r.children[3].className) === want;
+    return /\bwarn\b/.test(r.children[4].className) === want;
   });
   check(amberOk, 'Fair is amber exactly when a take at the touch clears the taker fee', amberN);
   {
@@ -713,45 +758,177 @@ function manOrders(P, key) { const a = []; P.D.store.orders.forEach(o => { if (o
     check(te.side === 'BUY' && te.e > 0, 'fair 0.70 over an ask of 0.67: buying at the ask clears the fee', te);
   }
   // click loads into the focused ladder, Shift+click into the other
-  const wxRow = wtb.children.find(r => r.getAttribute('data-mkt') && st.market(r.getAttribute('data-mkt')).kind === 'WEATHER');
+  const wxRow = wrows().find(r => st.market(r.getAttribute('data-mkt')).kind === 'WEATHER');
   const wxKey = wxRow.getAttribute('data-mkt');
-  click(wxRow.children[0], { shiftKey: true });
+  click(wxRow.children[1], { shiftKey: true });
   check(D.focus.ladders.B === wxKey && D.focus.key === natKey, 'Shift+click loads the other ladder and keeps the focus');
   await run(300);
   eq(st.book(wxKey).depth, 'FULL', 'the newly loaded ladder subscribes at full depth');
   // keyboard: / search, arrows, Enter
   A.el.focus();
   key('Slash', '/');
-  eq(P.doc.activeElement, MS.watch.el.q, '/ focuses the watchlist search');
-  MS.watch.el.q.value = 'copper'; fire(MS.watch.el.q, 'input', {});
+  eq(P.doc.activeElement, WE.q, '/ focuses the watchlist search');
+  WE.q.value = 'copper'; fire(WE.q, 'input', {});
   await run(300);
-  const vis = wtb.children.filter(r => r.getAttribute('data-mkt'));
-  check(vis.length === 1 && /COPPER/.test(vis[0].children[0].textContent), 'search filters the watchlist', vis.map(r => r.children[0].textContent));
+  const vis = wrows();
+  check(vis.length === 1 && /COPPER/.test(vis[0].children[1].textContent), 'search filters the watchlist', vis.map(r => r.children[1].textContent));
   n0 = st.orders.size;
   key('KeyB', 'b');
   eq(st.orders.size, n0, 'typing in the search is never a command');
   key('Enter', 'Enter');
   const copperKey = vis[0].getAttribute('data-mkt');
   check(D.focus.key === copperKey && D.focus.ladders.A === copperKey, 'Enter loads the match into the focused ladder');
-  MS.watch.el.q.value = ''; fire(MS.watch.el.q, 'input', {});
+  WE.q.value = ''; fire(WE.q, 'input', {});
   key('Escape', 'Escape');
-  check(P.doc.activeElement !== MS.watch.el.q, 'Esc leaves the search');
+  check(P.doc.activeElement !== WE.q, 'Esc leaves the search');
   await run(300);
   P.$('m-watch').focus();
   key('ArrowDown', 'ArrowDown'); key('ArrowDown', 'ArrowDown'); key('Enter', 'Enter');
   check(D.focus.key && D.focus.key !== copperKey, 'Up/Down and Enter work with the list focused', D.focus.key);
-  // group collapse
-  click(grps[0].children[0]);
-  await run(300);
-  check(MS.cfg.watch.collapsed['15M'] && !wtb.children.some(r => r.getAttribute('data-mkt') && st.market(r.getAttribute('data-mkt')).grp === '15M'), 'a group row click collapses it');
+  // group and category collapse
   click(wtb.children.find(r => r.getAttribute('data-grp') === '15M').children[0]);
-  // venue filter
-  const vbP = MS.watch.el.vb.find(b => b.textContent === 'P');
-  click(vbP); await run(300);
-  check(wtb.children.filter(r => r.getAttribute('data-mkt')).every(r => r.getAttribute('data-mkt').charAt(0) === 'P'), 'the P filter shows Polymarket only');
-  click(MS.watch.el.vb.find(b => b.textContent === 'ALL')); await run(300);
-  D.focus.set(natKey); await run(300);
-
+  await run(300);
+  check(MS.cfg.watch.collapsed['15M'] && !wrows().some(r => st.market(r.getAttribute('data-mkt')).grp === '15M'), 'a group row click collapses it');
+  click(wtb.children.find(r => r.getAttribute('data-grp') === '15M').children[0]);
+  click(wtb.children.find(r => r.getAttribute('data-grp') === 'c:WEATHER').children[0]); await run(300);
+  check(!wrows().some(r => st.market(r.getAttribute('data-mkt')).kind === 'WEATHER') && wtb.children.some(r => r.getAttribute('data-grp') === 'c:WEATHER'), 'a category row click collapses the category to its header');
+  click(wtb.children.find(r => r.getAttribute('data-grp') === 'c:WEATHER').children[0]); await run(300);
+  // venue: K+P, K, P
+  eq(WE.ven.textContent, 'K+P', 'venue starts on both');
+  click(WE.ven); click(WE.ven); await run(300);
+  check(WE.ven.textContent === 'P' && wrows().length && wrows().every(r => r.getAttribute('data-mkt').charAt(0) === 'P'), 'the P filter shows Polymarket only');
+  click(WE.ven); await run(300);
+  // categories
+  const chip = c => WE.cats.find(b => b.getAttribute('data-v') === c);
+  click(chip('WEATHER')); await run(300);
+  check(wrows().length && wrows().every(r => st.market(r.getAttribute('data-mkt')).cat === 'WEATHER') && /\bon\b/.test(chip('WEATHER').className), 'a category chip shows that category only');
+  click(chip('')); await run(300);
+  // sort: CLOSE, VOL, SPRD, EDGE
+  click(WE.sort); await run(300);
+  eq(MS.cfg.watch.sort + ' ' + WE.sort.textContent, 'vol VOL', 'the sort cycles to volume');
+  {
+    const ks = wrows().map(r => r.getAttribute('data-mkt')), fin = ks.filter(k => st.market(k).grp === '15M').map(k => st.book(k).vol);
+    check(fin.every((v, i) => !i || v <= fin[i - 1]), 'inside a group the busiest market comes first', fin);
+  }
+  click(WE.sort); click(WE.sort); click(WE.sort); await run(300);
+  eq(MS.cfg.watch.sort, 'close', 'and round to time to close');
+  // T / T+1
+  click(WE.day[1]); await run(300);
+  check(MS.cfg.watch.day === 'T1' && wrows().length >= 1 && wrows().every(r => st.market(r.getAttribute('data-mkt')).date > st.today), 'T+1 shows the markets settling tomorrow only', wrows().map(r => r.getAttribute('data-mkt') + ' ' + st.market(r.getAttribute('data-mkt')).date));
+  click(WE.day[0]); await run(300);
+  check(wrows().every(r => st.market(r.getAttribute('data-mkt')).date <= st.today), 'T shows today\'s');
+  // the star: unpinning a market nothing holds takes it off the watchlist; the backend agrees
+  {
+    const wk = wrows().map(r => r.getAttribute('data-mkt')).find(k => st.market(k).kind === 'WEATHER' && !Object.values(D.focus.ladders).includes(k) && !(st.position(k) && st.position(k).pos));
+    const star = wrows().find(r => r.getAttribute('data-mkt') === wk).children[0];
+    fire(star, 'pointerdown', { button: 0 }); fire(star, 'click', {}); P.frame();
+    check(!wrows().some(r => r.getAttribute('data-mkt') === wk), 'unpinning takes it off at once');
+    await run(300);
+    check(P.sim().market(wk).pin === false && st.market(wk).pin === false && !st.pinPend.has(wk), 'the backend unpinned it (mkt.pin false)');
+    click(chip('')); click(WE.scope[1]);
+    WE.q.value = st.market(wk).tk; fire(WE.q, 'input', {}); await run(600);
+    const back = wrows().find(r => r.getAttribute('data-mkt') === wk);
+    check(back && back.children[0].textContent === '☆', 'ALL still lists it, unstarred', back && back.children[0].textContent);
+    click(back.children[0]); await run(300);
+    check(st.market(wk).pin === true, 'a star in ALL pins it again');
+    WE.q.value = ''; fire(WE.q, 'input', {});
+    click(WE.scope[0]); await run(300);
+    check(wrows().some(r => r.getAttribute('data-mkt') === wk), 'and it is back on the watchlist');
+  }
+  // ALL: the day's whole universe, paged and virtual
+  {
+    click(WE.scope[1]); await run(600);
+    const total = +WE.n.textContent;
+    // (this test's clock is late in the ET day: many of today's games and hours have closed)
+    check(MS.cfg.watch.scope === 'all' && total > 500, 'ALL lists the day\'s whole universe (both venues, every category)', WE.n.textContent);
+    const drawn = wtb.children.filter(r => !/\bvpad\b/.test(r.className)).length;
+    check(drawn <= 70, 'only the rows in view exist (virtual)', drawn);
+    const pads = wtb.children.filter(r => /\bvpad\b/.test(r.className)).map(r => parseInt(r.children[0].style.getPropertyValue('height'), 10));
+    const items = MS.watch.items.length;
+    check(Math.abs(pads.reduce((x, y) => x + y, 0) + (drawn) * 18 - items * 18) < 1, 'the spacer rows keep the whole list\'s height', { pads, drawn, items });
+    const gets0 = MS.watch.uni.gets;
+    MS.watch.body.scrollTop = 18 * 500; fire(MS.watch.body, 'scroll', {}); await run(600);
+    check(MS.watch.uni.gets > gets0 && wrows().length > 10 && wrows().every(r => r.children[1].textContent !== '…'), 'scrolling far down asks for the pages there and draws them', { gets: MS.watch.uni.gets - gets0 });
+    check(wtb.children.filter(r => !/\bvpad\b/.test(r.className)).length <= 70, 'still only the rows in view');
+    // a listing row (not live): load it into a ladder, its book arrives
+    const uniRow = wrows().find(r => /\buni\b/.test(r.className) && r.getAttribute('data-mkt').charAt(0) === 'K');
+    check(!!uniRow, 'ALL shows listing rows that are not live', wrows().slice(0, 3).map(r => r.className));
+    const uk = uniRow.getAttribute('data-mkt');
+    eq(st.market(uk), null, 'a listing row is not in the store');
+    click(uniRow.children[1], { shiftKey: true }); await run(600);
+    check(st.market(uk) && st.book(uk) && st.book(uk).depth === 'FULL' && D.focus.ladders.B === uk && rowsOf(B.tb).length > 5, 'loaded into a ladder it goes live: its market and full book arrive', { m: !!st.market(uk), b: st.book(uk) && st.book(uk).depth });
+    eq(st.market(uk).pin, false, 'a ladder brings it live without pinning it');
+    // T+1 in ALL
+    click(WE.day[1]); await run(600);
+    check(+WE.n.textContent > 500 && MS.watch.uni.res.date > st.today, 'T+1 in ALL lists tomorrow\'s universe', WE.n.textContent);
+    click(WE.day[0]); click(WE.scope[0]); await run(300);
+    MS.watch.body.scrollTop = 0; fire(MS.watch.body, 'scroll', {});
+    D.focus.set(natKey, { ladder: 'A' }); D.focus.set(gameKey, { ladder: 'B', other: true }); await run(300);
+  }
+  // THE MARKET BROWSER: u (or + on the watchlist)
+  {
+    const BR = D.browse.state(), BE = BR.el;
+    A.el.focus(); key('KeyU', 'u');
+    check(D.browse.isOpen && P.doc.activeElement !== BE.q, 'the handler only shows the browser: its search takes focus after the frame (a focus there would force a layout in the handler)');
+    await run(600);
+    check(D.browse.isOpen && /\bbrowse\b/.test(P.doc.body.className) && P.doc.activeElement === BE.q, 'u opens the market browser with its search focused');
+    const btb = BR.V.tb, brows = () => btb.children.filter(r => r.getAttribute('data-mkt'));
+    check(+BE.n.textContent.split(' ')[0] > 500 && brows().length > 10 && btb.children.filter(r => !/\bvpad\b/.test(r.className)).length <= 70, 'it lists the day\'s universe, virtual', BE.n.textContent);
+    check(BE.cats.some(b => /^SPORTS \d+$/.test(b.textContent)) && BE.cats.some(b => /^WEATHER \d+$/.test(b.textContent)), 'the category chips carry their counts', BE.cats.map(b => b.textContent));
+    BE.q.value = 'denver'; fire(BE.q, 'input', {}); await run(800);
+    BE.q.value = 'den'; fire(BE.q, 'input', {}); await run(800);
+    const dr = brows().find(r => /^DEN /.test(r.children[2].textContent) && r.children[0].textContent === '☆');
+    check(!!dr, 'a search narrows it (the server matches tickers, titles and groups)', brows().map(r => r.children[2].textContent).slice(0, 5));
+    const dk = dr.getAttribute('data-mkt');
+    fire(dr.children[0], 'pointerdown', { button: 0 }); P.frame();
+    check(dr.children[0].textContent === '★', 'its star pins at once');
+    await run(400);
+    check(st.market(dk) && st.market(dk).pin === true && st.book(dk), 'pinned: the market joins the live set with its book');
+    key('ArrowDown', 'ArrowDown'); key('Enter', 'Enter'); await run(400);
+    check(!D.browse.isOpen && D.focus.key && D.focus.key === BR.cursor, 'Enter loads the cursor\'s market into the focused ladder and closes the browser', [D.focus.key, BR.cursor]);
+    click(WE.browse); await run(300);
+    check(D.browse.isOpen, '+ on the watchlist opens it too');
+    key('Escape', 'Escape');
+    check(!D.browse.isOpen, 'Esc closes it');
+    click(WE.scope[0]); await run(300);
+    check(wrows().some(r => r.getAttribute('data-mkt') === dk), 'the market pinned in the browser is on the watchlist');
+    D.focus.set(natKey, { ladder: 'A' }); await run(300);
+  }
+  // ---- virtual lists: the drawn window moves 8 rows at a time, so most scroll frames redraw
+  // nothing (2026-10-06 browser pass: every 2-row scroll step relaid out ~50 rows, ~5 ms)
+  {
+    const host = P.doc.createElement('div'); P.doc.body.appendChild(host);
+    let calls = 0;
+    const V = D.vlist(host, [{ h: 'A' }, { h: 'B', w: 40 }], 'grid', { rowH: 18, headH: 20, h: 360, onScroll: () => { calls++; } });
+    const items = Array.from({ length: 1000 }, (_, i) => i);
+    const drawAll = () => V.draw(items, String, i => [String(i), ''], () => '');
+    const firstKey = () => { const r = V.tb.children.find(x => !/\bvpad\b/.test(x.className)); return r ? r.getAttribute('data-k') : null; };
+    const scrollTo = row => { host.scrollTop = row * 18; fire(host, 'scroll', {}); };
+    drawAll();
+    eq(V.a + '-' + V.b + ' ' + firstKey(), '0-45 0', 'a virtual list draws the rows in view and a margin: 45 of 1,000');
+    scrollTo(5);
+    eq(calls, 0, 'scrolling inside the drawn window asks for no redraw (the browser just scrolls)');
+    scrollTo(20);
+    eq(calls, 1, 'leaving it asks for one');
+    drawAll();
+    eq(V.a + ' ' + firstKey(), '8 8', 'and the window moves by whole chunks of 8 rows, 8 rows above the view');
+    scrollTo(23);
+    eq(calls, 1, 'the next rows scroll free again');
+    scrollTo(995); drawAll();
+    check(V.b === 1000 && V.a <= 1000 - 21, 'at the end it draws the end, never an empty window', [V.a, V.b]);
+    const pads = V.tb.children.filter(r => /\bvpad\b/.test(r.className)).map(r => parseInt(r.children[0].style.getPropertyValue('height'), 10));
+    eq(pads.reduce((x, y) => x + y, 0) + (V.b - V.a) * 18, 1000 * 18, 'the spacers keep the whole list\'s height');
+    const nScroll = () => host._ls.filter(l => l.type === 'scroll').length;
+    const tb0 = V.tb;
+    V.retable([{ h: 'A' }, { h: 'B', w: 40 }, { h: 'C', w: 40 }], 'grid');
+    check(V.tb !== tb0 && host.contains(V.tb) && !host.contains(tb0) && nScroll() === 1, 'a new column set swaps the table, not the listeners', nScroll());
+    host.remove();
+    // the watchlist's wider column set (from 420 px) reuses its list
+    const n0 = MS.watch.body._ls.filter(l => l.type === 'scroll').length;
+    MS.watch.wide = true; D.render.mark('mwatch'); await run(300);
+    MS.watch.wide = false; D.render.mark('mwatch'); await run(300);
+    check(n0 === 1 && MS.watch.body._ls.filter(l => l.type === 'scroll').length === 1 && MS.watch.body.contains(MS.watch.tb), 'the watchlist widening and narrowing keeps one scroll listener', [n0, MS.watch.body._ls.filter(l => l.type === 'scroll').length]);
+  }
   // ---- ticket ---------------------------------------------------------------------------------
   const E = MS.ticket.el;
   eq(E.mkt.textContent, nat.short, 'the ticket follows the focused market');
@@ -762,7 +939,7 @@ function manOrders(P, key) { const a = []; P.D.store.orders.forEach(o => { if (o
   check(/auto/.test(E.px.className) && E.px.value === '0.63', 'the price field shows AUTO in grey');
   const tyBtn = t => E.types.find(b => b.textContent === t);
   check(!tyBtn('30m').disabled && tyBtn('START').disabled && !tyBtn('5m').disabled, '5m and 30m are there; START needs a game start time (a 15-minute window has none)');
-  check(['IOC', 'FOK', '5s', '15s', '60s', '5m', '30m', 'START'].every(t => tyBtn(t)), 'IOC FOK POST 5s 15s 60s 5m 30m START, no GTC');
+  check(['IOC', 'FOK', '5s', '15s', '60s', '5m', '30m', 'START', 'CLOSE'].every(t => tyBtn(t)), 'IOC FOK POST 5s 15s 60s 5m 30m START CLOSE, no open-ended GTC');
   click(tyBtn('IOC')); P.frame();
   check(/^BUY 1 ≤0\.65$/.test(E.buy.textContent), 'IOC shows how far it may fill (the cap)', E.buy.textContent);
   check(/cost/.test(E.costL.textContent) && E.cost.textContent === '0.67' && E.shL.textContent === 'S3 free' && E.shOk.textContent === 'OK', 'check line: cost (0.65 plus the 0.02 taker fee), shard free cash, OK', [E.cost.textContent, E.shL.textContent, E.sh.textContent, E.shOk.textContent]);
@@ -796,6 +973,29 @@ function manOrders(P, key) { const a = []; P.D.store.orders.forEach(o => { if (o
     D.focus.set(natKey); await run(300);
     check(MS.cfg.tk.type === 'PSTART' && / 15s$/.test(E.buy.textContent) && !E.buy.disabled && /\bon\b/.test(tyBtn('15s').className),
       'START chosen on a market with no start acts as 15 s (the buttons stay live)', [E.buy.textContent, E.buy.disabled]);
+    click(tyBtn('IOC')); P.frame();
+  }
+  // CLOSE: an order that rests until the market closes (Kalshi expiration_ts / PM GTD at the close)
+  {
+    check(!!tyBtn('CLOSE') && !tyBtn('CLOSE').disabled, 'the ticket offers CLOSE (until close) next to START');
+    const wxm = Array.from(st.markets.values()).find(m => m.kind === 'WEATHER' && m.status === 'OPEN' && m.close_ms - P.clock.t > 3 * 3600e3 && st.book(m.key) && st.book(m.key).bb !== null);
+    D.focus.set(wxm.key); await run(300);
+    click(tyBtn('CLOSE')); P.frame();
+    check(/@\d\.\d+ CLOSE \d+h\d\dm$/.test(E.buy.textContent), 'the button says CLOSE and the time to close', E.buy.textContent);
+    check(/until the market closes at/.test(tyBtn('CLOSE').getAttribute('title')), 'CLOSE carries the close time on its title');
+    D.manual.ticketPrice(wxm.key, D.grid.step(wxm.g, st.book(wxm.key).bb, -2)); P.frame();
+    n0 = st.orders.size;
+    click(E.buy);
+    o = newest(P, x => x.own === 'MAN');
+    const closeS = Math.floor(wxm.close_ms / 1000) * 1000;
+    check(st.orders.size === n0 + 1 && o.tif === 'POST' && o.exp_ms === closeS, 'CLOSE sends a post whose exchange expiry is the market close', { exp: o.exp_ms, close: wxm.close_ms });
+    await run(300);
+    o = st.orders.get(o.cid);
+    check(o.st === 'WORK' && o.exp_ms === closeS, 'the venue rests it until the close (more than 24 h is allowed when the close is)', { st: o.st, why: o.why });
+    const wr = P.$('m-work-body').children[0].children[2].children.find(r => r.getAttribute('data-k') === o.cid);
+    check(wr && /^\d+h\d\dm$/.test(wr.children[7].textContent) && /until close/.test(wr.children[7].getAttribute('title')), 'WORKING counts it down as the time to close', wr && wr.children[7].textContent);
+    D.act.cancel([o.cid]); await run(300);
+    D.focus.set(natKey); await run(300);
     click(tyBtn('IOC')); P.frame();
   }
   check(E.eM.textContent !== '' && /c/.test(E.eM.textContent), 'edge vs model shown', E.eM.textContent);
@@ -1015,6 +1215,181 @@ function manOrders(P, key) { const a = []; P.D.store.orders.forEach(o => { if (o
     draw('');
     eq(n, 1, 'a level that goes away does not flash (no grey box on an empty cell)');
   }
+  // ---- a P&L keyed on its realized part: no flash when only the mark moves; green up, red down
+  {
+    const tb = P.doc.createElement('tbody');
+    const draw = (t, fk) => D.dom.keyedRows(tb, [1], String, () => [{ t, cls: 'n', fl: 'd', flg: 1500, fk }]);
+    draw('+1.00', '100');
+    const td = tb.children[0].children[0], got = [];
+    td.animate = kf => { got.push(kf[0].boxShadow); return {}; };
+    draw('+1.40', '100');
+    eq(got.length, 0, 'a P&L keyed on its realized part does not flash when only the mark moves');
+    draw('+2.40', '150');
+    check(got.length === 1 && /63,185,80/.test(got[0]), 'it flashes green when the realized part rises', got);
+    td._flT = 0; draw('+0.40', '20');
+    check(got.length === 2 && /248,81,73/.test(got[1]), 'and red when it falls', got);
+  }
+  // ---- FLASH: calm by default (SUBTLE), routine book updates only with FULL, nothing with OFF ---
+  {
+    const proto = P.doc.createElement('td').constructor.prototype, anim0 = proto.animate;
+    let fl = [];
+    proto.animate = function (kf, o) { fl.push({ el: this, ms: o && o.duration, c: kf && kf[0] && kf[0].boxShadow }); return { cancel() {} }; };
+    const onLad = () => fl.filter(x => A.tb.contains(x.el));
+    const reset = () => { fl = []; rowsOf(A.tb).forEach(r => r.children.forEach(c => { c._flT = 0; })); };
+    eq(D.ui.flash, 'subtle', 'FLASH defaults to SUBTLE');
+    eq(P.doc.documentElement.getAttribute('data-flash'), 'subtle', 'and says so on <html> (the CSS fallback durations)');
+    D.focus.set(natKey, { ladder: 'A' });
+    P.sim().freeze(natKey, { bids: [[6300, 120], [6200, 85]], asks: [[6400, 80], [6500, 210]] }); await run(300);
+    reset();
+    P.sim().freeze(natKey, { bids: [[6300, 140], [6200, 60]], asks: [[6400, 95], [6500, 180]] }); await run(300);
+    eq(ladCell(P, 'A', 6300, 'bq').textContent, '140', 'the new sizes are drawn');
+    eq(onLad().length, 0, 'SUBTLE: a routine size change on the ladder does not flash (the depth bar shows size)');
+    reset();
+    P.sim().trade(natKey, 'BUY', 3); await run(300);
+    const lastPx = onLad().filter(x => /\bpx\b/.test(x.el.className));
+    check(lastPx.length === 1 && /\blast\b/.test(lastPx[0].el.className), 'a print gives the last-trade price row a short highlight', onLad().map(x => x.el.className));
+    check(lastPx.length && lastPx[0].ms >= 400 && lastPx[0].ms <= 600, 'SUBTLE fades over 400-600 ms', lastPx[0] && lastPx[0].ms);
+    check(!onLad().some(x => /\b(bq|aq|lt)\b/.test(x.el.className)), 'and nothing else on the ladder flashes for it');
+    reset();
+    click(ladCell(P, 'A', 6100, 'bq'));
+    const myCid = newest(P, x => x.own === 'MAN').cid;
+    P.frame();
+    check(onLad().some(x => x.el === ladCell(P, 'A', 6100, 'wb')), 'our own order flashes its cell when it is sent');
+    reset();
+    await run(300);
+    check(onLad().some(x => x.el === ladCell(P, 'A', 6100, 'wb')), 'and again when the venue acknowledges it (a state change)');
+    reset();
+    await run(2000, 250);
+    check(!onLad().some(x => x.el === ladCell(P, 'A', 6100, 'wb')), 'the countdown ticking is not a state change: no flash');
+    D.act.cancel([myCid]); await run(300);
+    D.ui.setFlash('full'); reset();
+    eq(D.storage.get('flash'), 'full', 'the FLASH choice is saved (safe storage)');
+    P.sim().freeze(natKey, { bids: [[6300, 100], [6200, 70]], asks: [[6400, 60], [6500, 150]] }); await run(300);
+    check(onLad().some(x => /\bbq\b/.test(x.el.className)) && onLad().every(x => x.ms === 300), 'FULL: size changes flash again, 300 ms', onLad().map(x => x.ms));
+    D.ui.setFlash('off'); reset();
+    P.sim().freeze(natKey, { bids: [[6300, 90], [6200, 75]], asks: [[6400, 66], [6500, 140]] }); P.sim().trade(natKey, 'SELL', 2); await run(300);
+    eq(fl.length, 0, 'OFF: nothing flashes anywhere');
+    key('KeyF', 'f');
+    eq(D.ui.flash, 'subtle', 'f cycles FLASH (OFF to SUBTLE)');
+    // POSITIONS: unrealized P&L moves with every mark, so it flashes only with FULL (2026-10-06
+    // browser pass: twenty Systematic positions twinkled ~9 cells a second in SUBTLE)
+    {
+      P.sim().freeze(natKey, { bids: [[6300, 120]], asks: [[6400, 300]] }); await run(300);
+      D.act.order({ v: 'K', tk: nat.tk, side: 'BUY', px: 6400, qty: 2, tif: 'IOC', touch: 6400 }, null); await run(800);
+      const ptbF = P.$('m-pos-body').children[0].children[2];
+      const unrlOf = () => { const r = ptbF.children.find(x => x.getAttribute('data-k') === natKey); return r ? r.children[7] : null; };
+      check(!!unrlOf() && st.position(natKey).pos >= 2, 'a position to mark', st.position(natKey));
+      const u0 = unrlOf().textContent;
+      fl = [];
+      P.sim().freeze(natKey, { bids: [[6600, 120]], asks: [[6700, 300]] }); await run(1200);
+      P.sim().freeze(natKey, { bids: [[6100, 120]], asks: [[6200, 300]] }); await run(1200);
+      check(unrlOf().textContent !== u0 && !fl.some(x => x.el === unrlOf()), 'SUBTLE: unrealized P&L in POSITIONS does not flash when the mark moves', [u0, unrlOf().textContent]);
+      D.ui.setFlash('full'); fl = [];
+      P.sim().freeze(natKey, { bids: [[6600, 120]], asks: [[6700, 300]] }); await run(1200);
+      check(fl.some(x => x.el === unrlOf()), 'FULL: it does');
+      D.ui.setFlash('subtle');
+      D.act.order({ v: 'K', tk: nat.tk, side: 'SELL', px: 6600, qty: st.position(natKey).pos, tif: 'IOC', touch: 6600 }, null); await run(800);
+      eq(st.position(natKey).pos, 0, 'flat again');
+    }
+    // a busy book repaints the ladder at most about 10 times a second
+    const bk = JSON.parse(JSON.stringify(D.contract.examples.book));
+    bk.tk = nat.tk; bk.trades = []; bk.last = null;
+    const p0 = A.paints;
+    for (let i = 0; i < 50; i++) {
+      bk.bids[0][1] = 100 + i; bk.ex_ms = P.clock.t;
+      st._handlers.book(JSON.parse(JSON.stringify(bk)));
+      P.clock.t += 20; P.frame();
+    }
+    const n10 = A.paints - p0;
+    check(n10 >= 8 && n10 <= 11, 'a book updating 50 times a second repaints its ladder about 10 times a second', n10);
+    click(ladCell(P, 'A', 6100, 'bq'));
+    const pp = A.paints; P.frame();
+    eq(A.paints, pp + 1, 'a click still paints on the very next frame');
+    D.act.cancelAll('MAN', null);
+    proto.animate = anim0;
+    P.sim().freeze(natKey, { bids: [[6300, 120], [6200, 85], [6100, 40]], asks: [[6400, 80], [6500, 210], [6700, 12]] });
+    await run(500);
+  }
+  // ---- instant controls: pressed at pointerdown, safe controls act there, orders keep the click --
+  {
+    const press = (el, props) => fire(el, 'pointerdown', Object.assign({ button: 0, pointerType: 'mouse' }, props || {}));
+    const up = el => fire(el, 'pointerup', { button: 0 });
+    const foot = P.$('m-lad-a-foot');
+    const fb = t => foot.children[0].children.concat(foot.children[1].children).find(b => b.textContent === t);
+    D.focus.set(natKey, { ladder: 'A' }); await run(300);
+    click(fb('1'));
+    const paints0 = A.paints;
+    press(fb('CLR'));
+    check(/\bprs\b/.test(fb('CLR').className), 'a pressed control shows pressed in the same event');
+    eq(A.cfg.qty, 0, 'a footer setting acts at pointerdown, before the click');
+    up(fb('CLR')); fire(fb('CLR'), 'click', {});
+    check(!/\bprs\b/.test(fb('CLR').className), 'pointerup clears the pressed state');
+    press(fb('5'), { shiftKey: true }); fire(fb('5'), 'click', { shiftKey: true });
+    eq(A.cfg.qty, 5, 'the click after a pointerdown that acted is swallowed (Shift+5 adds once, not twice)');
+    P.frame();
+    check(/\bon\b/.test(fb('5').className) && A.paints === paints0, 'the footer repaints alone: the 38 rows are not redrawn for a setting', { paints: A.paints - paints0 });
+    fire(fb('15s'), 'click', {});
+    eq(A.cfg.ttl, 15, 'a keyboard or scripted click (no pointerdown) still acts');
+    // an order cell: pressed at pointerdown, sent only on the click
+    const n1 = st.orders.size, cell = ladCell(P, 'A', 6000, 'bq');
+    press(cell);
+    check(st.orders.size === n1 && /\bprs\b/.test(cell.className), 'an order cell shows pressed at pointerdown but sends nothing yet');
+    up(cell); fire(cell, 'click', {});
+    const sent = newest(P, x => x.own === 'MAN');
+    check(st.orders.size === n1 + 1 && sent.px === 6000 && sent.st === 'PEND', 'the click sends it, PEND in the store at once');
+    check(!P.sim().order(sent.cid), 'the simulated venue has not seen it inside the handler (its work runs after the paint)');
+    P.frame();
+    check(/\bpend\b/.test(ladCell(P, 'A', 6000, 'wb').className), 'the next frame paints it pending');
+    await run(300);
+    check(P.sim().order(sent.cid) && st.orders.get(sent.cid).st === 'WORK', 'then the venue takes it and the ack arrives');
+    D.act.cancel([sent.cid]); await run(300);
+    // a press dragged off an order cell never sends
+    const n2 = st.orders.size;
+    press(ladCell(P, 'A', 5900, 'bq')); up(P.$('m-lad-a-head'));
+    eq(st.orders.size, n2, 'a press released elsewhere sends nothing');
+    // PRICE copies to the ticket at pointerdown
+    press(ladCell(P, 'A', 6100, 'px'));
+    eq(MS.ticket.px, 6100, 'a PRICE press copies the price to the ticket at once');
+    fire(ladCell(P, 'A', 6100, 'px'), 'click', {});
+    // the tab switch acts at pointerdown
+    press(P.$('tab-sys'));
+    eq(D.render.tab, 'systematic', 'the tab switch acts at pointerdown');
+    fire(P.$('tab-sys'), 'click', {});
+    press(P.$('tab-man')); fire(P.$('tab-man'), 'click', {});
+    eq(D.render.tab, 'manual', 'and back');
+    // the ticket: settings at pointerdown, BUY / SELL on the click
+    const E2 = MS.ticket.el, n3 = st.orders.size;
+    press(E2.types.find(b => b.textContent === '60s'));
+    eq(MS.cfg.tk.type, 'P60', 'a ticket order type acts at pointerdown');
+    press(E2.buy);
+    eq(st.orders.size, n3, 'BUY does not send at pointerdown');
+    fire(E2.buy, 'click', {});
+    eq(st.orders.size, n3 + 1, 'it sends on the click');
+    click(E2.types.find(b => b.textContent === '15s'));
+    await run(300);
+    // a working row's x cancels at pointerdown
+    const live1 = manOrders(P).find(x => !x.terminal);
+    const xr = P.$('m-work-body').children[0].children[2].children.find(r => r.getAttribute('data-k') === live1.cid);
+    press(xr.children[10]);
+    check(st.orders.get(live1.cid).local.cxlPend, 'a working order\'s x cancels at pointerdown');
+    fire(xr.children[10], 'click', {});
+    await run(300);
+    // the dev check: handler and paint time per control
+    D.perf.set(true);
+    const ctls = [fb('1'), fb('5'), fb('60s'), fb('15s'), P.$('tab-sys'), P.$('tab-man'), E2.types.find(b => b.textContent === 'IOC'),
+                  E2.types.find(b => b.textContent === '15s'), MS.watch.el.cats[2], MS.watch.el.cats[0], MS.watch.el.day[1], MS.watch.el.day[0], P.$('sb-keys'), P.$('keysheet-close'), P.$('sb-set'), P.$('set-close')];
+    for (const c of ctls) { press(c); up(c); fire(c, 'click', {}); P.frame(); }
+    click(ladCell(P, 'A', 5800, 'bq')); P.frame();
+    A.el.focus(); key('Space', ' '); P.frame();
+    const rep = D.perf.report();
+    check(rep.length >= 10 && rep.some(r => r.ctl === '#tab-sys') && rep.some(r => /m-lad-a:q$/.test(r.ctl)) && rep.some(r => /m-lad-a:bq$/.test(r.ctl)) && rep.some(r => r.ctl === 'key:Space'),
+      'the dev check records handler and paint time per control', rep.map(r => r.ctl));
+    const over = rep.filter(r => r.h > 16.7 || r.p > 16.7);
+    eq(over.map(r => r.ctl + ' ' + r.h + '/' + r.p).join(', '), '', 'every control: handler and frame inside one frame (16.7 ms) here');
+    check(P.errors.length === 0, 'and the dev check logs no SLOW control', P.errors.slice(0, 2));
+    D.perf.set(false);
+    D.act.cancelAll('MAN', null); await run(300);
+  }
 
   // ---- 2400 px and wider: a fourth ladder, and SPLIT ------------------------------------------
   P.setXWide(true);
@@ -1100,6 +1475,66 @@ function manOrders(P, key) { const a = []; P.D.store.orders.forEach(o => { if (o
   await run(500);
   eq(A.shownKey, nk, 'and shows it');
 
+  // ---- ACTIVITY: the operator's own tape, and the header's count of what he has not seen ------
+  {
+    D.tabs.set('manual');
+    const ak = D.focus.ladders.A;                    // the natural gas window open now (natKey rolled)
+    P.sim().freeze(ak, { bids: [[6300, 120], [6200, 85]], asks: [[6400, 80], [6500, 210]] }); await run(300);
+    const atb = P.$('m-act-body').children[0].children[2], arows = () => atb.children.filter(r => /^a-/.test(r.className));
+    const top = () => arows()[0], ev = r => r.children[1].textContent;
+    eq(P.$('m-act').children[0].textContent.indexOf('ACTIVITY'), 0, 'MANUAL has an ACTIVITY tape');
+    click(ladCell(P, 'A', 6200, 'bq'));
+    const ca = newest(P, x => x.own === 'MAN');
+    P.frame();
+    check(top() && ev(top()) === 'SUB' && top().children[2].textContent === 'BUY' && /side-BUY/.test(top().children[2].className) && top().getAttribute('data-mkt') === ak,
+      'an order shows on the tape at the click: SUB, side in its colour, linked to its market', top() && top().textContent);
+    eq(top().children[6].textContent, 'POST 15s', 'a sent post says what it rests for');
+    await run(300);
+    D.act.cancel([ca.cid]); await run(300);
+    check(ev(top()) === 'CXL' && /USER/.test(top().children[6].textContent) && /a-CXL/.test(top().className), 'a cancel shows CXL with its reason (grey)', top().textContent);
+    {
+      const ttlBtn = v => P.$('m-lad-a-foot').children[1].children.find(b => b.getAttribute('data-v') === v);
+      click(ttlBtn('CLOSE')); await run(600);           // (clear of the ladder's roll hold)
+      click(ladCell(P, 'A', 6100, 'bq'));
+      const cc = newest(P, x => x.own === 'MAN');
+      P.frame();
+      check(ev(top()) === 'SUB' && top().children[6].textContent === 'POST CL' && cc.exp_ms === Math.floor(st.market(ak).close_ms / 1000) * 1000, 'an until-close post says POST CL on the tape', top().textContent + ' | ' + st.alerts.slice(0, 2).map(a => a.msg).join(' / '));
+      await run(300); D.act.cancel([cc.cid]); await run(300);
+      click(ttlBtn('15')); P.frame();
+    }
+    click(ladCell(P, 'A', 6400, 'bq')); await run(400);
+    check(arows().slice(0, 3).some(r => ev(r) === 'FILL' && /\bT\b/.test(r.children[6].textContent)), 'an IOC that fills shows FILL with its liquidity (T)', arows().slice(0, 3).map(r => r.textContent));
+    const pr = P.$('m-pos-body').children[0].children[2].children.find(r => r.getAttribute('data-k') === ak);
+    click(pr.children[10]); await run(400);
+    const ex = arows().find(r => ev(r) === 'EXIT');
+    check(ex && /^[+−]?\d+\.\d\d$/.test(ex.children[6].textContent) && ex.getAttribute('data-mkt') === ak, 'flattening shows EXIT with the market\'s P&L', ex && ex.textContent);
+    const fb = P.$('m-act-tools').children.find(b => b.textContent === 'FILLS');
+    click(fb); await run(300);
+    check(arows().length && arows().every(r => /^(FILL|PART|EXIT)$/.test(ev(r))), 'FILLS shows fills and exits only');
+    click(P.$('m-act-tools').children.find(b => b.textContent === 'ALL')); await run(300);
+    click(ex.children[4]); P.frame();
+    eq(D.focus.key, ak, 'a tape row focuses its market');
+    // the counter: SYS fills while MANUAL shows count as not seen; ACT shows them
+    eq(D.activity.unseen.MAN, 0, 'the operator\'s own events count as seen while MANUAL is on screen');
+    D.activity.seen('SYS'); await run(300);
+    eq(P.$('h-act').textContent, '0', 'ACT reads 0 with nothing unseen');
+    const id0 = D.activity.n;
+    D.act.start(); await run(60000, 250);
+    const un = +P.$('h-act').textContent, fresh = D.activity.lists.SYS.filter(e => e.id > id0);
+    check(un > 0 && /\bwarn\b/.test(P.$('hc-act').className) && D.activity.unseen.SYS === un, 'Systematic\'s fills and exits, while MANUAL shows, count in the header\'s ACT (amber)', { un, cls: P.$('hc-act').className });
+    check(fresh.some(e => e.type === 'SUB') && un === fresh.filter(e => e.type === 'FILL' || e.type === 'EXIT').length,
+      'only the alert types count (fills and exits by default), not every quote', { un, fills: fresh.filter(e => e.type === 'FILL' || e.type === 'EXIT').length, all: fresh.length });
+    fire(P.$('hc-act'), 'pointerdown', { button: 0 }); fire(P.$('hc-act'), 'click', {}); await run(300);
+    check(D.render.tab === 'systematic' && P.$('h-act').textContent === '0', 'ACT shows the tab they happened on and counts them seen');
+    // the tape is a virtual list: a minute of busy lanes is hundreds of events, a few dozen rows
+    D.render.force('systematic'); P.frame();
+    const stb = P.$('s-act-body').children[0].children[2], sDrawn = stb.children.filter(r => /^a-/.test(r.className)).length;
+    check(D.activity.lists.SYS.length > 200 && sDrawn > 10 && sDrawn <= 64, 'the tape keeps every event and draws only the rows in view', { events: D.activity.lists.SYS.length, drawn: sDrawn });
+    const sPads = stb.children.filter(r => /\bvpad\b/.test(r.className)).map(r => parseInt(r.children[0].style.getPropertyValue('height'), 10) || 0);
+    eq(sPads.reduce((x, y) => x + y, 0) + sDrawn * D.dom.rowPx(), D.activity.lists.SYS.length * D.dom.rowPx(), 'its spacers keep the whole tape\'s height (it scrolls back through all of it)');
+    D.act.stop(); D.tabs.set('manual'); await run(500);
+  }
+
   // ---- no errors anywhere ---------------------------------------------------------------------
   eq(D.render.errors, 0, 'no render errors' + (D.render.lastError ? ': ' + D.render.lastError : ''));
   eq(st.invalid, 0, 'no contract violations' + (st.lastInvalid ? ': ' + st.lastInvalid : ''));
@@ -1125,6 +1560,50 @@ function manOrders(P, key) { const a = []; P.D.store.orders.forEach(o => { if (o
     check(s2.orders.size === n1 && /RO/.test(s2.alerts[0].msg), 'and refuses clicks');
     check(Q.D.manual.state().ticket.el.buy.disabled && Q.D.manual.state().ticket.el.blk.textContent === 'RO', 'the ticket too');
     eq(Q.D.render.errors, 0, 'no render errors (read-only)');
+  }
+
+  // =============================================================================================
+  // 4. desktop alerts: permission from a click, filters, the 4 s rate limit, the sound
+  // =============================================================================================
+  {
+    class Note { constructor(title, o) { Note.list.push({ title, body: o.body, tag: o.tag }); } close() {} }
+    Note.list = []; Note.permission = 'default'; Note.asked = 0;
+    Note.requestPermission = cb => { Note.asked++; Note.permission = 'granted'; if (cb) cb('granted'); return Promise.resolve('granted'); };
+    let tones = 0;
+    class Audio { constructor() { this.state = 'running'; this.currentTime = 0; this.destination = {}; }
+      createOscillator() { return { frequency: { value: 0 }, connect() {}, start() { tones++; }, stop() {} }; }
+      createGain() { return { gain: { setValueAtTime() {}, exponentialRampToValueAtTime() {} }, connect() {} }; } }
+    const Q = bootPage({ seed: 13, Notification: Note, AudioContext: Audio });
+    await Q.run(1500);
+    const A = Q.D.activity, su = Q.D.header.su;
+    check(!A.cfg.on && !A.cfg.sound && A.cfg.when === 'hidden' && A.cfg.MAN.join() === 'FILL,EXIT' && A.cfg.SYS.join() === 'FILL,EXIT', 'alerts start off: fills and exits only, only while the page is hidden');
+    Q.key('KeyP', 'p'); Q.frame();
+    const onBtn = su.desk.btns.find(b => b.textContent === 'ON');
+    Q.fire(onBtn, 'pointerdown', { button: 0 });
+    eq(Note.asked, 0, 'the permission is never asked on pointerdown');
+    Q.fire(onBtn, 'click', {}); await Q.run(100);
+    check(Note.asked === 1 && A.cfg.on && /allowed/.test(su.deskSt.textContent), 'Desktop ON asks for the permission from the click, and shows it allowed', su.deskSt.textContent);
+    Q.click(su.sound.btns.find(b => b.textContent === 'ON'));
+    Q.click(su.when.btns.find(b => b.textContent === 'ALWAYS'));
+    check(A.cfg.sound && A.cfg.when === 'always' && Q.D.storage.getJSON('alerts').on === true, 'sound and ALWAYS are saved');
+    Q.key('Escape', 'Escape');
+    const st2 = Q.D.store, nk = Q.D.focus.ladders.A;
+    Q.sim().freeze(nk, { bids: [[6300, 120]], asks: [[6400, 300]] }); await Q.run(300);
+    const buy = () => Q.D.act.order({ v: 'K', tk: st2.market(nk).tk, side: 'BUY', px: 6400, qty: 1, tif: 'IOC', touch: 6400 }, null);
+    buy(); await Q.run(400);
+    check(Note.list.length === 1 && Note.list[0].title === 'MAN FILL' && /BUY 1 .*@0\.64/.test(Note.list[0].body) && Note.list[0].tag === 'desk-MAN', 'a fill raises one desktop alert: MAN FILL, what and where', Note.list);
+    check(tones === 1, 'with one short tone');
+    eq(A.list('MAN', 'ALL').filter(e => e.type === 'SUB').length >= 1 && Note.list.every(n => !/^MAN SUB/.test(n.title)), true, 'a sent order is on the tape but raises no alert (not in the filter)');
+    buy(); buy(); await Q.run(1000);
+    eq(Note.list.length, 1, 'more fills inside 4 s wait (one alert per mode per 4 s)');
+    await Q.run(3500, 250);
+    await new Promise(r => setTimeout(r, 4100));       // the batch flushes on a real 4 s timer
+    check(Note.list.length === 2 && /^MAN: 2 fills$/.test(Note.list[1].title) && Note.list[1].body.split('\n').length === 2, 'then one alert for the batch: MAN: 2 fills', Note.list.slice(1));
+    Q.D.activity.toggleType('MAN', 'SUB');
+    Q.D.activity.sent.MAN = 0;
+    buy(); await Q.run(400);
+    check(Note.list.some(n => /SUB/.test(n.title) || /SUB/.test(n.body)), 'a type switched on in the filter alerts too');
+    eq(Q.D.render.errors, 0, 'no render errors (alerts)');
   }
 
   console.log(fails ? `${fails} of ${checks} checks FAILED` : `ui desk v3 manual: ${checks} checks, 0 failures`);

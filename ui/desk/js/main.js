@@ -26,9 +26,18 @@
     safe('layout', function () { Desk.layout.init(); });
     Desk.keys.attach();
     Desk.focus.bindClicks();
+    Desk.press.attach();
     safe('header', function () { Desk.header.init(); });
     safe('manual', function () { if (Desk.manual && Desk.manual.init) Desk.manual.init(); });
+    safe('browse', function () { if (Desk.browse && Desk.browse.init) Desk.browse.init(); });
     safe('systematic', function () { if (Desk.systematic && Desk.systematic.init) Desk.systematic.init(); });
+    // ACTIVITY: the tape in each tab, the header's unseen counter, desktop alerts (activity.js)
+    safe('activity', function () {
+      var A = Desk.activity, $ = Desk.dom.$;
+      A.load();
+      Desk.render.add({ id: 's-act', tab: 'systematic', fn: A.mount({ mode: 'SYS', body: $('s-act-body'), tools: $('s-act-tools'), lane: true }) });
+      Desk.render.add({ id: 'm-act', tab: 'manual', fn: A.mount({ mode: 'MAN', body: $('m-act-body'), tools: $('m-act-tools') }) });
+    });
     Desk.render.add({ id: 'manual', tab: 'manual', fn: function (d) { if (Desk.manual && Desk.manual.render) Desk.manual.render(d); } });
     Desk.render.add({ id: 'systematic', tab: 'systematic', fn: function (d) { if (Desk.systematic && Desk.systematic.render) Desk.systematic.render(d); } });
     // the stream carries the ladders on screen: follow focus and layout
@@ -39,6 +48,9 @@
       if (!d.has('focus') && !d.has('layout') && !d.all) return;
       ['A', 'B', 'C', 'D'].forEach(function (s) { Desk.dom.setAttr(Desk.dom.$('m-lad-' + s.toLowerCase()), 'data-focused', Desk.focus.ladder === s ? '1' : null); });
     } });
+
+    // the dev check's listeners go last, so they time every other handler of the event
+    safe('perf', function () { Desk.perf.load(); Desk.perf.attach(); });
 
     Desk.store.begin();
     Desk.tick.on(function (now) { Desk.store.tick(now); });

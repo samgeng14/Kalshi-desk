@@ -68,7 +68,7 @@
     edgeWarnN: 30,          // ...once this many fills have both a fair and a 60 s markout
     thinN: 30,              // markout figures from fewer fills than this show grey
     shardLowU: 10000,       // a shard with under $1.00 free shows amber in the cash line
-    fillsMax: 200,          // rows in FILLS (the panel scrolls; a hidden tab keeps its layout)
+    fillsMax: 1000,         // fills FILLS scrolls through (virtual rows: only those in view exist)
     recentMo: 40,           // recent fills listed under MARKOUTS
     showTermMs: 3000,       // CXL / REJ / EXP rows stay this long in WORKING
     pendMs: 5000            // a START/STOP with no answer stops showing pending after this
@@ -239,7 +239,8 @@
   // A column's ww is its width in WIDE mode (a cap on a column that is elastic below 1920 px).
   // When every WIDE column has a width, a blank filler column takes the slack at the right.
   function mode() { var L = Desk.layout; return L && L.sysMode ? L.sysMode() : (L && L.wide ? 'w' : (L && L.narrow ? 'n' : 'd')); }
-  function Grid(hostId, cls, cols) { this.hostId = hostId; this.cls = cls; this.all = cols; this.sig = null; this.tb = null; this.cols = []; this.fill = false; }
+  // vopts: a virtual grid (Desk.vlist: only the rows in view exist) with these vlist options
+  function Grid(hostId, cls, cols, vopts) { this.hostId = hostId; this.cls = cls; this.all = cols; this.sig = null; this.tb = null; this.cols = []; this.fill = false; this.vopts = vopts || null; this.V = null; }
   Grid.prototype.ensure = function () {
     var m = mode();
     var cols = this.all.filter(function (c) { return !c.m || c.m.indexOf(m) >= 0; });
@@ -250,19 +251,24 @@
     var defs = cols.map(function (c) { return { h: c.h, w: m === 'w' && c.ww ? c.ww : c.w, cls: c.hc, title: c.title }; });
     this.fill = m === 'w' && defs.every(function (d) { return !!d.w; });
     if (this.fill) defs.push({ h: '' });
-    this.tb = D.table(host, defs, this.cls);
+    if (this.vopts && Desk.vlist) {
+      if (this.V && this.V.host === host) this.tb = this.V.retable(defs, this.cls);
+      else { this.V = Desk.vlist(host, defs, this.cls, this.vopts); this.tb = this.V.tb; }
+    } else this.tb = D.table(host, defs, this.cls);
     return true;
   };
   var FILLER = { t: '', cls: 'fill' };
-  Grid.prototype.draw = function (items, keyFn, rowFn, ctx) {
+  Grid.prototype.draw = function (items, keyFn, rowFn, ctx, opts) {
     var cols = this.cols, n = cols.length + (this.fill ? 1 : 0);
     if (!items.length) { D.emptyRow(this.tb, n); return 0; }
-    return D.keyedRows(this.tb, items, keyFn, function (it) {
+    var cellsFn = function (it) {
       var out = new Array(n);
       for (var i = 0; i < cols.length; i++) out[i] = cols[i].f(it, ctx);
       if (n > cols.length) out[cols.length] = FILLER;
       return out;
-    }, rowFn);
+    };
+    if (this.V) { this.V.draw(items, keyFn, cellsFn, rowFn, opts); return items.length; }
+    return D.keyedRows(this.tb, items, keyFn, cellsFn, rowFn, opts);
   };
   Grid.prototype.ids = function () { return this.cols.map(function (c) { return c.id; }); };
 
@@ -272,6 +278,14 @@
   function blank() { return num(''); }
   function signOf(u, unit) { var r = Math.round(u / unit); return r > 0 ? 'up' : (r < 0 ? 'dn' : ''); }
   function pnlC(u) { return has(u) ? num(F.pnl(u), signOf(u, 100)) : blank(); }
+  // P&L that flashes when it moves (green up, red down), at most once every 1.5 s per cell
+  function pnlF(u) { var c = pnlC(u); if (has(u)) { c.fl = 'd'; c.flg = 1500; } return c; }
+  // FLASH SUBTLE: marks move unrealized P&L on every book tick, so it flashes only with FULL; a
+  // P&L that includes it flashes (SUBTLE) when its realized part moves (a fill, a settlement)
+  function unrlF(u) { var c = pnlF(u); if (c.fl) c.flv = 'full'; return c; }
+  function pnlR(u, real) { var c = pnlF(u); if (c.fl && Desk.ui.flash !== 'full') c.fk = has(real) ? String(Math.round(real / 100)) : ''; return c; }
+  // every cell of a new row (a fill that just arrived) flashes once
+  function nf(c) { c.nf = 'sz'; return c; }
   function moneyC(u, cls) { return has(u) ? num(F.money(u), cls) : blank(); }
   // u per contract as signed cents, coloured by direction, grey under thinN samples
   function centsC(u, n) {
@@ -332,13 +346,13 @@
     { id: 'mo10', h: 'MO10' + C, w: 52, hc: 'n', f: function (r) { return centsC(moOf(r).m10, moOf(r).c10); } },
     { id: 'mo60', h: 'MO60' + C, w: 52, hc: 'n', f: function (r) { return centsC(moOf(r).m60, moOf(r).c60); } },
     { id: 'fees', h: 'Fees', w: 52, hc: 'n', f: function (r) { return moneyC(r.fees, r.fees ? '' : 'dim'); } },
-    { id: 'real', h: 'Real', w: 60, hc: 'n', m: 'dw', f: function (r) { return pnlC(r.real); } },
-    { id: 'unrl', h: 'Unrl', w: 60, hc: 'n', m: 'w', f: function (r) { return pnlC(r.unrl); } },
+    { id: 'real', h: 'Real', w: 60, hc: 'n', m: 'dw', f: function (r) { return pnlF(r.real); } },
+    { id: 'unrl', h: 'Unrl', w: 60, hc: 'n', m: 'w', f: function (r) { return unrlF(r.unrl); } },
     // trading P&L (real + unrl) with LIP in its own column, so a reward cannot hide losing fills;
     // Day = P&L + LIP (what the header's DAY S adds up)
-    { id: 'pnl', h: 'P&L', w: 60, hc: 'n', f: function (r) { return pnlC(r.pnl); } },
+    { id: 'pnl', h: 'P&L', w: 60, hc: 'n', f: function (r) { return pnlR(r.pnl, r.real); } },
     { id: 'lip', h: 'LIP', w: 52, hc: 'n', f: function (r) { return r.lip ? num(F.money(r.lip), signOf(r.lip, 100)) : blank(); } },
-    { id: 'day', h: 'Day', w: 60, hc: 'n', m: 'dw', f: function (r) { return pnlC(r.day); } },
+    { id: 'day', h: 'Day', w: 60, hc: 'n', m: 'dw', f: function (r) { return pnlR(r.day, has(r.real) ? r.real + (r.lip || 0) : null); } },
     { id: 'last', h: 'Last', w: 74, hc: 'n', m: 'dw', title: 'time of the lane\'s last signal', f: function (r) { return num(F.time(r.last_ms), 'dim'); } },
     { id: 'why', h: 'Reason', ww: 360, f: function (r) { return txt(r.why, 'dim', r.why || null); } },
     // the lane KILL: grey, red while the lane has live orders (and under the pointer)
@@ -428,14 +442,19 @@
     { id: 'ttl', h: 'TTL', w: 40, hc: 'n', f: function (o, c) {
       if (o.terminal) return blank();
       if (o.tif !== 'POST') return num(o.tif, 'dim');
-      return num(o.exp_ms ? F.secs(o.exp_ms - c.srv) : '');
+      if (!o.exp_ms) return blank();
+      var left = o.exp_ms - c.srv;
+      return num(left < 100000 ? F.secs(left) : F.left(left));      // a long expiry (until close) in minutes / hours
     } },
     { id: 'edge', h: 'Edge' + C, w: 50, hc: 'n', m: 'dw', title: 'edge vs model fair at send, cents per contract', f: function (o) { return centsC(o.edge); } },
     { id: 'touch', h: 'Touch', w: 52, hc: 'n', m: 'w', f: function (o) { return num(pxOf(o.touch, o.key), 'dim'); } },
     { id: 'ack', h: 'Ack', w: 44, hc: 'n', m: 'w', f: function (o) { return num(o.t.ack && o.t.sent ? String(Math.max(0, o.t.ack - o.t.sent)) : '', 'dim'); } },
     { id: 'st', h: 'St', w: 80, f: function (o) {
       var t = stText(o);
-      return { t: t, cls: 't st st-' + o.st + (o.terminal && o.why ? ' why' : ''), title: o.terminal && t !== o.st ? t : null };
+      // FLASH SUBTLE: a lane order flashes when it fills or is rejected; every requote's
+      // sent / working / cancelled only with FULL (busy lanes would twinkle all the time)
+      var fk = Desk.ui.flash === 'full' ? o.st + '|' + o.filled : (o.filled ? 'F' + o.filled : '') + (o.st === 'REJ' ? 'R' : '');
+      return { t: t, cls: 't st st-' + o.st + (o.terminal && o.why ? ' why' : ''), title: o.terminal && t !== o.st ? t : null, fl: 's', fk: fk };
     } },
     { id: 'x', h: '', w: 24, f: function (o) {
       if (o.terminal) return { t: '', cls: '', attr: NOLINK_X };
@@ -466,15 +485,17 @@
   // ---------------------------------------------------------------------------------------------
   // FILLS (systematic)
   // ---------------------------------------------------------------------------------------------
+  // a fill that arrived on the stream in the last 3 s (never one drawn at load or after a filter change)
+  function freshFill(f) { return !!f.at && Date.now() - f.at < 3000; }
   function fillEdge(f) { return !has(f.fair) || !(f.qty > 0) ? null : (f.fair - f.px) * sgn(f.side) - (f.fee || 0) / f.qty; }
   var FILL_COLS = [
-    { id: 'time', h: 'Time', w: 88, f: function (f) { return num(F.timeT(f.ts_ms)); } },
-    { id: 'lane', h: 'Lane', w: 56, f: function (f) { return txt(f.lane || ''); } },
+    { id: 'time', h: 'Time', w: 88, f: function (f) { return nf(num(F.timeT(f.ts_ms))); } },
+    { id: 'lane', h: 'Lane', w: 56, f: function (f) { return nf(txt(f.lane || '')); } },
     { id: 'v', h: 'V', w: 24, m: 'w', f: function (f) { return txt(f.v, 'dim'); } },
-    { id: 'mkt', h: 'Market', ww: 280, f: function (f) { return txt(mname(f.key, f.tk), '', f.tk); } },
-    { id: 'side', h: 'Side', w: 48, f: function (f) { return txt(f.side, 'side-' + f.side); } },
-    { id: 'px', h: 'Px', w: 52, hc: 'n', f: function (f) { return num(pxOf(f.px, f.key)); } },
-    { id: 'qty', h: 'Qty', w: 48, hc: 'n', f: function (f) { return num(F.size(f.qty)); } },
+    { id: 'mkt', h: 'Market', ww: 280, f: function (f) { return nf(txt(mname(f.key, f.tk), '', f.tk)); } },
+    { id: 'side', h: 'Side', w: 48, f: function (f) { return nf(txt(f.side, 'side-' + f.side)); } },
+    { id: 'px', h: 'Px', w: 52, hc: 'n', f: function (f) { return nf(num(pxOf(f.px, f.key))); } },
+    { id: 'qty', h: 'Qty', w: 48, hc: 'n', f: function (f) { return nf(num(F.size(f.qty))); } },
     { id: 'liq', h: 'Liq', w: 32, m: 'dw', f: function (f) { return txt(f.liq, 'dim'); } },
     { id: 'fee', h: 'Fee', w: 48, hc: 'n', m: 'dw', f: function (f) { return moneyC(f.fee, f.fee ? '' : 'dim'); } },
     { id: 'fair', h: 'Fair', w: 52, hc: 'n', m: 'dw', f: function (f) { return num(pxOf(f.fair, f.key), 'fair'); } },
@@ -495,7 +516,7 @@
     }
     g.draw(items, function (f) { return f.fid; }, function (f) {
       return { cls: focusCls('s-fills', f.fid, f.key), attr: { 'data-mkt': f.key, 'data-v': f.v } };
-    });
+    }, null, { isNew: freshFill });
     var a = filter ? (agg.lanes.get(filter) || EMPTY) : agg.all;
     D.setText(ui.fillsInfo, a.n ? 'n ' + a.n + ' ctr ' + F.size(Math.round(a.ctr * 100) / 100) : '');
     filterTag(ui.fillsTag);
@@ -521,7 +542,7 @@
     { id: 'pos', h: 'Pos', w: 54, hc: 'n', f: function (r) { if (r.kind !== 'mem') return blank(); var c = q(r, num(r.p ? F.pos6(r.p.pos) : '')); if (r.p && !r.unknown) c.title = F.ssize(r.p.pos); return c; } },
     { id: 'avg', h: 'Avg', w: 50, hc: 'n', m: 'dw', f: function (r) { return r.kind !== 'mem' ? blank() : q(r, num(r.p ? pxOf(r.p.avg, r.mkey) : '')); } },
     { id: 'mark', h: 'Mark', w: 50, hc: 'n', m: 'dw', f: function (r) { return r.kind !== 'mem' ? blank() : q(r, num(r.p ? pxOf(r.p.mark, r.mkey) : '')); } },
-    { id: 'unrl', h: 'Unrl', w: 56, hc: 'n', f: function (r) { return q(r, pnlC(r.unrl)); } },
+    { id: 'unrl', h: 'Unrl', w: 56, hc: 'n', f: function (r) { return q(r, unrlF(r.unrl)); } },
     { id: 'ify', h: 'IfYES', w: 56, hc: 'n', f: function (r) { return r.kind !== 'mem' ? blank() : q(r, pnlC(r.p ? r.p.if_yes : null)); } },
     { id: 'ifn', h: 'IfNO', w: 56, hc: 'n', f: function (r) { return r.kind !== 'mem' ? blank() : q(r, pnlC(r.p ? r.p.if_no : null)); } },
     { id: 'maxl', h: 'MaxL', w: 56, hc: 'n', f: function (r) { return q(r, moneyC(r.maxl, r.maxl ? '' : 'dim')); } },
@@ -818,6 +839,14 @@
     var key = laneMarket(lid);
     if (key && Desk.focus) Desk.focus.set(key, { other: !!(ev && ev.shiftKey), from: panel });
   }
+  var FAST = { stop: 1, lkill: 1, cxl: 1, cxlall: 1, fclear: 1 };
+  function fastCtl(ev) {
+    var t = ev.target;
+    if (!t || !t.closest) return null;
+    var a = t.closest('[data-act]');
+    if (a) return FAST[a.getAttribute('data-act')] && !a.disabled && !(a.classList && a.classList.contains('dis')) ? a : null;
+    return t.closest('[data-lane]');
+  }
   function onClick(ev) {
     var t = ev.target;
     if (!t || !t.closest) return;
@@ -904,11 +933,13 @@
     buildTools();
     grids.lanes = new Grid('s-lanes-body', 'lanes', LANE_COLS);
     grids.work = new Grid('s-work-body', 'work', WORK_COLS);
-    grids.fills = new Grid('s-fills-body', 'fills', FILL_COLS);
+    grids.fills = new Grid('s-fills-body', 'fills', FILL_COLS, { rowH: D.rowPx, headH: 20, onScroll: function () { R.mark('sysfills'); } });
     grids.risk = new Grid('s-risk-body', 'risk', RISK_COLS);
     grids.mo = new Grid('s-mo-body', 'mo', MO_COLS);
+    // safe controls act on pointerdown (STOP, a lane KILL, cancels, the lane filter); START and the
+    // lane toggle (it can switch a lane on) keep the click; every control shows pressed at once
     var rootEl = $('tab-systematic');
-    if (rootEl) rootEl.addEventListener('click', onClick);
+    if (rootEl) D.onPress(rootEl, onClick, fastCtl);
     bindKeys();
   }
 
@@ -927,7 +958,7 @@
     if (lay || d.has('lane') || fills || sys || d.has('hdr') || d.has('ord')) renderLanes();
     if (lay || d.has('mkt')) renderHeld();
     if (lay || d.has('ord') || clock || d.has('mkt') || focus || sys) renderWorking(now);
-    if (lay || fills || d.has('mkt') || focus || sys) renderFills();
+    if (lay || fills || d.has('mkt') || focus || sys || d.has('sysfills')) renderFills();
     if (lay || d.has('risk') || d.has('pos') || d.has('hdr') || d.has('ord') || d.has('mkt') || focus) { renderRisk(); cashLine(); }
     if (sumDirty) riskSummary(equity());
     if (lay || fills || sys || focus || d.has('lane') || d.has('mkt')) renderMo();

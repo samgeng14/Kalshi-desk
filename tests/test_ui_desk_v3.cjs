@@ -218,7 +218,7 @@ const flushMicro = () => new Promise(r => setImmediate(r));
   const st = D.store, EX = C.examples, T0 = 1791306000000;
   const KEY = 'K|KXNATGAS15M-26OCT061930-30';
   const baseSnap = () => ({
-    epoch: EX.hb.epoch, sid: EX.hb.sid, seq: 100, srv_ms: T0, hdr: EX.hdr, markets: [EX.mkt], books: [EX.book],
+    epoch: EX.hb.epoch, sid: EX.hb.sid, seq: 100, srv_ms: T0, date: EX.hb.date, hdr: EX.hdr, markets: [EX.mkt], books: [EX.book],
     orders: [], fills: [], mos: [], pos: [], lanes: [], risk: { groups: [], shards: [] }, alerts: [], feeds: EX.hb.feeds,
     subs: { ladders: [], tops: 'ALL' }
   });
@@ -609,6 +609,33 @@ const flushMicro = () => new Promise(r => setImmediate(r));
     check(r.s === 400 && r.j.err.code === 'BAD_REQUEST', 'an expiry under 5 s ahead is a bad request');
     r = order(ng, 'BUY', 6000, 1, 'IOC', null, { exp_ms: e1 + 60000 });
     check(r.s === 400 && r.j.err.code === 'BAD_REQUEST', 'an IOC carries no expiry');
+    // until close: exp_ms = the market's close, however far (a T+1 weather market closes > 24 h out)
+    const far = sim.markets().filter(x => x.kind === 'WEATHER' && x.status === 'OPEN').sort((a, b) => b.close_ms - a.close_ms)[0];
+    sim.freeze(far.key, { bids: [[2000, 30]], asks: [[2600, 30]] });
+    const fc = Math.floor(far.close_ms / 1000) * 1000;
+    check(fc - t > 86400000, 'the demo lists a market closing more than 24 h ahead', (fc - t) / 3600e3);
+    r = order(far, 'BUY', 2100, 1, 'POST', null, { ttl_s: null, exp_ms: fc });
+    check(r.s === 200 && r.j.ord.st === 'WORK' && r.j.ord.exp_ms === fc, 'a post until the close rests with the close as its venue expiry', r.j);
+    D.contract.validateResponse('POST /api/order', r.s, r.j).forEach(e => check(false, 'until-close reply: ' + e));
+    r = order(far, 'BUY', 2100, 1, 'POST', null, { ttl_s: null, exp_ms: fc + 1000 });
+    check(r.s === 400 && r.j.err.code === 'BAD_REQUEST' && /close/.test(r.j.err.msg), 'an expiry past the market\'s close is a bad request', r.j);
+    {
+      // on a sim of its own (its clock runs to a 15-minute close)
+      let tc = t;
+      const simC = D.sim.create({ now: () => tc, emit: () => {}, seed: 21, sid: 'closes01' });
+      const runC = ms => { const end = tc + ms; while (tc < end) { tc = Math.min(end, Math.max(tc + 1, Math.min(simC.nextDue(), tc + 100))); simC.pump(); } };
+      runC(500);
+      const lk = simC.markets().find(x => x.kind === 'LIP15' && x.status === 'OPEN' && x.close_ms - tc > 20000);
+      simC.freeze(lk.key, { bids: [[5000, 40]], asks: [[5200, 40]] });
+      const lc = Math.floor(lk.close_ms / 1000) * 1000;
+      let rc = null;
+      simC.request('POST', '/api/order', { cid: 'Mclose0001', v: 'K', tk: lk.tk, side: 'BUY', px: '0.4800', qty: 1, tif: 'POST', ttl_s: null, exp_ms: lc, override: false, touch: null, t_click_ms: null },
+        (st2, j2) => { rc = { s: st2, j: j2 }; }, { 'X-Desk': simC.token });
+      runC(300);
+      check(rc && rc.s === 200 && rc.j.ord.st === 'WORK', 'a 15-minute window takes an until-close post', rc && rc.j);
+      runC(lk.close_ms - tc + 500);
+      check(simC.order('Mclose0001').st === 'EXP' && simC.order('Mclose0001').why === 'EXPIRY', 'it ends EXP at the close', { st: simC.order('Mclose0001').st, why: simC.order('Mclose0001').why });
+    }
     const game = sim.markets().find(x => x.kind === 'GAME');
     check(sim.markets().every(x => x.kind === 'GAME' ? x.game && typeof x.game.start === 'number' : true), 'games carry their start');
     const gev = evs.filter(e => e.type === 'mkt').map(e => e.data).concat(sim.snapshot().markets).find(x => x.tk === game.tk);
@@ -882,6 +909,153 @@ const flushMicro = () => new Promise(r => setImmediate(r));
     eq(await mk('http:', '?demo=1', ''), 'demo', '?demo=1 with no token is demo');
     eq(await mk('http:', '', ''), 'live', 'http with no token and no ?demo=1 is live (a backend that is down shows SRV DOWN, never the simulation)');
     eq(await mk('http:', '?demo=1', 'tok-X'), 'live', 'a page the backend served (a token) is live even with ?demo=1');
+  }
+
+  if (process.env.V) console.log('section 11');
+  // ---- 11. THE UNIVERSE: everything settling today and tomorrow, paged, never streamed ---------
+  {
+    let tu = Date.UTC(2026, 9, 6, 17, 30, 0);          // 13:30 ET
+    const ue = [];
+    const su = D.sim.create({ now: () => tu, emit: e => ue.push(e), seed: 7, sid: 'universe' });
+    const runU = ms => { const end = tu + ms; while (tu < end) { tu = Math.min(end, Math.max(tu + 1, Math.min(su.nextDue(), tu + 100))); su.pump(); } };
+    const H = { 'X-Desk': su.token };
+    const get = q => { let o = null; su.request('GET', '/api/universe?' + q, undefined, (st2, j) => { o = { s: st2, j }; }, H); runU(30); return o; };
+    const post = (p2, b) => { let o = null; su.request('POST', p2, b, (st2, j) => { o = { s: st2, j }; }, H); runU(60); return o; };
+    runU(1000);
+    const listed = su.universe().length + su.markets().length;
+    check(listed > 2500 && listed < 8000, 'the demo lists a few thousand markets for today and tomorrow', listed);
+    const live0 = su.markets().length;
+    check(live0 < 80, 'of which only the desk\'s own are live (mkt events, books)', live0);
+    const rT = get('day=T&limit=200'), rT1 = get('day=T1&limit=200');
+    for (const r of [rT, rT1]) D.contract.validateResponse('GET /api/universe', r.s, r.j).forEach(e => check(false, 'universe reply: ' + e));
+    check(rT.s === 200 && rT.j.total > 1000 && rT1.j.total > 800, 'T and T+1 each list well over a thousand markets', [rT.j.total, rT1.j.total]);
+    check(rT.j.date === '2026-10-06' && rT1.j.date === '2026-10-07', 'T is today\'s ET date, T+1 tomorrow\'s', [rT.j.date, rT1.j.date]);
+    check(C.enums.CAT.every(c => rT.j.cats[c] > 0), 'every category has markets today', rT.j.cats);
+    eq(rT.j.groups.reduce((t, g) => t + g.n, 0), rT.j.total, 'the groups add up to the total');
+    eq(rT.j.groups.map(g => g.cat).join(','), rT.j.groups.map(g => g.cat).slice().sort((a, b) => C.enums.CAT.indexOf(a) - C.enums.CAT.indexOf(b)).join(','), 'groups come category by category (SPORTS WEATHER FIN ECON OTHER)');
+    const leagues = new Set(rT.j.groups.filter(g => g.cat === 'SPORTS').map(g => g.gk.split(' ')[0]));
+    check(['MLB', 'NHL', 'NBA', 'NCAAF', 'UCL'].every(l => leagues.has(l)), 'sports group by league and game', [...leagues]);
+    check(rT1.j.groups.some(g => /^ATP /.test(g.gk)) && !leagues.has('ATP'), 'Shanghai\'s tennis plays overnight ET: today\'s matches are closed at 13:30, tomorrow\'s are listed');
+    check(rT.j.groups.some(g => g.gk === '15M') && rT.j.groups.some(g => / 1H /.test(g.gk)), 'FIN lists the 15-minute windows and the hourly events', rT.j.groups.filter(g => g.cat === 'FIN').map(g => g.gk).slice(0, 6));
+    check(rT.j.groups.some(g => /^GAS /.test(g.gk)) && rT.j.groups.some(g => /^RATES /.test(g.gk)), 'ECON lists daily gas and rates');
+    // Polymarket US: mainly sports and weather
+    const pm = get('day=T&v=P&limit=200');
+    check(pm.j.total > 50 && pm.j.cats.SPORTS + pm.j.cats.WEATHER === pm.j.total, 'Polymarket US lists sports and weather', pm.j.cats);
+    // paging: the second page continues the first, in the same order
+    const p0 = get('day=T&sort=vol&offset=0&limit=50'), p1 = get('day=T&sort=vol&offset=50&limit=50'), pAll = get('day=T&sort=vol&offset=0&limit=100');
+    eq(p0.j.rows.concat(p1.j.rows).map(r => r.tk).join(), pAll.j.rows.map(r => r.tk).join(), 'pages line up: offset 50 continues offset 0');
+    // sorts
+    const inGroups = (rows, f) => { let ok = true; for (let i = 1; i < rows.length; i++) if (rows[i].gk === rows[i - 1].gk && !f(rows[i - 1], rows[i])) ok = false; return ok; };
+    check(inGroups(pAll.j.rows, (a, b) => a.vol >= b.vol), 'sort=vol: inside a group the busiest first');
+    const cl = get('day=T&sort=close&limit=200');
+    check(inGroups(cl.j.rows, (a, b) => a.close_ms <= b.close_ms), 'sort=close: inside a group the soonest first');
+    const sp = get('day=T&cat=WEATHER&sort=sprd&limit=200'), spv = r => (r.sprd === null ? Infinity : +r.sprd);
+    check(inGroups(sp.j.rows, (a, b) => spv(a) <= spv(b)), 'sort=sprd: tightest first, a one-sided book last');
+    const ed = get('day=T&cat=WEATHER&sort=edge&limit=200'), edv = r => (r.edge === null ? -Infinity : +r.edge);
+    check(ed.j.rows.some(r => r.edge !== null) && inGroups(ed.j.rows, (a, b) => edv(a) >= edv(b)), 'sort=edge: the best take after the fee first (rows with a model fair)');
+    // filters
+    const wx = get('day=T&cat=WEATHER&limit=200');
+    check(wx.j.rows.every(r => r.cat === 'WEATHER') && wx.j.total === rT.j.cats.WEATHER, 'cat filters, and the cats counts say how many it will find');
+    const qd = get('day=T&q=den&limit=200');
+    check(qd.j.total > 0 && qd.j.rows.every(r => (r.tk + r.title + r.short + r.gk).toLowerCase().indexOf('den') >= 0), 'q searches tickers, titles and groups');
+    for (const bad of ['day=X', 'day=T&limit=500', 'day=T&sort=price', 'day=T&cat=CRYPTO', 'cat=FIN']) {
+      const b = get(bad);
+      check(b.s === 400 && b.j.err.code === 'BAD_REQUEST', 'a query outside the contract is refused: ' + bad, b.j);
+    }
+    // pin a listing row: it joins the live set (mkt with pin true, then its book)
+    const row = wx.j.rows.find(r => !r.live && r.v === 'K');
+    const n0 = ue.length;
+    const w = post('/api/watch', { v: row.v, tk: row.tk, on: true });
+    check(w.s === 200 && w.j.ok && w.j.pin === true, 'POST /api/watch pins it', w.j);
+    D.contract.validateResponse('POST /api/watch', w.s, w.j).forEach(e => check(false, 'watch reply: ' + e));
+    const mk = ue.slice(n0).filter(e => e.type === 'mkt' && e.data.tk === row.tk);
+    check(mk.length === 1 && mk[0].data.pin === true && mk[0].data.cat === 'WEATHER' && mk[0].data.date === '2026-10-06', 'a mkt event lists it, pinned, with its category and date', mk.map(e => e.data));
+    runU(500);
+    check(ue.slice(n0).some(e => e.type === 'book' && e.data.tk === row.tk), 'and its book streams (TOP: every live market\'s top)');
+    check(get('day=T&q=' + row.tk).j.rows[0].live && get('day=T&q=' + row.tk).j.rows[0].pin, 'the listing now says live and pinned');
+    const uw = post('/api/watch', { v: row.v, tk: row.tk, on: false });
+    check(uw.j.pin === false && su.market(row.v + '|' + row.tk).pin === false && ue.filter(e => e.type === 'mkt' && e.data.tk === row.tk).pop().data.pin === false, 'unpinning sends mkt.pin false');
+    const unk = post('/api/watch', { v: 'K', tk: 'KXNOSUCH-1', on: true });
+    check(unk.s === 404 && unk.j.err.code === 'UNKNOWN_MARKET', 'pinning an unknown market is refused', unk.j);
+    // a ladder on a listing row brings it live without pinning it
+    const lr = get('day=T1&cat=SPORTS&limit=50').j.rows.find(r => !r.live && r.v === 'K');
+    const sub = post('/api/subscribe', { sid: 'universe', ladders: [{ v: lr.v, tk: lr.tk }], tops: 'ALL' });
+    runU(300);
+    check(sub.j.ok && su.market(lr.v + '|' + lr.tk) && su.market(lr.v + '|' + lr.tk).pin === false && ue.some(e => e.type === 'book' && e.data.tk === lr.tk && e.data.depth === 'FULL'),
+      'a ladder subscription on a listing row brings it live at full depth, unpinned', sub.j);
+    // hb and the snapshot carry today's ET date; every event and the snapshot stay in contract
+    check(ue.filter(e => e.type === 'hb').every(e => e.data.date === '2026-10-06'), 'hb.date is today (ET)');
+    eq(su.snapshot().date, '2026-10-06', 'snapshot.date too');
+    eq(ue.filter(e => D.contract.validateEvent(e).length).length, 0, 'every event stays in contract');
+    // only live markets stream: book events name live markets only
+    const booked = new Set(ue.filter(e => e.type === 'book').map(e => e.data.v + '|' + e.data.tk));
+    check([...booked].every(k => su.market(k)), 'no listing row streams a book (only the live set does)');
+    // an exclusive event settles one way: two brackets of one weather event, pinned, to the close
+    const ev = wx.j.rows.find(r => !r.live && /^KXHIGH/.test(r.tk) && wx.j.rows.filter(x => x.tk.split('-').slice(0, 2).join('-') === r.tk.split('-').slice(0, 2).join('-') && !x.live).length >= 3);
+    const evk = ev.tk.split('-').slice(0, 2).join('-'), sibs = wx.j.rows.filter(x => x.tk.indexOf(evk + '-') === 0 && !x.live);
+    sibs.forEach(r => post('/api/watch', { v: r.v, tk: r.tk, on: true }));
+    runU(sibs[0].close_ms - tu + 2000);
+    const res = sibs.map(r => su.market('K|' + r.tk)).map(m => m.status + ':' + m.result);
+    check(res.every(x => /^SETTLED:/.test(x)) && res.filter(x => /YES$/.test(x)).length <= 1, 'pinned brackets of one event settle at the close, at most one YES', res);
+  }
+
+  if (process.env.V) console.log('section 12');
+  // ---- 12. Systematic trades all the time once started, inside its limits --------------------
+  {
+    let tf = Date.UTC(2026, 9, 6, 18, 7, 0);
+    const per = [], viol = { ceil: 0, budget: 0 };
+    let fills = 0;
+    const sf = D.sim.create({ now: () => tf, seed: 4, sid: 'lively01', emit: e => {
+      if (e.type === 'fill' && e.data.own === 'SYS') fills++;
+      if (e.type === 'hdr') ['K', 'P'].forEach(v => { if (+e.data.sys[v].used > +e.data.sys[v].eff + 0.5) viol.ceil++; });
+      if (e.type === 'lane' && +e.data.used > +e.data.budget + 1) viol.budget++;
+    } });
+    const runF = ms => { const end = tf + ms; while (tf < end) { tf = Math.min(end, Math.max(tf + 1, Math.min(sf.nextDue(), tf + 100))); sf.pump(); } };
+    runF(1000);
+    sf.request('POST', '/api/start', {}, () => {}, { 'X-Desk': sf.token });
+    runF(500);
+    for (let i = 0; i < 4; i++) { fills = 0; runF(5 * 60000); per.push(fills / 5); }
+    check(per.every(x => x >= 5), 'running, the lanes fill several times a minute in every 5-minute stretch (15-minute windows rolling included)', per);
+    eq(sf.state.run.state, 'RUN', 'and Systematic is still running after 20 minutes');
+    eq(viol.ceil, 0, 'Systematic never passes its 70% ceiling');
+    eq(viol.budget, 0, 'no lane passes its budget (a lane stays out of a market another lane holds)');
+  }
+
+  if (process.env.V) console.log('section 10');
+  // ---- 10. the palette: near-black surfaces, ink that still reads on every one -----------------
+  {
+    const css = fs.readFileSync(path.join(JS, '..', 'desk.css'), 'utf8');
+    const root = /:root\s*\{([\s\S]*?)\n\}/.exec(css)[1];
+    const tok = {};
+    for (const m of root.matchAll(/--([\w-]+):\s*(#[0-9A-Fa-f]{6})/g)) tok[m[1]] = m[2];
+    const lum = hex => {
+      const c = [1, 3, 5].map(i => parseInt(hex.slice(i, i + 2), 16) / 255).map(x => (x <= 0.03928 ? x / 12.92 : Math.pow((x + 0.055) / 1.055, 2.4)));
+      return 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+    };
+    const ratio = (a, b) => { const x = lum(tok[a]), y = lum(tok[b]); return (Math.max(x, y) + 0.05) / (Math.min(x, y) + 0.05); };
+    check(lum(tok.bg0) < 0.001, 'the gutters, header and status bar are near-black (#000)', tok.bg0);
+    check(lum(tok.bg1) < 0.004 && lum(tok.bg1) > lum(tok.bg0), 'panels sit one step above the black', tok.bg1);
+    check(lum(tok.bg0) < lum(tok.bg1) && lum(tok.bg1) < lum(tok.bg2) && lum(tok.bg2) < lum(tok.bg3), 'surfaces step up bg0 < bg1 < bg2 < bg3');
+    check(ratio('line', 'bg1') >= 1.25 && ratio('line', 'bg0') >= 1.3, 'hairlines still separate panels on black', [ratio('line', 'bg1').toFixed(2), ratio('line', 'bg0').toFixed(2)]);
+    check(/\.tabroot \{[^}]*background: var\(--line\)/.test(css), 'the 1 px gaps between panels are drawn in the hairline colour');
+    const bad = [];
+    ['tx0', 'tx1', 'tx2'].forEach(t => ['bg0', 'bg1', 'bg2', 'bg3', 'sel'].forEach(b => { if (ratio(t, b) < 4.5) bad.push(t + '/' + b + ' ' + ratio(t, b).toFixed(2)); }));
+    ['bid-tx', 'ask-tx', 'up', 'dn', 'warn', 'fair', 'espn'].forEach(t => ['bg0', 'bg1', 'bg2'].forEach(b => { if (ratio(t, b) < 4.5) bad.push(t + '/' + b + ' ' + ratio(t, b).toFixed(2)); }));
+    eq(bad.join(', '), '', 'every ink keeps at least 4.5:1 on every surface it sits on');
+  }
+
+  // ---- 11. 2026-10-06 browser pass: layout containment, the browser overlay, pressable controls ---
+  {
+    const css = fs.readFileSync(path.join(JS, '..', 'desk.css'), 'utf8'), mcss = fs.readFileSync(path.join(JS, '..', 'manual.css'), 'utf8');
+    const html = fs.readFileSync(path.join(JS, '..', 'index.html'), 'utf8');
+    check(/#tabs \.panel > \.pbody \{ contain: strict; \}/.test(css), 'a panel body in the tabs is strictly contained: a change inside it never lays out the rest of the screen');
+    const wide = /@media \(min-width: 1920px\) \{\s*body:not\(\[data-split="1"\]\) #m-browse \{([^}]*)\}/.exec(mcss);
+    check(!!wide && /grid-column: 1 \/ 4/.test(wide[1]) && /width: auto/.test(wide[1]), 'WIDE: the market browser covers the grid\'s watchlist and ladders A and B, not a computed width that ends inside ladder B', wide && wide[1]);
+    check(/<button class="sbc dim" id="sb-hk" type="button">/.test(html), 'the status bar\'s HOTKEYS cell is a button (it shows pressed like every control)');
+    const FD = makeCtx().Desk;
+    eq(FD.dom.rowPx(), 18, 'a grid row is 18 px when the page cannot read its style (the compact default)');
+    FD.dom.rowPxReset();
+    eq(FD.dom.rowPx(), 18, 'and again after a density or height change resets it');
   }
 
   console.log(fails ? `${fails} of ${checks} checks FAILED` : `ui desk v3: ${checks} checks, 0 failures`);

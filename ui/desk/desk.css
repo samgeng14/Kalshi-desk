@@ -3,24 +3,28 @@
  * The desk's visual system. Rules: no rounded corners, no drop shadows, no gradients as
  * decoration, no emoji; colour only for meaning (bid/buy blue, ask/sell red, up/down, attention
  * amber, failure red, model fair purple); everything else grey. Panels tile edge to edge with
- * 1 px gaps; the page never scrolls, panels scroll inside. The only motion is a 300 ms flash.
+ * 1 px gaps; the page never scrolls, panels scroll inside. The only motion is a short value flash
+ * (FLASH: OFF / SUBTLE 500 ms fade, the default / FULL 300 ms; core.js).
  * Inset box-shadows below draw 1-2 px rules (selected row bar, touch outline, active tab), not
  * shadows. Tab-specific rules live in manual.css and systematic.css.
  */
 
 /* ------------------------------------------------------------------------------------------
-   Tokens (hex values from the UI spec; contrast checked there on #111418)
+   Tokens. Surfaces are near-black (2026-10-06: the operator asked for a deeper black): the
+   gutters, header and status bar are #000, panels sit one step up so the 1 px hairlines and the
+   lifted greys still separate them. Ink contrast is checked against every surface by the node
+   test (tests/test_ui_desk_v3.cjs): tx0/tx1/tx2 >= 4.5:1 on bg0..bg2, tx2 >= 4.5:1 on bg3.
    ------------------------------------------------------------------------------------------ */
 :root {
   /* surfaces */
-  --bg0: #0B0D10;   /* gutters, header, status bar */
-  --bg1: #111418;   /* panels */
-  --bg2: #171B21;   /* title bars, table headers, inputs */
-  --bg3: #1E232B;   /* hover, active tab, pending cell */
-  --sel: #1A2433;   /* selected row (the one clicked: with a 2 px bar) */
-  --fmk: #151C26;   /* the focused market's other rows: a tint, no bar */
-  --line: #242A33;  /* hairlines */
-  --line2: #323A45; /* panel edges, scrollbars */
+  --bg0: #000000;   /* gutters, header, status bar */
+  --bg1: #08090B;   /* panels */
+  --bg2: #101216;   /* title bars, table headers, inputs */
+  --bg3: #1B1F26;   /* hover, active tab, pending cell, pressed */
+  --sel: #15202F;   /* selected row (the one clicked: with a 2 px bar) */
+  --fmk: #0E1520;   /* the focused market's other rows: a tint, no bar */
+  --line: #212730;  /* hairlines */
+  --line2: #2C333D; /* panel edges, scrollbars */
   /* ink */
   --tx0: #E6E8EB;   /* numbers */
   --tx1: #A2A9B4;   /* labels */
@@ -38,7 +42,7 @@
   --ok: #1A7F37;    /* START available */
   --fair: #C792EA;  /* model fair */
   --espn: #9AA4B2;  /* ESPN */
-  --be: #1C1F2B;    /* break-even band */
+  --be: #171A26;    /* break-even band */
   /* flashes */
   --fl-up: rgba(63,185,80,.22); --fl-dn: rgba(248,81,73,.22); --fl-sz: rgba(230,232,235,.10); --fl-warn: rgba(227,160,8,.35);
   /* type */
@@ -85,6 +89,13 @@ button.stop { background: var(--bg3); }
 button.killb { background: var(--crit); border-color: var(--crit); color: #fff; font-weight: 700; }
 button.confirm { background: var(--warn); border-color: var(--warn); color: #000; font-weight: 700; }
 button.buy:disabled, button.sell:disabled, button.go:disabled { background: var(--bg3); border-color: var(--line2); color: var(--tx2); }
+/* pressed (core.js Desk.press): drawn from pointerdown, before any handler or network reply, the
+   same 1 px white inset on every control (buttons, ladder cells, grid cells, linked rows) so a
+   press always reads whatever the control's own colour */
+.prs { box-shadow: inset 0 0 0 1px var(--tx0) !important; }
+button.prs { background: var(--bg3); }
+button.buy.prs, button.sell.prs, button.go.prs, button.confirm.prs, #kill.prs { filter: brightness(1.3); }
+table.grid tr.prs > td { background: var(--bg3); }
 input, select {
   height: var(--input-h); padding: 0 4px; border: 1px solid var(--line2); border-radius: 0;
   background: var(--bg2); color: var(--tx0); font: 12px/1 var(--font-num); font-variant-numeric: tabular-nums;
@@ -119,15 +130,21 @@ input:focus { outline: 1px solid var(--tx0); outline-offset: -1px; }
 .tag.crit { background: var(--crit); color: #fff; } .tag.ok { color: var(--up); }
 .tag.ro { display: none; } .tag.ro.on { display: inline-block; }
 
-/* value flash fallback (the renderer uses the Web Animations API when it can) */
-/* drawn as an inset shadow so a tinted cell (bid/ask, depth bar) keeps its colour under the flash */
+/* value flash fallback (the renderer uses the Web Animations API when it can; core.js flash()).
+   Drawn as an inset shadow so a tinted cell (bid/ask, depth bar) keeps its colour under the flash.
+   Two identical classes per kind restart the animation without a reflow. FLASH SUBTLE (the
+   default) fades over 500 ms, FULL over 300 ms, OFF never flashes. */
 @keyframes fl-up { from { box-shadow: inset 0 0 0 64px var(--fl-up); } to { box-shadow: inset 0 0 0 64px transparent; } }
 @keyframes fl-dn { from { box-shadow: inset 0 0 0 64px var(--fl-dn); } to { box-shadow: inset 0 0 0 64px transparent; } }
 @keyframes fl-sz { from { box-shadow: inset 0 0 0 64px var(--fl-sz); } to { box-shadow: inset 0 0 0 64px transparent; } }
 @keyframes fl-warn { from { box-shadow: inset 0 0 0 64px var(--fl-warn); } to { box-shadow: inset 0 0 0 64px transparent; } }
-.fl-up { animation: fl-up .3s linear; } .fl-dn { animation: fl-dn .3s linear; }
-.fl-sz { animation: fl-sz .3s linear; } .fl-warn { animation: fl-warn .6s linear; }
-@media (prefers-reduced-motion: reduce) { .fl-up, .fl-dn, .fl-sz, .fl-warn { animation: none; } }
+.fl-up, .fl-up2 { animation: fl-up .5s ease-out; } .fl-dn, .fl-dn2 { animation: fl-dn .5s ease-out; }
+.fl-sz, .fl-sz2 { animation: fl-sz .5s ease-out; } .fl-warn, .fl-warn2 { animation: fl-warn .6s linear; }
+:root[data-flash="full"] .fl-up, :root[data-flash="full"] .fl-up2, :root[data-flash="full"] .fl-dn, :root[data-flash="full"] .fl-dn2,
+:root[data-flash="full"] .fl-sz, :root[data-flash="full"] .fl-sz2 { animation-duration: .3s; animation-timing-function: linear; }
+:root[data-flash="off"] .fl-up, :root[data-flash="off"] .fl-up2, :root[data-flash="off"] .fl-dn, :root[data-flash="off"] .fl-dn2,
+:root[data-flash="off"] .fl-sz, :root[data-flash="off"] .fl-sz2, :root[data-flash="off"] .fl-warn, :root[data-flash="off"] .fl-warn2 { animation: none; }
+@media (prefers-reduced-motion: reduce) { .fl-up, .fl-up2, .fl-dn, .fl-dn2, .fl-sz, .fl-sz2, .fl-warn, .fl-warn2 { animation: none; } }
 
 /* ------------------------------------------------------------------------------------------
    Header (28 px)
@@ -168,6 +185,12 @@ body:not([data-split])[data-tab="systematic"] #tab-sys, body:not([data-split])[d
   #h-kal-free, #h-pm-free, #h-day-split { display: none; }      /* on the cells' titles instead */
 }
 #hc-mode { flex: 0 0 48px; justify-content: center; padding: 0 2px; }
+/* ACT: events not seen yet (fills and exits by default; the alert filters in settings); amber
+   while any; a click shows the tab they happened on */
+button.hc { height: 27px; border: 0; border-left: 1px solid var(--line); background: transparent; color: inherit; cursor: pointer; }
+button.hc:hover { background: var(--bg2); }
+#hc-act { flex: 0 0 auto; min-width: 56px; }
+#hc-act.warn .hv { color: var(--warn); } #hc-act .hv { color: var(--tx2); }
 .hl { font: 10px/1 var(--font-ui); color: var(--tx2); text-transform: uppercase; letter-spacing: .04em; }
 .hv { font: 13px/1 var(--font-num); font-variant-numeric: tabular-nums slashed-zero; color: var(--tx0); }
 .hv.up { color: var(--up); } .hv.dn { color: var(--dn); }
@@ -232,10 +255,18 @@ body.log #logdrawer { display: flex; }
   display: none; border-top: 1px solid var(--line2);
 }
 body.set #setdrawer { display: flex; }
-#setdrawer .set-body { display: grid; grid-template-columns: 420px 480px minmax(0, 1fr); gap: 1px; background: var(--bg0); overflow: hidden; }
+#setdrawer .set-body { display: grid; grid-template-columns: 360px 420px minmax(0, 1fr) 420px; gap: 1px; background: var(--line); overflow: hidden; }
+/* the per-viewer column: FLASH, ALERTS, sound, the PERF check (saved in this browser only) */
+#set-ui { padding: 4px 6px; }
+#set-ui .set-h { height: 20px; display: flex; align-items: center; font: 600 11px/1 var(--font-ui); color: var(--tx1); letter-spacing: .04em; text-transform: uppercase; }
+#set-ui .set-row { height: 24px; display: flex; align-items: center; gap: 2px; white-space: nowrap; }
+#set-ui .set-row .lb { flex: 0 0 64px; font: 10px/1 var(--font-ui); color: var(--tx2); text-transform: uppercase; letter-spacing: .04em; }
+#set-ui .set-row button { height: 20px; padding: 0 6px; font: 11px/1 var(--font-ui); }
+#set-ui .set-row .st { margin-left: 6px; font: 11px/1 var(--font-num); color: var(--tx2); }
+#set-ui .set-row .st.warn { color: var(--warn); } #set-ui .set-row .st.ok { color: var(--up); }
 #setdrawer .set-col { background: var(--bg1); overflow: auto; min-width: 0; }
 table.set td.lbl { color: var(--tx1); }
-#keysheet { position: fixed; left: 0; right: 0; top: var(--hdr-h); bottom: var(--sbar-h); z-index: 30; display: none; background: rgba(11,13,16,.88); }
+#keysheet { position: fixed; left: 0; right: 0; top: var(--hdr-h); bottom: var(--sbar-h); z-index: 30; display: none; background: rgba(0,0,0,.86); }
 body.keys #keysheet { display: flex; align-items: flex-start; justify-content: center; padding-top: 40px; }
 #keysheet .sheet { width: 640px; max-height: 80%; border: 1px solid var(--line2); }
 table.keys td.kk { font-family: var(--font-num); color: var(--tx0); }
@@ -248,22 +279,30 @@ table.keys td.kk { font-family: var(--font-num); color: var(--tx0); }
    tab instead of laying it out from scratch, which took 25-35 ms with 200 fills. A hidden tab
    is not painted, hit-tested or focusable, and its renderers are skipped until it shows. */
 main#tabs { position: relative; min-height: 0; min-width: 0; overflow: hidden; }
-.tabroot { display: grid; visibility: hidden; position: absolute; inset: 0; gap: 1px; background: var(--bg0); min-height: 0; }
+.tabroot { display: grid; visibility: hidden; position: absolute; inset: 0; gap: 1px; background: var(--line); min-height: 0; }   /* the 1 px gaps are the hairlines */
 .tabroot:focus { outline: none; }        /* focusable (-1) so a click in a SPLIT half takes that tab's keys */
 body[data-tab="systematic"] #tab-systematic { visibility: visible; z-index: 1; }
 body[data-tab="manual"] #tab-manual { visibility: visible; z-index: 1; }
+/* Where the engine has it (Safari 18+, Chrome), the hidden tab is content-visibility: hidden
+   instead: its rendering state stays cached, so a switch does not restyle its whole subtree
+   (measured in Chrome at 1512 px with the lanes running: style and layout of a switch 8 ms -> 4 ms).
+   Its contents are not painted, hit-tested or focusable, as with visibility: hidden. */
+@supports (content-visibility: hidden) {
+  .tabroot { visibility: visible; content-visibility: hidden; }
+  body[data-tab="systematic"] #tab-systematic, body[data-tab="manual"] #tab-manual, body[data-split="1"] .tabroot { content-visibility: visible; }
+}
 
 /* SYSTEMATIC: 36 / 164 / lower; lower = 1fr | 607 px (| LOG from 2400 px); left 250 / rest; right 330 / rest */
 #tab-systematic { grid-template-rows: 36px 164px minmax(0, 1fr); grid-template-columns: minmax(0, 1fr); }
 .s-lower { display: grid; grid-template-columns: minmax(0, 1fr) 607px; gap: 1px; min-height: 0; min-width: 0; }
 #s-log { display: none; }
-.s-left { display: grid; grid-template-rows: 250px minmax(0, 1fr); gap: 1px; min-height: 0; min-width: 0; }
+.s-left { display: grid; grid-template-rows: 210px 170px minmax(0, 1fr); gap: 1px; min-height: 0; min-width: 0; }
 .s-right { display: grid; grid-template-rows: 330px minmax(0, 1fr); gap: 1px; min-height: 0; min-width: 0; }
 
 /* MANUAL: 288 | 340 | 340 | 1fr (about 541 px at 1512); right column 176 / 180 / 200 / rest */
 #tab-manual { grid-template-columns: var(--watch-w) var(--lad-w) var(--lad-w) minmax(0, 1fr); grid-template-rows: minmax(0, 1fr); }
 #m-lad-c, #m-lad-d { display: none; }
-.m-right { display: grid; grid-template-rows: 176px 180px 200px minmax(0, 1fr); gap: 1px; min-height: 0; min-width: 0; }
+.m-right { display: grid; grid-template-rows: 176px 160px 140px 150px minmax(0, 1fr); gap: 1px; min-height: 0; min-width: 0; }
 
 /* WIDE (external monitor, >= 1920 px): a third ladder; the right column stops at 600 px and the
    watchlist takes what is left (from 420 px it adds Sprd, Vol and Close) */
@@ -271,9 +310,9 @@ body[data-tab="manual"] #tab-manual { visibility: visible; z-index: 1; }
   :root { --watch-w: 320px; }
   #tab-manual { grid-template-columns: max(var(--watch-w), calc(100% - 3 * var(--lad-w) - 600px - 4px)) var(--lad-w) var(--lad-w) var(--lad-w) minmax(0, 1fr); }
   #m-lad-c { display: flex; }
-  .m-right { grid-template-rows: 176px 220px 260px minmax(0, 1fr); }
+  .m-right { grid-template-rows: 176px 200px 200px 240px minmax(0, 1fr); }
   .s-lower { grid-template-columns: minmax(0, 1fr) 760px; }
-  .s-left { grid-template-rows: 320px minmax(0, 1fr); }
+  .s-left { grid-template-rows: 280px 240px minmax(0, 1fr); }
   .s-right { grid-template-rows: 400px minmax(0, 1fr); }
 }
 /* 2400 px and wider: a fourth ladder (the stream carries at most four at full depth), and
@@ -299,8 +338,8 @@ body[data-split="1"] #m-lad-b, body[data-split="1"] #m-lad-c, body[data-split="1
 body[data-split="1"] .s-lower { grid-template-columns: minmax(0, 1fr) 560px; }
 /* short windows */
 @media (max-height: 759px) {
-  .m-right { grid-template-rows: 176px 150px 160px minmax(0, 1fr); }
-  .s-left { grid-template-rows: 200px minmax(0, 1fr); }
+  .m-right { grid-template-rows: 176px 120px 110px 120px minmax(0, 1fr); }
+  .s-left { grid-template-rows: 170px 140px minmax(0, 1fr); }
   .s-right { grid-template-rows: 280px minmax(0, 1fr); }
 }
 
@@ -317,6 +356,11 @@ body[data-split="1"] .s-lower { grid-template-columns: minmax(0, 1fr) 560px; }
 .ptools { margin-left: auto; display: flex; align-items: center; gap: 4px; min-width: 0; }
 .ptools input { height: 16px; font-size: 11px; }
 .pbody { flex: 1 1 auto; min-height: 0; overflow: auto; position: relative; overscroll-behavior: contain; }
+/* A panel body in the tabs takes its size from the panel, never from its rows: strict containment
+   keeps a change inside it (a fill on top of a tape, a new working order) from laying out the
+   rest of the screen (measured in Chrome with the lanes trading: frames over 8 ms 1 in 9 -> 1 in
+   75; a row added to a 200-row grid 4.6 -> 1.4 ms). */
+#tabs .panel > .pbody { contain: strict; }
 .pfoot {
   flex: 0 0 20px; height: 20px; display: flex; align-items: center; gap: 8px; padding: 0 6px;
   border-top: 1px solid var(--line); background: var(--bg2); font: 11px/1 var(--font-num); color: var(--tx1); white-space: nowrap; overflow: hidden;
@@ -368,6 +412,18 @@ table.grid td.x:hover { color: var(--tx0); background: var(--crit); }
 table.grid td.side-BUY { color: var(--bid-tx); } table.grid td.side-SELL { color: var(--ask-tx); }
 table.grid td.thin { color: var(--tx2); }                 /* n < 30: never looks conclusive */
 table.grid td.btn { padding: 0 2px; } table.grid td.btn button { height: 16px; font-size: 11px; padding: 0 4px; }
+
+/* ACTIVITY tape: fills bold, exits by their P&L, rejects red, the rest (sent, cancelled,
+   expired) grey; the side in its colour */
+table.grid.act td.ev { font: 600 10px/1 var(--font-ui); letter-spacing: .04em; }
+table.grid.act tr.a-SUB > td, table.grid.act tr.a-CXL > td, table.grid.act tr.a-EXP > td { color: var(--tx2); }
+table.grid.act tr.a-SUB > td.side-BUY, table.grid.act tr.a-SUB > td.side-SELL { opacity: .75; }
+table.grid.act tr.a-FILL > td { font-weight: 700; }
+table.grid.act tr.a-REJ > td { color: var(--dn); }
+table.grid.act tr.a-EXIT > td.ev { color: var(--tx0); }
+table.grid.act tr.ext > td { box-shadow: none; }
+table.grid.act td.tm { font-size: 11px; }
+.ptools button[data-a="kind"] { min-width: 0; }
 
 /* ------------------------------------------------------------------------------------------
    Order states (CQG/IB conventions)
