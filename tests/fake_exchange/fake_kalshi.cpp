@@ -404,19 +404,25 @@ bool FakeKalshi::wait_ws_flushed(int ms) {
 
 std::string FakeKalshi::frame_text(const std::string& payload) const { return net::ws_text(payload, fragment_bytes_); }
 
-void FakeKalshi::enqueue(const std::shared_ptr<Session>& s, std::string bytes, std::string label) {
+void FakeKalshi::enqueue(const std::shared_ptr<Session>& s, std::string bytes, std::string label, int sid) {
   {
     std::lock_guard<std::mutex> lk(s->m);
     if (s->dead || s->closing) return;
-    s->out.emplace_back(std::move(bytes), std::move(label));
+    s->out.push_back(OutItem{std::move(bytes), std::move(label), sid});
+    if (sid) ++s->pending[sid];
     ++s->queued;
   }
   s->cv.notify_all();
 }
 
 void FakeKalshi::writer_loop(const std::shared_ptr<Session>& s) {
+  auto unpend = [&s](int sid) {   // under s->m
+    if (!sid) return;
+    auto it = s->pending.find(sid);
+    if (it != s->pending.end() && --it->second == 0) s->pending.erase(it);
+  };
   for (;;) {
-    std::pair<std::string, std::string> item;
+    OutItem item;
     {
       std::unique_lock<std::mutex> lk(s->m);
       s->cv.wait(lk, [&] { return s->closing || !s->out.empty(); });
@@ -425,17 +431,19 @@ void FakeKalshi::writer_loop(const std::shared_ptr<Session>& s) {
       s->out.pop_front();
       if (s->dead) {
         ++s->written;
+        unpend(item.sid);
         lk.unlock();
         s->cv.notify_all();
         continue;
       }
     }
     while (steady_ms() < stall_until_ms_.load() && !stopping_) std::this_thread::sleep_for(std::chrono::milliseconds(2));
-    const bool ok = net::write_all(s->fd, item.first);
-    if (ok && !item.second.empty()) log_wire(item.second);  // before `written` moves: see EVENTS_FIRST
+    const bool ok = net::write_all(s->fd, item.bytes);
+    if (ok && !item.label.empty()) log_wire(item.label);  // before `written` moves: see EVENTS_FIRST
     {
       std::lock_guard<std::mutex> lk(s->m);
       ++s->written;
+      unpend(item.sid);
       if (!ok) s->dead = true;
     }
     s->cv.notify_all();
@@ -446,6 +454,27 @@ void FakeKalshi::writer_loop(const std::shared_ptr<Session>& s) {
 
 void FakeKalshi::deliver_locked(const std::shared_ptr<Session>& s, int sid, Sub& sub, const std::string& type,
                                 const json& msg, bool seq, std::int64_t now, Targets* targets) {
+  if (sub.overflowed) return;
+  if (cfg_.ws_sub_buffer > 0) {
+    // A reader that stopped reading: the venue drops the subscription with error 25 rather than
+    // queue without end (the fake's outbound queue had no bound until 2026-10-07).
+    std::size_t unwritten = 0;
+    {
+      std::lock_guard<std::mutex> lk(s->m);
+      auto it = s->pending.find(sid);
+      unwritten = it == s->pending.end() ? 0 : it->second;
+    }
+    if (unwritten >= cfg_.ws_sub_buffer) {
+      sub.overflowed = true;
+      enqueue(s,
+              frame_text(ordered({{"type", "error"},
+                                  {"sid", sid},
+                                  {"msg", json{{"code", 25}, {"msg", "Subscription buffer overflow"}}},
+                                  {"sending_ts_ms", now}})),
+              "ws " + std::to_string(s->id) + " error 25 " + std::to_string(sid));
+      return;
+    }
+  }
   auto drop = drop_left_.find(sub.channel);
   if (drop != drop_left_.end() && drop->second > 0) {
     // lost on the way: the number is spent, so the reader sees a gap
@@ -470,11 +499,11 @@ void FakeKalshi::deliver_locked(const std::shared_ptr<Session>& s, int sid, Sub&
   std::string label = "ws " + std::to_string(s->id) + " " + type + " " + key;
   if (seq) label += " " + std::to_string(n);
   const std::string frame = frame_text(payload);
-  enqueue(s, frame, label);
+  enqueue(s, frame, label, sid);
   auto dup = dup_left_.find(sub.channel);
   if (dup != dup_left_.end() && dup->second > 0) {
     --dup->second;
-    enqueue(s, frame, label + " again");
+    enqueue(s, frame, label + " again", sid);
   }
   if (targets) {
     std::lock_guard<std::mutex> lk(s->m);
@@ -499,7 +528,80 @@ void FakeKalshi::send_snapshot_locked(const std::shared_ptr<Session>& s, int sid
   deliver_locked(s, sid, sub, "orderbook_snapshot", msg, true, now, targets);
 }
 
+namespace {
+// what orders a private message behind earlier ones: its order, its group, its position
+std::set<std::string> held_keys(const Event& e) {
+  std::set<std::string> k;
+  if (!account_channel(e.channel) || !e.msg.is_object()) return k;
+  if (e.msg.contains("order_id") && e.msg["order_id"].is_string()) k.insert("o:" + e.msg["order_id"].get<std::string>());
+  if (e.msg.contains("order_group_id") && e.msg["order_group_id"].is_string())
+    k.insert("g:" + e.msg["order_group_id"].get<std::string>());
+  if (e.channel == "market_positions" && e.msg.contains("market_ticker") && e.msg["market_ticker"].is_string())
+    k.insert("p:" + e.msg["market_ticker"].get<std::string>());
+  return k;
+}
+bool meets(const std::set<std::string>& a, const std::set<std::string>& b) {
+  for (const auto& x : a)
+    if (b.count(x)) return true;
+  return false;
+}
+}  // namespace
+
 FakeKalshi::Targets FakeKalshi::publish_locked(const std::vector<Event>& events) {
+  if (held_.empty()) return publish_now_locked(events);
+  std::set<std::string> blocked;
+  for (const Held& h : held_) blocked.insert(h.keys.begin(), h.keys.end());
+  std::vector<Event> now, later;
+  for (const Event& e : events) {
+    const std::set<std::string> k = held_keys(e);
+    if (!k.empty() && meets(k, blocked)) {
+      blocked.insert(k.begin(), k.end());   // the rest of this order's messages follow it
+      later.push_back(e);
+    } else {
+      now.push_back(e);
+    }
+  }
+  if (!later.empty()) hold_locked(std::move(later), true);
+  return publish_now_locked(now);
+}
+
+std::uint64_t FakeKalshi::hold_locked(std::vector<Event> events, bool ready) {
+  Held h;
+  h.id = next_held_++;
+  for (const Event& e : events) {
+    const std::set<std::string> k = held_keys(e);
+    h.keys.insert(k.begin(), k.end());
+  }
+  h.events = std::move(events);
+  h.ready = ready;
+  held_.push_back(std::move(h));
+  return held_.back().id;
+}
+
+void FakeKalshi::release_locked(std::uint64_t id) {
+  for (Held& h : held_)
+    if (h.id == id) h.ready = true;
+  std::set<std::string> blocked;
+  std::deque<Held> keep;
+  for (Held& h : held_) {
+    if (h.ready && !meets(h.keys, blocked)) {
+      publish_now_locked(h.events);
+    } else {
+      blocked.insert(h.keys.begin(), h.keys.end());
+      keep.push_back(std::move(h));
+    }
+  }
+  held_.swap(keep);
+}
+
+void FakeKalshi::sweep_locked(const std::shared_ptr<Session>& s) {
+  for (auto it = s->subs.begin(); it != s->subs.end();) {
+    if (it->second.overflowed) it = s->subs.erase(it);
+    else ++it;
+  }
+}
+
+FakeKalshi::Targets FakeKalshi::publish_now_locked(const std::vector<Event>& events) {
   Targets t;
   if (events.empty()) return t;
   const std::int64_t now = now_locked();
@@ -518,12 +620,39 @@ FakeKalshi::Targets FakeKalshi::publish_locked(const std::vector<Event>& events)
       }
     }
   }
+  for (auto& [id, s] : sessions_) {
+    (void)id;
+    sweep_locked(s);
+  }
   return t;
 }
 
 // ---- WebSocket commands -----------------------------------------------------------------------
 
 void FakeKalshi::ws_command_locked(const std::shared_ptr<Session>& s, const std::string& text) {
+  const std::int64_t now = now_locked();
+  if (cfg_.ws_cmds_per_s > 0) {
+    while (!s->cmd_ms.empty() && now - s->cmd_ms.front() >= 1000) s->cmd_ms.pop_front();
+    if (s->cmd_ms.size() >= static_cast<std::size_t>(cfg_.ws_cmds_per_s)) {
+      const json j = json::parse(text, nullptr, false);
+      const json id = j.is_object() && j.contains("id") && j["id"].is_number_integer() && j["id"].get<long long>() != 0
+                          ? j["id"]
+                          : omit();
+      enqueue(s,
+              frame_text(ordered({{"id", id},
+                                  {"type", "error"},
+                                  {"msg", json{{"code", 27}, {"msg", "Too many requests"}}},
+                                  {"sending_ts_ms", now}})),
+              "ws " + std::to_string(s->id) + " error 27");
+      return;   // refused: it does not count toward the next second
+    }
+    s->cmd_ms.push_back(now);
+  }
+  ws_command_inner_locked(s, text);
+  sweep_locked(s);
+}
+
+void FakeKalshi::ws_command_inner_locked(const std::shared_ptr<Session>& s, const std::string& text) {
   const std::int64_t now = now_locked();
   const std::string tag = "ws " + std::to_string(s->id) + " ";
   const json j = json::parse(text, nullptr, false);
@@ -590,6 +719,8 @@ void FakeKalshi::ws_command_locked(const std::shared_ptr<Session>& s, const std:
       if (account_channel(c) && !s->authed) return error(9, "Authentication required");
     std::vector<std::string> markets;
     if (!markets_of(&markets)) return error(11, "Invalid parameter");
+    if (cfg_.ws_sub_market_limit > 0 && markets.size() > cfg_.ws_sub_market_limit)
+      return error(26, "Subscription market limit exceeded");
     const bool snap = params.value("send_initial_snapshot", false);
     for (const auto& c : channels) {
       const int sid = s->next_sid++;
@@ -630,6 +761,11 @@ void FakeKalshi::ws_command_locked(const std::shared_ptr<Session>& s, const std:
     if (!markets_of(&markets)) return error(11, "Invalid parameter", sid);
     if (markets.empty() && action != "get_snapshot") return error(14, "Market Ticker required", sid);
     std::vector<std::string> added;
+    if (action == "add_markets" && cfg_.ws_sub_market_limit > 0 && !sub.all) {
+      std::set<std::string> after(sub.markets.begin(), sub.markets.end());
+      after.insert(markets.begin(), markets.end());
+      if (after.size() > cfg_.ws_sub_market_limit) return error(26, "Subscription market limit exceeded", sid);
+    }
     if (action == "add_markets") {
       for (const auto& t : markets)
         if (!sub.all && std::find(sub.markets.begin(), sub.markets.end(), t) == sub.markets.end()) {
@@ -826,7 +962,7 @@ void FakeKalshi::serve(int fd) {
     const json body = req.body.empty() ? json() : json::parse(req.body, nullptr, false);
     Reply rep;
     Targets wait_for;
-    std::vector<Event> after;  // private messages held until the reply is written
+    std::uint64_t held = 0;  // private messages held until the reply is written (Held)
     {
       std::lock_guard<std::mutex> lk(mu_);
       const std::int64_t now = now_locked();
@@ -856,10 +992,11 @@ void FakeKalshi::serve(int fd) {
       if (is(K::FILL_BEFORE_REPLY) || is(K::HIT_AFTER_REST)) mode = PrivateOrder::EVENTS_FIRST;
       if (is(K::FILL_DURING_CANCEL)) mode = PrivateOrder::REPLY_FIRST;
       if (faulted && f.private_order != PrivateOrder::NATURAL) mode = f.private_order;
-      std::vector<Event> now_events;
+      std::vector<Event> now_events, after;
       for (Event& e : engine_.drain_events())
         (mode == PrivateOrder::REPLY_FIRST && account_channel(e.channel) ? after : now_events).push_back(std::move(e));
       Targets t = publish_locked(now_events);
+      if (!after.empty()) held = hold_locked(std::move(after), false);
       if (mode == PrivateOrder::EVENTS_FIRST) wait_for = std::move(t);
     }
     if (!wait_for.empty()) {
@@ -904,9 +1041,9 @@ void FakeKalshi::serve(int fd) {
       net::write_all(fd, data);
       log_wire(label);
     }
-    if (!after.empty()) {
+    if (held) {
       std::lock_guard<std::mutex> lk(mu_);
-      publish_locked(after);
+      release_locked(held);
     }
     if (close_after) return;
   }

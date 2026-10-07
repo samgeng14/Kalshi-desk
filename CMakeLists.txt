@@ -396,8 +396,10 @@ target_precompile_headers(fake-kalshi REUSE_FROM deskd_core)
 #                signature), rate limits per shard, the socket's commands, sids and seq, every
 #                channel, and each fault (drops, 5xx, a cut body, chunked, 429, stalls, socket
 #                drops, seq gaps, duplicate fills, the fill before the 201, a cancel racing a fill,
-#                a cancel before the 201), the fixture tape over the socket, eight clients at once,
-#                and the fake-kalshi binary started and stopped
+#                a cancel before the 201), the cancel-all's minute of echo, errors 25-27 (buffer
+#                overflow, market limit, command rate), one order's private messages kept in order
+#                under REPLY_FIRST, the fixture tape over the socket, eight clients at once, and
+#                the fake-kalshi binary started and stopped
 foreach(t engine wire)
   add_executable(deskd-test-fake-${t} tests/deskd/test_fake_${t}.cpp)
   target_link_libraries(deskd-test-fake-${t} PRIVATE fake_kalshi)

@@ -43,7 +43,11 @@
 //   unsubscribe {sids} -> {"id","sid","seq","type":"unsubscribed"}; list_subscriptions -> ok + list.
 //   errors {"id","type":"error","msg":{"code","msg"}}: 1 unparseable, 2 params, 3 channels,
 //     4 sids, 5 command, 7 unknown sid, 8 channel, 9 auth, 11 parameter, 12 exactly one sid,
-//     13 action, 14 market ticker, 15 action required.
+//     13 action, 14 market ticker, 15 action required, and the limits (FakeConfig ws_*):
+//     25 "Subscription buffer overflow" (no id, the sid; the subscription is gone), 26
+//     "Subscription market limit exceeded" and 27 "Too many requests" (the command refused).
+//     The venue documents the codes, not its numbers: the limits here are the fake's own, and
+//     deskd must survive each code whatever the number (a slow md-k, a TOP list of ~3,300).
 //   Channels and types: orderbook_delta (orderbook_snapshot, orderbook_delta), ticker, trade, fill,
 //     user_orders ("user_order"), market_positions ("market_position"), order_group_updates.
 //     seq, per sid and across every market on it, on orderbook_* , trade, order_group_updates and
@@ -72,6 +76,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <type_traits>
@@ -92,6 +97,13 @@ namespace fakex {
 //   NATURAL       queued for the socket at once; the socket's writer and the reply race
 //   REPLY_FIRST   queued only after the reply's last byte is written
 //   EVENTS_FIRST  the reply waits until they are written
+// Whatever the mode, one order's (and one market's position) private messages leave in the
+// engine's order: a later request's messages for an order wait behind that order's messages
+// still held for an earlier reply. Until 2026-10-07 a cancel sent on another connection once the
+// create's 201 arrived could publish its "canceled" before the create's held "resting" (review):
+// an ordering the venue is not known to produce, and a flaky one. The fake's own choice: the
+// venue documents no ordering for private messages, so deskd still tolerates any (it keeps the
+// largest fill count and never revives a terminal order).
 enum class PrivateOrder { NATURAL, REPLY_FIRST, EVENTS_FIRST };
 
 struct HttpFault {
@@ -147,6 +159,12 @@ struct FakeConfig {
   // (v3_research fills F10, 2026-10-06).
   int idle_close_ms = 60000;
   int ws_ping_ms = 0;                // the server pings every so often; 0: never
+  // WebSocket limits (errors 25-27 above); 0 turns one off. 5,000 unwritten messages on one
+  // subscription is far past what a reader that keeps up leaves queued (a 2,600-market snapshot
+  // burst is 2,600), so only a reader that stopped reading meets it.
+  std::size_t ws_sub_buffer = 5000;
+  std::size_t ws_sub_market_limit = 0;   // markets on one subscription
+  int ws_cmds_per_s = 0;                 // commands a second on one connection
   PrivateOrder private_order = PrivateOrder::NATURAL;
   bool manual_clock = false;         // time moves only by advance_ms
   std::int64_t start_ms = 0;         // the manual clock's first reading; 0: the wall clock now
@@ -224,19 +242,34 @@ class FakeKalshi {
     bool all = false;
     std::vector<std::string> markets;  // in the order added
     std::int64_t seq = 0;
+    bool overflowed = false;           // error 25 sent; removed at the end of the fan-out
+  };
+  struct OutItem {
+    std::string bytes, label;  // the frame, its wire-log label
+    int sid = 0;               // the subscription it belongs to, 0: none
   };
   struct Session {
     int id = 0, fd = -1;
     bool authed = false;
     std::mutex m;
     std::condition_variable cv;
-    std::deque<std::pair<std::string, std::string>> out;  // (frame bytes, wire-log label)
+    std::deque<OutItem> out;
+    std::map<int, std::size_t> pending;  // unwritten messages by subscription (error 25)
     bool closing = false, dead = false;
     std::uint64_t queued = 0, written = 0;
     std::thread writer;
     // under FakeKalshi::mu_
     std::map<int, Sub> subs;
     int next_sid = 1;
+    std::deque<std::int64_t> cmd_ms;  // command times in the last second (error 27)
+  };
+  // Private messages held for a reply (REPLY_FIRST), or waiting behind such a batch for the same
+  // order: published in this order, each once it is ready and no earlier one shares a key.
+  struct Held {
+    std::uint64_t id = 0;
+    std::set<std::string> keys;  // "o:<order_id>", "g:<group_id>", "p:<ticker>"
+    std::vector<Event> events;
+    bool ready = false;
   };
   struct Bucket {
     double tokens = 0, rate = 0, cap = 0;
@@ -256,15 +289,22 @@ class FakeKalshi {
   void serve_ws(int fd, const net::Request& req);
   void writer_loop(const std::shared_ptr<Session>& s);
   void log_wire(const std::string& line);
-  void enqueue(const std::shared_ptr<Session>& s, std::string bytes, std::string label);
+  void enqueue(const std::shared_ptr<Session>& s, std::string bytes, std::string label, int sid = 0);
   std::string frame_text(const std::string& payload) const;
 
+  // Publishes events, except that a private message for an order (or position) with messages
+  // still held goes behind them (Held); the returned targets cover what went out now.
   Targets publish_locked(const std::vector<Event>& events);
+  Targets publish_now_locked(const std::vector<Event>& events);
+  std::uint64_t hold_locked(std::vector<Event> events, bool ready);  // a new Held batch; its id
+  void release_locked(std::uint64_t id);   // that batch is ready: publish what can go
+  void sweep_locked(const std::shared_ptr<Session>& s);   // drops overflowed subscriptions
   void deliver_locked(const std::shared_ptr<Session>& s, int sid, Sub& sub, const std::string& type,
                       const json& msg, bool seq, std::int64_t now, Targets* targets);
   void send_snapshot_locked(const std::shared_ptr<Session>& s, int sid, Sub& sub, const std::string& ticker,
                             std::int64_t now, Targets* targets);
   void ws_command_locked(const std::shared_ptr<Session>& s, const std::string& text);
+  void ws_command_inner_locked(const std::shared_ptr<Session>& s, const std::string& text);
   void pump_locked(std::int64_t now);
   bool take_fault_locked(const net::Request& req, HttpFault* f);
 
@@ -295,6 +335,8 @@ class FakeKalshi {
 
   std::map<int, std::shared_ptr<Session>> sessions_;
   int next_session_ = 1;
+  std::deque<Held> held_;
+  std::uint64_t next_held_ = 1;
   std::deque<HttpFault> faults_;
   PrivateOrder private_order_;
   std::map<std::string, int> drop_left_, dup_left_;

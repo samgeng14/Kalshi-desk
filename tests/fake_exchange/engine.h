@@ -55,7 +55,11 @@
 // reserves the cost of the part its opposite position cannot close, plus the worst taker fee
 // unless post-only); a FOK or reduce-only order that cannot fill answers 201 with nothing filled;
 // a fill's `action` ("buy" when it opens contracts, else "sell"); no last_update_reason on user
-// cancels, cancel-all and group triggers; open interest counted as traded volume.
+// cancels, cancel-all and group triggers; open interest counted as traded volume; an explicit
+// exchange_index that is not the market's own shard answers 404 not_found "market not found on
+// exchange N" (exchange_sharding.md says a write naming a shard goes to that shard and is silent
+// on a market that lives elsewhere: a demo check, plan section 8); a cancel-all's minute of
+// echo applies to the whole account, not to the subaccount it named.
 //
 // Street liquidity. Everyone who is not the account is "the street": its orders sit in the same
 // FIFO queues as ours. A tape or scenario adds street orders at the back of a level, removes them
@@ -256,9 +260,10 @@ struct EngineConfig {
   std::int64_t min_expiry_lead_s = 0;  // undocumented on the venue (K1): demo-check
   std::int64_t expiry_delay_ms = 0;    // how late the venue's expiry runs after the second
   // "Newly placed orders may also be cancelled during the minute after the request"
-  // (cancel-all-orders.md). 0: off; otherwise orders that rest within this long after a cancel-all
-  // are cancelled as they rest.
-  std::int64_t cancel_all_echo_ms = 0;
+  // (cancel-all-orders.md): orders that rest within this long after a cancel-all are cancelled as
+  // they rest. On by default, as on the venue (until 2026-10-07 it was 0 here, so no test showed
+  // that an order placed in the minute after KILL's cancel-all is cancelled); 0 turns it off.
+  std::int64_t cancel_all_echo_ms = 60000;
   std::int64_t group_window_ms = 15000;
   std::int64_t tape_debt_ms = 2000;    // how long a tape debt waits for the tape's removal
   std::uint64_t seed = 20261006;

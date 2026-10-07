@@ -1014,6 +1014,161 @@ void test_ws_faults() {
   CHECK(next_type(*wp, "subscribed"));
 }
 
+// ---- review additions (2026-10-07) ----------------------------------------------------------------
+
+// "Newly placed orders may also be cancelled during the minute after the request": on by default
+// now. An order placed 1 s after a cancel-all is acknowledged (201, resting) and then cancelled;
+// one placed 61 s after rests. KILL's re-arm therefore waits 60 s from the cancel-all's return,
+// not from the click (gw/kill.h cancel_all_done).
+void test_cancel_all_echo() {
+  FakeConfig cfg = quiet();
+  cfg.manual_clock = true;
+  cfg.start_ms = T0;
+  Venue v(cfg);
+  CHECK(v.f.with_engine([](Engine& e, std::int64_t) { return e.config().cancel_all_echo_ms; }) == 60000);
+  auto ws = open_ws(v.port());
+  ws->send_json(cmd(1, "subscribe", {{"channels", json::array({"user_orders"})}}));
+  CHECK(next_type(*ws, "subscribed"));
+  HttpConn c(v.port());
+  auto r = call(c, "POST", ORDERS, post_only(T, "1", "0.30", "EC-0"));
+  CHECK(r.status() == 201);
+  r = call(c, "DELETE", ORDERS);   // KILL's cancel-all
+  CHECK(r.status() == 204);
+  CHECK(v.by_cid("EC-0") && v.by_cid("EC-0")->status == OrdStatus::CANCELED);
+  ws->drain(150);
+  v.f.advance_ms(1000);   // an order the moment a re-arm timed from the click would allow it
+  r = call(c, "POST", ORDERS, post_only(T, "1", "0.30", "EC-1"));
+  CHECK(r.status() == 201 && r.j["remaining_count"] == "1.00");   // placed, says the 201 ...
+  const std::string id1 = r.j.value("order_id", "");
+  CHECK(call(c, "GET", "/portfolio/orders/" + id1).j["order"]["status"] == "canceled");   // ... then cancelled
+  std::vector<std::string> st;
+  for (const auto& m : ws->drain(200))
+    if (m.value("type", "") == "user_order" && m["msg"]["order_id"] == id1) st.push_back(m["msg"]["status"]);
+  CHECK(!st.empty() && st.back() == "canceled");
+  v.f.advance_ms(60001);   // a minute after the cancel-all
+  r = call(c, "POST", ORDERS, post_only(T, "1", "0.30", "EC-2"));
+  CHECK(r.status() == 201);
+  CHECK(call(c, "GET", "/portfolio/orders/" + r.j.value("order_id", "")).j["order"]["status"] == "resting");
+}
+
+// Errors 25 to 27: a subscription whose reader stopped reading is dropped with 25; a
+// subscription past the market limit is refused 26, on subscribe and on add_markets; commands
+// past the rate are refused 27.
+void test_ws_limits() {
+  {
+    FakeConfig cfg = quiet();
+    cfg.ws_sub_buffer = 50;
+    Venue v(cfg);
+    auto ws = open_ws(v.port());
+    ws->send_json(cmd(1, "subscribe", {{"channels", json::array({"orderbook_delta"})}, {"market_ticker", T}}));
+    ws->send_json(cmd(2, "subscribe", {{"channels", json::array({"ticker"})}, {"market_ticker", T}}));
+    ws->drain(200);
+    v.f.stall_ws(500);   // the socket stops moving: messages pile up unwritten
+    for (int i = 0; i < 80; ++i)
+      v.f.with_engine([i](Engine& e, std::int64_t now) { e.street_add(T, false, 1000 + 10 * i, 1, now); });
+    std::vector<json> got = ws->drain(800);
+    int deltas = 0;
+    std::optional<json> err;
+    for (const auto& m : got) {
+      if (m.value("type", "") == "orderbook_delta") ++deltas;
+      if (m.value("type", "") == "error") err = m;
+    }
+    CHECK(deltas == 50);
+    CHECK(err && (*err)["msg"]["code"] == 25 && (*err)["sid"] == 1 && !err->contains("id"));
+    CHECK(err && (*err)["msg"]["msg"] == "Subscription buffer overflow");
+    CHECK(log_at(v.f.wire_log(), {"error 25 1"}) >= 0);
+    // the subscription is gone; the other one on the connection goes on
+    v.f.with_engine([](Engine& e, std::int64_t now) { e.street_add(T, false, 2500, 1, now); });
+    auto after = ws->drain(300);
+    for (const auto& m : after) CHECK(m.value("type", "") != "orderbook_delta");
+    ws->send_json(cmd(3, "list_subscriptions"));
+    auto list = next_type(*ws, "ok");
+    CHECK(list && (*list)["msg"].size() == 1 && (*list)["msg"][0]["sid"] == 2);
+    ws->send_json(cmd(4, "update_subscription", {{"sid", 1}, {"action", "get_snapshot"}}));
+    auto e7 = next_type(*ws, "error");
+    CHECK(e7 && (*e7)["msg"]["code"] == 7);
+  }
+  {
+    FakeConfig cfg = quiet();
+    cfg.ws_sub_market_limit = 3;
+    Venue v(cfg);
+    auto ws = open_ws(v.port());
+    const json four = json::array({"KXA-1", "KXA-2", "KXA-3", "KXA-4"});
+    ws->send_json(cmd(1, "subscribe", {{"channels", json::array({"ticker"})}, {"market_tickers", four}}));
+    auto e = next_type(*ws, "error");
+    CHECK(e && (*e)["msg"]["code"] == 26 && (*e)["id"] == 1 && (*e)["msg"]["msg"] == "Subscription market limit exceeded");
+    ws->send_json(cmd(2, "subscribe", {{"channels", json::array({"ticker"})}, {"market_tickers", json::array({"KXA-1", "KXA-2", "KXA-3"})}}));
+    auto sub = next_type(*ws, "subscribed");
+    CHECK(sub && (*sub)["msg"]["sid"] == 1);
+    ws->send_json(cmd(3, "update_subscription", {{"sid", 1}, {"action", "add_markets"}, {"market_tickers", json::array({"KXA-2"})}}));
+    CHECK(next_type(*ws, "ok"));   // already there: still 3
+    ws->send_json(cmd(4, "update_subscription", {{"sid", 1}, {"action", "add_markets"}, {"market_tickers", json::array({"KXA-4"})}}));
+    e = next_type(*ws, "error");
+    CHECK(e && (*e)["msg"]["code"] == 26 && (*e)["sid"] == 1);
+  }
+  {
+    FakeConfig cfg = quiet();
+    cfg.ws_cmds_per_s = 5;
+    cfg.manual_clock = true;
+    cfg.start_ms = T0;
+    Venue v(cfg);
+    auto ws = open_ws(v.port());
+    for (int i = 1; i <= 6; ++i) ws->send_json(cmd(i, "list_subscriptions"));
+    int oks = 0;
+    std::optional<json> e;
+    for (const auto& m : ws->drain(300)) {
+      oks += m.value("type", "") == "ok";
+      if (m.value("type", "") == "error") e = m;
+    }
+    CHECK(oks == 5);
+    CHECK(e && (*e)["msg"]["code"] == 27 && (*e)["id"] == 6 && (*e)["msg"]["msg"] == "Too many requests");
+    v.f.advance_ms(1000);
+    ws->send_json(cmd(7, "list_subscriptions"));
+    CHECK(next_type(*ws, "ok"));
+  }
+}
+
+// One order's private messages leave in the engine's order even when its create's reply is slow
+// (REPLY_FIRST holds them) and a cancel on another connection is answered first. Until 2026-10-07
+// the cancel's "canceled" could go out before the create's held "resting".
+void test_private_order_per_order() {
+  FakeConfig cfg = quiet();
+  cfg.private_order = PrivateOrder::REPLY_FIRST;
+  Venue v(cfg);
+  auto ws = open_ws(v.port());
+  ws->send_json(cmd(1, "subscribe", {{"channels", json::array({"user_orders"})}}));
+  CHECK(next_type(*ws, "subscribed"));
+  HttpFault slow;
+  slow.kind = HttpFault::Kind::STALL_AFTER;
+  slow.method = "POST";
+  slow.path = ORDERS;
+  slow.stall_ms = 600;
+  v.f.add_fault(slow);
+  std::thread create([&v] {
+    HttpConn a(v.port());
+    auto r = call(a, "POST", ORDERS, post_only(T, "1", "0.30", "PO-1"));
+    CHECK(r.status() == 201);
+  });
+  std::string id;
+  for (int i = 0; i < 200 && id.empty(); ++i) {
+    if (auto o = v.by_cid("PO-1")) id = o->order_id;
+    else std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  CHECK(!id.empty());
+  HttpConn b(v.port());
+  const auto rb = call(b, "DELETE", ORDERS + "/" + id);   // answered while the create's reply stalls
+  CHECK(rb.status() == 200);
+  create.join();
+  std::vector<std::string> st;
+  for (const auto& m : ws->drain(300))
+    if (m.value("type", "") == "user_order" && m["msg"]["order_id"] == id) st.push_back(m["msg"]["status"]);
+  CHECK((st == std::vector<std::string>{"resting", "canceled"}));
+  // and the wire log has the cancel's reply before either message: the messages waited
+  const auto log = v.f.wire_log();
+  const int del = log_at(log, {"http 200 DELETE"}), resting = log_at(log, {"user_order " + id});
+  CHECK(del >= 0 && resting > del);
+}
+
 // ---- the recorded tape over the socket -------------------------------------------------------------
 
 // The fixture played to its end on the manual clock, as fast as the engine goes: a client keeping
@@ -1244,6 +1399,9 @@ int main() {
   test_ws_private();
   test_faults();
   test_ws_faults();
+  test_cancel_all_echo();
+  test_ws_limits();
+  test_private_order_per_order();
   test_tape_over_wire();
   test_concurrency();
   test_binary();
