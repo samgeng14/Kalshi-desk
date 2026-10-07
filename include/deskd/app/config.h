@@ -18,6 +18,10 @@ struct DeskdConfig {
   std::string env;                   // as written; deskd's hosts follow --live, never this
   std::string key_id;
   std::string pem_path;
+  // "rsa" (the old desk's keys; the default, so its configs still load) or "ed25519" (the demo
+  // key of 2026-10-06; Kalshi allows them since 2026-10-01). gw/kalshi_sign.h checks it against
+  // the PEM at load: a mismatch is refused, never signed with.
+  std::string key_type = "rsa";
   // "deskd": { ... }
   std::string data_dir = "data";     // holds deskd.heartbeat; resolved to an absolute path at start
   // The account lock's directory (app/lock.h): "" = $HOME/Library/Application Support/

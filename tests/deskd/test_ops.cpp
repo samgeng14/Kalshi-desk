@@ -284,10 +284,14 @@ static void test_config() {
   CHECK(c.data_dir.find("~") == std::string::npos);
   CHECK(!c.live);   // env "prod" never makes deskd live
   CHECK(c.web_threads == 16 && c.keepalive_s == 2);
+  CHECK(c.key_type == "rsa");   // the old desk's configs name no key type: its keys are RSA
   // defaults without a deskd section
   DeskdConfig e = load_deskd_config(write(R"({"env": "demo"})"));
   CHECK(e.http_port == 8788 && e.data_dir == "data" && e.max_streams == 4 && e.daily_stop == 300000);
   CHECK(e.lock_dir.empty());   // the fixed default under $HOME
+  // the demo key's type (~/.kalshi/deskd-demo.json); anything but rsa or ed25519 is refused
+  DeskdConfig k = load_deskd_config(write(R"({"env": "demo", "key_id": "kid", "pem_path": "~/.kalshi/k.pem", "key_type": "ed25519"})"));
+  CHECK(k.key_type == "ed25519");
   DeskdConfig l = load_deskd_config(write(R"({"deskd": {"lock_dir": "/tmp/locks"}})"));
   CHECK(l.lock_dir == "/tmp/locks");
   auto throws = [&](const std::string& text, const std::string& want) {
@@ -299,6 +303,7 @@ static void test_config() {
     return false;
   };
   CHECK(throws(R"({"deskd": {"live": true}})", "command-line flag only"));
+  CHECK(throws(R"({"key_type": "ecdsa"})", "\"key_type\" must be \"rsa\" or \"ed25519\""));
   CHECK(throws(R"({"deskd": {"heartbeat_window": 5000}})", "unknown key \"heartbeat_window\""));
   CHECK(throws(R"({"deskd": {"http_port": "8788"}})", "\"http_port\" has the wrong type"));
   CHECK(throws(R"({"deskd": {"max_streams": 15}})", "max_streams"));

@@ -23,6 +23,9 @@ git clone <this repo> ~/Code/kalshi-desk && cd ~/Code/kalshi-desk
   -DCMAKE_OSX_ARCHITECTURES=arm64 -DOPENSSL_ROOT_DIR=/opt/homebrew/opt/openssl@3
 nice -n 15 ninja -C build-deskd -j 4 deskd-all            # deskd, deskctl, fake-kalshi, their tests
 cd build-deskd && ctest -R deskd --output-on-failure
+./kalshi-demo-probe [--order-check]        # signed reads (and one tiny order) on Kalshi's DEMO through
+                                           # deskd's net/ and signer; reads ~/.kalshi/demo.json, prints
+                                           # handshake and request latencies; never touches production
 ```
 
 Never more than `-j 4`, always `nice -n 15`, one build at a time, and never in `build/` while a

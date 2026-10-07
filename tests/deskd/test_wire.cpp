@@ -15,9 +15,13 @@
 //     get, fills, positions, balance per shard, cancel, a cancel of a gone order, batch cancel,
 //     cancel-all, markets, orderbook, the soft refusals (post-only cross, collateral, duplicate
 //     cid, triggered group), a bad signature, and the faults that make a write UNKNOWN
+//   - the demo probe binary (tools/kalshi_demo_probe.cpp) run against the fake over TLS through
+//     its real command line: handshakes, the reads, the order check, the dumps, no key material
+//     in its output; a production base and a non-demo key file refused before any socket
 #include <openssl/evp.h>
 #include <openssl/pem.h>
 #include <signal.h>
+#include <sys/wait.h>
 
 #include <cstdio>
 #include <fstream>
@@ -841,6 +845,96 @@ static void round_trip(const std::string& key_type) {
               static_cast<unsigned long long>(ps.misses));
 }
 
+// ---- the demo probe binary against the fake -----------------------------------------------------
+// tools/kalshi_demo_probe through its real command line: a key file in ~/.kalshi/demo.json's shape
+// naming a key made for this test, the fake over TLS as the venue (its CA trusted for loopback
+// only), the handshake figures, the reads, the order check (a post-only bid at $0.01 placed, read
+// back, cancelled, read back, gone from the resting list) and the dumps. Its output never carries
+// key material, the key id or a signature. A production base, a key file for another environment
+// and a key type that does not match the PEM are each refused before any socket opens.
+static void test_probe_binary() {
+  std::string err;
+  const std::string pem = new_key_pem("ED25519");
+  auto signer = KalshiSigner::from_pem("probe-key", pem, "ed25519", &err);
+  CHECK(signer != nullptr);
+  if (!signer) return;
+  fakex::FakeConfig cfg;
+  cfg.auth = fakex::AuthMode::VERIFY;
+  cfg.public_key_pem = signer->public_pem();
+  cfg.auth_max_skew_ms = 5000;
+  fx::Venue v(cfg);
+  CHECK(v.ok);
+  TempDir d;
+  write_file(d.file("key.pem"), pem);   // made a moment ago for this test: not a credential
+  auto key_file = [&](const char* name, const char* env, const char* type) {
+    write_file(d.file(name), json{{"env", env}, {"key_id", "probe-key"}, {"private_key_path", d.file("key.pem")},
+                                  {"key_type", type}}.dump());
+    return d.file(name);
+  };
+  auto run = [&](const std::string& key, const std::string& args, int* rc) {
+    const std::string cmd = std::string(KALSHI_DEMO_PROBE_BIN) + " --key " + key + " --loopback-ca " + fx::pki().p.ca_cert +
+                            " " + args + " 2>&1";
+    FILE* p = ::popen(cmd.c_str(), "r");
+    std::string out;
+    if (!p) {
+      *rc = -2;
+      return out;
+    }
+    char b[4096];
+    std::size_t n;
+    while ((n = std::fread(b, 1, sizeof b, p)) > 0) out.append(b, n);
+    const int st = ::pclose(p);
+    *rc = WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+    return out;
+  };
+  const std::string demo_key = key_file("demo.json", "demo", "ed25519");
+  int rc = -1;
+  const std::string out = run(demo_key, "--base " + v.ep().url() + " --handshakes 3 --order-check --order-ticker " + fx::T +
+                                            " --dump " + d.path, &rc);
+  CHECK(rc == 0);
+  if (rc != 0) std::fprintf(stderr, "probe output:\n%s\n", out.c_str());
+  auto has = [&](const char* s) { return out.find(s) != std::string::npos; };
+  CHECK(has("key: ed25519, id of 9 characters, from "));
+  CHECK(has("guard: allowed, loopback"));
+  CHECK(has("production check: api.elections.kalshi.com is a production host") && has("(sockets opened: 0)"));
+  CHECK(has("resumption on : TLSv1.3") && has("resumption off: TLSv1.3") && has(", 0 resumed"));
+  CHECK(has(", 2 resumed") || has(", 1 resumed"));   // the first of three cannot resume
+  CHECK(has("exchange_active true, trading_active true"));
+  CHECK(has("BALANCE available $2000.0000") && has("shard 0 $1000.0000") && has("shard 2 $1000.0000"));
+  CHECK(has("    resting orders: 0\n"));
+  CHECK(has("2 markets (1 with a YES bid), no cursor"));
+  CHECK(has("post-only bid 1 @ 0.0100, expires in 15 s, cid P-") && has("(best bid 0.4000, best ask 0.4200)"));
+  CHECK(has("outcome ACK: order_id ") && has(", filled 0.00, remaining 1.00"));
+  CHECK(has("read back resting after"));
+  CHECK(has("expiration_time - created_time = 1"));   // 14-15 s: whole seconds
+  CHECK(has("outcome ACK: reduced_by 1.00"));
+  CHECK(has("read back canceled after"));
+  CHECK(has("resting orders: 0 (this check's: 0)"));
+  CHECK(has("write->reply") && has("pool: ") && has("sign (ed25519, this key): p50"));
+  CHECK(has("\nok\n"));
+  // nothing of the key, its id or a signature
+  CHECK(!has("BEGIN") && !has("KALSHI-ACCESS") && !has("probe-key") && !has("?"));
+  // the fake saw exactly one order from it, post-only at $0.01, cancelled
+  CHECK(v.f->with_engine([](fakex::Engine& e, std::int64_t) {
+    const auto os = e.user_orders();
+    return os.size() == 1 && os[0]->status == fakex::OrdStatus::CANCELED && os[0]->price == 100 && os[0]->post_only &&
+           os[0]->initial == 100 && os[0]->client_order_id.rfind("P-", 0) == 0;
+  }));
+  for (const char* n : {"exchange_status", "balance", "markets", "create", "order", "cancel", "order_canceled"})
+    CHECK(std::filesystem::exists(d.file(std::string("kalshi_demo_") + n + ".json")));
+  std::printf("probe against the fake: exit %d, %zu bytes of output\n", rc, out.size());
+
+  // a production base: the guard refuses it before any socket, exit 2, no handshake section
+  const std::string prod = run(demo_key, "--base https://api.elections.kalshi.com/trade-api/v2 --handshakes 1", &rc);
+  CHECK(rc == 2 && prod.find("is a production host") != std::string::npos && prod.find("handshakes (") == std::string::npos);
+  // a key file for another environment, and a key type that does not match the PEM
+  const std::string wrong_env = run(key_file("prod.json", "prod", "ed25519"), "--base " + v.ep().url(), &rc);
+  CHECK(rc == 2 && wrong_env.find("only ever touches the demo exchange") != std::string::npos);
+  const std::string wrong_type = run(key_file("rsa.json", "demo", "rsa"), "--base " + v.ep().url(), &rc);
+  CHECK(rc == 2 && wrong_type.find("the config says rsa") != std::string::npos);
+  CHECK(v.f->connections_accepted() > 0);   // the first run connected; the three refusals added nothing
+}
+
 int main() {
   ::signal(SIGPIPE, SIG_IGN);
   CHECK(fx::pki().ok);
@@ -852,5 +946,6 @@ int main() {
   test_classify();
   round_trip("ed25519");
   round_trip("rsa");
+  test_probe_binary();
   return finish("deskd-wire");
 }

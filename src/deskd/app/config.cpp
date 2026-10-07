@@ -50,6 +50,9 @@ DeskdConfig load_deskd_config(const std::string& path) {
   take(j, "key_id", c.key_id, path);
   take(j, "pem_path", c.pem_path, path);
   c.pem_path = expand_home(c.pem_path);
+  take(j, "key_type", c.key_type, path);
+  if (c.key_type != "rsa" && c.key_type != "ed25519")
+    throw std::runtime_error(path + ": \"key_type\" must be \"rsa\" or \"ed25519\", not \"" + c.key_type + "\"");
 
   auto it = j.find("deskd");
   if (it == j.end() || it->is_null()) return c;

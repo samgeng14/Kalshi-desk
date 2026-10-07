@@ -338,6 +338,7 @@ file(GENERATE OUTPUT ${CMAKE_BINARY_DIR}/generated/deskd/build_paths.h CONTENT
 #define DESKD_BIN \"$<TARGET_FILE:deskd>\"
 #define DESKCTL_BIN \"$<TARGET_FILE:deskctl>\"
 #define FAKE_KALSHI_BIN \"$<TARGET_FILE:fake-kalshi>\"
+#define KALSHI_DEMO_PROBE_BIN \"$<TARGET_FILE:kalshi-demo-probe>\"
 #define DESKD_NODE \"${DESKD_NODE_PATH}\"
 #define DESKD_PYTHON \"${DESKD_PYTHON_PATH}\"
 ")
@@ -425,7 +426,8 @@ add_dependencies(deskd-test-fake-wire fake-kalshi)  # it starts the binary once
 #          connection, cut and dropped replies as UNKNOWN, close_notify and a bare FIN, idle closes,
 #          the spare pool's counters, SO_NOSIGPIPE, latency on loopback
 #   wire   the signer (RSA-PSS and Ed25519, verified by the fake), the builders and parsers against
-#          the documented shapes and the fake over TLS, and what each write reply means
+#          the documented shapes and the fake over TLS, what each write reply means, and the demo
+#          probe binary run against the fake
 foreach(t http)
   add_executable(deskd-test-${t} tests/deskd/test_${t}.cpp)
   target_link_libraries(deskd-test-${t} PRIVATE deskd_core)
@@ -439,6 +441,15 @@ foreach(t net wire)
   add_test(NAME deskd-${t} COMMAND deskd-test-${t})
 endforeach()
 
+# tools/kalshi_demo_probe: signed reads (and, asked for, one tiny post-only order and its cancel)
+# against Kalshi's DEMO exchange through deskd's own net/ and signer, with latency figures. Not a
+# ctest entry (it needs the network and ~/.kalshi/demo.json); deskd-test-wire runs the binary
+# against the fake over TLS instead.
+add_executable(kalshi-demo-probe tools/kalshi_demo_probe.cpp)
+target_link_libraries(kalshi-demo-probe PRIVATE deskd_core)
+target_precompile_headers(kalshi-demo-probe REUSE_FROM deskd_core)
+add_dependencies(deskd-test-wire kalshi-demo-probe)
+
 add_custom_target(deskd-all DEPENDS deskd deskctl deskd-test-bus deskd-test-ops deskd-test-web deskd-test-process
                                     fake-kalshi deskd-test-fake-engine deskd-test-fake-wire
-                                    deskd-test-http deskd-test-net deskd-test-wire)
+                                    deskd-test-http deskd-test-net deskd-test-wire kalshi-demo-probe)
