@@ -1,5 +1,5 @@
 #pragma once
-// JSON in the shapes of ui/desk/js/contract.js (version 1.4.0), the single statement of what
+// JSON in the shapes of ui/desk/js/contract.js (version 1.5.0), the single statement of what
 // deskd serves the screen. "If the backend and this file disagree, this file wins": the tests
 // run contract.js's own validator over what these builders produce (tests/deskd/contract_check.cjs).
 //
@@ -7,6 +7,9 @@
 // /api/universe (paged discovery) and POST /api/watch. A 1.2 hb has no date, which 1.4's
 // validator refuses, and the page's store drops an invalid event: the 1.4 page served by a 1.2
 // deskd sat at SRV DOWN for good (review, 2026-10-06).
+// 1.5 (merged 2026-10-07, the same day): the universe reply carries grev, the result's shape,
+// and answers groups null to a query that sends the current grev; mkt events carry gk and live
+// (deskd sends none until gw has a universe); POST /api/watch may refuse MARKET_CLOSED.
 #include <cstdint>
 #include <nlohmann/json.hpp>
 #include <string>
@@ -18,7 +21,10 @@
 
 namespace deskd {
 
-constexpr const char* kContractVersion = "1.4.0";
+constexpr const char* kContractVersion = "1.5.0";
+// grev of the empty universe deskd lists until gw has markets (contract 1.5: a short id that
+// changes whenever a group or a count changes; nothing changes while there is nothing)
+constexpr const char* kEmptyUniverseGrev = "0";
 
 // {"ok":false,"err":{"code":code,"msg":msg}}
 nlohmann::json err_body(const std::string& code, const std::string& msg);

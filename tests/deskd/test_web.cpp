@@ -700,17 +700,22 @@ static void test_request_checker(Desk& k) {
   auto st = post(port, "/api/stop", R"({"why":"anything"})", token, "", "text/plain");
   CHECK(st && st->status == 200);
 
-  // THE UNIVERSE (contract 1.4): an empty page for each day, its ET date; bad queries refused
+  // THE UNIVERSE (contract 1.5): an empty page for each day, its ET date, its grev (groups null
+  // only when the query sends that grev back); bad queries refused
   const std::int64_t now = now_ms();
   for (const std::string& q : {std::string("day=T"), std::string("day=T1&cat=WEATHER&v=K&q=den&sort=vol&offset=0&limit=100"),
-                               std::string("day=T&cat=&v=&limit=200&offset=400"), std::string("day=T1&sort=edge")}) {
+                               std::string("day=T&cat=&v=&limit=200&offset=400"), std::string("day=T1&sort=edge"),
+                               std::string("day=T&grev=0"), std::string("day=T&grev=1x9f2a.1")}) {
     auto r = get(port, "/api/universe?" + q);
     CHECK(r && r->status == 200);
     capture("GET /api/universe", r);
     g_capture["queries"].push_back({{"key", "GET /api/universe"}, {"path", "/api/universe?" + q}, {"accepted", r && r->status == 200}});
     if (r && r->status == 200) {
       const json j = json::parse(r->body);
-      CHECK(j["total"] == 0 && j["rows"].empty() && j["cats"]["SPORTS"] == 0);
+      CHECK(j["total"] == 0 && j["rows"].empty() && j["cats"]["SPORTS"] == 0 && j["cats"].size() == 5);
+      CHECK(j["grev"] == kEmptyUniverseGrev);
+      if (q.find("grev=0") != std::string::npos) CHECK(j["groups"].is_null());
+      else CHECK(j["groups"].is_array() && j["groups"].empty());
       const std::string today = et_date(now);
       CHECK(j["date"] == (q.compare(0, 6, "day=T1") == 0 ? et_date_after(today) : today) || j["date"] == et_date(now_ms()));
     }

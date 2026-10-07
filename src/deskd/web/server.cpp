@@ -403,7 +403,7 @@ void WebServer::Impl::routes() {
     reply_json(res, 200, json{{"ok", true}, {"epoch", d.pub->epoch()}, {"srv_ms", now_ms()}});
   });
 
-  // THE UNIVERSE, paged (contract 1.4). Week 0 lists no market: the reply is an empty page for
+  // THE UNIVERSE, paged (contract 1.5). Until gw has a universe the reply is an empty page for
   // the day asked, after the same query check contract.js makes.
   svr.Get("/api/universe", [](const httplib::Request& req, httplib::Response& res) {
     json q = json::object();

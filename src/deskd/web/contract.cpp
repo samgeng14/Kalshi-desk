@@ -172,13 +172,18 @@ json universe_json(const json& q, std::int64_t wall_ms) {
   const std::string day = q.value("day", std::string("T"));
   json cats = json::object();
   for (const char* c : {"SPORTS", "WEATHER", "FIN", "ECON", "OTHER"}) cats[c] = 0;
+  // grev names the result's shape (its groups and their counts; contract 1.5). The empty listing
+  // has one shape, kEmptyUniverseGrev; a page that holds it already sends it back and gets
+  // groups null, as it will when the shape is thousands of groups on a real day.
+  const bool same_shape = q.contains("grev") && q["grev"].is_string() && q["grev"] == kEmptyUniverseGrev;
   return json{{"ok", true},
               {"day", day},
               {"date", day == "T1" ? et_date_after(today) : today},
               {"total", 0},
               {"offset", q.contains("offset") && q["offset"].is_number_integer() ? q["offset"] : json(0)},
               {"rows", json::array()},
-              {"groups", json::array()},
+              {"groups", same_shape ? json(nullptr) : json(json::array())},
+              {"grev", kEmptyUniverseGrev},
               {"cats", cats},
               {"ts_ms", wall_ms}};
 }
@@ -327,7 +332,7 @@ void validate(const json& node, const json& v, const std::string& path, std::vec
     if (!node.contains(it.key()) && !node.contains(it.key() + "?")) errs.push_back(path + "." + it.key() + ": not in the contract");
 }
 
-// contract.js's endpoints[...].request, version 1.4.0
+// contract.js's endpoints[...].request, version 1.5.0 (no request body changed from 1.4)
 const json& request_schemas() {
   static const json venue = json::array({"enum", "K", "P"});
   static const json ref = {{"v", venue}, {"tk", "tk"}};
@@ -406,7 +411,8 @@ std::vector<std::string> check_universe_query(const json& q) {
       {"q?", "str"},
       {"sort?", json::array({"enum", "vol", "sprd", "close", "edge"})},
       {"offset?", "count"},
-      {"limit?", "count"}};
+      {"limit?", "count"},
+      {"grev?", "str"}};
   std::vector<std::string> errs;
   validate(schema, q, "$", errs);
   if (q.is_object() && q.contains("limit") && q["limit"].is_number() && (num(q["limit"]) < 1 || num(q["limit"]) > 200))
