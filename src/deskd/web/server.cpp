@@ -2,6 +2,7 @@
 
 #include <httplib.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cctype>
 #include <chrono>
@@ -33,6 +34,21 @@ bool host_ok(const std::string& host, int port) {
   for (char c : host) h.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
   const std::string p = std::to_string(port);
   return h == "127.0.0.1:" + p || h == "localhost:" + p;
+}
+
+std::string cross_site_refusal(const std::string& sec_fetch_site, const std::string* origin, int port) {
+  auto lower = [](std::string v) {
+    for (char& c : v) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return v;
+  };
+  const std::string site = lower(sec_fetch_site);
+  if (site == "cross-site" || site == "same-site") return "Sec-Fetch-Site " + site + ": the desk answers its own page only";
+  if (origin) {
+    const std::string o = lower(*origin), p = std::to_string(port);
+    if (o != "http://127.0.0.1:" + p && o != "http://localhost:" + p)
+      return "Origin " + origin->substr(0, 80) + " is not this desk's page";
+  }
+  return "";
 }
 
 bool token_ok(const std::string& got, const std::string& want) {
@@ -81,6 +97,24 @@ void reply_json(httplib::Response& res, int status, const json& body) {
 void reply_err(httplib::Response& res, const std::string& code, const std::string& msg) {
   reply_json(res, err_http(code), err_body(code, msg));
 }
+// The refusal, then the connection closed under it. A request refused before httplib reads its
+// body (a POST refused in the pre-routing hook, a GET that carries a body) leaves that body on
+// the socket, and on a kept-open connection the next request would be parsed out of it: a
+// cross-site form POST can carry a whole second request in its text/plain body. cpp-httplib
+// 0.18.3 keeps the connection whatever the reply's headers say (only the request's own
+// "Connection: close" ends it), so the reply goes out through a content provider that writes it
+// all and then reports failure, the one path on which httplib closes the socket.
+void reply_close(httplib::Response& res, const std::string& code, const std::string& msg) {
+  auto body = std::make_shared<std::string>(err_body(code, msg).dump());
+  res.status = err_http(code);
+  res.set_header("Cache-Control", "no-store");
+  res.set_header("Connection", "close");   // also tells the error handler the reply is ours
+  res.set_content_provider(body->size(), "application/json",
+                           [body](std::size_t off, std::size_t len, httplib::DataSink& sink) {
+                             sink.write(body->data() + off, std::min(len, body->size() - off));
+                             return false;   // all written: "failed" so httplib closes
+                           });
+}
 
 bool re_chars(const std::string& s, std::size_t lo, std::size_t hi, const char* extra) {
   if (s.size() < lo || s.size() > hi) return false;
@@ -95,14 +129,6 @@ bool sid_ok(const std::string& s) { return re_chars(s, 8, 64, "_-"); }
 bool tk_ok(const std::string& s) { return re_chars(s, 1, 96, "._-"); }   // contract RE_TK
 
 bool is_str(const json& j, const char* k) { return j.contains(k) && j[k].is_string(); }
-bool only_keys(const json& j, std::initializer_list<const char*> keys) {
-  for (auto it = j.begin(); it != j.end(); ++it) {
-    bool known = false;
-    for (const char* k : keys) known = known || it.key() == k;
-    if (!known) return false;
-  }
-  return true;
-}
 // a {v, tk} market reference, strictly
 bool parse_ref(const json& j, MarketRef* out) {
   if (!j.is_object() || j.size() != 2 || !is_str(j, "v") || !is_str(j, "tk")) return false;
@@ -157,22 +183,38 @@ struct WebServer::Impl {
   std::atomic<int> port{0};
   std::atomic<std::uint64_t> requests{0};
   std::atomic<bool> stopping{false};
+  std::atomic<int> waiting{0};   // request threads blocked on gw or pub right now
 
   using Handler = std::function<void(const httplib::Request&, httplib::Response&, const json&)>;
 
-  // Every POST: Host, then the token, then a JSON object body. These run in the handler, after
-  // httplib has read the body: refused in the pre-routing hook, an unread body would be left on
-  // a keep-alive connection and read as the next request. KILL takes any body: a KILL is never
-  // refused for its shape, only for Host and token.
-  httplib::Server::Handler post(Handler h, bool any_body = false) {
-    return [this, h, any_body](const httplib::Request& req, httplib::Response& res) {
-      if (!host_ok(req.get_header_value("Host"), port.load()))
-        return reply_err(res, "FORBIDDEN", "Host must be 127.0.0.1:" + std::to_string(port.load()) + " or localhost:" +
-                                               std::to_string(port.load()));
+  // Why the request is refused before anything else, or "": exactly one Host, and it names this
+  // port on 127.0.0.1 or localhost (DNS rebinding); no cross-site or same-site Sec-Fetch-Site and
+  // no Origin but this desk's own page. The Host rule alone let any page on another site hold the
+  // 4 stream slots with <script src> or a no-cors fetch, which carry Host 127.0.0.1:8788 (review,
+  // 2026-10-06: four such streams and the page's own got 409, the screen dark while Systematic
+  // kept trading). deskctl, curl and the ops probe send neither header and pass.
+  std::string refusal(const httplib::Request& req) const {
+    const int p = port.load();
+    if (req.get_header_value_count("Host") != 1)
+      return "exactly one Host header, 127.0.0.1:" + std::to_string(p) + " or localhost:" + std::to_string(p);
+    if (!host_ok(req.get_header_value("Host"), p))
+      return "Host must be 127.0.0.1:" + std::to_string(p) + " or localhost:" + std::to_string(p);
+    if (req.get_header_value_count("Origin") > 1 || req.get_header_value_count("Sec-Fetch-Site") > 1)
+      return "one Origin and one Sec-Fetch-Site at most";
+    const std::string origin = req.get_header_value("Origin");
+    return cross_site_refusal(req.get_header_value("Sec-Fetch-Site"), req.has_header("Origin") ? &origin : nullptr, p);
+  }
+
+  // Every POST, after the pre-routing hook passed its Host and origin and httplib read its body:
+  // the token, then a JSON object, then the contract's request schema for `key`
+  // (check_request), and only then the handler. KILL and Stop take any body (key ""): a safety
+  // action is never refused for its shape, only for Host, origin and token.
+  httplib::Server::Handler post(const std::string& key, Handler h) {
+    return [this, key, h](const httplib::Request& req, httplib::Response& res) {
       if (!token_ok(req.get_header_value("X-Desk"), d.token))
         return reply_err(res, "FORBIDDEN", "X-Desk token missing or not this start's");
       json body = json::object();
-      if (!any_body) {
+      if (!key.empty()) {
         const std::string ct = req.get_header_value("Content-Type");
         if (ct.compare(0, 16, "application/json") != 0)
           return reply_err(res, "BAD_REQUEST", "Content-Type must be application/json");
@@ -181,26 +223,55 @@ struct WebServer::Impl {
         } catch (const json::exception&) {
           return reply_err(res, "BAD_REQUEST", "body is not JSON");
         }
-        if (!body.is_object()) return reply_err(res, "BAD_REQUEST", "body is not a JSON object");
+        const std::vector<std::string> errs = check_request(key, body);
+        if (!errs.empty()) {
+          std::string msg = errs[0];
+          for (std::size_t i = 1; i < errs.size() && i < 3; ++i) msg += "; " + errs[i];
+          return reply_err(res, "BAD_REQUEST", msg);
+        }
       }
       h(req, res, body);
     };
   }
 
+  // A request thread waits on an owner (gw, pub) only through this, and at most kMaxWaiting of
+  // the 16 wait at once: a frozen owner then holds 4 threads, never the pool. The rest answer
+  // INTERNAL at once.
+  static constexpr int kMaxWaiting = 4;
+  struct Waiter {
+    std::atomic<int>& n;
+    bool ok;
+    explicit Waiter(std::atomic<int>& c) : n(c), ok(c.fetch_add(1) < kMaxWaiting) {}
+    ~Waiter() { n.fetch_sub(1); }
+  };
+
+  // Start and Stop: gw answers in microseconds; the web thread waits at most 50 ms for it (plan
+  // section 2), then says the request is queued and the stream's hdr carries the outcome. A Stop
+  // stays queued in gw's control lane and is applied when gw turns again.
   void control_reply(httplib::Response& res, const ControlPromise& p, bool posted, const char* what) {
     if (!posted) return reply_err(res, "INTERNAL", std::string("gw inbox full: ") + what + " not queued");
     auto f = p->get_future();
-    if (f.wait_for(std::chrono::seconds(1)) != std::future_status::ready)
-      return reply_err(res, "INTERNAL", std::string("gw did not answer ") + what + " in 1 s");
+    Waiter w(waiting);
+    if (!w.ok)
+      return reply_err(res, "INTERNAL", std::string(what) + " queued; " + std::to_string(kMaxWaiting) +
+                                            " requests already wait on gw or pub: the stream's hdr shows the outcome");
+    if (f.wait_for(std::chrono::milliseconds(kGwWaitMs)) != std::future_status::ready)
+      return reply_err(res, "INTERNAL", std::string(what) + " queued; gw has not answered within " +
+                                            std::to_string(kGwWaitMs) + " ms: the stream's hdr shows the outcome");
     ControlReply r = f.get();
     if (r.code.empty()) return reply_json(res, 200, json{{"ok", true}, {"run", run_json(r.run)}, {"n", r.n}});
     json body = err_body(r.code, r.msg);
     if (r.code == "PREFLIGHT") body["preflight"] = preflight_json(r.preflight);
     reply_json(res, err_http(r.code), body);
   }
+  static constexpr int kGwWaitMs = 50;
 
+  // Snapshot and subscribe: the contract's answer is the data itself, so these wait for pub (up
+  // to 2 s), but under the same cap.
   PubReply pub_call(PubMsg m, PubPromise p) {
     auto f = p->get_future();
+    Waiter w(waiting);
+    if (!w.ok) return PubReply{500, err_body("INTERNAL", std::to_string(kMaxWaiting) + " requests already wait on gw or pub")};
     if (!d.pub->post(std::move(m))) return PubReply{500, err_body("INTERNAL", "pub inbox full")};
     if (f.wait_for(std::chrono::seconds(2)) != std::future_status::ready)
       return PubReply{500, err_body("INTERNAL", "pub did not answer in 2 s")};
@@ -239,19 +310,37 @@ void WebServer::Impl::routes() {
   svr.set_tcp_nodelay(true);
   svr.set_payload_max_length(64 * 1024);
 
-  // GET (and anything else without a body): Host first, before routing
+  // Every request, every method, before routing and before httplib reads a body: Host and
+  // origin first ("FORBIDDEN ... before anything else", contract). A POST refused here has its
+  // body unread, so its connection is closed after the reply (reply_close); so is a GET that
+  // carries a body, which httplib never reads.
   svr.set_pre_routing_handler([this](const httplib::Request& req, httplib::Response& res) {
     requests.fetch_add(1, std::memory_order_relaxed);
-    if (req.method == "POST") return httplib::Server::HandlerResponse::Unhandled;   // see post()
-    if (!host_ok(req.get_header_value("Host"), port.load())) {
-      reply_err(res, "FORBIDDEN", "Host must be 127.0.0.1:" + std::to_string(port.load()) + " or localhost:" +
-                                      std::to_string(port.load()));
+    const bool has_body = req.method == "POST" || req.method == "PUT" || req.method == "PATCH" || req.method == "DELETE";
+    const std::string why = refusal(req);
+    if (!why.empty()) {
+      if (has_body) reply_close(res, "FORBIDDEN", why);
+      else reply_err(res, "FORBIDDEN", why);
+      return httplib::Server::HandlerResponse::Handled;
+    }
+    if (!has_body && (req.get_header_value_u64("Content-Length") > 0 || req.has_header("Transfer-Encoding"))) {
+      reply_close(res, "BAD_REQUEST", req.method + " with a body");
       return httplib::Server::HandlerResponse::Handled;
     }
     return httplib::Server::HandlerResponse::Unhandled;
   });
-  svr.set_error_handler([](const httplib::Request&, httplib::Response& res) {
-    if (!res.body.empty()) return httplib::Server::HandlerResponse::Unhandled;   // ours already
+  svr.set_error_handler([this](const httplib::Request& req, httplib::Response& res) {
+    if (!res.body.empty() || res.has_header("Connection")) return httplib::Server::HandlerResponse::Unhandled;   // ours
+    if (res.status == 413) {
+      // over 64 KiB: httplib skipped the body without reading it into memory. Host, origin and
+      // token still come first.
+      const std::string why = refusal(req);
+      if (!why.empty()) reply_err(res, "FORBIDDEN", why);
+      else if (req.method == "POST" && !token_ok(req.get_header_value("X-Desk"), d.token))
+        reply_err(res, "FORBIDDEN", "X-Desk token missing or not this start's");
+      else reply_err(res, "BAD_REQUEST", "body over 64 KiB");
+      return httplib::Server::HandlerResponse::Handled;
+    }
     if (res.status == 404) reply_err(res, "NOT_FOUND", "no such endpoint");
     else if (res.status < 500) reply_err(res, "BAD_REQUEST", "HTTP " + std::to_string(res.status));
     else reply_err(res, "INTERNAL", "HTTP " + std::to_string(res.status));
@@ -314,21 +403,33 @@ void WebServer::Impl::routes() {
     reply_json(res, 200, json{{"ok", true}, {"epoch", d.pub->epoch()}, {"srv_ms", now_ms()}});
   });
 
+  // THE UNIVERSE, paged (contract 1.4). Week 0 lists no market: the reply is an empty page for
+  // the day asked, after the same query check contract.js makes.
+  svr.Get("/api/universe", [](const httplib::Request& req, httplib::Response& res) {
+    json q = json::object();
+    for (const auto& kv : req.params) {   // contract.js parseQuery: the last value of a key wins
+      const std::string& v = kv.second;
+      const bool digits = !v.empty() && v.size() < 16 && v.find_first_not_of("0123456789") == std::string::npos;
+      q[kv.first] = (kv.first == "offset" || kv.first == "limit") && digits ? json(std::stoll(v)) : json(v);
+    }
+    const std::vector<std::string> errs = check_universe_query(q);
+    if (!errs.empty()) return reply_err(res, "BAD_REQUEST", errs[0]);
+    reply_json(res, 200, universe_json(q, now_ms()));
+  });
+
   // deskctl status. Outside /api/: not part of the screen's contract, and never the token.
   svr.Get("/ops/status", [this](const httplib::Request&, httplib::Response& res) {
     json s = d.status ? d.status() : json::object();
     s["web"] = {{"port", port.load()},
                 {"requests", requests.load()},
                 {"streams", d.pub->streams().open_count()},
+                {"waiting", waiting.load()},
                 {"threads", d.threads}};
     reply_json(res, 200, s);
   });
 
   // ---- POSTs -------------------------------------------------------------------------------
-  svr.Post("/api/subscribe", post([this](const httplib::Request&, httplib::Response& res, const json& b) {
-    if (!only_keys(b, {"sid", "ladders", "tops"}) || !is_str(b, "sid") || !b.contains("ladders") ||
-        !b["ladders"].is_array() || !b.contains("tops"))
-      return reply_err(res, "BAD_REQUEST", "subscribe takes {sid, ladders, tops}");
+  svr.Post("/api/subscribe", post("POST /api/subscribe", [this](const httplib::Request&, httplib::Response& res, const json& b) {
     Subs subs;
     for (const auto& l : b["ladders"]) {
       MarketRef r;
@@ -336,16 +437,14 @@ void WebServer::Impl::routes() {
       subs.ladders.push_back(r);
     }
     if (subs.ladders.size() > 4) return reply_err(res, "BAD_REQUEST", "at most 4 ladders");
-    if (b["tops"].is_string() && b["tops"] == "ALL") {
-      subs.tops_all = true;
-    } else if (b["tops"].is_array()) {
+    if (b["tops"].is_string()) {
+      subs.tops_all = true;   // "ALL", the only string the schema lets through
+    } else {
       for (const auto& t : b["tops"]) {
         MarketRef r;
         if (!parse_ref(t, &r)) return reply_err(res, "BAD_REQUEST", "tops: \"ALL\" or [{v, tk}]");
         subs.tops.push_back(r);
       }
-    } else {
-      return reply_err(res, "BAD_REQUEST", "tops: \"ALL\" or [{v, tk}]");
     }
     auto p = std::make_shared<std::promise<PubReply>>();
     PubReply r = pub_call(PubSubscribe{b["sid"].get<std::string>(), std::move(subs), p}, p);
@@ -357,7 +456,7 @@ void WebServer::Impl::routes() {
   // KILL answers while gw is frozen. send-cx is expected to take the new generation at once; if
   // it has not within 100 ms (dead, or stuck in a write), the screen hears it as CRIT rather than
   // seeing KILLED alone. A repeated KILL sends cancel-all again: idempotent and never harmful.
-  svr.Post("/api/kill", post([this](const httplib::Request&, httplib::Response& res, const json&) {
+  svr.Post("/api/kill", post("", [this](const httplib::Request&, httplib::Response& res, const json&) {
     const bool first = d.kill->trip(now_ms(), mono_ms(), "operator");
     const std::uint64_t gen = d.kill->generation();
     if (first) d.pub->alert("CRIT", "KILL", "KILL by operator: new orders refused until re-armed (60 s)");
@@ -367,11 +466,10 @@ void WebServer::Impl::routes() {
     }
     const RunView r{RunState::KILLED, d.kill->since_ms(), d.kill->rearm_ms(), d.kill->why()};
     reply_json(res, 200, json{{"ok", true}, {"run", run_json(r)}, {"n", 0}});
-  }, true));
+  }));
 
   // gw applies the re-arm itself, on its own thread, before it looks at any later Start
-  svr.Post("/api/rearm", post([this](const httplib::Request&, httplib::Response& res, const json& b) {
-    if (!b.empty()) return reply_err(res, "BAD_REQUEST", "rearm takes {}");
+  svr.Post("/api/rearm", post("POST /api/rearm", [this](const httplib::Request&, httplib::Response& res, const json&) {
     const std::int64_t now = now_ms();
     const std::string why = d.kill->rearm(now, mono_ms());
     if (!why.empty()) return reply_err(res, "BAD_STATE", why);
@@ -379,53 +477,51 @@ void WebServer::Impl::routes() {
     reply_json(res, 200, json{{"ok", true}, {"run", run_json(RunView{RunState::STOP, now, 0, ""})}, {"n", 0}});
   }));
 
-  svr.Post("/api/start", post([this](const httplib::Request&, httplib::Response& res, const json& b) {
-    if (!b.empty()) return reply_err(res, "BAD_REQUEST", "start takes {}");
+  svr.Post("/api/start", post("POST /api/start", [this](const httplib::Request&, httplib::Response& res, const json&) {
     auto p = std::make_shared<std::promise<ControlReply>>();
     const bool posted = d.gw->post(Start{p});
     control_reply(res, p, posted, "start");
   }));
 
   // Stop is a safety action like KILL: never refused for its body
-  svr.Post("/api/stop", post([this](const httplib::Request&, httplib::Response& res, const json&) {
+  svr.Post("/api/stop", post("", [this](const httplib::Request&, httplib::Response& res, const json&) {
     auto p = std::make_shared<std::promise<ControlReply>>();
     const bool posted = d.gw->post(Stop{"operator", p});
     control_reply(res, p, posted, "stop");
-  }, true));
+  }));
 
   // Week 0 lists no markets and holds no orders, lanes or balances. These are the answers the
-  // gateway would give an empty universe, so the page's buttons get contract replies, not 404s.
-  svr.Post("/api/order", post([](const httplib::Request&, httplib::Response& res, const json& b) {
-    if (!is_str(b, "cid") || !is_str(b, "v") || !is_str(b, "tk")) return reply_err(res, "BAD_REQUEST", "order needs cid, v, tk");
-    reply_err(res, "UNKNOWN_MARKET", b["v"].get<std::string>().substr(0, 1) + "|" + b["tk"].get<std::string>().substr(0, 96) +
-                                         ": no markets are listed in this stage");
+  // gateway would give an empty universe, so the page's buttons get contract replies, not 404s;
+  // a body that breaks the contract never gets this far (post: BAD_REQUEST).
+  svr.Post("/api/order", post("POST /api/order", [](const httplib::Request&, httplib::Response& res, const json& b) {
+    reply_err(res, "UNKNOWN_MARKET", b["v"].get<std::string>() + "|" + b["tk"].get<std::string>() + ": no markets are listed in this stage");
   }));
-  svr.Post("/api/cancel", post([](const httplib::Request&, httplib::Response& res, const json& b) {
-    if (b.contains("cids") && b.size() == 1 && b["cids"].is_array())
-      return reply_json(res, 200, json{{"ok", true}, {"n", 0}, {"cids", json::array()}});   // unknown cids are skipped
-    if (is_str(b, "v") && is_str(b, "tk")) return reply_err(res, "NOT_FOUND", "no such market");
-    reply_err(res, "BAD_REQUEST", "cancel takes {cids} or {v, tk, own, side, px}");
+  svr.Post("/api/cancel", post("POST /api/cancel", [](const httplib::Request&, httplib::Response& res, const json& b) {
+    if (b.contains("cids")) return reply_json(res, 200, json{{"ok", true}, {"n", 0}, {"cids", json::array()}});   // unknown cids are skipped
+    reply_err(res, "NOT_FOUND", "no such market");
   }));
-  svr.Post("/api/cancel_all", post([](const httplib::Request&, httplib::Response& res, const json& b) {
-    if (!is_str(b, "own")) return reply_err(res, "BAD_REQUEST", "cancel_all takes {own, v}");
+  svr.Post("/api/cancel_all", post("POST /api/cancel_all", [](const httplib::Request&, httplib::Response& res, const json&) {
     reply_json(res, 200, json{{"ok", true}, {"n", 0}, {"cids", json::array()}});
   }));
-  svr.Post("/api/amend", post([](const httplib::Request&, httplib::Response& res, const json& b) {
-    if (!is_str(b, "cid")) return reply_err(res, "BAD_REQUEST", "amend needs cid");
+  svr.Post("/api/amend", post("POST /api/amend", [](const httplib::Request&, httplib::Response& res, const json&) {
     reply_err(res, "NOT_FOUND", "no such order");
   }));
-  svr.Post(R"(/api/lane/([A-Za-z0-9_-]+))", post([](const httplib::Request& req, httplib::Response& res, const json& b) {
-    if (!b.contains("on") || !b["on"].is_boolean()) return reply_err(res, "BAD_REQUEST", "lane takes {on}");
+  svr.Post(R"(/api/lane/([A-Za-z0-9_-]+))", post("POST /api/lane/{id}", [](const httplib::Request& req, httplib::Response& res, const json&) {
     reply_err(res, "NOT_FOUND", "no lane " + std::string(req.matches[1]));
   }));
-  svr.Post("/api/release", post([](const httplib::Request&, httplib::Response& res, const json& b) {
-    if (!is_str(b, "v") || !is_str(b, "tk")) return reply_err(res, "BAD_REQUEST", "release takes {v, tk}");
+  svr.Post("/api/release", post("POST /api/release", [](const httplib::Request&, httplib::Response& res, const json&) {
     reply_err(res, "UNKNOWN_MARKET", "no markets are listed in this stage");
   }));
-  svr.Post("/api/transfer", post([](const httplib::Request&, httplib::Response& res, const json& b) {
-    if (!is_str(b, "from") || !is_str(b, "to") || !is_str(b, "amt"))
-      return reply_err(res, "BAD_REQUEST", "transfer takes {from, to, amt}");
+  svr.Post("/api/watch", post("POST /api/watch", [](const httplib::Request&, httplib::Response& res, const json&) {
+    reply_err(res, "UNKNOWN_MARKET", "no markets are listed in this stage");
+  }));
+  svr.Post("/api/transfer", post("POST /api/transfer", [](const httplib::Request&, httplib::Response& res, const json&) {
     reply_err(res, "NO_CASH", "no shard balances in this stage");
+  }));
+  // Any other POST: the token first, like every POST, then 404 (until 2026-10-06 an unknown
+  // path answered 404 before the token was looked at)
+  svr.Post(R"(/.*)", post("", [](const httplib::Request&, httplib::Response& res, const json&) {
+    reply_err(res, "NOT_FOUND", "no such endpoint");
   }));
 
   // ---- the page ----------------------------------------------------------------------------
@@ -466,7 +562,14 @@ void WebServer::wait_ready() { impl_->svr.wait_until_ready(); }
 
 void WebServer::stop() {
   if (impl_->stopping.exchange(true)) return;
-  impl_->d.pub->streams().close_all();   // every stream's provider ends within 250 ms
+  // Every stream's provider sees `stopping` within 250 ms and ends its response with the closing
+  // chunk. svr.stop() at once cut them off mid-response instead (httplib's chunked loop leaves on
+  // is_shutting_down() before the provider's sink.done()): the browser logged
+  // ERR_INCOMPLETE_CHUNKED_ENCODING on every SIGTERM. Wait up to 300 ms for them.
+  impl_->d.pub->streams().close_all();
+  const std::int64_t end = mono_ms() + 300;
+  while (impl_->d.pub->streams().open_count() > 0 && mono_ms() < end)
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
   impl_->svr.stop();
 }
 

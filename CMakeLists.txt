@@ -346,8 +346,10 @@ target_precompile_headers(deskctl REUSE_FROM deskd_core)
 # tests/deskd: the repo's CHECK style, one executable per area.
 #   bus      units, messages, the two-lane queue (priority overtakes, a full lane drops and marks a gap)
 #   ops      the account lock, the heartbeat rule, config, the subscription and send guards
-#   web      Host and token guards, SSE framing and seq, the stream limit and lifecycle, the
-#            snapshot and replies checked by contract.js itself (node), KILL with gw frozen
+#   web      Host, origin and token guards, the strict request checker (its verdicts compared
+#            with contract.js's), SSE framing and seq, the stream limit and lifecycle, the
+#            snapshot and replies checked by contract.js itself (node), KILL with gw frozen and
+#            with send-cx's inbox full
 #   process  the real binaries: a second deskd refused (also from another working directory),
 #            SIGTERM, deskctl status and kill
 foreach(t bus ops web process)
@@ -356,6 +358,9 @@ foreach(t bus ops web process)
   target_precompile_headers(deskd-test-${t} REUSE_FROM deskd_core)
   add_test(NAME deskd-${t} COMMAND deskd-test-${t})
 endforeach()
+# Without node the contract.js conformance check cannot run: deskd-test-web returns 77 and ctest
+# reports the test skipped, not passed (until 2026-10-06 it printed a line and passed).
+set_tests_properties(deskd-web PROPERTIES SKIP_RETURN_CODE 77)
 add_dependencies(deskd-test-process deskd deskctl)
 
 # ---- tests/fake_exchange: a fake Kalshi for deskd's tests (plan section 8) ---------------------
