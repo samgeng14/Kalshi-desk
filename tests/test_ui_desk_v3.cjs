@@ -326,6 +326,29 @@ const flushMicro = () => new Promise(r => setImmediate(r));
   // the snapshot does not list Mtestabc-3/4: they stay while young (in flight), then go
   seq = st.seq;
   ap('hb', EX.hb);
+  // contract 1.5: a market leaves the live set (mkt live false); T / T1; the ET day roll
+  {
+    const H = st._handlers, K2 = 'K|KXTESTLIVE-1', K3 = 'K|KXTESTLIVE-2';
+    const mk = tk => Object.assign(JSON.parse(JSON.stringify(EX.mkt)), { tk, ev: 'KXTESTLIVE', og: 'KXTESTLIVE', pin: false });
+    const bk = tk => Object.assign(JSON.parse(JSON.stringify(EX.book)), { tk, depth: 'TOP' });
+    check(!C.validate(C.events.mkt.schema, Object.assign(mk('KXTESTLIVE-1'), { live: false })).length, 'mkt with live false is in contract');
+    H.mkt(mk('KXTESTLIVE-1')); H.book(bk('KXTESTLIVE-1'));
+    check(st.liveMarket(K2) && st.book(K2) && st.market(K2).gk === '15M', 'a live market with its book (and its group key, mkt.gk)');
+    H.mkt(Object.assign(mk('KXTESTLIVE-1'), { live: false }));
+    check(!st.market(K2) && !st.book(K2) && !st.liveMarket(K2), 'mkt live false: the book goes and, nothing here holding it, the market too');
+    H.mkt(mk('KXTESTLIVE-2')); H.book(bk('KXTESTLIVE-2'));
+    H.pos(Object.assign(JSON.parse(JSON.stringify(EX.pos)), { tk: 'KXTESTLIVE-2', pos: 0, avg: null, own: null, unrl: '0.0000', real: '0.1200', maxl: '0.0000', if_yes: '0.0000', if_no: '0.0000' }));
+    H.mkt(Object.assign(mk('KXTESTLIVE-2'), { live: false }));
+    check(st.market(K3) && st.market(K3).live === false && !st.book(K3) && st.liveMarket(K3) === null, 'a position row (flat, kept for the day) keeps the market\'s record, not live and without a book, so it keeps its name');
+    eq(st.dayOf('2026-10-06') + st.dayOf('2026-10-05') + '/' + st.dayOf('2026-10-07') + '/' + st.dayOf('2026-10-08'), 'TT/T1/', 'T is today or earlier, T1 tomorrow exactly, later dates neither');
+    const K4 = 'K|KXTESTLIVE-4';
+    H.mkt(mk('KXTESTLIVE-4')); H.pos(Object.assign(JSON.parse(JSON.stringify(EX.pos)), { tk: 'KXTESTLIVE-4' }));
+    const nextDay = Object.assign(JSON.parse(JSON.stringify(EX.hb)), { date: '2026-10-07' });
+    seq = st.seq; ap('hb', nextDay);
+    check(!st.pos.has(K3) && !st.market(K3) && st.pos.has(K4) && st.position(K4).pos === 12 && st.market(K4), 'a new ET day drops the flat position rows (and the records kept for them), never an open position', [...st.pos.keys()]);
+    eq(st.dayOf('2026-10-07') + '/' + st.dayOf('2026-10-08'), 'T/T1', 'and T and T1 move with hb.date');
+    seq = st.seq; ap('hb', EX.hb);
+  }
 
   if (process.env.V) console.log('section 5');
   // ---- 5. sequence gaps, epochs, silence ---------------------------------------------------
@@ -425,13 +448,16 @@ const flushMicro = () => new Promise(r => setImmediate(r));
     // settled markets are forgotten after 30 min unless a position or a ladder holds them
     const sm = JSON.parse(JSON.stringify(EX.mkt)); sm.tk = 'KXOLD-1'; sm.status = 'SETTLED'; sm.result = 'YES';
     const sm2 = JSON.parse(JSON.stringify(sm)); sm2.tk = 'KXOLD-2';
-    S5._handlers.mkt(sm); S5._handlers.mkt(sm2);
+    const sm3 = JSON.parse(JSON.stringify(sm)); sm3.tk = 'KXOLD-3';
+    S5._handlers.mkt(sm); S5._handlers.mkt(sm2); S5._handlers.mkt(sm3);
     const pp = JSON.parse(JSON.stringify(EX.pos)); pp.tk = 'KXOLD-2'; pp.pos = 0; pp.avg = null; pp.mark = null; S5._handlers.pos(pp);
+    const pp3 = JSON.parse(JSON.stringify(EX.pos)); pp3.tk = 'KXOLD-3'; S5._handlers.pos(pp3);
     const later = Date.now() + 31 * 60000;
     S5.prune(Date.now() + 60000);
     check(S5.markets.has('K|KXOLD-1'), 'a market settled a minute ago stays');
     S5.prune(later);
-    check(!S5.markets.has('K|KXOLD-1') && !S5.books.has('K|KXOLD-1') && S5.markets.has('K|KXOLD-2'), 'after 30 min it goes, unless a position row holds it');
+    check(!S5.markets.has('K|KXOLD-1') && !S5.books.has('K|KXOLD-1') && S5.markets.has('K|KXOLD-3'), 'after 30 min it goes, unless an open position holds it');
+    check(!S5.markets.has('K|KXOLD-2'), 'a flat position row (kept for the day) does not hold it: the sim\'s snapshot drops it by the same rule');
   }
 
   if (process.env.V) console.log('section 6');
@@ -633,8 +659,22 @@ const flushMicro = () => new Promise(r => setImmediate(r));
         (st2, j2) => { rc = { s: st2, j: j2 }; }, { 'X-Desk': simC.token });
       runC(300);
       check(rc && rc.s === 200 && rc.j.ord.st === 'WORK', 'a 15-minute window takes an until-close post', rc && rc.j);
+      // a 30-minute post on the same window: its expiry is after the close, so the close ends it
+      let rd = null;
+      simC.request('POST', '/api/order', { cid: 'Mclose0002', v: 'K', tk: lk.tk, side: 'BUY', px: '0.4700', qty: 1, tif: 'POST', ttl_s: 1800, override: false, touch: null, t_click_ms: null },
+        (st2, j2) => { rd = { s: st2, j: j2 }; }, { 'X-Desk': simC.token });
+      // an absolute expiry 5.5 s ahead: the backend takes it (5 s is its floor at receipt); the page
+      // asks 6 s, so a click this close to the edge is refused there first (manual.js EXP_MIN_MS)
+      const e55 = Math.floor((tc + 5999) / 1000) * 1000;
+      let re = null;
+      simC.request('POST', '/api/order', { cid: 'Mclose0003', v: 'K', tk: lk.tk, side: 'BUY', px: '0.4600', qty: 1, tif: 'POST', ttl_s: null, exp_ms: e55, override: false, touch: null, t_click_ms: null },
+        (st2, j2) => { re = { s: st2, j: j2 }; }, { 'X-Desk': simC.token });
+      runC(300);
+      check(rd && rd.s === 200 && rd.j.ord.exp_ms > lk.close_ms, 'a 30-minute post on a window closing sooner rests past the close (its expiry is not cut)', rd && rd.j.ord);
+      check(re && re.s === 200 && e55 - tc >= 5000 && e55 - tc < 6000, 'an expiry between 5 and 6 s ahead is still taken by the backend', re && re.j);
       runC(lk.close_ms - tc + 500);
       check(simC.order('Mclose0001').st === 'EXP' && simC.order('Mclose0001').why === 'EXPIRY', 'it ends EXP at the close', { st: simC.order('Mclose0001').st, why: simC.order('Mclose0001').why });
+      check(simC.order('Mclose0002').st === 'CXL' && simC.order('Mclose0002').why === 'MARKET_CLOSED', 'the order whose expiry is after the close ends CXL MARKET_CLOSED (a cancel before exp_ms, caused by the close)', { st: simC.order('Mclose0002').st, why: simC.order('Mclose0002').why });
     }
     const game = sim.markets().find(x => x.kind === 'GAME');
     check(sim.markets().every(x => x.kind === 'GAME' ? x.game && typeof x.game.start === 'number' : true), 'games carry their start');
@@ -924,7 +964,7 @@ const flushMicro = () => new Promise(r => setImmediate(r));
     runU(1000);
     const listed = su.universe().length + su.markets().length;
     check(listed > 2500 && listed < 8000, 'the demo lists a few thousand markets for today and tomorrow', listed);
-    const live0 = su.markets().length;
+    const live0 = su.markets().length, bootKeys = su.markets().map(m => m.key);
     check(live0 < 80, 'of which only the desk\'s own are live (mkt events, books)', live0);
     const rT = get('day=T&limit=200'), rT1 = get('day=T1&limit=200');
     for (const r of [rT, rT1]) D.contract.validateResponse('GET /api/universe', r.s, r.j).forEach(e => check(false, 'universe reply: ' + e));
@@ -977,26 +1017,123 @@ const flushMicro = () => new Promise(r => setImmediate(r));
     check(uw.j.pin === false && su.market(row.v + '|' + row.tk).pin === false && ue.filter(e => e.type === 'mkt' && e.data.tk === row.tk).pop().data.pin === false, 'unpinning sends mkt.pin false');
     const unk = post('/api/watch', { v: 'K', tk: 'KXNOSUCH-1', on: true });
     check(unk.s === 404 && unk.j.err.code === 'UNKNOWN_MARKET', 'pinning an unknown market is refused', unk.j);
+    // contract 1.5: unpinned and held by nothing, it leaves the live set
+    runU(1500);
+    const gone = ue.filter(e => e.type === 'mkt' && e.data.tk === row.tk).pop().data;
+    check(gone.live === false && !su.market(row.v + '|' + row.tk) && !!su.listing(row.v + '|' + row.tk),
+      'unpinned and held by nothing, it leaves the live set: its last mkt event says live false, and it is a listing row again', gone);
+    check(ue.filter(e => e.type === 'mkt' && e.data.live === false).every(e => !D.contract.validateEvent(e).length), 'that event is in contract');
+    let nb = ue.length; runU(5000);
+    eq(ue.slice(nb).filter(e => e.type === 'book' && e.data.tk === row.tk).length, 0, 'its book stops');
+    const back1 = get('day=T&q=' + row.tk).j.rows[0];
+    check(back1 && back1.live === false && back1.pin === false, 'the listing says not live, not pinned', back1);
+    check(!su.snapshot().markets.some(m => m.tk === row.tk), 'and the snapshot leaves it out');
+    check(ue.filter(e => e.type === 'mkt').every(e => typeof e.data.gk === 'string' && e.data.gk.length > 0), 'every mkt event carries its group key (gk)');
+    // pins on markets that are not open
+    const later = su.universe().find(r => r.open_ms > tu), shut = su.universe().find(r => r.close_ms <= tu);
+    const pl = post('/api/watch', { v: later.v, tk: later.tk, on: true }), ps = post('/api/watch', { v: shut.v, tk: shut.tk, on: true });
+    check(pl.s === 409 && pl.j.err.code === 'MARKET_CLOSED' && ps.s === 409 && ps.j.err.code === 'MARKET_CLOSED', 'a pin on a market that is not open (not yet, or no longer) is refused MARKET_CLOSED', [pl.j, ps.j]);
+    D.contract.validateResponse('POST /api/watch', pl.s, pl.j).forEach(e => check(false, 'watch refusal: ' + e));
+    eq(post('/api/watch', { v: shut.v, tk: shut.tk, on: false }).s, 200, 'an unpin is always accepted');
+    // T1 is tomorrow exactly; a later date is in neither
+    check(rT1.j.rows.every(r => r.date === '2026-10-07') && rT.j.rows.every(r => r.date <= '2026-10-06'), 'T1 rows are dated tomorrow, T rows today or earlier');
+    {
+      const src = su.universe().find(r => r.date === '2026-10-07' && r.open_ms <= tu && r.close_ms > tu + 3600000);
+      const far = Object.assign({}, src, { key: src.v + '|' + src.tk + 'X', tk: src.tk + 'X', date: '2026-10-08', close_ms: src.close_ms + 86400000 });
+      su.state.uni.set(far.key, far); su.state.uniCache = null;
+      const t1q = get('day=T1&q=' + far.tk), tq = get('day=T&q=' + far.tk);
+      check(t1q.j.total === 0 && tq.j.total === 0, 'a market dated the day after tomorrow is in neither T nor T1', [t1q.j.total, tq.j.total]);
+      su.state.uni.delete(far.key); su.state.uniCache = null;
+    }
+    // grev: the page sends the shape it holds, the backend leaves groups out while it matches
+    {
+      const g1 = get('day=T&sort=vol&limit=50'), g2 = get('day=T&sort=vol&limit=50&offset=50&grev=' + encodeURIComponent(g1.j.grev));
+      check(typeof g1.j.grev === 'string' && g1.j.groups.length > 10 && g2.j.groups === null && g2.j.grev === g1.j.grev && g2.j.rows.length === 50,
+        'with the grev it holds, the page gets its rows without the groups again', { grev: g1.j.grev, g2: g2.j.groups && g2.j.groups.length });
+      D.contract.validateResponse('GET /api/universe', g2.s, g2.j).forEach(e => check(false, 'universe reply without groups: ' + e));
+      const g3 = get('day=T&sort=vol&limit=50&grev=stale.1');
+      check(Array.isArray(g3.j.groups) && g3.j.groups.length === g1.j.groups.length, 'another grev gets the groups in full');
+      check(C.enums.CAT.every(c => typeof g1.j.cats[c] === 'number') && Object.keys(g1.j.cats).length === C.enums.CAT.length, 'cats has exactly the five categories');
+      const bad = JSON.parse(JSON.stringify(g1.j)); bad.cats.CRYPTO = 3;
+      check(D.contract.validateResponse('GET /api/universe', 200, bad).length > 0, 'a cats key outside the five breaks the contract');
+    }
     // a ladder on a listing row brings it live without pinning it
-    const lr = get('day=T1&cat=SPORTS&limit=50').j.rows.find(r => !r.live && r.v === 'K');
+    const lr = get('day=T1&cat=SPORTS&limit=50').j.rows.find(r => !r.live && r.v === 'K' && r.bid !== null && r.ask !== null);
     const sub = post('/api/subscribe', { sid: 'universe', ladders: [{ v: lr.v, tk: lr.tk }], tops: 'ALL' });
     runU(300);
     check(sub.j.ok && su.market(lr.v + '|' + lr.tk) && su.market(lr.v + '|' + lr.tk).pin === false && ue.some(e => e.type === 'book' && e.data.tk === lr.tk && e.data.depth === 'FULL'),
       'a ladder subscription on a listing row brings it live at full depth, unpinned', sub.j);
+    // while a working order holds it, it stays live off the ladder; flat, unpinned, off every
+    // ladder, it leaves (a flat position row does not hold it)
+    {
+      const lk2 = lr.v + '|' + lr.tk, lm = su.market(lk2);
+      const best = (mm, side) => { const ks = [...(side === 'BUY' ? mm.bids : mm.asks).entries()].filter(x => x[1] > 0).map(x => x[0]); return ks.length ? (side === 'BUY' ? Math.max(...ks) : Math.min(...ks)) : null; };
+      const ord = (cid, side, px, tif, ttl) => post('/api/order', { cid, v: lr.v, tk: lr.tk, side, px: N.pxStr(px), qty: 1, tif, ttl_s: ttl, override: true, touch: null, t_click_ms: null });
+      const rest = ord('Mhold00001', 'BUY', 100, 'POST', 60);
+      check(rest.s === 200 && rest.j.ord.st === 'WORK', 'an order rests on it', rest.j);
+      const ask = best(lm, 'SELL');
+      if (ask !== null) ord('Mhold00002', 'BUY', ask, 'IOC', null);
+      const bid2 = best(su.market(lk2), 'BUY');
+      if (ask !== null && bid2 !== null) ord('Mhold00003', 'SELL', bid2, 'IOC', null);
+      post('/api/subscribe', { sid: 'universe', ladders: [], tops: 'ALL' }); runU(2000);
+      check(su.market(lk2), 'off the ladder, its working order keeps it live');
+      const P2 = su.position(lk2);
+      check(P2 && P2.pos === 0 && P2.real !== 0, 'a round trip leaves a flat position row', P2 && { pos: P2.pos, real: P2.real });
+      post('/api/cancel', { cids: ['Mhold00001'] }); runU(2000);
+      check(!su.market(lk2) && ue.filter(e => e.type === 'mkt' && e.data.tk === lr.tk).pop().data.live === false, 'once the order is gone it leaves the live set (the flat row does not hold it)');
+      nb = ue.length; runU(10000);
+      eq(ue.slice(nb).filter(e => e.type === 'book' && e.data.tk === lr.tk).length, 0, 'and stops streaming');
+      check(!su.state.markets.has(lk2) && su.state.pos.has(lk2), 'the flat row stays for the day');
+      global.__flatKey = lk2;
+    }
+    // a pin on a rolling series carries to the next window (and so does no pin)
+    {
+      const lips = su.markets().filter(m => m.kind === 'LIP15' && m.status === 'OPEN');
+      const ser = tk => tk.split('-')[0], a = lips[0], b2 = lips.find(m => ser(m.tk) !== ser(a.tk));
+      check(a.pin && b2.pin, 'the desk\'s own markets start pinned');
+      post('/api/watch', { v: a.v, tk: a.tk, on: false });
+      runU(a.close_ms - tu + 3000);
+      const nextA = su.markets().find(m => m.kind === 'LIP15' && m.status === 'OPEN' && ser(m.tk) === ser(a.tk));
+      const nextB = su.markets().find(m => m.kind === 'LIP15' && m.status === 'OPEN' && ser(m.tk) === ser(b2.tk));
+      check(nextA && nextA.key !== a.key && nextA.pin === false && nextB && nextB.key !== b2.key && nextB.pin === true,
+        'at the roll the next window keeps the pin of the one before (unpinned stays unpinned, pinned stays pinned)', [nextA && nextA.pin, nextB && nextB.pin]);
+      const ev2 = ue.filter(e => e.type === 'mkt' && e.data.tk === nextA.tk)[0];
+      check(ev2 && ev2.data.pin === false && ev2.data.live === true, 'its mkt event says so', ev2 && ev2.data);
+      post('/api/watch', { v: nextA.v, tk: nextA.tk, on: true });
+    }
     // hb and the snapshot carry today's ET date; every event and the snapshot stay in contract
     check(ue.filter(e => e.type === 'hb').every(e => e.data.date === '2026-10-06'), 'hb.date is today (ET)');
     eq(su.snapshot().date, '2026-10-06', 'snapshot.date too');
     eq(ue.filter(e => D.contract.validateEvent(e).length).length, 0, 'every event stays in contract');
-    // only live markets stream: book events name live markets only
-    const booked = new Set(ue.filter(e => e.type === 'book').map(e => e.data.v + '|' + e.data.tk));
-    check([...booked].every(k => su.market(k)), 'no listing row streams a book (only the live set does)');
+    // only live markets stream: a book event names a market of the live set at that moment (the
+    // desk's own from the start, or one a mkt event brought in and no live-false event took out)
+    {
+      const liveNow = new Map(bootKeys.map(k => [k, true]));
+      let bad = 0;
+      ue.forEach(e => { const k = e.data && e.data.v + '|' + e.data.tk; if (e.type === 'mkt') liveNow.set(k, e.data.live !== false); else if (e.type === 'book' && !liveNow.get(k)) bad++; });
+      eq(bad, 0, 'no listing row streams a book (only the live set does, and only while it is in it)');
+    }
     // an exclusive event settles one way: two brackets of one weather event, pinned, to the close
     const ev = wx.j.rows.find(r => !r.live && /^KXHIGH/.test(r.tk) && wx.j.rows.filter(x => x.tk.split('-').slice(0, 2).join('-') === r.tk.split('-').slice(0, 2).join('-') && !x.live).length >= 3);
     const evk = ev.tk.split('-').slice(0, 2).join('-'), sibs = wx.j.rows.filter(x => x.tk.indexOf(evk + '-') === 0 && !x.live);
     sibs.forEach(r => post('/api/watch', { v: r.v, tk: r.tk, on: true }));
+    // the ET day rolls at midnight (04:00 UTC): yesterday's T+1 rows are today's, yesterday's
+    // markets that have not closed (weather, at 01:00) stay under T, flat position rows go
+    const t1row = rT1.j.rows.find(r => r.close_ms > Date.UTC(2026, 9, 7, 6) && !r.live);
+    runU(Date.UTC(2026, 9, 7, 4, 10) - tu);
+    {
+      const nT = get('day=T&limit=200&q=' + encodeURIComponent(t1row.tk)), nT1 = get('day=T1&limit=200');
+      check(nT.j.date === '2026-10-07' && nT.j.rows.some(r => r.tk === t1row.tk && r.title === t1row.title), 'after midnight yesterday\'s T+1 row is listed under T, the same listing', nT.j.rows.map(r => r.tk));
+      check(nT1.j.date === '2026-10-08' && nT1.j.total > 500 && nT1.j.rows.every(r => r.date === '2026-10-08'), 'and T+1 is the new tomorrow', [nT1.j.date, nT1.j.total]);
+      const oldWx = get('day=T&cat=WEATHER&limit=200&q=' + encodeURIComponent('10/06'));
+      check(oldWx.j.total > 0 && oldWx.j.rows.every(r => r.date === '2026-10-06' && r.close_ms > tu), 'yesterday\'s weather, open until 01:00, is still listed under T', oldWx.j.total);
+      check(!su.state.pos.has(global.__flatKey) && !su.snapshot().pos.some(p => p.v + '|' + p.tk === global.__flatKey), 'the flat position row went at the ET day change (the snapshot too)');
+      check([...su.state.pos.values()].every(p => p.pos !== 0), 'only open positions cross midnight');
+    }
     runU(sibs[0].close_ms - tu + 2000);
     const res = sibs.map(r => su.market('K|' + r.tk)).map(m => m.status + ':' + m.result);
     check(res.every(x => /^SETTLED:/.test(x)) && res.filter(x => /YES$/.test(x)).length <= 1, 'pinned brackets of one event settle at the close, at most one YES', res);
+    eq(get('day=T&cat=WEATHER&limit=200&q=' + encodeURIComponent('10/06')).j.total, 0, 'after their close yesterday\'s rows leave the listing');
   }
 
   if (process.env.V) console.log('section 12');
@@ -1042,6 +1179,15 @@ const flushMicro = () => new Promise(r => setImmediate(r));
     ['tx0', 'tx1', 'tx2'].forEach(t => ['bg0', 'bg1', 'bg2', 'bg3', 'sel'].forEach(b => { if (ratio(t, b) < 4.5) bad.push(t + '/' + b + ' ' + ratio(t, b).toFixed(2)); }));
     ['bid-tx', 'ask-tx', 'up', 'dn', 'warn', 'fair', 'espn'].forEach(t => ['bg0', 'bg1', 'bg2'].forEach(b => { if (ratio(t, b) < 4.5) bad.push(t + '/' + b + ' ' + ratio(t, b).toFixed(2)); }));
     eq(bad.join(', '), '', 'every ink keeps at least 4.5:1 on every surface it sits on');
+    // 2026-10-06 review: on the deeper black the inside-the-spread PRICE cells (then bg0 on bg1,
+    // 1.05:1) and the focused market's rows (1.09:1) no longer showed
+    check(ratio('inside', 'bg1') >= 1.15 && ratio('fmk', 'bg1') >= 1.15, 'the ladder\'s inside-the-spread tint and the focused market\'s row tint stand off the panel (>= 1.15:1)',
+      { inside: ratio('inside', 'bg1').toFixed(3), fmk: ratio('fmk', 'bg1').toFixed(3) });
+    check(lum(tok.sel) > lum(tok.fmk) && ratio('sel', 'fmk') >= 1.08, 'the clicked row (sel) still reads above the focused market\'s other rows (fmk)', ratio('sel', 'fmk').toFixed(3));
+    check(/table\.lad tr\.inside > td\.px \{ background: var\(--inside\); \}/.test(css), 'inside-the-spread rows use the --inside tint');
+    const bad2 = [];
+    ['tx0', 'tx1', 'tx2', 'bid-tx', 'ask-tx', 'up', 'dn', 'warn', 'fair', 'espn'].forEach(t => ['inside', 'fmk', 'sel'].forEach(b => { if (ratio(t, b) < 4.5) bad2.push(t + '/' + b + ' ' + ratio(t, b).toFixed(2)); }));
+    eq(bad2.join(', '), '', 'and every ink keeps 4.5:1 on the tints');
   }
 
   // ---- 11. 2026-10-06 browser pass: layout containment, the browser overlay, pressable controls ---
@@ -1052,6 +1198,8 @@ const flushMicro = () => new Promise(r => setImmediate(r));
     const wide = /@media \(min-width: 1920px\) \{\s*body:not\(\[data-split="1"\]\) #m-browse \{([^}]*)\}/.exec(mcss);
     check(!!wide && /grid-column: 1 \/ 4/.test(wide[1]) && /width: auto/.test(wide[1]), 'WIDE: the market browser covers the grid\'s watchlist and ladders A and B, not a computed width that ends inside ladder B', wide && wide[1]);
     check(/<button class="sbc dim" id="sb-hk" type="button">/.test(html), 'the status bar\'s HOTKEYS cell is a button (it shows pressed like every control)');
+    check(/\[data-prs\] \{ box-shadow: inset 0 0 0 1px var\(--tx0\) !important; \}/.test(css) && !/\.prs\b/.test(css), 'pressed is drawn from the data-prs attribute (a className rewrite cannot drop it)');
+    check(/\[data-warn\] \{ outline: 2px solid var\(--warn\)/.test(css) && !/data-flash="off"\] \.fl-warn/.test(css), 'the amber warn cue is not switched off by FLASH OFF; Reduce Motion draws it static (data-warn)');
     const FD = makeCtx().Desk;
     eq(FD.dom.rowPx(), 18, 'a grid row is 18 px when the page cannot read its style (the compact default)');
     FD.dom.rowPxReset();

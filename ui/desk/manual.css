@@ -76,6 +76,9 @@ table.grid tr.vpad > td { padding: 0; border: 0; }
 #tab-manual table.watch tr.cat > td, #tab-manual table.browse tr.cat > td { color: var(--tx0); font-weight: 700; background: var(--bg2); cursor: pointer; }
 #tab-manual table.watch tr.uni > td.t, #tab-manual table.browse tr.uni > td.t { color: var(--tx1); }
 #tab-manual table.watch tr.ph > td, #tab-manual table.browse tr.ph > td { color: var(--tx2); }
+/* a new search on its way: the previous results stay drawn, dimmed, until its first page lands
+   (typing never blanks the list) */
+#tab-manual .pbody.wait > table.grid > tbody td { color: var(--tx2) !important; }
 
 /* ------------------------------------------------------------------------------------------
    THE MARKET BROWSER: an overlay over the watchlist and the first two ladders

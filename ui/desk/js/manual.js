@@ -28,20 +28,30 @@
  *     title), so the column reads by place value. Zoom: a grid finer than a cent opens at x10
  *     (whole-cent rows); a zoom picked by hand is remembered per market (per series for the
  *     15-minute windows).
+ *   - Repaints: anything the operator did, at once; its own market's book, orders and position,
+ *     at most 10 times a second; the clock and the header's cash repaint the three head lines
+ *     only (the rows only while one counts down).
  *   - Our orders show size and seconds left ('8 12s'), a partial fill '8(2)'; a sent order not
  *     yet acknowledged is grey and dotted (PEND); a cancel in flight is struck through.
  *   - REF markers: F model fair, E ESPN, A our average entry. Break-even band: prices within the
  *     taker fee of the model fair.
- * WATCHLIST (THE UNIVERSE, contract 1.4): T / T+1 (settles today / tomorrow); scope ★ (the
+ * WATCHLIST (THE UNIVERSE, contract 1.4 / 1.5): T / T+1 (settles today / tomorrow); scope ★ (the
  *   watchlist: pinned, held, on a ladder; from the store) or ALL (the day's whole universe, paged
  *   from GET /api/universe); categories (ALL SPT WX FIN ECO OTH), venue (K+P / K / P), sort
  *   (CLOSE VOL SPRD EDGE), search (/), collapsible category and group rows, a star column (pin:
- *   POST /api/watch), virtual rows. + or u opens the market browser (browse.js).
+ *   POST /api/watch), virtual rows. + or u opens the market browser (browse.js). Typing in ALL
+ *   keeps the previous results drawn (dimmed) until the new search's first page lands; Enter loads
+ *   the cursor's market when it is a row of the list drawn now (a search or a filter change clears
+ *   the cursor), else the first row, and an Enter pressed before the results land waits for them.
+ *   A listing market that a ladder brought live and nothing else holds leaves the live set when
+ *   the ladder moves on (contract 1.5: mkt live false): the store forgets it and ALL shows its
+ *   listing row again.
  * TICKET: venue (paired market on the other venue), side, qty, price (AUTO follows the touch until
  *   typed or stepped), IOC / FOK / POST 5s 15s 60s 5m 30m START CLOSE (15 s default; START = an
  *   exchange-side expiry at the game's start_ms, off when the market has none or it has passed;
  *   CLOSE = until close, an exchange-side expiry at the market's close: Kalshi expiration_ts,
- *   Polymarket US GTD; its countdown is the time to close),
+ *   Polymarket US GTD; its countdown is the time to close; both need 6 s ahead at the click, a
+ *   second more than the backend's 5 s floor, so an edge click is refused here, CLOSING),
  *   cost / max loss / fee / shard line (a short Kalshi shard offers MOVE: one click moves the
  *   missing cash from the shard with the most free cash), edge vs model and ESPN, the guard as a
  *   second click (the button turns OVERRIDE for 3 s).
@@ -83,6 +93,11 @@
   var KEY_HOLD_MS = 10000;           // a keyboard scroll holds off the auto-recentre this long
   var HELD_MS = 3000;                // our send shows the market MAN until the mkt echo, at most this long
   var LAD_MIN_MS = 100;              // routine book updates repaint a ladder at most 10 times a second
+  // an absolute expiry (CLOSE, START) must be this far ahead when the page sends it: the backend
+  // refuses one under 5 s ahead at receipt, so the page asks 6 s and a click near the edge is
+  // refused here (CLOSING) instead of coming back REJ BAD_REQUEST
+  var EXP_MIN_MS = 6000;
+  var ENTER_WAIT_MS = 3000;          // an Enter queued behind a search is dropped after this long
   // ticket order types; ttl 'START' = until the game starts
   var TK_TYPES = [
     { id: 'IOC', tif: 'IOC', ttl: null, label: 'IOC' }, { id: 'FOK', tif: 'FOK', ttl: null, label: 'FOK' },
@@ -190,21 +205,22 @@
     isExt: function (o) { return !!o && (o.own === 'EXT' || logic.foreign(o.cid)); },
     fit6: function (t, s) { return t.length > 6 ? s : t; },
     ttlOK: function (ttl) { var e = Desk.contract && Desk.contract.enums.TTL_S; return !!e && e.indexOf(ttl) >= 0; },
-    // CLOSE ("until close"): the market's close, cut to a whole second, at least 5 s ahead; null
-    // when the market is not open or closes sooner
+    // CLOSE ("until close"): the market's close, cut to a whole second, at least EXP_MIN_MS (6 s)
+    // ahead; null when the market is not open or closes sooner
     closeExp: function (m, nowS) {
       if (!m || m.status !== 'OPEN' || !m.close_ms) return null;
       var e = Math.floor(m.close_ms / 1000) * 1000;
-      return e - nowS >= 5000 ? e : null;
+      return e - nowS >= EXP_MIN_MS ? e : null;
     },
+    EXP_MIN_MS: EXP_MIN_MS,
     // a countdown for a cell: '12s', '14m', '3h05m'
     expShort: function (ms) { if (ms === null || ms === undefined) return ''; return ms < 100000 ? Desk.fmt.secs(ms) : Desk.fmt.left(ms); },
-    // START: an expiry at the game's start, a whole second, at least 5 s ahead (and so before the
-    // close); null when not possible
+    // START: an expiry at the game's start, a whole second, at least EXP_MIN_MS ahead (and so
+    // before the close); null when not possible
     startExp: function (m, nowS) {
       if (!m || !m.start_ms) return null;
       var e = Math.floor(m.start_ms / 1000) * 1000;
-      return e - nowS >= 5000 && e - nowS <= 86400000 ? e : null;
+      return e - nowS >= EXP_MIN_MS && e - nowS <= 86400000 ? e : null;
     },
     // MOVE for a short Kalshi shard: the shard with the most free cash and the amount to move
     // (the shortfall rounded up to the dollar, at most that shard's free cash); null when none
@@ -355,7 +371,7 @@
   // ---------------------------------------------------------------------------------------------
   var LAD = {};                      // slot -> ladder runtime
   var TK = { key: null, px: null, pxBad: false, arm: null, el: {} };
-  var W = { cursor: null, cursorI: -1, lastFocus: null, items: [], rowItems: [], q: '', lastAt: 0, dirty: false, scroll: false, el: {}, pinOf: {}, uni: null, V: null,
+  var W = { cursor: null, cursorI: -1, lastFocus: null, items: [], rowItems: [], q: '', drawnSig: '', drawnRes: null, lastAt: 0, dirty: false, scroll: false, el: {}, pinOf: {}, uni: null, V: null, enterQ: null, lay: {},
             rowAtItem: function () { return null; } };
   var GR = { work: null, fills: null, pos: null, posAt: 0, posDirty: false };
   var sentAt = new Map();            // key -> our last send there (MAN shown until the mkt echo)
@@ -455,7 +471,7 @@
       head: $(id + '-head'), cols: $(id + '-cols'), body: $(id + '-body'), foot: $(id + '-foot'),
       tb: null, h: {}, f: {}, rows: 38, top: 0, asc: null, rowsKey: null, rowsG: null,
       shownKey: undefined, needCenter: true, over: false, hold: 0, arm: null, drag: null, dragMovedAt: 0,
-      wacc: 0, dirty: true, rollAt: 0, paintAt: 0, due: false, timer: null, paints: 0
+      wacc: 0, dirty: true, rollAt: 0, paintAt: 0, due: false, timer: null, paints: 0, heads: 0, timeDep: false, hdrSig: ''
     };
     // header: three 20 px lines
     var H = L.h;
@@ -595,7 +611,7 @@
     var why = blockReason(m) || qtyReason(m, L.cfg.qty);
     if (why) { refuse(L, c.td, why); return null; }
     var it = logic.clickIntent(m.g, b ? b.bb : null, b ? b.ba : null, side, c.px, cfg.cap, L.cfg.ttl);
-    if (!untilClose(it, m)) { refuse(L, c.td, 'CLOSING: ' + m.short + ' closes in under 5 s'); return null; }
+    if (!untilClose(it, m)) { refuse(L, c.td, 'CLOSING: ' + m.short + ' closes in under 6 s'); return null; }
     var now = Date.now(), a = L.arm;
     var here = !!a && a.side === side && a.row === c.px && a.key === x.key;
     // Shift+click always overrides (the backend's touch may differ from ours); so does the
@@ -706,7 +722,7 @@
       var why = blockReason(m);
       if (why) { alertWarn('REPRICE ' + m.short + ': ' + why + ', not re-sent'); return false; }
       var rit = { tif: 'POST', px: r.px, ttl_s: r.ttl, touch: b ? (r.side === 'BUY' ? b.bb : b.ba) : null };
-      if (!untilClose(rit, m)) { alertWarn('REPRICE ' + m.short + ': closes in under 5 s, not re-sent'); return false; }
+      if (!untilClose(rit, m)) { alertWarn('REPRICE ' + m.short + ': closes in under 6 s, not re-sent'); return false; }
       var cid = send(r.key, m, r.side, rit, qty, false, r.ev);
       if (cid) st.localAlert('INFO', 'MAN', 'REPRICE ' + r.side + ' ' + Desk.fmt.size(qty) + ' ' + m.short + ' ' + Desk.fmt.pxg(r.from, m.g) + ' to ' + Desk.fmt.pxg(r.px, m.g) + ': queue place lost');
       return false;
@@ -801,14 +817,33 @@
     }
   }
   // A ladder repaints at once for anything the operator did or must see now (a click, a key, our
-  // own order changing, the market changing, a stale feed); routine updates (the book, the clock,
-  // Systematic's orders, the header's cash) are coalesced to at most one paint per LAD_MIN_MS.
+  // own order changing, the market changing, a stale feed); routine updates of its own market (the
+  // book, Systematic's orders there, its position) are coalesced to at most one paint per
+  // LAD_MIN_MS. Changes elsewhere never repaint it: the header's cash repaints the head alone
+  // when the shown market's shard cash (as drawn) changed, and the clock repaints the head alone
+  // unless a row counts down (our order's expiry, a print leaving LTQ, an armed guard).
   function ladUrgent(L, d, key, changed) {
     return d.all || changed || L.dirty || d.has('focus') || d.has('layout') || d.has('stale') || d.has('ui') ||
       (key !== null && (d.has('mord:' + key) || d.has('mkt:' + key)));
   }
-  function ladRoutine(d, key) {
-    return d.has('clock') || d.has('hdr') || d.has('pos') || (key !== null && (d.has('book:' + key) || d.has('ord:' + key)));
+  // 'rows' (the whole ladder, coalesced), 'head' (the three head lines alone) or null
+  function ladRoutine(L, d, key) {
+    if (key !== null && (d.has('book:' + key) || d.has('ord:' + key) || d.has('pos:' + key))) return 'rows';
+    if (d.has('clock') && L.timeDep) return 'rows';
+    if (d.has('clock') || (d.has('hdr') && ladHdrSig(key) !== L.hdrSig)) return 'head';
+    return null;
+  }
+  // what the head shows of the header: the shown market's shard free cash (Kalshi) or PM's free
+  // cash and read-only flag, as drawn
+  function ladHdrSig(key) {
+    var h = S().hdr, m = key ? S().market(key) : null;
+    if (!h || !m) return '';
+    if (m.v === 'K') {
+      var sh = null, a = h.cash.K.shards;
+      for (var i = 0; i < a.length; i++) if (a[i].id === m.shard) sh = a[i];
+      return 'K' + (sh ? Desk.fmt.money(sh.free) : '');
+    }
+    return 'P' + (h.cash.P.ro ? 'RO' : Desk.fmt.money(h.cash.P.free));
   }
   function ladLater(L, ms) {
     if (L.timer) return;
@@ -819,7 +854,9 @@
     var changed = key !== L.shownKey;
     if (L.footDirty || d.has('hk')) { L.footDirty = false; renderLadFoot(L); }
     if (!ladUrgent(L, d, key, changed)) {
-      if (!ladRoutine(d, key) && !L.due) return;
+      var why = ladRoutine(L, d, key);
+      if (!why && !L.due) return;
+      if (why === 'head' && !L.due) { L.heads++; renderLadHead(L, key, st.market(key), st.book(key), now); return; }
       if (now - L.paintAt < LAD_MIN_MS) { L.due = true; ladLater(L, L.paintAt + LAD_MIN_MS - now); return; }
     }
     L.due = false; L.paintAt = now; L.paints++;
@@ -827,11 +864,9 @@
     // a new market starts from fresh rows, so a reused price row never flashes the old sizes
     if (changed) { L.shownKey = key; L.arm = null; L.drag = null; L.needCenter = true; L.hold = 0; L.rowsKey = null; L.tb.textContent = ''; }
     var m = key ? st.market(key) : null, b = key ? st.book(key) : null;
-    Desk.dom.setAttr(L.el, 'data-v', m ? m.v : null);
-    Desk.dom.setAttr(L.el, 'data-ro', m && m.v === 'P' && st.hdr && st.hdr.cash.P.ro ? '1' : null);
     renderLadHead(L, key, m, b, now);
     renderLadFoot(L);
-    if (!m) { L.asc = null; Desk.dom.keyedRows(L.tb, [], String, function () { return []; }); return; }
+    if (!m) { L.asc = null; L.timeDep = false; Desk.dom.keyedRows(L.tb, [], String, function () { return []; }); return; }
     var k = zoomFor(m);
     if (L.rowsKey !== key + '|' + k || L.rowsG !== m.g) {
       if (L.rowsKey !== null) L.tb.textContent = '';
@@ -866,6 +901,10 @@
     if (vp && vp.size) { vpr = new Map(); vp.forEach(function (q, p) { var r = asc[logic.nearestIdx(asc, p)]; vpr.set(r, Math.round(((vpr.get(r) || 0) + q) * 100) / 100); }); }
     var arm = L.arm && L.arm.until > now && L.arm.key === key ? L.arm : null;
     if (L.arm && !arm) L.arm = null;
+    // rows that change with the clock alone: our orders' countdowns, prints leaving LTQ, the guard
+    var td = !!arm || lt.size > 0;
+    if (!td) [wo.BUY, wo.SELL].forEach(function (mp) { mp.forEach(function (e) { if (e.nMan && e.exp) td = true; }); });
+    L.timeDep = td;
     var drag = L.drag;
     var F = Desk.fmt, g = m.g;
     var woCell = function (e, side, p) {
@@ -903,6 +942,9 @@
 
   function renderLadHead(L, key, m, b, now) {
     var H = L.h, D = Desk.dom, F = Desk.fmt, st = S();
+    D.setAttr(L.el, 'data-v', m ? m.v : null);
+    D.setAttr(L.el, 'data-ro', m && m.v === 'P' && st.hdr && st.hdr.cash.P.ro ? '1' : null);
+    L.hdrSig = ladHdrSig(key);
     if (!m) {
       D.setText(H.vt, ''); D.setText(H.ttl, key ? st.split(key).tk : 'none'); D.setAttr(H.ttl, 'title', key || null);
       [H.clk, H.src, H.own, H.blk, H.pos, H.unrl, H.shL, H.sh, H.fee, H.mid, H.mdl, H.espn, H.chg].forEach(function (x) { D.setText(x, ''); });
@@ -1258,7 +1300,7 @@
       E.browse = btn('+', 'wbr', { 'data-a': 'browse', title: 'market browser (u)' });
       add(tools, E.day[0], E.day[1], E.scope[0], E.scope[1], E.q, E.browse);
       Desk.dom.onPress(tools, onWatchTool, btnOf);
-      E.q.addEventListener('input', function () { W.q = E.q.value; W.dirty = true; mark('mwatch'); });
+      E.q.addEventListener('input', function () { W.q = E.q.value; watchReset(); W.dirty = true; mark('mwatch'); });
     }
     // the filter bar under the title: categories, venue, sort, the count
     var bar = el('div', 'wbar');
@@ -1296,9 +1338,14 @@
     else if (a === 'sort') wc.sort = SORT_CYCLE[(SORT_CYCLE.indexOf(wc.sort) + 1) % SORT_CYCLE.length];
     else if (a === 'browse') { if (Desk.browse) Desk.browse.open(true); return; }
     else return;
-    // a new list starts at its top
-    if (W.V) { W.V.top = 0; if (W.body) W.body.scrollTop = 0; }
+    watchReset();
     saveCfg(); W.dirty = true; mark('mwatch');
+  }
+  // a new search or filter: the list starts at its top and the cursor (a row of the old list) goes,
+  // so Enter loads the first hit unless an arrow or a press picks another
+  function watchReset() {
+    W.cursor = null; W.cursorI = -1;
+    if (W.V) { W.V.top = 0; if (W.body) W.body.scrollTop = 0; }
   }
   function onWatchBody(ev) {
     var tr = ev.target && ev.target.closest ? ev.target.closest('tr') : null;
@@ -1364,11 +1411,32 @@
     W.cursor = r ? r.key : null;
     W.scroll = true; W.dirty = true; mark('mwatch');
   }
-  // Enter: the cursor's market, or the first row when the cursor is not in the list (a search)
+  // Enter: the cursor's market when it is a row of the list drawn now, else the first row. While a
+  // search is still on its way (ALL: its first page; ★: a frame not yet drawn with the new text)
+  // the Enter waits and loads the first hit when it lands.
+  // what the list drawn last was made of: an Enter right after a search or filter change (before
+  // the next frame) must not read the previous list
+  function watchSig() { var wc = cfg.watch; return [wc.scope, wc.day, wc.cat, wc.v, wc.sort, (W.q || '').toLowerCase()].join('|'); }
+  function watchWaiting() {
+    if (W.drawnSig !== watchSig()) return true;
+    return cfg.watch.scope === 'all' ? !W.uni || W.uni.waiting() || W.uni.res !== W.drawnRes : false;
+  }
+  function watchFirst() { var r = W.rowItems && W.rowItems.length && W.rowAtItem ? W.rowAtItem(W.rowItems[0]) : null; return r ? r.key : null; }
+  function watchGo(k, other) { W.enterQ = null; Desk.focus.set(k, { other: !!other, from: 'm-watch' }); }
   function watchLoad(other) {
-    var k = W.cursorI >= 0 && W.cursor ? W.cursor : null;
-    if (!k && W.rowItems && W.rowItems.length) { var r = W.rowAtItem(W.rowItems[0]); k = r ? r.key : null; }
-    if (k) Desk.focus.set(k, { other: !!other, from: 'm-watch' });
+    var waiting = watchWaiting();
+    var k = waiting ? null : ((W.cursorI >= 0 && W.cursor ? W.cursor : null) || watchFirst());
+    if (k) { watchGo(k, other); return; }
+    if (waiting || (cfg.watch.scope === 'all' && W.uni.res && W.uni.res.total > 0)) { W.enterQ = { other: !!other, at: Date.now() }; W.dirty = true; mark('mwatch'); }
+  }
+  function watchEnterQ() {
+    var e = W.enterQ;
+    if (!e) return;
+    if (Date.now() - e.at > ENTER_WAIT_MS) { W.enterQ = null; return; }
+    if (watchWaiting()) return;
+    var k = watchFirst();
+    if (k) watchGo(k, e.other);
+    else if (cfg.watch.scope !== 'all' || (W.uni.res && W.uni.res.total === 0)) W.enterQ = null;
   }
   function watchPinCursor() { if (W.cursor) togglePin(W.cursor, W.pinOf[W.cursor]); }
   function renderWatch(d) {
@@ -1391,25 +1459,32 @@
     st.markets.forEach(function (m) { if (m.kind !== 'GAME') return; var b = st.book(m.key); if (b && b.ref && b.ref.game) groupGame.set(logic.watchGroup(m), b.ref.game); });
     // the list: ★ from the store, ALL from the paged universe (a live market's own book wins)
     var q = (W.q || '').toLowerCase(), items, rowAtI, total, cats;
+    var rowItems;
     if (wc.scope === 'all') {
       W.uni.set({ day: wc.day, cat: wc.cat, v: wc.v, q: W.q || '', sort: wc.sort });
       if (W.uni.pending()) W.dirty = true;                 // a search waiting for the typing to rest
-      else if (!W.uni.res) W.uni.want(0, Desk.universe.PAGE);
+      else if (W.uni.waiting()) W.uni.want(0, Desk.universe.PAGE);
       if (d.has('clock')) W.uni.tick(now);
       var res = W.uni.res;
-      items = res ? UNI.layout(res.groups, wc.collapsed, { q: q }) : [];
-      rowAtI = function (i) { var r = W.uni.row(i); if (!r) return null; var m = st.market(r.key); return m && m.status === 'OPEN' ? UNI.liveRow(m, st.book(r.key)) : r; };
+      // cached on the listing's shape: a redraw does not rebuild one item per row
+      var lay = W.uni.layout(wc.collapsed, q);
+      items = lay.items; rowItems = lay.rowItems;
+      // a market in the live set shows its own book; any other row is the listing's
+      rowAtI = function (i) { var r = W.uni.row(i); if (!r) return null; var m = st.liveMarket(r.key); return m && m.status === 'OPEN' ? UNI.liveRow(m, st.book(r.key)) : r; };
       total = res ? res.total : null; cats = res ? res.cats : null;
     } else {
       var o = UNI.order(watchRows(st, wc, q), wc.sort);
-      items = UNI.layout(o.groups, wc.collapsed, { q: q });
+      var lay2 = UNI.layoutOf(W.lay, o.groups, o.groups.map(function (g) { return g.gk + ':' + g.n; }).join(','), wc.collapsed, q);
+      items = lay2.items; rowItems = lay2.rowItems;
       rowAtI = function (i) { return o.rows[i] || null; };
       total = o.rows.length; cats = o.cats;
     }
+    W.drawnSig = watchSig(); W.drawnRes = wc.scope === 'all' ? W.uni.res : null;
+    // ALL: the previous results stay drawn, dimmed, until a new search's first page lands
+    D.setClass(W.body, 'wait', wc.scope === 'all' && !!W.uni.res && W.uni.waiting());
     W.items = items;
     W.rowAtItem = function (ii) { var it = items[ii]; return it && it.t === 'row' ? rowAtI(it.i) : null; };
-    W.rowItems = [];
-    for (var ii = 0; ii < items.length; ii++) if (items[ii].t === 'row') W.rowItems.push(ii);
+    W.rowItems = rowItems;
     D.setText(E.n, total === null ? '…' : String(total));
     if (E.cats && cats) E.cats.forEach(function (b) { var c = b.getAttribute('data-v'); D.setAttr(b, 'title', c ? c + ' ' + (cats[c] || 0) : null); });
     // the cursor's item (after a focus change: find it; then keep it in view)
@@ -1418,7 +1493,7 @@
       for (var ci = 0; ci < W.rowItems.length; ci++) { var rr = W.rowAtItem(W.rowItems[ci]); if (rr && rr.key === W.cursor) { W.cursorI = W.rowItems[ci]; break; } }
     }
     if (W.scroll) { W.scroll = false; if (W.cursorI >= 0) W.V.reveal(W.cursorI); }
-    if (!items.length) { D.emptyRow(W.tb, W.ncol, wc.scope === 'all' && !W.uni.res ? 'loading' : 'none'); return; }
+    if (!items.length) { D.emptyRow(W.tb, W.ncol, wc.scope === 'all' && !W.uni.res ? 'loading' : 'none'); watchEnterQ(); return; }
     var nowS = now + (st.srvOffset || 0), ncol = W.ncol, wide = W.builtWide;
     W.pinOf = {};
     W.V.draw(items, function (x) {
@@ -1436,8 +1511,9 @@
       if (x.t === 'grp') return { cls: 'grp', attr: { 'data-grp': x.gk, 'data-mkt': null, 'data-v': null } };
       var r = rowAtI(x.i);
       if (!r) return { cls: 'ph', attr: { 'data-mkt': null, 'data-v': null, 'data-grp': null } };
-      var m = r.m || st.market(r.key);
-      return { cls: [r.key === W.cursor ? 'sel' : '', m && m.status !== 'OPEN' ? 'closed' : '', r.live || m ? '' : 'uni'].join(' ').trim(), attr: { 'data-mkt': r.key, 'data-v': r.v, 'data-grp': null } };
+      var m = r.m || st.liveMarket(r.key);
+      // the cursor's row carries the bar; with no cursor (a new search), the focused market's
+      return { cls: [r.key === (W.cursor || Desk.focus.key) ? 'sel' : '', m && m.status !== 'OPEN' ? 'closed' : '', r.live || m ? '' : 'uni'].join(' ').trim(), attr: { 'data-mkt': r.key, 'data-v': r.v, 'data-grp': null } };
     });
     // the pages the rows in view need
     if (wc.scope === 'all' && W.uni.res) {
@@ -1445,11 +1521,12 @@
       for (var vi = W.V.a; vi < W.V.b; vi++) { var it = items[vi]; if (it && it.t === 'row') { if (it.i < a) a = it.i; if (it.i > b) b = it.i; } }
       if (b >= 0) W.uni.want(a, b + 1);
     }
+    watchEnterQ();
   }
   // one market row: a live market from the store (its book, ESPN, the game clock), a listing row
   // as the universe served it
   function watchCells(r, st, nowS, wide) {
-    var F = Desk.fmt, m = r.m || st.market(r.key), live = !!m, b = live ? st.book(r.key) : null, g = live ? m.g : null, P = st.position(r.key);
+    var F = Desk.fmt, m = r.m || st.liveMarket(r.key), live = !!m, b = live ? st.book(r.key) : null, g = live ? m.g : null, P = st.position(r.key);
     var ref = b ? b.ref : null, pin = st.pinned(r.key, r.pin);
     W.pinOf[r.key] = r.pin;
     var px = function (u) { return u === null || u === undefined ? '' : (g ? F.pxg(u, g) : F.px(u, 2)); };
@@ -1712,7 +1789,7 @@
     if (why) { alertWarn(why); return null; }
     var it = logic.hotIntent(kind, m.g, b ? b.bb : null, b ? b.ba : null, side, cfg.cap, L.cfg.ttl);
     if (it.err) { alertWarn(kind.toUpperCase() + ' ' + side + ' ' + m.short + ': ' + it.err); return null; }
-    if (!untilClose(it, m)) { alertWarn('CLOSING: ' + m.short + ' closes in under 5 s'); return null; }
+    if (!untilClose(it, m)) { alertWarn('CLOSING: ' + m.short + ' closes in under 6 s'); return null; }
     var guard = S().priceGuard(x.key, side, it.px);
     if (guard) { alertWarn(guard); return null; }
     return send(x.key, m, side, it, L.cfg.qty, false, ev, it.take ? it.touch : undefined);

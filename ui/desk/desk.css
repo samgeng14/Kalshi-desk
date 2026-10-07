@@ -21,8 +21,9 @@
   --bg1: #08090B;   /* panels */
   --bg2: #101216;   /* title bars, table headers, inputs */
   --bg3: #1B1F26;   /* hover, active tab, pending cell, pressed */
-  --sel: #15202F;   /* selected row (the one clicked: with a 2 px bar) */
-  --fmk: #0E1520;   /* the focused market's other rows: a tint, no bar */
+  --sel: #182436;   /* selected row (the one clicked: with a 2 px bar) */
+  --fmk: #131B28;   /* the focused market's other rows: a tint, no bar (>= 1.15:1 on bg1) */
+  --inside: #171B23; /* ladder PRICE cells inside the spread (>= 1.15:1 on bg1) */
   --line: #212730;  /* hairlines */
   --line2: #2C333D; /* panel edges, scrollbars */
   /* ink */
@@ -91,11 +92,12 @@ button.confirm { background: var(--warn); border-color: var(--warn); color: #000
 button.buy:disabled, button.sell:disabled, button.go:disabled { background: var(--bg3); border-color: var(--line2); color: var(--tx2); }
 /* pressed (core.js Desk.press): drawn from pointerdown, before any handler or network reply, the
    same 1 px white inset on every control (buttons, ladder cells, grid cells, linked rows) so a
-   press always reads whatever the control's own colour */
-.prs { box-shadow: inset 0 0 0 1px var(--tx0) !important; }
-button.prs { background: var(--bg3); }
-button.buy.prs, button.sell.prs, button.go.prs, button.confirm.prs, #kill.prs { filter: brightness(1.3); }
-table.grid tr.prs > td { background: var(--bg3); }
+   press always reads whatever the control's own colour. An attribute (data-prs), not a class, so
+   a renderer rewriting className (a ladder cell, BUY / SELL, KILL) never drops it mid-press. */
+[data-prs] { box-shadow: inset 0 0 0 1px var(--tx0) !important; }
+button[data-prs] { background: var(--bg3); }
+button.buy[data-prs], button.sell[data-prs], button.go[data-prs], button.confirm[data-prs], #kill[data-prs] { filter: brightness(1.3); }
+table.grid tr[data-prs] > td { background: var(--bg3); }
 input, select {
   height: var(--input-h); padding: 0 4px; border: 1px solid var(--line2); border-radius: 0;
   background: var(--bg2); color: var(--tx0); font: 12px/1 var(--font-num); font-variant-numeric: tabular-nums;
@@ -133,7 +135,9 @@ input:focus { outline: 1px solid var(--tx0); outline-offset: -1px; }
 /* value flash fallback (the renderer uses the Web Animations API when it can; core.js flash()).
    Drawn as an inset shadow so a tinted cell (bid/ask, depth bar) keeps its colour under the flash.
    Two identical classes per kind restart the animation without a reflow. FLASH SUBTLE (the
-   default) fades over 500 ms, FULL over 300 ms, OFF never flashes. */
+   default) fades over 500 ms, FULL over 300 ms, OFF never flashes a value. The amber warn cue (a
+   refused click, a rolled ladder) shows in every mode; under Reduce Motion it is a static
+   600 ms outline (the data-warn attribute) instead. */
 @keyframes fl-up { from { box-shadow: inset 0 0 0 64px var(--fl-up); } to { box-shadow: inset 0 0 0 64px transparent; } }
 @keyframes fl-dn { from { box-shadow: inset 0 0 0 64px var(--fl-dn); } to { box-shadow: inset 0 0 0 64px transparent; } }
 @keyframes fl-sz { from { box-shadow: inset 0 0 0 64px var(--fl-sz); } to { box-shadow: inset 0 0 0 64px transparent; } }
@@ -143,8 +147,9 @@ input:focus { outline: 1px solid var(--tx0); outline-offset: -1px; }
 :root[data-flash="full"] .fl-up, :root[data-flash="full"] .fl-up2, :root[data-flash="full"] .fl-dn, :root[data-flash="full"] .fl-dn2,
 :root[data-flash="full"] .fl-sz, :root[data-flash="full"] .fl-sz2 { animation-duration: .3s; animation-timing-function: linear; }
 :root[data-flash="off"] .fl-up, :root[data-flash="off"] .fl-up2, :root[data-flash="off"] .fl-dn, :root[data-flash="off"] .fl-dn2,
-:root[data-flash="off"] .fl-sz, :root[data-flash="off"] .fl-sz2, :root[data-flash="off"] .fl-warn, :root[data-flash="off"] .fl-warn2 { animation: none; }
+:root[data-flash="off"] .fl-sz, :root[data-flash="off"] .fl-sz2 { animation: none; }
 @media (prefers-reduced-motion: reduce) { .fl-up, .fl-up2, .fl-dn, .fl-dn2, .fl-sz, .fl-sz2, .fl-warn, .fl-warn2 { animation: none; } }
+[data-warn] { outline: 2px solid var(--warn) !important; outline-offset: -2px; }
 
 /* ------------------------------------------------------------------------------------------
    Header (28 px)
@@ -490,7 +495,7 @@ table.lad td.aq:hover { box-shadow: inset 0 0 0 1px var(--ask-tx); }
 table.lad td.px { text-align: center; color: var(--tx1); cursor: copy; }
 table.lad td.px.bb, table.lad td.px.ba { color: var(--tx0); font-weight: 700; box-shadow: inset 0 0 0 1px var(--line2); }
 table.lad td.px.last { text-decoration: underline; text-decoration-color: var(--tx1); text-decoration-thickness: 1px; text-underline-offset: 2px; }
-table.lad tr.inside > td.px { background: var(--bg0); }
+table.lad tr.inside > td.px { background: var(--inside); }
 table.lad tr.be > td.px { background: var(--be); box-shadow: inset 2px 0 0 var(--fair); }
 table.lad td.rf { text-align: center; padding: 0; font: 700 11px/1 var(--font-num); }
 .mk-f { color: var(--fair); } .mk-e { color: var(--espn); } .mk-a { color: var(--tx0); }

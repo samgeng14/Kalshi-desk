@@ -35,6 +35,19 @@
  *   always holds the expiry: on Kalshi a resting order with expiration_ts (GTC with an expiry;
  *   at the close for CLOSE), on Polymarket US a GTD order. There is no open-ended GTC. A POST
  *   that would cross is cancelled by the exchange (st CXL, why POST_CROSS).
+ *   - Polymarket US GTD: the backend sends the venue whatever expiration makes the order rest
+ *     until exp_ms (if the venue applies a minimum lead or a threshold to GTD orders, as the
+ *     Polymarket CLOB's one minute, the backend adds it), and ord.exp_ms is always the effective
+ *     expiry the order will really have.
+ *   - At the close: a venue cancel at or after the order's exp_ms is reported EXP (why EXPIRY);
+ *     one before it, caused by the market closing (or ending early), is CXL (why
+ *     MARKET_CLOSED). An "until close" order on a market that closes on schedule (exp_ms ==
+ *     close_ms, every Kalshi market closes on a whole second) therefore ends EXP EXPIRY.
+ * - CLOSE TIME: mkt.close_ms / a universe row's close_ms is when trading is expected to end: the
+ *   venue's scheduled close (Kalshi close_time, Polymarket US the market's end time), or Kalshi's
+ *   expected_expiration_time when that is earlier (a game listed with a close_time days after
+ *   the game). The countdown, the sort by close and "until close" all use it. A market that
+ *   ends earlier still (decided early) closes then: its resting orders end CXL MARKET_CLOSED.
  * - ORDER STATES: PEND (sent, not acknowledged), WORK (resting, nothing filled), PART (resting,
  *   partly filled), and the terminal states FILL (fully filled), CXL (cancelled; filled may be
  *   > 0, e.g. an IOC that filled 6 of 10), REJ (rejected; filled is 0), EXP (exchange expiry
@@ -108,16 +121,34 @@
  *   its take edge where the desk has a model, and whether it is pinned or live. A row is a
  *   snapshot: the page re-asks for the rows on screen every few seconds while it shows them.
  * - The LIVE SET (mkt events and books on the stream) is: the markets the desk's lanes trade,
- *   the operator's watchlist (POST /api/watch pins a market; mkt.pin), every market with a
- *   position or a working order, and the ladders' markets (POST /api/subscribe: a ladder on a
- *   market outside the live set brings it in: its mkt event comes first, then its book).
+ *   the operator's watchlist (POST /api/watch pins a market; mkt.pin), every market with an open
+ *   position (pos != 0) or a working order, and the ladders' markets (POST /api/subscribe: a
+ *   ladder on a market outside the live set brings it in: its mkt event comes first, then its
+ *   book).
+ * - The live set SHRINKS (contract 1.5): when nothing holds a market any more (unpinned, off
+ *   every ladder, flat, no working order, not a lane's), the backend sends its mkt event once
+ *   more with live false, stops its book, and leaves it out of the next snapshot; it is then a
+ *   universe row like any other (row.live false). On that event the page forgets the book (and
+ *   the market, unless a ladder, a position row or a working order still holds it on the page)
+ *   and shows the listing's row again. A market that closes or settles leaves by the 30-minute
+ *   rule instead (snapshot.markets). Every other mkt event carries live true.
+ * - Pins: a pin on a rolling series carries to the next listing (a 15-minute window's pin to the
+ *   next window of its series, a city's weather day to the next day of that city). The markets
+ *   the desk's lanes trade start pinned. Pins persist across a backend restart (the backend
+ *   keeps the watchlist with its own state; the demo venues, restarted with the page, start from
+ *   the defaults). A pin on a market that is not OPEN is refused MARKET_CLOSED; an unpin is
+ *   always accepted. A pin goes with its market when the market settles.
  * - Days and dates: mkt.date / row.date is the ET date the market's outcome is decided (a
  *   15-minute window's close date, a weather day, a game's date, a release date); hb.date and
- *   snapshot.date are today's ET date on the server clock. The page shows T (date <= today) and
- *   T1 (date > today) apart.
+ *   snapshot.date are today's ET date on the server clock. T = date <= today and still OPEN
+ *   (yesterday's markets that have not closed, e.g. a weather day that closes at 01:00,
+ *   included); T1 = date == today + 1 exactly. Anything dated later is in neither. A market
+ *   listed but not yet open (open_ms > now: a later 15-minute window) is in neither either.
  * - Categories (CAT): SPORTS (grouped by league and game), WEATHER, FIN (15-minute and hourly
  *   windows, daily index/crypto/FX/commodity closes), ECON (daily econ releases, gas, rates),
- *   OTHER. Each market has a group: grp, or for a game grp + its matchup (gk on a row).
+ *   OTHER. Each market has a group key gk (mkt.gk and row.gk, the same string): grp, or for a
+ *   game grp + its matchup ('NBA NYK@CHI'). gk is unique across the day (across categories), and
+ *   the page groups the watchlist and the universe by it.
  *
  * ---------------------------------------------------------------------------------------------
  * SEMANTICS (what the numbers mean; the demo venues in sim.js compute exactly these)
@@ -380,7 +411,9 @@
                                     // orders (why TAKEOVER); lanes stay out until POST /api/release
     cat: ['enum'].concat(enums.CAT),   // category (THE UNIVERSE)
     date: 'date',                   // ET date the outcome is decided (T / T1 against hb.date)
-    pin: 'bool'                     // on the operator's watchlist (POST /api/watch)
+    pin: 'bool',                    // on the operator's watchlist (POST /api/watch)
+    gk: 'str',                      // the group the page shows it under (THE UNIVERSE), as row.gk
+    live: 'bool'                    // false once, when the market leaves the live set (THE UNIVERSE)
   };
   S.book = {
     v: ['enum'].concat(enums.VENUE),
@@ -445,7 +478,7 @@
   S.pos = {
     v: ['enum'].concat(enums.VENUE),
     tk: 'tk',
-    pos: 'ssize',                          // + long YES, - long NO; 0 = flat (row kept for the day)
+    pos: 'ssize',                          // + long YES, - long NO; 0 = flat (row kept until the ET day changes)
     avg: 'price?',                         // YES-terms average entry of the open position
     own: ['enum?'].concat(enums.POS_OWN),
     mark: 'price?',                        // mid used for unrl
@@ -512,6 +545,7 @@
     feeds: { KX: FEED_OBJ, KXP: FEED_OBJ, PM: FEED_OBJ }
   };
 
+  // tops 'ALL' = every OPEN market in the live set (never the universe)
   var SUBS = { ladders: ['arr', MKT_REF], tops: ['or', ['enum', 'ALL'], ['arr', MKT_REF]] };
   // one row of GET /api/universe
   S.uni = {
@@ -536,15 +570,19 @@
     pin: 'bool',                           // on the watchlist
     live: 'bool'                           // in the live set (its mkt and book are on the stream)
   };
+  var UNI_CATS = {}; enums.CAT.forEach(function (c) { UNI_CATS[c] = 'count'; });
   var UNI_RESP = {
     ok: ['enum', true],
     day: ['enum'].concat(enums.UNI_DAY),
-    date: 'date',                          // the ET date that day is
+    date: 'date',                          // T: today's ET date; T1: tomorrow's
     total: 'count',                        // rows matching the filters
     offset: 'count',
     rows: ['arr', S.uni],                  // rows offset .. offset + limit - 1 of the ordered result
-    groups: ['arr', { gk: 'str', cat: ['enum'].concat(enums.CAT), n: 'count' }],   // every group of the result, in order
-    cats: ['map', 'count'],                // rows per category for this day, venue and text (ignoring cat)
+    // every group of the result, in order; null when the request's grev is the current one (the
+    // page holds these groups already)
+    groups: ['nul', ['arr', { gk: 'str', cat: ['enum'].concat(enums.CAT), n: 'count' }]],
+    grev: 'str',                           // the result's shape (its groups and their counts) as a short id
+    cats: UNI_CATS,                        // rows per category for this day, venue and text (ignoring cat): every CAT
     ts_ms: 'ms'
   };
 
@@ -577,7 +615,7 @@
     open_ms: T0 + 900000, close_ms: T0 + 1800000, status: 'OPEN', result: null,
     grid: [{ start: '0.0000', end: '1.0000', step: '0.0100' }],
     fee: { type: 'QUAD', mult: 1 }, shard: 'S3', lip: true, start_ms: null, man: false,
-    cat: 'FIN', date: '2026-10-06', pin: true
+    cat: 'FIN', date: '2026-10-06', pin: true, gk: '15M', live: true
   };
   EX.book = {
     v: 'K', tk: 'KXNATGAS15M-26OCT061930-30', depth: 'FULL',
@@ -639,7 +677,7 @@
   // ---------------------------------------------------------------------------------------------
   var events = {
     hdr: { doc: 'Header numbers. Full replacement. On change, at most 4/s.', schema: S.hdr, example: EX.hdr },
-    mkt: { doc: 'One market\'s listing. Sent when a market is listed (15-minute roll, new game, new day), when its status/result changes, and for every market in the snapshot. Full replacement keyed by (v, tk).',
+    mkt: { doc: 'One market\'s listing. Sent when a market is listed or joins the live set (15-minute roll, new game, new day, a pin, a ladder), when its status/result/pin/man changes, and for every market in the snapshot. Full replacement keyed by (v, tk). live is true on every one except the last: when nothing holds the market any more it is sent once with live false, its book stops and the snapshot leaves it out (THE UNIVERSE).',
            schema: S.mkt, example: EX.mkt },
     book: { doc: 'One market\'s book in YES terms plus its live reference values. Full replacement of the subscribed depth (FULL: every level the backend holds, up to 100 a side; TOP: best level a side). Coalesced to at most 20/s per ticker. After POST /api/subscribe the backend sends one book for every newly subscribed market at once.',
             schema: S.book, example: EX.book },
@@ -647,7 +685,7 @@
            schema: S.ord, example: EX.ord },
     fill: { doc: 'One execution (Kalshi private fill channel). Keyed by fid. The ord event with the new filled/avg comes first.',
             schema: S.fill, example: EX.fill },
-    pos: { doc: 'One market\'s position, full replacement keyed by (v, tk). Immediately after fills; at most 1/s on mark changes. A flat position (pos 0) stays for the day with its real.',
+    pos: { doc: 'One market\'s position, full replacement keyed by (v, tk). Immediately after fills; at most 1/s on mark changes. A flat position (pos 0) stays with its real until the ET day changes (hb.date): then the backend drops it (no event; the snapshot leaves it out) and the page drops it too.',
            schema: S.pos, example: EX.pos },
     lane: { doc: 'One Systematic lane\'s row, full replacement keyed by id. On change, at most 2/s.', schema: S.lane, example: EX.lane },
     risk: { doc: 'Risk book: outcome groups (worst case across the group\'s real-world outcomes) and cash per shard. Full replacement, at most 1/s.',
@@ -710,14 +748,14 @@
       example: { response: { ok: true, epoch: 'e-1791300000', srv_ms: T0 } }
     },
     'POST /api/subscribe': {
-      doc: 'Names the books the sid\'s stream carries: up to 4 ladders at FULL depth and the watchlist at TOP ("ALL" = every OPEN market). Replaces the previous subscription. The backend then pushes one book for every newly subscribed market. A sid with no open stream is refused 409 BAD_STATE (the page retries after the stream opens). The page sends it after every stream open and again whenever a snapshot\'s subs differ from the ladders on screen.',
+      doc: 'Names the books the sid\'s stream carries: up to 4 ladders at FULL depth and the watchlist at TOP ("ALL" = every OPEN market in the live set, never the universe). Replaces the previous subscription. The backend then pushes one book for every newly subscribed market. A sid with no open stream is refused 409 BAD_STATE (the page retries after the stream opens). The page sends it after every stream open and again whenever a snapshot\'s subs differ from the ladders on screen.',
       request: { sid: 'str', ladders: ['arr', MKT_REF], tops: ['or', ['enum', 'ALL'], ['arr', MKT_REF]] },
       response: { ok: ['enum', true], subs: SUBS },
       example: { request: { sid: 'k3f9x2ab', ladders: [{ v: 'K', tk: 'KXNATGAS15M-26OCT061930-30' }], tops: 'ALL' },
                  response: { ok: true, subs: { ladders: [{ v: 'K', tk: 'KXNATGAS15M-26OCT061930-30' }], tops: 'ALL' } } }
     },
     'POST /api/order': {
-      doc: 'Place one order. The reply comes after the venue\'s acknowledgement and carries the order\'s state then (WORK, PART, FILL or CXL; IOC/FOK fills are in it), with its rev. A refusal returns the error and, when the cid was valid, the order: REJ when it never reached the venue or the venue rejected it, PEND when the venue did not answer in time (EXCHANGE; the private feed then settles it, on the stream). An error reply WITHOUT ord means the order was never sent to a venue (a 4xx check); a 5xx without ord means the page cannot know, so it keeps the order PEND and resyncs. The gateway checks risk in memory: no pre-check request is ever needed. The price guard refuses a crossing order more than 2 ticks through the touch unless override is true. A manual order in a market Systematic is quoting cancels those Systematic orders (why TAKEOVER) and keeps the market manual (mkt.man true) until POST /api/release. POST needs exactly one of ttl_s and exp_ms (a whole second, at least 5 s ahead and no later than the market\'s close_ms: a game\'s start_ms for START, the close itself for CLOSE, "until close"); IOC and FOK carry neither; an exp_ms past the close is refused BAD_REQUEST. An order resting until the close ends EXP (why EXPIRY) at the close. reduce_only (IOC only, as Kalshi allows) never increases the position: qty is cut to the open position, and an order on a flat position or on the increasing side is refused REDUCE (FLAT sends it).',
+      doc: 'Place one order. The reply comes after the venue\'s acknowledgement and carries the order\'s state then (WORK, PART, FILL or CXL; IOC/FOK fills are in it), with its rev. A refusal returns the error and, when the cid was valid, the order: REJ when it never reached the venue or the venue rejected it, PEND when the venue did not answer in time (EXCHANGE; the private feed then settles it, on the stream). An error reply WITHOUT ord means the order was never sent to a venue (a 4xx check); a 5xx without ord means the page cannot know, so it keeps the order PEND and resyncs. The gateway checks risk in memory: no pre-check request is ever needed. The price guard refuses a crossing order more than 2 ticks through the touch unless override is true. A manual order in a market Systematic is quoting cancels those Systematic orders (why TAKEOVER) and keeps the market manual (mkt.man true) until POST /api/release. POST needs exactly one of ttl_s and exp_ms (a whole second, at least 5 s ahead and no later than the market\'s close_ms: a game\'s start_ms for START, the close itself for CLOSE, "until close"); IOC and FOK carry neither; an exp_ms past the close is refused BAD_REQUEST. An order resting until the close ends EXP (why EXPIRY) at the close (a venue cancel at or after exp_ms is EXP EXPIRY; one before it caused by the market closing is CXL MARKET_CLOSED). reduce_only (IOC only, as Kalshi allows) never increases the position: qty is cut to the open position, and an order on a flat position or on the increasing side is refused REDUCE (FLAT sends it).',
       request: {
         cid: 'cid', v: ['enum'].concat(enums.VENUE), tk: 'tk', side: ['enum'].concat(enums.SIDE),
         px: 'price', qty: 'size', tif: ['enum'].concat(enums.TIF),
@@ -809,20 +847,20 @@
       example: { request: { v: 'K', tk: 'KXNATGAS15M-26OCT061930-30' }, response: { ok: true } }
     },
     'GET /api/universe': {
-      doc: 'THE UNIVERSE, paged. Query: day=T|T1 (required), cat= (a CAT, or empty for all), v= (K, P or empty), q= (text: matches tk, title, short and gk, case-insensitive), sort=vol|sprd|close|edge (default close), offset= (default 0), limit= (1 to 200, default 100). Order: category (CAT order), then group (each category\'s groups by their best row under the sort), then rows by the sort (vol most first, sprd and close least first, edge best first; a missing spread or edge last), ties by tk. groups lists every group of the result in that order with its row count, so the page can lay out the whole result and fetch only the pages it shows. A query outside this contract is refused BAD_REQUEST.',
+      doc: 'THE UNIVERSE, paged. Query: day=T|T1 (required; T = dated today or earlier and still OPEN, T1 = dated tomorrow exactly), cat= (a CAT, or empty for all), v= (K, P or empty), q= (text: matches tk, title, short and gk, case-insensitive), sort=vol|sprd|close|edge (default close), offset= (default 0), limit= (1 to 200, default 100), grev= (optional: the grev of the result the page holds for this same query). Order: category (CAT order), then group (each category\'s groups by their best row under the sort; groups tied on their best row by gk), then rows by the sort (vol most first, sprd and close least first, edge best first; a missing spread or edge last), ties by tk. groups lists every group of the result in that order with its row count, so the page can lay out the whole result and fetch only the pages it shows; grev names that shape (it changes whenever a group or a count changes), and when the request\'s grev equals it, groups is null (the page keeps its own: on a real day thousands of groups are not resent with every page). cats has every CAT. Markets listed but not yet open are left out. A query outside this contract is refused BAD_REQUEST.',
       query: { day: ['enum'].concat(enums.UNI_DAY), 'cat?': ['or', ['enum', ''], ['enum'].concat(enums.CAT)], 'v?': ['enum', '', 'K', 'P'], 'q?': 'str',
-               'sort?': ['enum'].concat(enums.UNI_SORT), 'offset?': 'count', 'limit?': 'count' },
+               'sort?': ['enum'].concat(enums.UNI_SORT), 'offset?': 'count', 'limit?': 'count', 'grev?': 'str' },
       response: UNI_RESP,
       errors: ['BAD_REQUEST', 'FORBIDDEN', 'INTERNAL'],
       example: { query: { day: 'T', cat: 'WEATHER', q: 'den', sort: 'vol', offset: 0, limit: 100 },
                  response: { ok: true, day: 'T', date: '2026-10-06', total: 1, offset: 0, rows: [EX.uni], groups: [{ gk: 'WX DEN 10/06', cat: 'WEATHER', n: 1 }],
-                             cats: { SPORTS: 0, WEATHER: 1, FIN: 0, ECON: 0, OTHER: 0 }, ts_ms: T0 } }
+                             grev: '1x9f2a.1', cats: { SPORTS: 0, WEATHER: 1, FIN: 0, ECON: 0, OTHER: 0 }, ts_ms: T0 } }
     },
     'POST /api/watch': {
-      doc: 'Pin a market to the watchlist (on true) or unpin it (on false). Pinning brings it into the live set: its mkt event (pin true) and its book follow on the stream. Unpinning sends its mkt event with pin false; it stays live while a lane, a position, a working order or a ladder holds it. Idempotent.',
+      doc: 'Pin a market to the watchlist (on true) or unpin it (on false). Pinning brings it into the live set: its mkt event (pin true) and its book follow on the stream. Unpinning sends its mkt event with pin false; it stays live while a lane, an open position, a working order or a ladder holds it, and otherwise leaves the live set (its mkt event with live false). A pin on a market that is not OPEN is refused MARKET_CLOSED; an unpin is always accepted. Pins carry over rolls and persist across a backend restart (THE UNIVERSE). Idempotent.',
       request: { v: ['enum'].concat(enums.VENUE), tk: 'tk', on: 'bool' },
       response: { ok: ['enum', true], pin: 'bool' },
-      errors: ['UNKNOWN_MARKET'],
+      errors: ['UNKNOWN_MARKET', 'MARKET_CLOSED'],
       example: { request: { v: 'K', tk: 'KXHIGHDEN-26OCT06-B71.5', on: true }, response: { ok: true, pin: true } }
     },
     'POST /api/transfer': {
@@ -989,7 +1027,9 @@
   }
 
   Desk.contract = {
-    version: '1.4.0',               // 1.3: exp_ms up to the market's close (CLOSE); 1.4: THE UNIVERSE
+    // 1.3: exp_ms up to the market's close (CLOSE); 1.4: THE UNIVERSE; 1.5: the live set shrinks
+    // (mkt.live), mkt.gk, grev, T1 = tomorrow exactly, pins and expiry at the close spelled out
+    version: '1.5.0',
     TOKEN_META: 'desk-token',            // <meta name="desk-token" content="..."> in the served page
     hostOk: hostOk,
     types: types,

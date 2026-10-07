@@ -11,6 +11,10 @@
  *   ladder underneath). The star pins / unpins at once (POST /api/watch); * does it from the
  *   keyboard. Up / Down move, Enter loads and closes, Shift+Enter loads the other ladder and
  *   stays, Esc closes.
+ *   Enter loads the cursor's market only when the cursor is a row of the results drawn now; a
+ *   search or a filter change clears the cursor, so Enter then loads the first hit. While a new
+ *   search is still on its way (the previous results stay drawn, dimmed), an Enter waits and
+ *   loads the first hit when it lands.
  *
  *   Desk.browse.open(on?), .close(), .isOpen, .state()
  */
@@ -22,8 +26,9 @@
   var SORT_CYCLE = ['close', 'vol', 'sprd', 'edge'], SORT_LBL = { close: 'CLOSE', vol: 'VOL', sprd: 'SPRD', edge: 'EDGE' };
   var VENUES = ['', 'K', 'P'], VEN_LBL = { '': 'K+P', K: 'K', P: 'P' };
   var FEE_LBL = { QUAD: 'T', QUAD_MAKER: 'T+M', FREE: 'FREE', PM: 'PM' };
+  var ENTER_WAIT_MS = 3000;            // an Enter queued behind a search is dropped after this long
   var B = { open: false, built: false, q: { day: 'T', cat: '', v: '', q: '', sort: 'vol' }, collapsed: {}, cursor: null, cursorI: -1,
-            items: [], rowItems: [], el: {}, uni: null, V: null, pinOf: {}, dirty: true, lastAt: 0 };
+            items: [], rowItems: [], el: {}, uni: null, V: null, pinOf: {}, dirty: true, lastAt: 0, enterQ: null };
 
   function $(id) { return hasDoc ? document.getElementById(id) : null; }
   function el(tag, cls, text, attrs) {
@@ -35,6 +40,8 @@
   }
   function btn(text, cls, attrs) { var b = el('button', cls, text, attrs); b.setAttribute('type', 'button'); return b; }
   function mark() { B.dirty = true; Desk.render.mark('mbrowse'); }
+  // a new search or filter: the cursor was a row of the old results
+  function reset() { B.cursor = null; B.cursorI = -1; B.V.top = 0; if (B.body) B.body.scrollTop = 0; }
   function btnOf(ev) { var b = ev.target && ev.target.closest ? ev.target.closest('button') : null; return b && !b.disabled ? b : null; }
 
   function build() {
@@ -74,13 +81,13 @@
       else if (a === 'sort') q.sort = SORT_CYCLE[(SORT_CYCLE.indexOf(q.sort) + 1) % SORT_CYCLE.length];
       else if (a === 'close') return;                      // closes on the click (below)
       else return;
-      B.V.top = 0; body.scrollTop = 0; B.cursorI = -1;
+      reset();
       mark();
     };
     Desk.dom.onPress(title, tool, function (ev) { var b = btnOf(ev); return b && b.getAttribute('data-a') !== 'close' ? b : null; });
     Desk.dom.onPress(bar, tool, btnOf);
     E.x.addEventListener('click', function () { close(); });
-    E.q.addEventListener('input', function () { B.q.q = E.q.value; B.V.top = 0; body.scrollTop = 0; mark(); });
+    E.q.addEventListener('input', function () { B.q.q = E.q.value; reset(); mark(); });
     // rows: the star and the headers act at pointerdown; a market row loads at pointerdown (the
     // document's row link) and the click that ends the press closes the browser
     var rowAt = function (ev) { var tr = ev.target && ev.target.closest ? ev.target.closest('tr') : null; return tr && B.V && B.V.tb.contains(tr) ? tr : null; };
@@ -144,10 +151,43 @@
     if (B.V) B.V.reveal(B.cursorI);
     mark();
   }
-  function load(other) {
-    if (!B.cursor) return;
-    Desk.focus.set(B.cursor, { other: !!other, from: 'm-browse' });
+  // the cursor, when it is a row of the results drawn now (an arrow put it there, or a press on
+  // a row in view); its item index is found in the drawn window when a press set it
+  function cursorKey() {
+    if (!B.cursor || !B.rowAt) return null;
+    var r = B.cursorI >= 0 ? B.rowAt(B.cursorI) : null;
+    if (r && r.key === B.cursor) return B.cursor;
+    for (var i = B.V ? B.V.a : 0; B.V && i < B.V.b; i++) { var x = B.rowAt(i); if (x && x.key === B.cursor) { B.cursorI = i; return B.cursor; } }
+    return null;
+  }
+  // the first hit of the results drawn, or null while its page is out
+  function firstKey() { var r = B.rowItems.length && B.rowAt ? B.rowAt(B.rowItems[0]) : null; return r ? r.key : null; }
+  function go(k, other) {
+    B.enterQ = null;
+    Desk.focus.set(k, { other: !!other, from: 'm-browse' });
     if (!other) close();
+  }
+  // the query as the controls set it, applied now (the render applies it on the next frame; an
+  // Enter in between must not read the previous list)
+  function syncQuery() { if (B.uni) { var q = B.q; B.uni.set({ day: q.day, cat: q.cat, v: q.v, q: q.q, sort: q.sort }); } }
+  function load(other) {
+    syncQuery();
+    // waiting: the search is out, or its results have landed but are not drawn yet
+    var waiting = !B.uni || B.uni.waiting() || B.uni.res !== B.drawn;
+    var k = waiting ? null : (cursorKey() || firstKey());
+    if (k) { go(k, other); return; }
+    // the search is still on its way (or its first page): load its first hit when it lands
+    if (waiting || (B.uni.res && B.uni.res.total > 0)) { B.enterQ = { other: !!other, at: Date.now() }; mark(); }
+  }
+  // a queued Enter, once the current query's first rows are drawn
+  function runEnterQ() {
+    var e = B.enterQ;
+    if (!e) return;
+    if (Date.now() - e.at > ENTER_WAIT_MS) { B.enterQ = null; return; }
+    if (B.uni.waiting() || B.uni.res !== B.drawn) return;
+    var k = firstKey();
+    if (k) go(k, e.other);
+    else if (B.uni.res && B.uni.res.total === 0) B.enterQ = null;      // nothing matched: nothing to load
   }
 
   function render(d) {
@@ -159,7 +199,9 @@
     var st = Desk.store, U = Desk.universe, F = Desk.fmt, D = Desk.dom, E = B.el, q = B.q;
     B.uni.set({ day: q.day, cat: q.cat, v: q.v, q: q.q, sort: q.sort });
     if (B.uni.pending()) B.dirty = true;                   // a search waiting for the typing to rest
-    else if (!B.uni.res) B.uni.want(0, U.PAGE);
+    else if (B.uni.waiting()) B.uni.want(0, U.PAGE);
+    // the previous results stay drawn, dimmed, until the new query's first page lands
+    D.setClass(B.body, 'wait', !!B.uni.res && B.uni.waiting());
     E.day.forEach(function (b) { D.setClass(b, 'on', b.getAttribute('data-v') === q.day); });
     D.setAttr(E.day[0], 'title', 'settles today' + (st.today ? ' ' + st.today : ''));
     D.setText(E.ven, VEN_LBL[q.v]); D.setClass(E.ven, 'on', !!q.v);
@@ -170,12 +212,14 @@
       D.setText(b, (c || 'ALL') + (n === null ? '' : ' ' + n)); D.setClass(b, 'on', c === q.cat);
     });
     D.setText(E.n, res ? res.total + ' rows' : '…');
-    var items = res ? U.layout(res.groups, B.collapsed, { q: q.q }) : [];
-    var rowAtI = function (i) { var r = B.uni.row(i); if (!r) return null; var m = st.market(r.key); return m && m.status === 'OPEN' ? U.liveRow(m, st.book(r.key)) : r; };
-    B.items = items; B.rowItems = [];
-    for (var ii = 0; ii < items.length; ii++) if (items[ii].t === 'row') B.rowItems.push(ii);
+    // the layout is cached on the listing's shape: a redraw does not rebuild one item per row
+    var lay = B.uni.layout(B.collapsed, q.q), items = lay.items;
+    B.drawn = res;
+    // a market in the live set shows its own book; any other row is the listing's
+    var rowAtI = function (i) { var r = B.uni.row(i); if (!r) return null; var m = st.liveMarket(r.key); return m && m.status === 'OPEN' ? U.liveRow(m, st.book(r.key)) : r; };
+    B.items = items; B.rowItems = lay.rowItems;
     B.rowAt = function (k) { var it = items[k]; return it && it.t === 'row' ? rowAtI(it.i) : null; };
-    if (!items.length) { D.emptyRow(B.V.tb, 13, res ? 'none' : 'loading'); return; }
+    if (!items.length) { D.emptyRow(B.V.tb, 13, res ? 'none' : 'loading'); runEnterQ(); return; }
     var nowS = now + (st.srvOffset || 0);
     B.pinOf = {};
     B.V.draw(items, function (x) {
@@ -217,6 +261,7 @@
     var a = Infinity, b = -1;
     for (var vi = B.V.a; vi < B.V.b; vi++) { var it = items[vi]; if (it && it.t === 'row') { if (it.i < a) a = it.i; if (it.i > b) b = it.i; } }
     if (b >= 0) B.uni.want(a, b + 1);
+    runEnterQ();
   }
 
   function init() {

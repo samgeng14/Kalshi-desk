@@ -160,7 +160,7 @@ function bootPage(opts) {
   };
   const rafs = [];
   const errors = [];
-  const mem = {};
+  const mem = Object.assign({}, opts.storage || {});
   const ctx = {
     console: { log: console.log, warn: console.warn, debug() {}, error: (...a) => { errors.push(a.map(x => (x && x.stack) || String(x)).join(' ')); } },
     setTimeout, clearTimeout, setInterval, clearInterval, setImmediate, performance, Promise, Map, Set, WeakSet, Uint8Array,
@@ -232,6 +232,7 @@ function ladRow(P, slot, px) {
 const COL = { wb: 0, bq: 1, rf: 2, px: 3, aq: 4, ws: 5, lt: 6 };
 function ladCell(P, slot, px, col) { const r = ladRow(P, slot, px); return r ? r.children[COL[col]] : null; }
 function newest(P, pred) { let best = null; P.D.store.orders.forEach(o => { if ((!pred || pred(o)) && (!best || (o.local && best.local ? o.local.at >= best.local.at : true))) best = o; }); return best; }
+function Desk_step(D, m, px, n) { return D.grid.step(m.g, px, n); }
 function manOrders(P, key) { const a = []; P.D.store.orders.forEach(o => { if (o.own === 'MAN' && (!key || o.key === key)) a.push(o); }); return a; }
 
 (async () => {
@@ -308,6 +309,11 @@ function manOrders(P, key) { const a = []; P.D.store.orders.forEach(o => { if (o
       eq(L.closeExp({ status: 'OPEN', close_ms: T + 3600500 }, T), T + 3600000, 'CLOSE: the market close, cut to a whole second');
       eq(L.closeExp({ status: 'OPEN', close_ms: T + 4000 }, T), null, 'CLOSE: refused under 5 s before the close');
       eq(L.closeExp({ status: 'CLOSED', close_ms: T + 600000 }, T), null, 'CLOSE: only on an open market');
+      // 2026-10-06 review: the backend refuses an expiry under 5 s ahead at receipt; the page asks
+      // 6 s, so a click 5.0-5.9 s before the close is refused here (CLOSING), never REJ BAD_REQUEST
+      eq(L.closeExp({ status: 'OPEN', close_ms: T + 5500 }, T), null, 'CLOSE: refused under 6 s before the close');
+      eq(L.closeExp({ status: 'OPEN', close_ms: T + 6000 }, T), T + 6000, 'CLOSE: taken from 6 s');
+      eq(L.startExp({ start_ms: T + 5900 }, T), null, 'START: the same 6 s margin');
       eq(L.expShort(12000), '12s', 'a short expiry counts in seconds');
       eq(L.expShort(3 * 3600e3 + 5 * 60e3), '3h05m', 'a long one reads as time to close');
     }
@@ -395,6 +401,61 @@ function manOrders(P, key) { const a = []; P.D.store.orders.forEach(o => { if (o
     eq(L.watchLabel(mm('K', 'X', 'OTHER', 'OTHER', 1, 'FED HOLD')), 'FED HOLD', 'anything else keeps its short label');
     eq(L.watchGroup(mm('K', 'X', 'NCAAF', 'GAME', 1, 'SOUMIS@TROY TROY')), 'NCAAF SOUMIS@TROY', 'a game is its own group');
     eq(L.pairOf(ms, ms.get('K|N1')), null, 'no pair for a Kalshi-only market');
+    // the layout is cached on the listing's shape: a redraw reuses it
+    {
+      const cache = {}, gr = [{ gk: 'G', cat: 'FIN', n: 3 }, { gk: 'H', cat: 'FIN', n: 2 }];
+      const l1 = UV.layoutOf(cache, gr, 's1', {}, ''), items1 = l1.items;
+      UV.layoutOf(cache, gr, 's1', {}, ''); UV.layoutOf(cache, gr, 's1', { H: false }, '');
+      check(cache.builds === 1 && cache.items === items1 && l1.rowItems.join() === '2,3,4,6,7', 'the layout is built once per shape: redraws reuse it', { builds: cache.builds, rows: l1.rowItems.join() });
+      UV.layoutOf(cache, gr, 's1', { H: true }, '');
+      check(cache.builds === 2 && cache.rowItems.join() === '2,3,4', 'a collapsed group rebuilds it');
+      UV.layoutOf(cache, gr, 's2', { H: true }, '');
+      eq(cache.builds, 3, 'and so does a new shape');
+    }
+    // one paged view on a transport whose replies the test releases one by one
+    {
+      const reqs = [];
+      D.transport = { get: p => new Promise(res => reqs.push({ p, res })) };
+      const tick = () => new Promise(r => setImmediate(r));
+      const grp = (n1, n2) => [{ gk: 'G', cat: 'FIN', n: n1 }, { gk: 'H', cat: 'FIN', n: n2 }];
+      const rowsFor = (off, n, tag) => Array.from({ length: n }, (_, i) => ({ v: 'K', tk: tag + (off + i), ev: 'E', title: 't', short: tag + (off + i), cat: 'FIN', grp: 'G', gk: 'G', kind: 'OTHER',
+        date: '2026-10-06', close_ms: 1791306000000, bid: '0.4000', ask: '0.4200', sprd: '0.0200', vol: 1, fee: { type: 'QUAD', mult: 1 }, fair: null, edge: null, pin: false, live: false }));
+      const answer = (rq, tag, grev, groups, total) => {
+        const off = +/offset=(\d+)/.exec(rq.p)[1];
+        rq.res({ status: 200, json: { ok: true, day: 'T', date: '2026-10-06', total, offset: off, rows: rowsFor(off, Math.min(100, total - off), tag), groups, grev, cats: { SPORTS: 0, WEATHER: 0, FIN: total, ECON: 0, OTHER: 0 }, ts_ms: 1 } });
+      };
+      let changes = 0;
+      const V = UV.create({ onChange: () => { changes++; } });
+      V.set({ day: 'T', cat: 'FIN', v: '', q: '', sort: 'vol' });
+      eq(reqs.length, 1, 'a new query asks for its first page');
+      answer(reqs.shift(), 'a', 'g1', grp(150, 50), 200); await tick();
+      check(V.res && V.res.total === 200 && V.row(0).tk === 'a0' && !V.waiting(), 'its first page lands');
+      V.want(90, 130);
+      check(reqs.length === 1 && /offset=100/.test(reqs[0].p) && /grev=g1/.test(reqs[0].p), 'the next page is asked with the shape the page holds (grev)', reqs.map(r => r.p));
+      answer(reqs.shift(), 'a', 'g1', null, 200); await tick();
+      check(V.row(120).tk === 'a120' && V.res.groups.length === 2, 'a reply without groups (same grev) keeps the groups the page holds');
+      // typing: the old result stays drawn until the new query's first page lands
+      V.set({ q: 'x' });
+      check(V.waiting() && V.res && V.row(0).tk === 'a0', 'a new search keeps the previous result drawn (waiting)');
+      const tStart = Date.now(); while (Date.now() - tStart < 170) await tick();
+      V.want(0, 100);
+      check(reqs.length === 1 && /q=x/.test(reqs[0].p) && !/grev=/.test(reqs[0].p), 'once the typing rests, the new query\'s first page is asked (no grev: a new result)', reqs.map(r => r.p));
+      check(V.row(0).tk === 'a0', 'still the old rows while it is out');
+      answer(reqs.shift(), 'x', 'gx', grp(30, 0).slice(0, 1), 30); await tick();
+      check(!V.waiting() && V.res.total === 30 && V.row(0).tk === 'x0' && V.row(100) === null, 'its first page swaps the list in at once');
+      // the listing changes shape on a refresh: the pages on screen are swapped in together
+      V.set({ q: '' }); while (Date.now() - tStart < 400) await tick(); V.want(0, 100);
+      answer(reqs.shift(), 'a', 'g1', grp(150, 50), 200); await tick();
+      V.want(90, 130); answer(reqs.shift(), 'a', 'g1', null, 200); await tick();
+      V.lastAt = 0; V.tick(Date.now());
+      check(reqs.length === 2 && reqs.every(r => /grev=g1/.test(r.p)), 'every 3 s the pages on screen are asked again', reqs.map(r => r.p));
+      const r0 = reqs.shift(), r1 = reqs.shift();
+      answer(r0, 'b', 'g2', grp(149, 50), 199); await tick();
+      check(V.res.grev === 'g1' && V.row(0).tk === 'a0' && V.row(120).tk === 'a120' && V.nx && V.nx.res.grev === 'g2', 'a page of a new shape waits: the old pages stay drawn, none goes blank', { grev: V.res.grev, r120: V.row(120) && V.row(120).tk });
+      answer(r1, 'b', 'g2', grp(149, 50), 199); await tick();
+      check(V.res.grev === 'g2' && V.row(0).tk === 'b0' && V.row(120).tk === 'b120' && !V.nx, 'once every page on screen has the new shape, they swap in together');
+      delete D.transport;
+    }
   }
 
   // =============================================================================================
@@ -1320,10 +1381,10 @@ function manOrders(P, key) { const a = []; P.D.store.orders.forEach(o => { if (o
     click(fb('1'));
     const paints0 = A.paints;
     press(fb('CLR'));
-    check(/\bprs\b/.test(fb('CLR').className), 'a pressed control shows pressed in the same event');
+    check(fb('CLR').hasAttribute('data-prs'), 'a pressed control shows pressed in the same event');
     eq(A.cfg.qty, 0, 'a footer setting acts at pointerdown, before the click');
     up(fb('CLR')); fire(fb('CLR'), 'click', {});
-    check(!/\bprs\b/.test(fb('CLR').className), 'pointerup clears the pressed state');
+    check(!fb('CLR').hasAttribute('data-prs'), 'pointerup clears the pressed state');
     press(fb('5'), { shiftKey: true }); fire(fb('5'), 'click', { shiftKey: true });
     eq(A.cfg.qty, 5, 'the click after a pointerdown that acted is swallowed (Shift+5 adds once, not twice)');
     P.frame();
@@ -1333,7 +1394,7 @@ function manOrders(P, key) { const a = []; P.D.store.orders.forEach(o => { if (o
     // an order cell: pressed at pointerdown, sent only on the click
     const n1 = st.orders.size, cell = ladCell(P, 'A', 6000, 'bq');
     press(cell);
-    check(st.orders.size === n1 && /\bprs\b/.test(cell.className), 'an order cell shows pressed at pointerdown but sends nothing yet');
+    check(st.orders.size === n1 && cell.hasAttribute('data-prs'), 'an order cell shows pressed at pointerdown but sends nothing yet');
     up(cell); fire(cell, 'click', {});
     const sent = newest(P, x => x.own === 'MAN');
     check(st.orders.size === n1 + 1 && sent.px === 6000 && sent.st === 'PEND', 'the click sends it, PEND in the store at once');
@@ -1521,18 +1582,169 @@ function manOrders(P, key) { const a = []; P.D.store.orders.forEach(o => { if (o
     const id0 = D.activity.n;
     D.act.start(); await run(60000, 250);
     const un = +P.$('h-act').textContent, fresh = D.activity.lists.SYS.filter(e => e.id > id0);
-    check(un > 0 && /\bwarn\b/.test(P.$('hc-act').className) && D.activity.unseen.SYS === un, 'Systematic\'s fills and exits, while MANUAL shows, count in the header\'s ACT (amber)', { un, cls: P.$('hc-act').className });
-    check(fresh.some(e => e.type === 'SUB') && un === fresh.filter(e => e.type === 'FILL' || e.type === 'EXIT').length,
-      'only the alert types count (fills and exits by default), not every quote', { un, fills: fresh.filter(e => e.type === 'FILL' || e.type === 'EXIT').length, all: fresh.length });
+    const sysHot = fresh.filter(e => e.type === 'EXIT' || e.type === 'REJ' || e.type === 'HALT').length;
+    check(un > 0 && /\bwarn\b/.test(P.$('hc-act').className) && D.activity.unseen.SYS === un, 'Systematic\'s exits, while MANUAL shows, count in the header\'s ACT (amber)', { un, cls: P.$('hc-act').className });
+    check(fresh.some(e => e.type === 'SUB') && fresh.some(e => e.type === 'FILL') && un === sysHot,
+      'only the SYS alert types count (exits, rejects, a halt by default): not every quote, not every lane fill', { un, sysHot, fills: fresh.filter(e => e.type === 'FILL').length, all: fresh.length });
     fire(P.$('hc-act'), 'pointerdown', { button: 0 }); fire(P.$('hc-act'), 'click', {}); await run(300);
     check(D.render.tab === 'systematic' && P.$('h-act').textContent === '0', 'ACT shows the tab they happened on and counts them seen');
     // the tape is a virtual list: a minute of busy lanes is hundreds of events, a few dozen rows
     D.render.force('systematic'); P.frame();
+    const allBtn = P.$('s-act-tools').children.find(b => b.textContent === 'ALL');
+    fire(allBtn, 'pointerdown', { button: 0 }); fire(allBtn, 'click', {}); P.frame();
     const stb = P.$('s-act-body').children[0].children[2], sDrawn = stb.children.filter(r => /^a-/.test(r.className)).length;
     check(D.activity.lists.SYS.length > 200 && sDrawn > 10 && sDrawn <= 64, 'the tape keeps every event and draws only the rows in view', { events: D.activity.lists.SYS.length, drawn: sDrawn });
     const sPads = stb.children.filter(r => /\bvpad\b/.test(r.className)).map(r => parseInt(r.children[0].style.getPropertyValue('height'), 10) || 0);
     eq(sPads.reduce((x, y) => x + y, 0) + sDrawn * D.dom.rowPx(), D.activity.lists.SYS.length * D.dom.rowPx(), 'its spacers keep the whole tape\'s height (it scrolls back through all of it)');
     D.act.stop(); D.tabs.set('manual'); await run(500);
+  }
+
+  // ---- 2026-10-06 review: presses that survive repaints, Enter in the browser and the watchlist,
+  // calm ladders, the amber cue in FLASH OFF, DAY on its realized part, the live set shrinking ---
+  {
+    D.tabs.set('manual'); await run(500);
+    const press = el => fire(el, 'pointerdown', { button: 0, pointerType: 'mouse' });
+    const up = el => fire(el, 'pointerup', { button: 0 });
+    const prs = el => !!el && el.hasAttribute('data-prs');
+    // (1) a press stays drawn until pointerup, whatever repaints its control
+    D.focus.setLadder('A'); await run(300);
+    const bKey = D.focus.ladders.B;
+    P.sim().freeze(bKey, { bids: [[4000, 10], [3900, 20]], asks: [[4200, 10], [4300, 5]] }); await run(400);
+    const bCell = ladCell(P, 'B', 4000, 'bq');
+    check(!!bCell && /\bhas\b/.test(bCell.className), 'ladder B shows its bid', bCell && bCell.className);
+    press(bCell); fire(bCell, 'mousedown', { button: 0 });
+    eq(D.focus.ladder, 'B', 'the press\'s mousedown makes ladder B the focused one (an urgent repaint of it)');
+    P.frame();
+    ['book:' + bKey, 'clock', 'hdr', 'focus', 'pos', 'pos:' + bKey, 'ord:' + bKey].forEach(t => D.render.mark(t)); P.frame();
+    B.dirty = true; D.render.mark('mlad'); P.frame();
+    check(prs(bCell) && B.tb.contains(bCell) && /\bbq\b/.test(bCell.className), 'a BID cell pressed on an unfocused ladder stays pressed through its repaints (2026-10-06: it read pressed only until the next frame)', bCell.className);
+    up(bCell);
+    check(!prs(bCell), 'pointerup clears it');
+    const aCell = rowsOf(A.tb).map(r => r.children[1]).find(td => /\bhas\b/.test(td.className));
+    press(aCell); D.render.mark('book:' + D.focus.ladders.A); A.dirty = true; D.render.mark('mlad'); P.frame(); P.frame();
+    check(prs(aCell), 'on the focused ladder too, through a book repaint');
+    up(aCell);
+    const E2 = MS.ticket.el;
+    check(!E2.buy.disabled, 'the ticket can send');
+    press(E2.buy);
+    ['mtk', 'clock', 'hdr', 'book:' + D.focus.key, 'pos'].forEach(t => D.render.mark(t)); P.frame(); P.frame();
+    check(prs(E2.buy) && /\bbuy\b/.test(E2.buy.className), 'ticket BUY stays pressed while the ticket repaints (its className is written every clock tick)', E2.buy.className);
+    up(E2.buy);
+    const kb = $('kill');
+    press(kb); D.render.mark('hdr'); D.render.mark('clock'); P.frame(); P.frame();
+    check(prs(kb), 'KILL stays pressed through the header\'s repaints');
+    up(kb);
+    check(!prs(kb) && st.hdr.run.state !== 'KILLED', 'and a press released without its click kills nothing');
+    // (2) the market browser: Enter loads what is drawn now, never a stale cursor
+    const BR = D.browse.state(), BE = BR.el, brows = () => BR.V.tb.children.filter(r => r.getAttribute('data-mkt'));
+    D.focus.setLadder('A'); A.el.focus(); key('KeyU', 'u'); await run(600);
+    BE.q.value = ''; fire(BE.q, 'input', {}); await run(600);
+    key('ArrowDown', 'ArrowDown'); key('ArrowDown', 'ArrowDown');
+    const x = BR.cursor;
+    key('Enter', 'Enter'); await run(300);
+    check(x && D.focus.key === x && !D.browse.isOpen, 'u, ArrowDown twice, Enter: the cursor\'s market', x);
+    A.el.focus(); key('KeyU', 'u'); await run(600);
+    BE.q.value = 'okc'; fire(BE.q, 'input', {}); P.frame();
+    check(BR.cursor === null, 'typing clears the cursor (a row of the old results)');
+    check(brows().length > 10 && /\bwait\b/.test(BR.body.className), 'typing keeps the previous results drawn, dimmed, until the search lands', brows().length);
+    key('Enter', 'Enter');
+    check(D.browse.isOpen && !!BR.enterQ, 'an Enter before the results land waits for them');
+    await run(800);
+    const hit = BR.rowAt(BR.rowItems[0]);
+    check(!D.browse.isOpen && !BR.enterQ && hit && D.focus.key === hit.key && D.focus.key !== x && /okc/i.test(hit.tk + hit.title + hit.short + hit.gk),
+      'u, type, Enter loads the first hit of the search (2026-10-06: it loaded the old cursor\'s market)', [D.focus.key, x]);
+    A.el.focus(); key('KeyU', 'u'); await run(600);
+    BE.q.value = ''; fire(BE.q, 'input', {}); await run(600);
+    key('ArrowDown', 'ArrowDown'); key('ArrowDown', 'ArrowDown');
+    const y = BR.cursor, chipW = BE.cats.find(b => b.getAttribute('data-v') === 'WEATHER');
+    fire(chipW, 'pointerdown', { button: 0 }); fire(chipW, 'click', {});
+    check(BR.cursor === null, 'a filter change clears the cursor too');
+    BE.q.focus(); key('Enter', 'Enter'); await run(800);
+    check(!D.browse.isOpen && D.focus.key !== y && st.market(D.focus.key) && st.market(D.focus.key).cat === 'WEATHER', 'Enter after a filter change loads the first row of the new list', [D.focus.key, y]);
+    A.el.focus(); key('KeyU', 'u'); await run(600);
+    const chipAll = BE.cats.find(b => b.getAttribute('data-v') === '');
+    fire(chipAll, 'pointerdown', { button: 0 }); fire(chipAll, 'click', {});
+    key('Escape', 'Escape'); await run(300);
+    // (3) the watchlist's ALL: typing never blanks it; a quick Enter loads the first hit
+    {
+      const WE2 = MS.watch.el, wr = () => MS.watch.tb.children.filter(r => r.getAttribute('data-mkt'));
+      click(WE2.scope[1]); await run(800);
+      WE2.q.focus();
+      let blank = 0;
+      for (const t of ['n', 'ny', 'nyc']) { WE2.q.value = t; fire(WE2.q, 'input', {}); P.frame(); if (!wr().length) blank++; }
+      check(blank === 0 && /\bwait\b/.test(MS.watch.body.className), 'typing n, ny, nyc in ALL keeps a list drawn (dimmed) every frame (2026-10-06: it read "loading")', { blank });
+      key('Enter', 'Enter');
+      check(!!MS.watch.enterQ, 'an Enter right after typing waits for the search');
+      await run(800);
+      const f0 = MS.watch.rowAtItem(MS.watch.rowItems[0]);
+      check(!MS.watch.enterQ && f0 && D.focus.key === f0.key && /nyc/i.test(f0.tk + f0.title + f0.short + f0.gk) && !/\bwait\b/.test(MS.watch.body.className),
+        'and loads its first hit when it lands', [D.focus.key, f0 && f0.key]);
+      const builds = MS.watch.uni.lay.builds;
+      for (let i = 0; i < 4; i++) { D.render.mark('clock'); MS.watch.dirty = true; await run(300); }
+      eq(MS.watch.uni.lay.builds, builds, 'redraws reuse the cached layout (one build per listing shape)');
+      WE2.q.value = ''; fire(WE2.q, 'input', {}); click(WE2.scope[0]); await run(600);
+    }
+    // (4) a ladder repaints for its own market: the lanes' header and position traffic elsewhere
+    // repaints its head at most
+    {
+      const quiet = P.sim().universe().find(r => r.cat === 'ECON' && r.v === 'K' && r.open_ms <= P.clock.t && r.close_ms > P.clock.t + 3600000 && r.bid !== null && r.ask !== null);
+      D.focus.set(quiet.key, { ladder: 'A' }); await run(800);
+      check(st.market(quiet.key) && st.book(quiet.key), 'a quiet listing market on ladder A, live');
+      P.sim().freeze(quiet.key, { bids: [[4000, 10]], asks: [[4200, 10]] });
+      D.act.start(); await run(3000, 50);
+      const p0 = A.paints, h0 = A.heads, s0 = D.store.applied;
+      await run(10000, 50);
+      const rowsPs = (A.paints - p0) / 10, headPs = (A.heads - h0) / 10;
+      check(D.store.applied - s0 > 100 && rowsPs < 1.5, 'with the lanes busy elsewhere, a ladder whose own book is quiet hardly repaints its rows (2026-10-06: 8 a second)', { rowsPs, headPs, events: D.store.applied - s0 });
+      check(headPs >= 2 && headPs <= 12, 'its head still follows the clock', headPs);
+      D.act.stop(); await run(1500);
+      // (5) moved off the ladder, nothing else holding it, the market leaves the live set
+      D.focus.set(natKey, { ladder: 'A' }); await run(2500);
+      check(!st.market(quiet.key) && !st.book(quiet.key) && !P.sim().market(quiet.key), 'a listing market that no ladder, pin, order or position holds leaves the live set: the store forgets it and its book', [!!st.market(quiet.key), !!st.book(quiet.key)]);
+    }
+    // (6) the amber cue on a refused click shows in FLASH OFF; under Reduce Motion it is static
+    {
+      const fb = t => P.$('m-lad-a-foot').children[0].children.concat(P.$('m-lad-a-foot').children[1].children).find(b => b.textContent === t);
+      D.focus.set(D.focus.ladders.A, { ladder: 'A' }); await run(300);
+      const proto = Object.getPrototypeOf(A.tb), anim0 = proto.animate, animated = [];
+      proto.animate = function () { animated.push(this); return {}; };
+      D.ui.setFlash('off'); click(fb('CLR')); await run(700);
+      const cell = rowsOf(A.tb)[6].children[1], n0 = st.orders.size;
+      click(cell);
+      check(st.orders.size === n0 && animated.indexOf(cell) >= 0, 'FLASH OFF: a refused click (QTY 0) still flashes amber at the cell (2026-10-06: OFF removed it)');
+      D.dom.setReduceMotion(true); animated.length = 0;
+      const cell2 = rowsOf(A.tb)[7].children[1];
+      click(cell2); P.frame(); P.frame();
+      check(!animated.length && cell2.hasAttribute('data-warn'), 'under Reduce Motion it is a static amber outline (no animation), kept through the repaint', cell2.className);
+      await new Promise(r => setTimeout(r, 700));
+      check(!cell2.hasAttribute('data-warn'), 'gone after 600 ms');
+      D.dom.setReduceMotion(false); D.ui.setFlash('subtle'); proto.animate = anim0;
+      click(fb('1')); await run(300);
+    }
+    // (7) DAY flashes when its realized part moves, not on marks
+    {
+      const hc = $('hc-day'), proto = Object.getPrototypeOf(hc), anim0 = proto.animate;
+      let n = 0; proto.animate = function () { if (this === hc) n++; return {}; };
+      const mv = Array.from(st.markets.values()).find(m => m.kind === 'LIP15' && m.status === 'OPEN' && m.close_ms - P.clock.t > 120000 && st.book(m.key) && st.book(m.key).ba !== null);
+      const ba = st.book(mv.key).ba;
+      D.act.order({ v: mv.v, tk: mv.tk, side: 'BUY', px: Desk_step(D, mv, ba, 2), qty: 20, tif: 'IOC', touch: ba }, null);
+      await run(2500);
+      check(st.position(mv.key) && st.position(mv.key).pos > 0, 'a position held on a moving market');
+      n = 0;
+      const seen = new Set();
+      for (let i = 0; i < 80; i++) { await run(250, 250); seen.add(Math.round(st.hdr.day.total / 100)); }
+      check(seen.size >= 2, 'its marks move the day\'s total', seen.size);
+      eq(n, 0, 'SUBTLE: DAY does not flash on marks (2026-10-06: 13 flashes in 20 s with the lanes running)');
+      D.ui.setFlash('full'); n = 0;
+      for (let i = 0; i < 80; i++) await run(250, 250);
+      check(n > 0, 'FULL: it does', n);
+      D.ui.setFlash('subtle');
+      await new Promise(r => setTimeout(r, 1600));      // the cell's quiet time after the FULL flashes
+      n = 0;
+      D.manual.flatten(mv.key, null); await run(1500);
+      check(st.position(mv.key).pos === 0 && n >= 1, 'a fill that realizes P&L flashes it in SUBTLE', { pos: st.position(mv.key).pos, n });
+      proto.animate = anim0;
+    }
   }
 
   // ---- no errors anywhere ---------------------------------------------------------------------
@@ -1576,8 +1788,13 @@ function manOrders(P, key) { const a = []; P.D.store.orders.forEach(o => { if (o
     const Q = bootPage({ seed: 13, Notification: Note, AudioContext: Audio });
     await Q.run(1500);
     const A = Q.D.activity, su = Q.D.header.su;
-    check(!A.cfg.on && !A.cfg.sound && A.cfg.when === 'hidden' && A.cfg.MAN.join() === 'FILL,EXIT' && A.cfg.SYS.join() === 'FILL,EXIT', 'alerts start off: fills and exits only, only while the page is hidden');
+    check(!A.cfg.on && !A.cfg.sound && A.cfg.when === 'hidden' && A.cfg.MAN.join() === 'FILL,PART,EXIT' && A.cfg.SYS.join() === 'EXIT,REJ,HALT',
+      'alerts start off, only while the page is hidden: MAN every fill (FILL, PART) and exit; SYS exits, rejects and a halt', [A.cfg.MAN.join(), A.cfg.SYS.join()]);
     Q.key('KeyP', 'p'); Q.frame();
+    // TEST says what it did (2026-10-06: nothing showed with alerts blocked and the sound off)
+    const testBtn = m => su.test.btns.find(b => b.textContent === m);
+    Q.click(testBtn('SYS')); Q.frame();
+    eq(su.testSt.textContent, 'off: turn Desktop or Sound on', 'TEST with Desktop and Sound off says so');
     const onBtn = su.desk.btns.find(b => b.textContent === 'ON');
     Q.fire(onBtn, 'pointerdown', { button: 0 });
     eq(Note.asked, 0, 'the permission is never asked on pointerdown');
@@ -1586,6 +1803,15 @@ function manOrders(P, key) { const a = []; P.D.store.orders.forEach(o => { if (o
     Q.click(su.sound.btns.find(b => b.textContent === 'ON'));
     Q.click(su.when.btns.find(b => b.textContent === 'ALWAYS'));
     check(A.cfg.sound && A.cfg.when === 'always' && Q.D.storage.getJSON('alerts').on === true, 'sound and ALWAYS are saved');
+    const nl0 = Note.list.length;
+    Q.click(testBtn('MAN')); Q.frame();
+    check(Note.list.length === nl0 + 1 && /^shown, sound played$/.test(su.testSt.textContent) && /\bok\b/.test(su.testSt.className), 'TEST shows a test alert and says shown', su.testSt.textContent);
+    Note.permission = 'denied';
+    Q.click(testBtn('MAN')); Q.frame();
+    check(Note.list.length === nl0 + 1 && /^needs the served page \(127\.0\.0\.1\), sound played$/.test(su.testSt.textContent) && /\bwarn\b/.test(su.testSt.className),
+      'with the permission refused on a page opened from a file, TEST says it needs the served page', su.testSt.textContent);
+    check(/needs the served page/.test(su.deskSt.textContent), 'and so does the Desktop row');
+    Note.permission = 'granted'; A.sent.MAN = 0; Note.list.length = 0; tones = 0;
     Q.key('Escape', 'Escape');
     const st2 = Q.D.store, nk = Q.D.focus.ladders.A;
     Q.sim().freeze(nk, { bids: [[6300, 120]], asks: [[6400, 300]] }); await Q.run(300);
@@ -1603,7 +1829,58 @@ function manOrders(P, key) { const a = []; P.D.store.orders.forEach(o => { if (o
     Q.D.activity.sent.MAN = 0;
     buy(); await Q.run(400);
     check(Note.list.some(n => /SUB/.test(n.title) || /SUB/.test(n.body)), 'a type switched on in the filter alerts too');
+    Q.D.activity.toggleType('MAN', 'SUB');
+    // a manual order filled in part alerts (PART is in MAN's default filter: 2026-10-06 review)
+    {
+      Q.sim().freeze(nk, { bids: [[6200, 50]], asks: [[6400, 300]] }); await Q.run(300);
+      Q.D.act.order({ v: 'K', tk: st2.market(nk).tk, side: 'BUY', px: 6300, qty: 10, tif: 'POST', ttl_s: 60, touch: 6200 }, null);
+      await Q.run(400);
+      await new Promise(r => setTimeout(r, 4100)); A.sent.MAN = 0;
+      const nn = Note.list.length;
+      Q.sim().trade(nk, 'SELL', 4); await Q.run(400);
+      const part = A.list('MAN', 'FILLS')[0];
+      check(part && part.type === 'PART' && part.qty === 4, 'a resting manual order filled 4 of 10 is a PART on the tape', part);
+      check(Note.list.length === nn + 1 && /^MAN PART$/.test(Note.list[nn].title) && /PART BUY 4 /.test(Note.list[nn].body), 'and raises an alert', Note.list.slice(nn));
+      Q.D.act.cancelAll('MAN', null); await Q.run(400);
+    }
+    // SYS: exits, rejects and a halt, as a digest every 30 s
+    {
+      eq(A.RATE.SYS + '/' + A.RATE.MAN, '30000/4000', 'one SYS alert per 30 s (a digest), one MAN alert per 4 s');
+      eq(A.digest('SYS', [{ type: 'EXIT', real: 5000 }, { type: 'EXIT', real: 7000 }, { type: 'REJ' }]), 'SYS: 2 exits, 1 reject, real +1.20', 'the digest counts what happened and the exits\' realized P&L');
+      const id0 = A.n, nn = Note.list.length;
+      const h = JSON.parse(JSON.stringify(Q.D.contract.examples.hdr)); h.mode = 'DEMO'; h.run = { state: 'RUN', since_ms: Q.clock.t, rearm_ms: null, why: '' };
+      Q.D.store._handlers.hdr(h);
+      h.run = { state: 'HALTED', since_ms: Q.clock.t, rearm_ms: null, why: 'daily stop' }; A.sent.SYS = Date.now();
+      Q.D.store._handlers.hdr(h);
+      const ht = A.lists.SYS.filter(e => e.id > id0);
+      check(ht.length === 1 && ht[0].type === 'HALT' && /daily stop/.test(A.line(ht[0])), 'Systematic halting by the daily stop is on its tape: HALT', ht);
+      check(Note.list.length === nn + 1 && /^SYS HALT$/.test(Note.list[nn].title), 'and alerts at once, whatever the 30 s digest holds', Note.list.slice(nn));
+      Q.D.store._handlers.hdr(h);
+      eq(A.lists.SYS.filter(e => e.id > id0).length, 1, 'once');
+    }
     eq(Q.D.render.errors, 0, 'no render errors (alerts)');
+  }
+  // a saved SOUND ON: Safari starts the audio only from a gesture, so the drawer asks for a tap
+  // and the first pointer release or key starts it (2026-10-06 review)
+  {
+    let resumes = 0;
+    class Audio2 { constructor() { this.state = 'suspended'; this.currentTime = 0; this.destination = {}; Audio2.made++; }
+      resume() { resumes++; this.state = 'running'; if (this.onstatechange) this.onstatechange(); return Promise.resolve(); }
+      createOscillator() { return { frequency: { value: 0 }, connect() {}, start() {}, stop() {} }; }
+      createGain() { return { gain: { setValueAtTime() {}, exponentialRampToValueAtTime() {} }, connect() {} }; } }
+    Audio2.made = 0;
+    const R2 = bootPage({ seed: 17, AudioContext: Audio2, storage: { 'desk3.alerts': JSON.stringify({ v: 2, on: false, sound: true, when: 'hidden', SYS: ['EXIT'], MAN: ['FILL', 'PART', 'EXIT'] }) } });
+    await R2.run(1000);
+    R2.D.header.openSet(true); R2.frame();            // (a key would be the gesture that starts it)
+    const su2 = R2.D.header.su;
+    check(R2.D.activity.cfg.sound && Audio2.made === 0 && su2.soundSt.textContent === 'tap to enable', 'a saved SOUND ON waits for a gesture: the drawer says tap to enable', su2.soundSt.textContent);
+    R2.fire(R2.$('m-ticket'), 'pointerup', { button: 0 }); await R2.run(100);
+    check(Audio2.made === 1 && resumes === 1 && su2.soundSt.textContent === '', 'the first pointer release starts the audio', { made: Audio2.made, resumes, st: su2.soundSt.textContent });
+    R2.fire(R2.$('m-ticket'), 'pointerup', { button: 0 });
+    eq(resumes, 1, 'and only the first');
+    const old = bootPage({ seed: 18, storage: { 'desk3.alerts': JSON.stringify({ on: true, sound: false, when: 'hidden', SYS: ['FILL', 'EXIT'], MAN: ['FILL', 'EXIT'] }) } });
+    await old.run(300);
+    check(old.D.activity.cfg.on && old.D.activity.cfg.SYS.join() === 'EXIT,REJ,HALT' && old.D.activity.cfg.MAN.join() === 'FILL,PART,EXIT', 'filters saved with the old defaults take the new ones (Desktop ON kept)', old.D.activity.cfg);
   }
 
   console.log(fails ? `${fails} of ${checks} checks FAILED` : `ui desk v3 manual: ${checks} checks, 0 failures`);

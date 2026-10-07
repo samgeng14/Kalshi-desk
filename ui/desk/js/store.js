@@ -7,11 +7,17 @@
  *
  * STATE (read-only for renderers)
  *   st.hdr                  header numbers (money fields in u) or null before the first snapshot
- *   st.markets  Map key -> {v, tk, key, ev, title, short, grp, kind, og, oc, open_ms, close_ms,
+ *   st.markets  Map key -> {v, tk, key, ev, title, short, grp, gk, kind, og, oc, open_ms, close_ms,
  *                           status, result, grid (contract ranges), g (Desk.grid), fee {type, mult},
- *                           shard, lip, cat, date, pin}: the LIVE SET (contract 1.4); the rest of
- *                           the day's universe is paged in by Desk.universe, never stored here
- *   st.today    hb.date / snapshot.date: today's ET date (T); st.dayOf(date) -> 'T' | 'T1'
+ *                           shard, lip, cat, date, pin, live}: the LIVE SET (contract 1.4); the rest
+ *                           of the day's universe is paged in by Desk.universe, never stored here.
+ *                           A mkt event with live false (contract 1.5: nothing holds the market on
+ *                           the backend any more) drops its book, and the market too unless a
+ *                           ladder, a position row or a working order holds it here (then it
+ *                           stays, live false, for its name, until the backend brings it back or
+ *                           the ET day changes)
+ *   st.today    hb.date / snapshot.date: today's ET date (T); st.dayOf(date) -> 'T' (today or
+ *               earlier, still open) | 'T1' (tomorrow exactly) | '' (later)
  *   st.pinPend  Map key -> {on, at}: a star clicked here, until the mkt echo agrees
  *   st.books    Map key -> {v, tk, key, depth 'FULL'|'TOP', bids [[px, size]] best first,
  *                           asks [[px, size]] best first, bb, ba, bbSz, baSz, mid (u, float) | null,
@@ -40,6 +46,7 @@
  * SELECTORS
  *   st.key(v, tk), st.split(key) -> {v, tk}
  *   st.market(key), st.book(key), st.position(key)
+ *   st.liveMarket(key)      the market while it is in the live set (its book streams), else null
  *   st.working(pred?)       non-terminal orders, newest first
  *   st.recent(ms, pred?)    terminal orders that ended within ms (the 3 s CXL/REJ display)
  *   st.manWorking()         count of non-terminal MAN orders
@@ -213,7 +220,7 @@
       try {
         st.epoch = s.epoch; st.sid = s.sid; st.seq = s.seq; st.today = s.date;
         st.srvOffset = s.srv_ms - nowMs();
-        H.hdr(s.hdr);
+        H.hdr(s.hdr, null, true);
         st.markets = new Map(); s.markets.forEach(function (m) { H.mkt(m, null, true, saved.markets); });
         st.books = new Map(); s.books.forEach(function (b) { H.book(b, null, true); });
         // keep local orders the backend has not echoed yet (in flight), and refusals made here
@@ -283,17 +290,33 @@
       st.books.forEach(function (b) { if (b.prints.length && b.prints[0].at < now - 10000) { b.prints = b.prints.filter(function (p) { return p.at >= now - 10000; }); } });
       if (now - st.lastPrune >= PRUNE_EVERY_MS) { st.lastPrune = now; st.prune(now); }
     },
-    // forget markets settled more than 30 min ago, with their books, unless a position or a
-    // ladder holds them (the snapshot drops them by the same rule)
+    // forget markets settled more than 30 min ago, with their books, unless an open position or a
+    // ladder holds them (the snapshot drops them by the same rule; a flat position row, kept for
+    // the day, does not hold its market)
     prune: function (now) {
-      var held = {}, n = 0;
-      if (Desk.focus && Desk.focus.ladders) Object.keys(Desk.focus.ladders).forEach(function (s2) { var k = Desk.focus.ladders[s2]; if (k) held[k] = 1; });
+      var held = st.ladderKeys(), n = 0;
       st.markets.forEach(function (m, key) {
-        if (m.status !== 'SETTLED' || !m.settledAt || now - m.settledAt < SETTLED_KEEP_MS || held[key] || st.pos.has(key)) return;
+        var P = st.pos.get(key);
+        // a record kept, not live, only for a ladder, a row or an order that has since gone
+        if (m.live === false && !st.heldHere(key)) { st.markets.delete(key); st.books.delete(key); n++; return; }
+        if (m.status !== 'SETTLED' || !m.settledAt || now - m.settledAt < SETTLED_KEEP_MS || held[key] || (P && P.pos)) return;
         st.markets.delete(key); st.books.delete(key); n++;
       });
       if (n) mark('mkt');
       return n;
+    },
+    ladderKeys: function () {
+      var held = {};
+      if (Desk.focus && Desk.focus.ladders) Object.keys(Desk.focus.ladders).forEach(function (s2) { var k = Desk.focus.ladders[s2]; if (k) held[k] = 1; });
+      return held;
+    },
+    // something on this page still needs a market's record: a ladder, a position row (an open one,
+    // or a flat one kept for the day: the Positions grid and the tape name it), a working order
+    heldHere: function (key) {
+      if (st.ladderKeys()[key] || st.pos.has(key)) return true;
+      var any = false;
+      st.orders.forEach(function (o) { if (!any && o.key === key && !o.terminal) any = true; });
+      return any;
     },
     canTrade: function (v) {
       if (st.killPend) return 'KILLED';
@@ -311,6 +334,7 @@
     // selectors
     // ------------------------------------------------------------------------------------------
     market: function (key) { return st.markets.get(key) || null; },
+    liveMarket: function (key) { var m = st.markets.get(key); return m && m.live !== false ? m : null; },
     book: function (key) { return st.books.get(key) || null; },
     position: function (key) { return st.pos.get(key) || null; },
     working: function (pred) {
@@ -324,8 +348,31 @@
       return out.sort(byNewest);
     },
     manWorking: function () { var n = 0; st.orders.forEach(function (o) { if (!o.terminal && o.own === 'MAN') n++; }); return n; },
-    // THE UNIVERSE: the day a market belongs to ('T' today or before, 'T1' later) against hb.date
-    dayOf: function (date) { return !st.today || !date || date <= st.today ? 'T' : 'T1'; },
+    // THE UNIVERSE: the day a market belongs to against hb.date (contract 1.5): 'T' today or
+    // earlier (yesterday's markets still open, e.g. a weather day that closes at 01:00), 'T1'
+    // tomorrow exactly, '' anything later
+    dayOf: function (date) {
+      if (!st.today || !date || date <= st.today) return 'T';
+      return date === st.tomorrow() ? 'T1' : '';
+    },
+    tomorrow: function () {
+      if (st._tmK !== st.today) {
+        st._tmK = st.today;
+        var p = String(st.today).split('-'), d = new Date(Date.UTC(+p[0], +p[1] - 1, +p[2] + 1));
+        st._tm = d.getUTCFullYear() + '-' + (d.getUTCMonth() < 9 ? '0' : '') + (d.getUTCMonth() + 1) + '-' + (d.getUTCDate() < 10 ? '0' : '') + d.getUTCDate();
+      }
+      return st._tm;
+    },
+    // a new ET day (hb.date moved on): flat position rows were today's, and go (contract: the
+    // backend drops them too, and its snapshot leaves them out)
+    newDay: function () {
+      var n = 0;
+      st.pos.forEach(function (P, key) { if (!P.pos) { st.pos.delete(key); n++; } });
+      // and the records kept only for those rows (markets that left the live set)
+      st.markets.forEach(function (m, key) { if (m.live === false && !st.heldHere(key)) { st.markets.delete(key); n++; } });
+      if (n) { mark('pos'); mark('mkt'); }
+      return n;
+    },
     // a market's star as shown: an optimistic toggle in flight, else the backend's (mkt.pin, or a
     // listing row's pin)
     pinned: function (key, dflt) {
@@ -430,7 +477,7 @@
   // ------------------------------------------------------------------------------------------
   function mapMoney(o, keys) { var r = {}; keys.forEach(function (k) { r[k] = money(o[k]); }); return r; }
   var H = {
-    hdr: function (d) {
+    hdr: function (d, env, fromSnap) {
       var shards = d.cash.K.shards.map(function (s) { return { id: s.id, cash: money(s.cash), free: money(s.free) }; });
       st.hdr = {
         mode: d.mode,
@@ -445,23 +492,32 @@
         preflight: d.preflight.map(function (r) { return { id: r.id, ok: r.ok, why: r.why }; }),
         lat: { kx_lag_ms: d.lat.kx_lag_ms, pm_lag_ms: d.lat.pm_lag_ms, gw_ack_ms: d.lat.gw_ack_ms, clk_off_ms: d.lat.clk_off_ms }
       };
+      if (Desk.activity && Desk.activity.onRun) Desk.activity.onRun(st.hdr.run, !!fromSnap);   // a HALT on the tape
       mark('hdr');
     },
     // prev: the market map to carry the grid cache and the settle time from (a snapshot builds a new one)
     mkt: function (d, env, fromSnap, prev) {
       var key = d.v + '|' + d.tk, old = (prev || st.markets).get(key);
       var m = {
-        v: d.v, tk: d.tk, key: key, ev: d.ev, title: d.title, short: d.short, grp: d.grp, kind: d.kind, og: d.og, oc: d.oc,
+        v: d.v, tk: d.tk, key: key, ev: d.ev, title: d.title, short: d.short, grp: d.grp, gk: d.gk, kind: d.kind, og: d.og, oc: d.oc,
         open_ms: d.open_ms, close_ms: d.close_ms, status: d.status, result: d.result, grid: d.grid,
         g: old && JSON.stringify(old.grid) === JSON.stringify(d.grid) ? old.g : Desk.grid.make(d.grid),
         fee: { type: d.fee.type, mult: d.fee.mult }, shard: d.shard, lip: d.lip, start_ms: d.start_ms, man: d.man,
-        cat: d.cat, date: d.date, pin: d.pin,
+        cat: d.cat, date: d.date, pin: d.pin, live: d.live !== false,
         settledAt: d.status !== 'SETTLED' ? null : (old && old.settledAt ? old.settledAt : nowMs())   // local ms first seen SETTLED
       };
-      st.markets.set(key, m);
       // an optimistic star gives way once the backend says the same
       if (st.pinPend.has(key) && st.pinPend.get(key).on === m.pin) st.pinPend.delete(key);
       mark('mkt'); mark('mkt:' + key);
+      if (!m.live && !fromSnap) {
+        // the market left the backend's live set: its book stops, so the page forgets it (the
+        // watchlist's ALL scope and the browser show the listing's row again); a ladder, an open
+        // position or a working order here keeps the market itself, marked not live
+        st.books.delete(key); mark('book'); mark('book:' + key); mark('uni');
+        if (st.heldHere(key)) st.markets.set(key, m); else st.markets.delete(key);
+        return;
+      }
+      st.markets.set(key, m);
     },
     book: function (d, env, fromSnap) {
       var key = d.v + '|' + d.tk, now = nowMs(), old = fromSnap ? null : st.books.get(key);
@@ -538,7 +594,7 @@
       };
       st.pos.set(key, p);
       if (Desk.activity) Desk.activity.onPos(p, old, !!fromSnap);
-      mark('pos');
+      mark('pos'); mark('pos:' + key);
     },
     lane: function (d) {
       if (!st.lanes.has(d.id)) st.laneOrder.push(d.id);
@@ -580,7 +636,7 @@
       mark('alert');
     },
     hb: function (d) {
-      if (d.date !== st.today) { st.today = d.date; mark('mkt'); }
+      if (d.date !== st.today) { if (st.today) st.newDay(); st.today = d.date; mark('mkt'); }
       st.lastHb = nowMs();
       st.needHb = false;                   // a stream hb newer than the snapshot: the stream is live
       st.srvOffset = d.srv_ms - nowMs();

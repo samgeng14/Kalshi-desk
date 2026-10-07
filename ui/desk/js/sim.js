@@ -26,7 +26,9 @@
  *    and tomorrow on both venues (sports by league and game with spreads, totals and props;
  *    weather highs, lows and rain; 15-minute and hourly crypto, daily index, FX and commodity
  *    closes; gas and rates; mentions, approval, charts), served paged by GET /api/universe. A
- *    row pinned (POST /api/watch) or loaded into a ladder becomes a live market with a book.
+ *    row pinned (POST /api/watch) or loaded into a ladder becomes a live market with a book;
+ *    once nothing holds it (unpinned, off every ladder, flat, no working order) it leaves the
+ *    live set again (contract 1.5: its last mkt event says live false) and is a row again.
  *  - Kalshi 15-minute LIP windows (copper, platinum, palladium, natgas, EURUSD, GBPUSD, USDJPY):
  *    fee type QUAD (takers pay, makers free), one market per series, rolled every 15 minutes,
  *    fair = Phi(ln(S/S0)/(sigma sqrt tau)).
@@ -218,6 +220,9 @@
         game: spec.game || null, manOwned: false, lastRegenMid: spec.p * U, m1Flat: false, c1Shot: -1, s1Cool: 0,
         cat: spec.cat || 'OTHER', date: spec.date || isoET(spec.close_ms), pin: spec.pin !== false, start: spec.start || null, uni: !!spec.uni
       };
+      // the group the page shows it under (contract 1.5 mkt.gk): grp, or for a game grp + matchup
+      var mu = String(spec.short).split(' ')[0];
+      m.gk = spec.gk || (spec.kind === 'GAME' && mu.indexOf('@') > 0 ? spec.grp + ' ' + mu : spec.grp);
       if (spec.mid !== undefined) { m.mid = spec.mid; m.lastRegenMid = spec.mid; }
       if (spec.spreadU) m.spreadU = spec.spreadU;
       regen(m);
@@ -229,7 +234,8 @@
       return { v: m.v, tk: m.tk, ev: m.ev, title: m.title, short: m.short, grp: m.grp, kind: m.kind, og: m.og, oc: m.oc,
                open_ms: m.open_ms, close_ms: m.close_ms, status: m.status, result: m.result, grid: m.grid,
                fee: { type: m.fee.type, mult: m.fee.mult }, shard: m.shard, lip: m.lip,
-               start_ms: m.game ? m.game.start : (m.start || null), man: !!m.manOwned, cat: m.cat, date: m.date, pin: !!m.pin };
+               start_ms: m.game ? m.game.start : (m.start || null), man: !!m.manOwned, cat: m.cat, date: m.date, pin: !!m.pin,
+               gk: m.gk, live: true };
     }
 
     // 15-minute LIP windows
@@ -483,7 +489,10 @@
       }
     }
     function genUniverse(now) {
-      S.uni.clear(); S.uniCache = null;
+      // a new day: rows still open stay (yesterday's weather closes at 01:00, yesterday's T+1 rows
+      // are today's T, unchanged), closed ones go; the generator skips keys it already lists
+      S.uni.forEach(function (r, k) { if (r.close_ms <= now) S.uni.delete(k); });
+      S.uniCache = null;
       var today = etMidnight(now);
       S.uniDay = isoET(now);
       [today, today + 86400000].forEach(function (day, di) {
@@ -598,7 +607,7 @@
       var bk = r.cat === 'SPORTS' ? (r.v === 'P' ? 'GAME_P' : 'GAME_K') : (r.cat === 'WEATHER' ? 'WEATHER' : (r.cat === 'FIN' ? 'LIP15' : 'MISC'));
       if (!S.ogOutcomes[r.og]) S.ogOutcomes[r.og] = r.outs || ['YES', 'NO'];
       var mid = r.bid !== null && r.ask !== null ? (r.bid + r.ask) / 2 : r.p * U;
-      var m = addMarket({ v: r.v, tk: r.tk, ev: r.ev, bk: bk, title: r.title, short: r.short, grp: r.grp, kind: r.kind, og: r.og, oc: r.outs ? r.oc : 'YES',
+      var m = addMarket({ v: r.v, tk: r.tk, ev: r.ev, bk: bk, title: r.title, short: r.short, grp: r.grp, gk: r.gk, kind: r.kind, og: r.og, oc: r.outs ? r.oc : 'YES',
                           open_ms: Math.min(r.open_ms, clock()), close_ms: r.close_ms, grid: r.grid, fee: r.fee,
                           shard: r.v === 'K' ? (r.tk.length % 2 ? 'S0' : 'S2') : null, lip: false, p: r.p, mid: mid,
                           spreadU: r.bid !== null && r.ask !== null ? Math.max(100, r.ask - r.bid) : null, cat: r.cat, date: r.date, pin: !!pin, start: r.start, uni: true }, false);
@@ -607,11 +616,46 @@
       S.forceBook.add(m.key); S.uniCache = null;
       return m;
     }
+    // THE LIVE SET shrinks (contract 1.5): a market brought in from the listing leaves it once
+    // nothing holds it: not pinned, not on a ladder, no open position, no working order. Its last
+    // mkt event says live false, its book stops, the snapshot leaves it out, and it is a listing
+    // row again (at its live touch). The desk's own markets (the lanes') never leave.
+    function sweepLive(now) {
+      if (now < (S.nextSweep || 0)) return;
+      S.nextSweep = now + 1000;
+      var onLadder = {}, busy = {}, drop = [];
+      S.subs.ladders.forEach(function (l) { onLadder[l.v + '|' + l.tk] = 1; });
+      S.live.forEach(function (o) { busy[o.key] = 1; });
+      S.markets.forEach(function (m) {
+        if (!m.uni || m.status !== 'OPEN' || m.pin || onLadder[m.key] || busy[m.key]) return;
+        var P = S.pos.get(m.key);
+        if (P && P.pos) return;
+        drop.push(m);
+      });
+      drop.forEach(function (m) { deactivate(m); });
+      return drop.length;
+    }
+    function deactivate(m) {
+      var d = mktData(m); d.live = false;
+      S.markets.delete(m.key); S.forceBook.delete(m.key);
+      emit('mkt', d);
+      var bid = bestLevel(m, 'BUY'), ask = bestLevel(m, 'SELL'), outs = S.ogOutcomes[m.og];
+      var r = { key: m.key, v: m.v, tk: m.tk, ev: m.ev, title: m.title, short: m.short, cat: m.cat, grp: m.grp, gk: m.gk, kind: m.kind,
+                date: m.date, open_ms: m.open_ms, close_ms: m.close_ms, start: m.start || null, p: Math.max(0.004, Math.min(0.996, m.mid / U)),
+                half: bid !== null && ask !== null ? Math.max(50, (ask - bid) / 2) : 200,
+                bid: bid === null ? null : Math.floor(bid / 100) * 100, ask: ask === null ? null : Math.ceil(ask / 100) * 100, vol: Math.round(m.vol), fee: m.fee,
+                fair: m.ref.fair === null ? null : Math.round(m.ref.fair), og: m.og, oc: m.oc, outs: outs && outs[0] !== 'YES' ? outs : null, grid: m.grid, pin: false };
+      if (r.bid !== null && r.ask !== null && r.ask <= r.bid) r.ask = r.bid + 100;
+      S.uni.set(r.key, r);
+      var arr = S.uniArr || (S.uniArr = []), i = 0;
+      while (i < arr.length && arr[i].key !== r.key) i++;
+      arr[i] = r;
+      S.uniCache = null;
+    }
     // a live market as a listing row
     function liveRow(m) {
-      var mu = String(m.short).split(' ')[0];
       return { key: m.key, v: m.v, tk: m.tk, ev: m.ev, title: m.title, short: m.short, cat: m.cat, grp: m.grp, kind: m.kind,
-               gk: m.kind === 'GAME' && mu.indexOf('@') > 0 ? m.grp + ' ' + mu : m.grp, date: m.date, close_ms: m.close_ms,
+               gk: m.gk, date: m.date, close_ms: m.close_ms,
                bid: bestLevel(m, 'BUY'), ask: bestLevel(m, 'SELL'), vol: m.vol, fee: m.fee, fair: m.ref.fair === null ? null : Math.round(m.ref.fair), pin: !!m.pin, live: true };
     }
     function edgeOf(r) {
@@ -627,14 +671,25 @@
       close: function (r) { return r.close_ms; },
       edge: function (r) { return r._e === null ? Infinity : -r._e; }
     };
-    // GET /api/universe: filter, order (category, group by its best row, row), page
+    // the listing's shape as a short id (contract 1.5 grev): FNV-1a over the groups and counts
+    function grevOf(groups) {
+      var h = 0x811c9dc5;
+      for (var i = 0; i < groups.length; i++) {
+        var t = groups[i].gk + ':' + groups[i].n + ',';
+        for (var j = 0; j < t.length; j++) { h ^= t.charCodeAt(j); h = Math.imul(h, 0x01000193) >>> 0; }
+      }
+      return (h >>> 0).toString(36) + '.' + groups.length;
+    }
+    // GET /api/universe: filter, order (category, group by its best row, row), page. T: dated
+    // today or earlier and still open (yesterday's weather closes at 01:00); T1: dated tomorrow
+    // exactly. Listed but not yet open (a later 15-minute window) is left out.
     function universe(q, now) {
       var day = q.day, sort = q.sort || 'close', off = q.offset || 0, lim = q.limit === undefined ? 100 : q.limit;
-      var today = isoET(now), date = day === 'T1' ? isoET(etMidnight(now) + 36 * 3600000) : today;
+      var today = isoET(now), tomorrow = isoET(etMidnight(now) + 36 * 3600000), date = day === 'T1' ? tomorrow : today;
       var sig = [day, q.cat || '', q.v || '', (q.q || '').toLowerCase(), sort].join('|'), cache = S.uniCache;
       if (!cache || cache.sig !== sig || now - cache.at > 1000) {
         var ql = (q.q || '').toLowerCase(), all = [];
-        var want = function (d) { return day === 'T1' ? d > today : d <= today; };
+        var want = function (d) { return day === 'T1' ? d === tomorrow : d <= today; };
         S.uni.forEach(function (r) { if (want(r.date) && r.open_ms <= now && now < r.close_ms) all.push(r); });
         S.markets.forEach(function (m) { if (m.status === 'OPEN' && want(m.date)) all.push(liveRow(m)); });
         var base = all.filter(function (r) { return (!q.v || r.v === q.v) && (!ql || (r.tk + ' ' + r.title + ' ' + r.short + ' ' + r.gk).toLowerCase().indexOf(ql) >= 0); });
@@ -654,7 +709,8 @@
         });
         var flat = [];
         glist.forEach(function (g) { g.rows.sort(cmpR); Array.prototype.push.apply(flat, g.rows); });
-        cache = S.uniCache = { sig: sig, at: now, flat: flat, groups: glist.map(function (g) { return { gk: g.gk, cat: g.cat, n: g.rows.length }; }), cats: cats, date: date };
+        var groups = glist.map(function (g) { return { gk: g.gk, cat: g.cat, n: g.rows.length }; });
+        cache = S.uniCache = { sig: sig, at: now, flat: flat, groups: groups, grev: grevOf(groups), cats: cats, date: date };
       }
       var page = cache.flat.slice(off, off + lim).map(function (r) {
         return { v: r.v, tk: r.tk, ev: r.ev, title: r.title, short: r.short, cat: r.cat, grp: r.grp, gk: r.gk, kind: r.kind, date: r.date, close_ms: r.close_ms,
@@ -662,7 +718,9 @@
                  vol: r2(r.vol), fee: { type: r.fee.type, mult: r.fee.mult }, fair: r.fair === null ? null : pxs(r.fair), edge: r._e === null ? null : ms(r._e),
                  pin: !!r.pin, live: !!r.live };
       });
-      return { ok: true, day: day, date: cache.date, total: cache.flat.length, offset: off, rows: page, groups: cache.groups, cats: cache.cats, ts_ms: now };
+      // groups go out only when the page does not hold this shape already (its grev)
+      return { ok: true, day: day, date: cache.date, total: cache.flat.length, offset: off, rows: page,
+               groups: q.grev && q.grev === cache.grev ? null : cache.groups, grev: cache.grev, cats: cache.cats, ts_ms: now };
     }
     // an activated market that closed settles: an exclusive event once (one outcome YES, drawn by
     // the listing's probabilities), an independent one by its own
@@ -1093,7 +1151,14 @@
     function closeMarket(m, now) {
       if (m.status !== 'OPEN') return;
       m.status = 'CLOSED';
-      S.live.forEach(function (o) { if (o.key === m.key) { if (o.st === 'PEND') o.cancelOnAck = 'MARKET_CLOSED'; else finish(o, 'CXL', 'MARKET_CLOSED', now); } });
+      // an order whose own expiry is reached (an "until close" order: exp_ms = the close) ends EXP
+      // EXPIRY; one the close ends before its expiry, CXL MARKET_CLOSED (contract)
+      S.live.forEach(function (o) {
+        if (o.key !== m.key) return;
+        if (o.st === 'PEND') o.cancelOnAck = 'MARKET_CLOSED';
+        else if (o.exp_ms && now >= o.exp_ms) finish(o, 'EXP', 'EXPIRY', now);
+        else finish(o, 'CXL', 'MARKET_CLOSED', now);
+      });
       emit('mkt', mktData(m));
     }
     function settle(m, result, now) {
@@ -1373,8 +1438,9 @@
       },
       M2: function (L, now) {
         var n = 0;
+        // the desk's own markets only: a market the operator brought in from the listing is his
         S.markets.forEach(function (m) {
-          if (m.v !== 'K' || (m.kind !== 'WEATHER' && m.kind !== 'GAME') || m.status !== 'OPEN' || m.manOwned) return;
+          if (m.uni || m.v !== 'K' || (m.kind !== 'WEATHER' && m.kind !== 'GAME') || m.status !== 'OPEN' || m.manOwned) return;
           var mine = laneLive(m.key, 'M2'), bbO = othersBest(m, 'bid'), baO = othersBest(m, 'ask');
           var side = null, px = null;
           if (n < 8 && bbO !== null && bbO >= 9600 && bbO <= 9900 && (baO === null || baO > bbO)) {
@@ -1612,6 +1678,8 @@
       return { v: m.v, tk: m.tk, depth: depth, bids: lv(bids), asks: lv(asks), trades: withPrints ? m.prints.map(pr) : [],
                last: m.last ? pr(m.last) : null, vol: r2(m.vol), ref: refData(m), ex_ms: Math.round(m.exMs) };
     }
+    // a market's book depth on the stream: FULL on a ladder; TOP for every OPEN market of the live
+    // set with tops 'ALL' (never the universe: a listing row has no book here)
     function depthOf(m) {
       for (var i = 0; i < S.subs.ladders.length; i++) if (S.subs.ladders[i].v === m.v && S.subs.ladders[i].tk === m.tk) return 'FULL';
       if (S.subs.tops === 'ALL') return m.status === 'OPEN' ? 'TOP' : null;
@@ -1683,7 +1751,12 @@
         rolls(now);
         settleUni(now);
         driftUniverse(now);
-        if (isoET(now) !== S.uniDay) genUniverse(now);       // a new day: a new listing
+        sweepLive(now);
+        if (isoET(now) !== S.uniDay) {
+          // a new day: a new listing, and flat position rows (kept for the day) go (contract pos)
+          S.pos.forEach(function (P, k) { if (!P.pos) S.pos.delete(k); });
+          genUniverse(now);
+        }
         if (S.run.state === 'KILLED' && S.run.rearm_ms && now >= S.run.rearm_ms && !S.run.rearmNoted) { S.run.rearmNoted = true; alert('INFO', 'KILL', 're-arm available'); }
         if (S.chaos && now >= S.nextChaos) { S.nextChaos = now + R(120000, 240000); S.drop = true; }
       }
@@ -1740,6 +1813,8 @@
         case 'POST /api/watch':
           var wk = body.v + '|' + body.tk, wm = S.markets.get(wk), wr = S.uni.get(wk);
           if (!wm && !wr) { reply2(reply, 404, { ok: false, err: err('UNKNOWN_MARKET', wk) }); return; }
+          // a pin on a market that is not open is refused (an unpin is always fine)
+          if (body.on && (wm ? wm.status !== 'OPEN' : (now >= wr.close_ms || now < wr.open_ms))) { reply2(reply, 409, { ok: false, err: err('MARKET_CLOSED', wk + ' is not open') }); return; }
           if (wm) { if (!!wm.pin !== body.on) { wm.pin = body.on; emit('mkt', mktData(wm)); } }
           else if (body.on) activate(wr, true);
           S.uniCache = null;
