@@ -19,10 +19,8 @@ Lane lane_of(const GwMsg& m) {
     Lane operator()(const PlaceIntent&) const { return Lane::NORMAL; }
     Lane operator()(const AmendIntent&) const { return Lane::NORMAL; }
     Lane operator()(const Start&) const { return Lane::NORMAL; }
+    Lane operator()(const Stop&) const { return Lane::CONTROL; }
     Lane operator()(const CancelIntent&) const { return Lane::PRIORITY; }
-    Lane operator()(const Kill&) const { return Lane::PRIORITY; }
-    Lane operator()(const Stop&) const { return Lane::PRIORITY; }
-    Lane operator()(const Rearm&) const { return Lane::PRIORITY; }
     Lane operator()(const SendResult&) const { return Lane::PRIORITY; }
     Lane operator()(const OrderEvent&) const { return Lane::PRIORITY; }
     Lane operator()(const Probe&) const { return Lane::PRIORITY; }

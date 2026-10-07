@@ -1,6 +1,10 @@
-// deskd bus: integer units, message lanes, the bounded two-lane queue, and the gateway's queue
-// rules (Kill overtakes 100 queued orders and deletes them; a click followed at once by Esc
-// never reaches the venue; a Stop overtakes a Start and the Start is answered, not timed out).
+// deskd bus: integer units, message lanes, the bounded three-lane queue, the kill switch, and the
+// gateway's queue rules (KILL deletes 100 queued orders without a message of its own; a click
+// followed at once by Esc never reaches the venue; a Stop overtakes a Start and the Start is
+// answered, not timed out; a re-arm never flips a later Start back to STOP), and send-cx taking a
+// KILL with its inbox full.
+#include <signal.h>
+
 #include <atomic>
 #include <chrono>
 #include <climits>
@@ -16,6 +20,7 @@
 #include "deskd/bus/units.h"
 #include "deskd/gw/gateway.h"
 #include "deskd/gw/kill.h"
+#include "deskd/net/send.h"
 
 using namespace deskd;
 using namespace std::chrono_literals;
@@ -53,12 +58,10 @@ static void test_units() {
 }
 
 static void test_lanes() {
-  CHECK(lane_of(Kill{}) == Lane::PRIORITY);
-  CHECK(lane_of(Stop{}) == Lane::PRIORITY);
+  CHECK(lane_of(Stop{}) == Lane::CONTROL);   // nothing else fills it
   CHECK(lane_of(CancelIntent{}) == Lane::PRIORITY);
   CHECK(lane_of(OrderEvent{}) == Lane::PRIORITY);
   CHECK(lane_of(SendResult{}) == Lane::PRIORITY);
-  CHECK(lane_of(Rearm{}) == Lane::PRIORITY);
   CHECK(lane_of(PlaceIntent{}) == Lane::NORMAL);
   CHECK(lane_of(AmendIntent{}) == Lane::NORMAL);
   CHECK(lane_of(Start{}) == Lane::NORMAL);   // so a later Stop overtakes it
@@ -102,6 +105,32 @@ static void test_queue() {
     CHECK(q.pop_for(0ms) == 100);
     CHECK(q.pop_for(0ms) == 1);
   }
+  // the control lane: a Stop behind a full priority lane and 1,000 orders is next, and a flood of
+  // private events cannot crowd it out (they fill their own lane and are dropped there)
+  {
+    BoundedQueue<int> q(1000, 8, 4);
+    for (int i = 0; i < 1000; ++i) q.push(i);
+    for (int i = 0; i < 20; ++i) q.push(5000 + i, Lane::PRIORITY);   // 8 fit, 12 dropped
+    CHECK(q.dropped() == 12);
+    CHECK(q.push(-7, Lane::CONTROL));
+    CHECK(q.pop_for(0ms) == -7);
+    CHECK(q.pop_for(0ms) == 5000);
+    CHECK(q.size(Lane::CONTROL) == 0);
+  }
+  // kick wakes a waiting reader without a message
+  {
+    BoundedQueue<int> q(4, 4);
+    std::thread kicker([&q] {
+      std::this_thread::sleep_for(30ms);
+      q.kick();
+    });
+    const auto t0 = std::chrono::steady_clock::now();
+    CHECK(!q.pop_for(5000ms));
+    CHECK(std::chrono::steady_clock::now() - t0 < 2000ms);
+    kicker.join();
+    q.push(3);
+    CHECK(q.pop_for(0ms) == 3);   // a kick leaves nothing behind
+  }
   // pop_for waits at most its timeout; close wakes a waiter and refuses pushes
   {
     BoundedQueue<int> q(4, 4);
@@ -142,42 +171,92 @@ static void test_queue() {
 }
 
 static void test_kill_switch() {
+  const std::int64_t W = 1791306000000, M = 5000000;   // a wall time and a steady time
   KillSwitch k;
+  int woken = 0;
+  k.on_trip([&woken] { ++woken; });
   CHECK(!k.active());
-  CHECK(k.rearm(1000) == "not KILLED");
-  CHECK(k.trip(1791306000000));
+  CHECK(k.generation() == 0 && k.state_gen() == 0);
+  CHECK(k.rearm(W, M) == "not KILLED");
+  CHECK(k.trip(W, M, "operator"));
+  CHECK(k.active() && k.why() == "operator");
+  CHECK(k.generation() == 1 && k.state_gen() == 1 && woken == 1);
+  CHECK(!k.trip(W + 5000, M + 5000, "again"));        // a second KILL keeps the first's times ...
+  CHECK(k.generation() == 2 && k.state_gen() == 1);   // ... but is a second cancel-all
+  CHECK(woken == 2);
+  CHECK(k.since_ms() == W && k.why() == "operator");
+  CHECK(k.rearm_ms() == W + 60000);
+  CHECK(k.rearm(W + 59000, M + 59000) == "rearm in 1 s");   // the 60 s lockout
+  // the lockout runs on the steady clock: a wall clock stepped forward cannot shorten it, and
+  // one stepped back cannot lengthen it
+  CHECK(!k.rearm(W + 3600000, M + 1000).empty());
   CHECK(k.active());
-  CHECK(!k.trip(1791306005000));                       // a second KILL keeps the first's times
-  CHECK(k.since_ms() == 1791306000000);
-  CHECK(k.rearm_ms() == 1791306060000);
-  CHECK(k.rearm(1791306059000) == "rearm in 1 s");     // the 60 s lockout
-  CHECK(k.active());
-  CHECK(k.rearm(1791306060000).empty());
+  CHECK(k.rearm(W - 3600000, M + 60000).empty());
   CHECK(!k.active());
-  CHECK(k.rearm_ms() == 0);
+  CHECK(k.rearm_ms() == 0 && k.rearmed_ms() == W - 3600000);
+  CHECK(k.state_gen() == 2 && k.generation() == 2);
+
+  // the lockout lasts 60 s from the moment send-cx's cancel-all returns, too: the venue cancels
+  // orders placed in the minute after a cancel-all
+  {
+    KillSwitch c;
+    CHECK(c.trip(W, M, "operator"));
+    c.cancel_all_done(W + 4000, M + 4000);
+    CHECK(c.rearm_ms() == W + 64000);
+    CHECK(c.rearm(W + 60000, M + 60000) == "rearm in 4 s");
+    CHECK(c.rearm(W + 64000, M + 64000).empty());
+    c.cancel_all_done(W + 70000, M + 70000);   // not KILLED: nothing to extend
+    CHECK(!c.active() && c.rearm_ms() == 0);
+  }
 
   // KILLED outlives the process until a re-arm
   TempDir d;
-  const std::string file = d.file("deskd.killed");
+  const std::string file = d.file("kalshi-demo.killed");
   {
     KillSwitch a;
     a.persist_to(file);
-    CHECK(a.restore() == 0);                 // nothing to restore
-    CHECK(a.trip(1791306000000));
+    CHECK(a.restore(W, M) == 0);             // nothing to restore
+    CHECK(a.generation() == 0);
+    CHECK(a.trip(W, M, "operator"));
   }
   {
-    KillSwitch b;                            // the next start
+    KillSwitch b;                            // the next start, 10 s later
     b.persist_to(file);
-    CHECK(b.restore() == 1791306000000);
-    CHECK(b.active() && b.rearm_ms() == 1791306060000);
-    CHECK(!b.rearm(1791306000500).empty());
-    CHECK(b.rearm(1791306061000).empty());
+    CHECK(b.restore(W + 10000, 777) == W);
+    CHECK(b.active() && b.why() == "restart");
+    CHECK(b.generation() == 1);              // send-cx cancels again at start
+    CHECK(b.rearm_ms() == W + 60000);        // what is left of the lockout, by the wall clock
+    CHECK(b.rearm(W + 50000, 777 + 49999) == "rearm in 1 s");
+    CHECK(b.rearm(W + 61000, 777 + 50000).empty());
   }
   {
     KillSwitch c;
     c.persist_to(file);
-    CHECK(c.restore() == 0);                 // re-armed: the next start is not KILLED
+    CHECK(c.restore(W, M) == 0);             // re-armed: the next start is not KILLED
     CHECK(!c.active());
+  }
+  {
+    // a KILL, a re-arm, and a KILL again: the last one is on disk (the re-arm's unlink and the
+    // trip's write share one lock, so a trip can no longer lose its file to a re-arm)
+    KillSwitch e;
+    e.persist_to(file);
+    CHECK(e.trip(W, M, "operator"));
+    CHECK(e.rearm(W + 60000, M + 60000).empty());
+    CHECK(e.trip(W + 61000, M + 61000, "operator"));
+    KillSwitch f;
+    f.persist_to(file);
+    CHECK(f.restore(W + 62000, 1) == W + 61000);
+  }
+  {
+    // a restore long after the KILL: the lockout is over, only the re-arm is needed; a wall
+    // clock far behind the file never makes it longer than a whole lockout
+    KillSwitch g;
+    g.persist_to(file);
+    CHECK(g.restore(W + 3600000, 10) == W + 61000);
+    CHECK(g.rearm(W + 3600000, 10).empty());
+    KillSwitch h;
+    h.persist_to(file);
+    CHECK(h.restore(W, 10) == 0);
   }
   {
     std::FILE* f = std::fopen(file.c_str(), "w");
@@ -185,8 +264,8 @@ static void test_kill_switch() {
     std::fclose(f);
     KillSwitch e;
     e.persist_to(file);
-    CHECK(e.restore() == 1);                 // unreadable still means KILLED (lockout over)
-    CHECK(e.rearm(1791306000000).empty());
+    CHECK(e.restore(W, M) == 1);             // unreadable still means KILLED (lockout over)
+    CHECK(e.rearm(W, M).empty());
   }
 }
 
@@ -237,23 +316,26 @@ static void test_gateway_rules() {
   Gateway gw(kill, [&all_ok] { return rows(all_ok.load()); });
   Worker w("gw");
   w.start([&gw](Worker& self) { gw.run(self); });
+  std::int64_t mono = mono_ms();   // the kill switch's steady clock, moved by hand past lockouts
 
-  // Kill overtakes 100 queued orders and deletes them all: none is ever handled as an order
+  // KILL overtakes 100 queued orders and deletes them all, with no message of its own: the trip
+  // kicks gw's inbox and gw reads the switch before the next message
   {
     Freeze f(gw);
     for (int i = 0; i < 100; ++i) CHECK(gw.post(order("Mq" + std::to_string(i) + "abcd", Owner::MAN, "KXT-A")));
-    CHECK(kill.trip(now_ms()));
-    gw.post(Kill{now_ms(), "test"});
+    CHECK(kill.trip(now_ms(), mono, "test"));
     CHECK(gw.inbox().size(Lane::NORMAL) == 100);
     f.thaw();
-    CHECK(settled(gw, 2));   // the probe and the Kill; nothing else
+    CHECK(settled(gw, 1));   // the probe; nothing else
+    for (int i = 0; i < 200 && gw.stats().kills_seen.load() == 0; ++i) std::this_thread::sleep_for(5ms);
+    CHECK(gw.stats().kills_seen.load() == 1);
     CHECK(gw.stats().erased_by_kill.load() == 100);
     CHECK(gw.stats().place_refused.load() == 0);
+    CHECK(gw.stats().handled.load() == 1);
     CHECK(gw.inbox().size() == 0);
     CHECK(gw.run_view().state == RunState::KILLED);
-    CHECK(kill.rearm(kill.rearm_ms()).empty());
-    gw.post(Rearm{now_ms()});
-    CHECK(settled(gw, 3));
+    mono += 60000;
+    CHECK(kill.rearm(now_ms(), mono).empty());
     CHECK(gw.run_view().state == RunState::STOP);
   }
   // a click followed at once by Esc: the market cancel deletes the queued order; another
@@ -310,19 +392,74 @@ static void test_gateway_rules() {
     CHECK(r2.code.empty());
     CHECK(r2.run.state == RunState::RUN);
     // KILL while running: the kill switch reads first, without waiting for gw
-    kill.trip(now_ms());
+    kill.trip(now_ms(), mono, "operator");
     CHECK(gw.run_view().state == RunState::KILLED);
     CHECK(gw.run_view().rearm_ms == kill.rearm_ms());
+    CHECK(gw.run_view().why == "operator");
+    for (int i = 0; i < 200 && gw.stats().kills_seen.load() < 2; ++i) std::this_thread::sleep_for(5ms);
+    CHECK(gw.stats().kills_seen.load() == 2);
+  }
+  // A re-arm, then a Start that gw answers RUN: nothing flips it back to STOP afterwards. Until
+  // 2026-10-06 the route cleared the switch and then posted a Rearm message; a Start handled
+  // between the two answered RUN and the Rearm then set STOP. Now gw applies the re-arm itself,
+  // before the next message, so it is the same here even with gw frozen through both.
+  {
+    Freeze f(gw);
+    mono += 60000;
+    CHECK(kill.rearm(now_ms(), mono).empty());
+    auto p = std::make_shared<std::promise<ControlReply>>();
+    gw.post(Start{p});
+    f.thaw();
+    auto fut = p->get_future();
+    CHECK(fut.wait_for(1s) == std::future_status::ready);
+    const ControlReply r = fut.get();
+    CHECK(r.code.empty() && r.run.state == RunState::RUN);
+    std::this_thread::sleep_for(600ms);   // two of gw's idle turns: still RUN
+    CHECK(gw.run_view().state == RunState::RUN);
   }
   w.request_stop();
   w.join();
 }
 
+// send-cx takes a KILL from the switch, never from its inbox: with the inbox full (cancels
+// dropped, a gap marked) the KILL still goes, and before any queued job.
+static void test_cancel_sender_kill() {
+  KillSwitch kill;
+  BoundedQueue<SendJob> q(8, 8);
+  watch_kill(kill, q);
+  SenderStats stats;
+  for (int i = 0; i < 40; ++i) q.push(SendJob{SendJob::Kind::WRITE, now_ms(), "Mfull-" + std::to_string(i)},
+                                      i % 2 ? Lane::PRIORITY : Lane::NORMAL);
+  CHECK(q.size() == 16 && q.dropped() == 24);   // full
+  CHECK(kill.trip(now_ms(), mono_ms(), "operator"));
+  std::atomic<int> alerts{0};
+  Worker cx("send-cx");
+  cx.start([&](Worker& self) {
+    run_cancel_sender(self, q, stats, kill, [&alerts](const std::string&, const std::string&, const std::string&) { ++alerts; });
+  });
+  for (int i = 0; i < 400 && stats.writes_refused.load() < 16; ++i) std::this_thread::sleep_for(5ms);
+  CHECK(stats.kills.load() == 1);
+  CHECK(stats.kill_gen_seen.load() == kill.generation());
+  CHECK(stats.writes_before_kill.load() == 0);   // the KILL went before every queued job
+  CHECK(stats.writes_refused.load() == 16);
+  CHECK(alerts.load() == 1);
+  // a second KILL while it waits on an empty inbox: woken by the trip, not by its 250 ms wait
+  const auto t0 = std::chrono::steady_clock::now();
+  kill.trip(now_ms(), mono_ms(), "operator");
+  for (int i = 0; i < 400 && stats.kills.load() < 2; ++i) std::this_thread::sleep_for(1ms);
+  CHECK(stats.kills.load() == 2);
+  CHECK(std::chrono::steady_clock::now() - t0 < 200ms);
+  cx.request_stop();
+  cx.join();
+}
+
 int main() {
+  ::signal(SIGPIPE, SIG_IGN);   // every deskd test main: an embedder never dies of a peer's close
   test_units();
   test_lanes();
   test_queue();
   test_kill_switch();
   test_gateway_rules();
+  test_cancel_sender_kill();
   return finish("deskd-bus");
 }

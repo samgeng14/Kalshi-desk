@@ -5,6 +5,7 @@
 // 2026-10-06): fees from the formula in redesign_all kalshi K6 and the worked example in
 // getting_started/fee_rounding.md; message fields from websockets/*.md; order rules from
 // api-reference/orders/create-order-v2.md. Every file the test makes lives under $TMPDIR.
+#include <csignal>
 #include <chrono>
 #include <fstream>
 #include <map>
@@ -988,6 +989,7 @@ void test_many_orders() {
 }  // namespace
 
 int main() {
+  std::signal(SIGPIPE, SIG_IGN);   // every deskd test main (this one opens no socket, but stays uniform)
   test_wire();
   test_grids_and_fees();
   test_matching();

@@ -1,7 +1,7 @@
 #pragma once
 // A worker is one named thread that owns its state (plan section 2). Its loop calls beat()
 // every time it comes round, idle or not, so a progress counter that stops moving means the
-// loop is stuck: ops withholds the supervisor's heartbeat when gw, md-k or priv-k stop moving.
+// loop is stuck: ops withholds the supervisor's heartbeat when a watched owner stops moving.
 #include <atomic>
 #include <cstdint>
 #include <functional>
@@ -28,7 +28,7 @@ class Worker {
 
   void beat();  // one more unit of progress
   std::uint64_t progress() const { return progress_.load(std::memory_order_relaxed); }
-  std::int64_t last_beat_ms() const { return last_beat_ms_.load(std::memory_order_relaxed); }
+  std::int64_t last_beat_ms() const { return last_beat_ms_.load(std::memory_order_relaxed); }   // steady clock
 
  private:
   std::string name_;

@@ -1,14 +1,25 @@
 #pragma once
 // ops: the supervisor's heartbeat, disk space and the preflight rows (plan section 2).
 //
-// The heartbeat file is written only while gw, md-k and priv-k each advanced their progress
-// counter in the last 5 s, so a desk whose web threads still answer but whose gateway or feeds
-// are stuck looks dead to the supervisor and is restarted. The old desk wrote its heartbeat
-// after every engine pass for the same reason (2026-09: a desk with every request thread busy
-// looked dead to /api/state while it was cycling normally, and the opposite case must not look
-// alive).
+// The heartbeat file is written only while every watched owner advanced its progress counter in
+// the last 5 s, so a desk whose web threads still answer but whose gateway or feeds are stuck
+// looks dead to the supervisor and is restarted. The old desk wrote its heartbeat after every
+// engine pass for the same reason (2026-09: a desk with every request thread busy looked dead to
+// /api/state while it was cycling normally, and the opposite case must not look alive).
+//
+// Watched (runtime.cpp): gw, md-k, priv-k, send-cx (KILL's own path) and pub (every page's hb),
+// plus "web", which has no loop of its own: ops sends GET /api/health over loopback each second
+// with a 200 ms timeout, and the "web" counter moves only on a 200. A wedged request pool would
+// otherwise leave no KILL path but the venue's website (deskctl kill uses the same route) while
+// the heartbeat said all was well (review, 2026-10-06). A real feed thread must therefore come
+// back to beat() well inside 5 s: week 1's socket reads take timeouts of 250 ms or less, so a
+// quiet socket never gets a healthy desk restarted.
+//
+// Every time here is on the steady clock (app/log.h) except the heartbeat file's content, which
+// the supervisor compares with its own `date +%s`.
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -54,14 +65,20 @@ class Ops {
   static constexpr std::uint64_t kDiskFloorBytes = 10ull * 1000 * 1000 * 1000;
   static constexpr const char* kHeartbeatFile = "deskd.heartbeat";
 
-  Ops(std::string data_dir, std::int64_t window_ms, std::vector<const Worker*> watched, const Feeds& feeds);
+  using ProbeFn = std::function<bool()>;   // true when web answered GET /api/health
+  using AlertFn = std::function<void(const std::string& lvl, const std::string& msg)>;
+
+  Ops(std::string data_dir, std::int64_t window_ms, std::vector<const Worker*> watched, const Feeds& feeds,
+      ProbeFn web_probe = nullptr, AlertFn alert = nullptr);
 
   void run(Worker& self);
 
   std::vector<PreflightRow> preflight() const;   // the latest rows, an immutable copy
   std::string heartbeat_path() const { return data_dir_ + "/" + kHeartbeatFile; }
-  std::int64_t heartbeat_written_ms() const { return written_ms_.load(); }
+  std::int64_t heartbeat_written_ms() const { return written_ms_.load(); }   // wall clock
   std::string heartbeat_withheld() const;        // "" while it is being written
+  std::uint64_t web_probes_ok() const { return web_ok_.load(); }
+  std::uint64_t web_probes_failed() const { return web_failed_.load(); }
 
  private:
   void refresh_preflight(std::int64_t now_ms, bool disk);
@@ -69,11 +86,14 @@ class Ops {
   const std::string data_dir_;
   const std::vector<const Worker*> watched_;
   const Feeds& feeds_;
+  const ProbeFn web_probe_;
+  const AlertFn alert_;
   HeartbeatRule rule_;
   std::optional<std::uint64_t> disk_free_;      // ops thread only
   std::shared_ptr<const std::vector<PreflightRow>> rows_;   // std::atomic_load / store
   std::shared_ptr<const std::string> withheld_;
   std::atomic<std::int64_t> written_ms_{0};
+  std::atomic<std::uint64_t> web_ok_{0}, web_failed_{0};
 };
 
 }  // namespace deskd

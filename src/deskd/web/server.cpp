@@ -11,6 +11,7 @@
 #include <fstream>
 #include <future>
 #include <sstream>
+#include <thread>
 
 #include "deskd/app/log.h"
 #include "deskd/gw/gateway.h"
@@ -206,6 +207,17 @@ struct WebServer::Impl {
     return f.get();
   }
 
+  // true once send-cx has handled kill generation gen (or a later one), polled for up to ms
+  bool kill_taken(std::uint64_t gen, int ms) const {
+    if (!d.cx_stats) return false;
+    const std::int64_t end = mono_ms() + ms;
+    while (d.cx_stats->kill_gen_seen.load() < gen) {
+      if (mono_ms() >= end) return false;
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return true;
+  }
+
   void serve_page(httplib::Response& res) {
     std::string html, page;
     if (!read_file(d.ui_dir + "/index.html", &html)) return reply_err(res, "INTERNAL", "cannot read the ui dir's index.html");
@@ -263,7 +275,7 @@ void WebServer::Impl::routes() {
     const std::string sid = req.get_param_value("sid");
     if (!sid_ok(sid)) return reply_err(res, "BAD_REQUEST", "sid: 8 to 64 of A-Z a-z 0-9 _ -");
     const std::int64_t now = now_ms();
-    auto s = std::make_shared<Stream>(sid, d.pub->stream_cap(), now);
+    auto s = std::make_shared<Stream>(sid, d.pub->stream_cap(), mono_ms());
     // seq 1 is an hb, queued before pub can see the stream. The page ignores Last-Event-ID's
     // resume option: every open starts at 1 and the page resyncs.
     s->q.offer("hb", now, d.pub->hb_data(sid, now));
@@ -281,13 +293,13 @@ void WebServer::Impl::routes() {
             return true;
           }
           out += s->q.drain_for(std::chrono::milliseconds(*last_write == 0 ? 0 : 250));
-          const std::int64_t t = now_ms();
+          const std::int64_t t = mono_ms();
           if (out.empty() && t - *last_write >= 15000) out = ": ka\n\n";   // 15 s quiet: a comment for proxies
           if (out.empty()) return true;
           *last_write = t;
           return sink.write(out.data(), out.size());
         },
-        [this, s](bool) { d.pub->streams().closed(s, now_ms()); });
+        [this, s](bool) { d.pub->streams().closed(s, mono_ms()); });
   });
 
   svr.Get("/api/snapshot", [this](const httplib::Request& req, httplib::Response& res) {
@@ -340,25 +352,29 @@ void WebServer::Impl::routes() {
     reply_json(res, r.status, r.body);
   }));
 
-  // KILL: its own path. The flag first, then send-cx (it cancels without gw), then gw (it
-  // refuses new orders and deletes queued ones). Nothing here waits for gw, so KILL answers
-  // while gw is frozen. A repeated KILL sends cancel-all again: idempotent and never harmful.
+  // KILL: its own path. The trip sets the flag and wakes send-cx and gw, which both watch the
+  // switch (gw/kill.h): no queue slot, so nothing can drop it, and nothing here waits for gw, so
+  // KILL answers while gw is frozen. send-cx is expected to take the new generation at once; if
+  // it has not within 100 ms (dead, or stuck in a write), the screen hears it as CRIT rather than
+  // seeing KILLED alone. A repeated KILL sends cancel-all again: idempotent and never harmful.
   svr.Post("/api/kill", post([this](const httplib::Request&, httplib::Response& res, const json&) {
-    const std::int64_t now = now_ms();
-    const bool first = d.kill->trip(now);
-    d.send_cx->push(SendJob{SendJob::Kind::KILL, now, ""}, Lane::PRIORITY);
-    d.gw->post(Kill{now, "operator"});
+    const bool first = d.kill->trip(now_ms(), mono_ms(), "operator");
+    const std::uint64_t gen = d.kill->generation();
     if (first) d.pub->alert("CRIT", "KILL", "KILL by operator: new orders refused until re-armed (60 s)");
-    const RunView r{RunState::KILLED, d.kill->since_ms(), d.kill->rearm_ms(), "operator"};
+    if (!kill_taken(gen, 100)) {
+      DLOG_ERR("KILL: send-cx has not taken generation %llu within 100 ms", static_cast<unsigned long long>(gen));
+      d.pub->alert("CRIT", "KILL", "send-cx has not taken the KILL within 100 ms: check the venues for resting orders");
+    }
+    const RunView r{RunState::KILLED, d.kill->since_ms(), d.kill->rearm_ms(), d.kill->why()};
     reply_json(res, 200, json{{"ok", true}, {"run", run_json(r)}, {"n", 0}});
   }, true));
 
+  // gw applies the re-arm itself, on its own thread, before it looks at any later Start
   svr.Post("/api/rearm", post([this](const httplib::Request&, httplib::Response& res, const json& b) {
     if (!b.empty()) return reply_err(res, "BAD_REQUEST", "rearm takes {}");
     const std::int64_t now = now_ms();
-    const std::string why = d.kill->rearm(now);
+    const std::string why = d.kill->rearm(now, mono_ms());
     if (!why.empty()) return reply_err(res, "BAD_STATE", why);
-    d.gw->post(Rearm{now});
     d.pub->alert("WARN", "KILL", "re-armed: Systematic needs a Start");
     reply_json(res, 200, json{{"ok", true}, {"run", run_json(RunView{RunState::STOP, now, 0, ""})}, {"n", 0}});
   }));

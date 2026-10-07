@@ -1,9 +1,16 @@
-// deskd ops and guards: the account lock (a second holder is refused; a missing data dir is
-// never created), the heartbeat rule and file, config loading, the empty-subscription guard,
-// and the send guard that keeps production hosts closed without --live and the lock.
+// deskd ops and guards: the account lock (one fixed absolute file per account; a second holder
+// is refused; a relative or missing configured dir is refused, never created), the heartbeat rule
+// and file (web's probe and every watched owner), the logger that never blocks a thread, config
+// loading, the empty-subscription guard, and the send guard that keeps production hosts closed
+// without --live and the production account's lock.
+#include <fcntl.h>
+#include <signal.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include <chrono>
+#include <climits>
+#include <cstdlib>
 #include <fstream>
 #include <nlohmann/json.hpp>
 #include <stdexcept>
@@ -34,24 +41,51 @@ static bool exists(const std::string& path) {
 static void test_lock() {
   TempDir d;
   std::string err;
-  auto a = AccountLock::acquire(d.path, &err);
+  auto a = AccountLock::acquire(d.path, "demo", "deskd DEMO", false, &err);
   CHECK(a && a->held());
-  CHECK(a && a->path() == d.file("kalshi-account.lock"));
-  CHECK(slurp(d.file("kalshi-account.lock")).find("pid ") == 0);
+  char real[PATH_MAX];
+  CHECK(::realpath(d.path.c_str(), real) != nullptr);
+  CHECK(a && a->path() == std::string(real) + "/kalshi-demo.lock");   // the real path, logged as such
+  CHECK(a && a->env() == "demo" && a->sibling(".killed") == std::string(real) + "/kalshi-demo.killed");
+  CHECK(slurp(d.file("kalshi-demo.lock")).find("pid " + std::to_string(::getpid()) + " deskd DEMO since ") == 0);
   // a second holder is refused, and told who holds it (flock is per open file: a second open in
-  // this process is refused the same way another process is)
-  auto b = AccountLock::acquire(d.path, &err);
+  // this process is refused the same way another process is), whatever path names the dir
+  auto b = AccountLock::acquire(d.path, "demo", "other", false, &err);
   CHECK(!b);
   CHECK(err.find("held by another process") != std::string::npos);
-  CHECK(err.find("pid ") != std::string::npos);
+  CHECK(err.find("deskd DEMO") != std::string::npos);
+  auto b2 = AccountLock::acquire(d.path + "/./", "demo", "other", false, &err);
+  CHECK(!b2);
+  // the other account is another file: a non-live deskd never blocks (or holds) the live one
+  auto p = AccountLock::acquire(d.path, "prod", "deskd LIVE", false, &err);
+  CHECK(p && p->held() && p->env() == "prod");
   a.reset();
-  auto c = AccountLock::acquire(d.path, &err);
+  auto c = AccountLock::acquire(d.path, "demo", "deskd DEMO", false, &err);
   CHECK(c && c->held());
-  // a missing data dir is refused and NOT created: a fresh private lock would protect nothing
+  // a relative dir is refused: from another working directory it would be another file, the bug
+  // of 2026-10-06 (two deskds with --data-dir data in two checkouts both came up)
+  CHECK(!AccountLock::acquire("data", "demo", "x", false, &err));
+  CHECK(err.find("not an absolute path") != std::string::npos);
+  CHECK(!AccountLock::acquire("", "demo", "x", true, &err));
+  CHECK(!AccountLock::acquire(d.path, "staging", "x", false, &err));
+  CHECK(err.find("neither prod nor demo") != std::string::npos);
+  // a missing configured dir is refused and NOT created: a fresh private lock would protect nothing
   const std::string missing = d.file("no-such-dir");
-  CHECK(!AccountLock::acquire(missing, &err));
+  CHECK(!AccountLock::acquire(missing, "demo", "x", false, &err));
   CHECK(err.find("does not exist") != std::string::npos);
   CHECK(!exists(missing));
+  // the default dir is made if missing (create_dir), and lives under $HOME
+  const std::string made = d.file("home/Library/Application Support/kalshi-desk/locks");
+  auto m = AccountLock::acquire(made, "demo", "x", true, &err);
+  CHECK(m && m->held() && exists(made + "/kalshi-demo.lock"));
+  const char* home = std::getenv("HOME");
+  const std::string saved = home ? home : "";
+  ::setenv("HOME", d.file("home").c_str(), 1);
+  CHECK(AccountLock::default_dir(&err) == made);
+  ::unsetenv("HOME");
+  CHECK(AccountLock::default_dir(&err).empty());
+  CHECK(err.find("HOME") != std::string::npos);
+  if (!saved.empty()) ::setenv("HOME", saved.c_str(), 1);
 }
 
 static void test_heartbeat_rule() {
@@ -86,8 +120,9 @@ static void test_heartbeat_rule() {
   CHECK(disk_free_bytes(d.path).has_value());
 }
 
-// The real ops thread over real workers: the file is written while gw, md-k and priv-k beat,
-// and withheld within the window once one of them stops.
+// The real ops thread over real workers: the file is written while gw, md-k and priv-k beat
+// (their placeholder loops come round every 250 ms with no traffic at all: a quiet feed keeps
+// the heartbeat), and withheld within the window once one of them stops.
 static void test_ops_thread() {
   TempDir d;
   Feeds feeds;
@@ -140,6 +175,93 @@ static void test_ops_thread() {
   priv.request_stop();
 }
 
+// web has no loop of its own to beat: ops asks GET /api/health each second, and a web pool that
+// stops answering withholds the heartbeat like a stuck owner, with a CRIT on the screen.
+static void test_web_probe() {
+  TempDir d;
+  Feeds feeds;
+  Worker gw("gw"), ops_w("ops");
+  gw.start([](Worker& w) {
+    while (!w.stopping()) {
+      w.beat();
+      std::this_thread::sleep_for(50ms);
+    }
+  });
+  std::atomic<bool> answers{true};
+  std::atomic<int> crit{0};
+  Ops ops(d.path, 1000, {&gw}, feeds, [&answers] { return answers.load(); },
+          [&crit](const std::string& lvl, const std::string& msg) {
+            if (lvl == "CRIT" && msg.find("web silent") != std::string::npos) ++crit;
+          });
+  ops_w.start([&ops](Worker& w) { ops.run(w); });
+  bool written = false;
+  for (int i = 0; i < 40 && !written; ++i) {
+    std::this_thread::sleep_for(50ms);
+    written = ops.heartbeat_withheld().empty() && ops.heartbeat_written_ms() > 0;
+  }
+  CHECK(written);
+  answers.store(false);
+  bool withheld = false;
+  for (int i = 0; i < 80 && !withheld; ++i) {
+    std::this_thread::sleep_for(50ms);
+    withheld = ops.heartbeat_withheld().find("web silent") == 0;
+  }
+  CHECK(withheld);
+  CHECK(crit.load() == 1);
+  CHECK(ops.web_probes_failed() >= 1);
+  answers.store(true);
+  bool back = false;
+  for (int i = 0; i < 60 && !back; ++i) {
+    std::this_thread::sleep_for(50ms);
+    back = ops.heartbeat_withheld().empty();
+  }
+  CHECK(back);
+  ops_w.request_stop();
+  gw.request_stop();
+  ops_w.join();
+  gw.join();
+}
+
+// A thread that logs never blocks on stderr: with stderr a pipe nobody reads, 20,000 lines take
+// well under a second, the ones past the queue are dropped and counted, and the logger says so
+// once the pipe drains. Until 2026-10-06 every log line was a write(2) on the calling thread, so
+// gw (it logs each refused order) and send-cx (each KILL) would have stopped on a full pipe.
+static void test_logger_never_blocks() {
+  int p[2];
+  CHECK(::pipe(p) == 0);
+  const int saved = ::dup(STDERR_FILENO);
+  ::dup2(p[1], STDERR_FILENO);
+  start_logger();
+  start_logger();   // idempotent
+  const std::uint64_t dropped0 = log_dropped();
+  const auto t0 = std::chrono::steady_clock::now();
+  for (int i = 0; i < 20000; ++i) DLOG_INFO("line %d of a flood nobody reads", i);
+  const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+  const std::uint64_t dropped = log_dropped() - dropped0;
+  CHECK(ms < 1000);
+  CHECK(dropped > 10000);   // the pipe holds 64 KiB, the queue 4,096 lines
+  // now drain the pipe: the logger writes the rest, then one line with the drop count
+  ::fcntl(p[0], F_SETFL, O_NONBLOCK);
+  char buf[65536];
+  std::string got;
+  bool flushed = false;
+  for (int i = 0; i < 500 && !flushed; ++i) {
+    ssize_t n;
+    while ((n = ::read(p[0], buf, sizeof buf)) > 0) got.append(buf, static_cast<std::size_t>(n));
+    flushed = flush_logger(5);
+  }
+  ssize_t n;
+  while ((n = ::read(p[0], buf, sizeof buf)) > 0) got.append(buf, static_cast<std::size_t>(n));
+  ::dup2(saved, STDERR_FILENO);
+  ::close(saved);
+  std::printf("20,000 log lines into a full pipe: %.1f ms, %llu dropped\n", ms, static_cast<unsigned long long>(dropped));
+  CHECK(flushed);
+  CHECK(got.find("] main: line 0 of a flood nobody reads\n") != std::string::npos);   // whole lines
+  CHECK(got.find(std::to_string(dropped) + " log lines dropped") != std::string::npos);
+  ::close(p[0]);
+  ::close(p[1]);
+}
+
 static void test_config() {
   TempDir d;
   auto write = [&d](const std::string& text) {
@@ -165,6 +287,9 @@ static void test_config() {
   // defaults without a deskd section
   DeskdConfig e = load_deskd_config(write(R"({"env": "demo"})"));
   CHECK(e.http_port == 8788 && e.data_dir == "data" && e.max_streams == 4 && e.daily_stop == 300000);
+  CHECK(e.lock_dir.empty());   // the fixed default under $HOME
+  DeskdConfig l = load_deskd_config(write(R"({"deskd": {"lock_dir": "/tmp/locks"}})"));
+  CHECK(l.lock_dir == "/tmp/locks");
   auto throws = [&](const std::string& text, const std::string& want) {
     try {
       load_deskd_config(write(text));
@@ -178,6 +303,7 @@ static void test_config() {
   CHECK(throws(R"({"deskd": {"http_port": "8788"}})", "\"http_port\" has the wrong type"));
   CHECK(throws(R"({"deskd": {"max_streams": 15}})", "max_streams"));
   CHECK(throws(R"({"deskd": [1]})", "not an object"));
+  CHECK(throws(R"({"deskd": {"lock_dir": "data/locks"}})", "lock_dir must be an absolute path"));
   CHECK(throws(R"({"env": )", "c.json"));
   bool missing = false;
   try {
@@ -236,12 +362,16 @@ static void test_send_guard() {
 
   TempDir d;
   std::string err;
-  auto lock = AccountLock::acquire(d.path, &err);
-  CHECK(lock && lock->held());
-  const SendGuard demo(false, lock.get()), live_no_lock(true, nullptr), live(true, lock.get());
+  auto lock = AccountLock::acquire(d.path, "prod", "test", false, &err);
+  auto demo_lock = AccountLock::acquire(d.path, "demo", "test", false, &err);
+  CHECK(lock && lock->held() && demo_lock && demo_lock->held());
+  const SendGuard demo(false, demo_lock.get()), live_no_lock(true, nullptr), live(true, lock.get()),
+      live_demo_lock(true, demo_lock.get());
   CHECK(demo.refuse("api.elections.kalshi.com").find("--live") != std::string::npos);
   CHECK(demo.refuse("gateway.polymarket.us").find("--live") != std::string::npos);
-  CHECK(live_no_lock.refuse("api.elections.kalshi.com").find("account lock") != std::string::npos);
+  CHECK(live_no_lock.refuse("api.elections.kalshi.com").find("account's lock") != std::string::npos);
+  // --live with the demo account's lock is still refused: the two conditions are independent
+  CHECK(live_demo_lock.refuse("api.elections.kalshi.com").find("account's lock") != std::string::npos);
   CHECK(live.refuse("api.elections.kalshi.com").empty());
   CHECK(demo.refuse("external-api.demo.kalshi.co").empty());
   CHECK(demo.refuse("127.0.0.1").empty());
@@ -250,11 +380,14 @@ static void test_send_guard() {
 }
 
 int main() {
+  ::signal(SIGPIPE, SIG_IGN);   // every deskd test main: an embedder never dies of a peer's close
   test_lock();
   test_heartbeat_rule();
   test_ops_thread();
+  test_web_probe();
   test_config();
   test_subscribe_guard();
   test_send_guard();
+  test_logger_never_blocks();   // last: the logger thread stays on for the rest of the process
   return finish("deskd-ops");
 }

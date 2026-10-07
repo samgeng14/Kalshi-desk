@@ -13,6 +13,7 @@ Gateway::Gateway(KillSwitch& kill, PreflightFn preflight, std::size_t normal_cap
   own_.state = RunState::STOP;
   own_.since_ms = now_ms();
   publish();
+  kill_.on_trip([this] { inbox_.kick(); });
 }
 
 bool Gateway::post(GwMsg m) {
@@ -24,20 +25,9 @@ void Gateway::publish() { std::atomic_store(&view_, std::make_shared<const RunVi
 
 RunView Gateway::run_view() const {
   const std::int64_t killed = kill_.since_ms();
-  if (killed) return RunView{RunState::KILLED, killed, kill_.rearm_ms(), "operator"};
+  if (killed) return RunView{RunState::KILLED, killed, kill_.rearm_ms(), kill_.why()};
   auto v = std::atomic_load(&view_);
   return v ? *v : RunView{};
-}
-
-void Gateway::run(Worker& self) {
-  while (!self.stopping()) {
-    auto m = inbox_.pop_for(std::chrono::milliseconds(250));
-    if (m) {
-      handle(*m);
-      stats_.handled.fetch_add(1, std::memory_order_relaxed);
-    }
-    self.beat();
-  }
 }
 
 namespace {
@@ -64,6 +54,58 @@ bool cancel_covers(const CancelIntent& c, const PlaceIntent& p) {
 }
 }  // namespace
 
+void Gateway::run(Worker& self) {
+  sync_kill();   // a KILL restored at start
+  while (!self.stopping()) {
+    auto m = inbox_.pop_for(std::chrono::milliseconds(250));
+    // Before the message: a KILL that tripped while it was being popped deletes it too, if it is
+    // a new order or a Start, exactly as it deletes the ones still queued.
+    if (sync_kill() && m && (std::holds_alternative<PlaceIntent>(*m) || std::holds_alternative<Start>(*m))) {
+      std::vector<GwMsg> gone;
+      gone.push_back(std::move(*m));
+      m.reset();
+      stats_.erased_by_kill.fetch_add(1);
+      answer_erased_starts(gone, "KILLED", "KILL overtook this start");
+    }
+    if (m) {
+      handle(*m);
+      stats_.handled.fetch_add(1, std::memory_order_relaxed);
+    }
+    self.beat();
+  }
+}
+
+
+bool Gateway::sync_kill() {
+  const std::uint64_t g = kill_.generation(), st = kill_.state_gen();
+  if (g == kill_gen_seen_ && st == kill_state_seen_) return false;
+  const bool changed = st != kill_state_seen_;
+  kill_gen_seen_ = g;
+  kill_state_seen_ = st;
+  if (kill_.active()) {
+    std::vector<GwMsg> gone;
+    const std::size_t n = inbox_.erase_if(Lane::NORMAL, [](const GwMsg& q) {
+      return std::holds_alternative<PlaceIntent>(q) || std::holds_alternative<Start>(q);
+    }, &gone);
+    stats_.erased_by_kill.fetch_add(n);
+    stats_.kills_seen.fetch_add(1);
+    if (changed || own_.state == RunState::RUN) {
+      own_ = RunView{RunState::STOP, kill_.since_ms(), 0, ""};
+      publish();
+    }
+    answer_erased_starts(gone, "KILLED", "KILL overtook this start");
+    DLOG_WARN("KILL (%s): Systematic stopped, %zu queued orders and starts deleted", kill_.why().c_str(), n);
+    return true;
+  }
+  // Re-armed. Later: reset every order group; GROUPS fails until order_group_updates confirms
+  // them. A Start gw already answered RUN after the re-arm stands.
+  if (changed && own_.state != RunState::RUN) {
+    own_ = RunView{RunState::STOP, kill_.rearmed_ms(), 0, ""};
+    publish();
+  }
+  return false;
+}
+
 void Gateway::handle(GwMsg& m) {
   if (auto* p = std::get_if<PlaceIntent>(&m)) {
     // No venue path in week 0 (the senders arrive in week 1). Refused, and counted, so a test or
@@ -79,18 +121,6 @@ void Gateway::handle(GwMsg& m) {
       return p && cancel_covers(cx, *p);
     });
     stats_.erased_by_cancel.fetch_add(n);
-    return;
-  }
-  if (auto* k = std::get_if<Kill>(&m)) {
-    std::vector<GwMsg> gone;
-    const std::size_t n = inbox_.erase_if(Lane::NORMAL, [](const GwMsg& q) {
-      return std::holds_alternative<PlaceIntent>(q) || std::holds_alternative<Start>(q);
-    }, &gone);
-    stats_.erased_by_kill.fetch_add(n);
-    own_ = RunView{RunState::STOP, k->t_ms, 0, ""};
-    publish();
-    answer_erased_starts(gone, "KILLED", "KILL overtook this start");
-    DLOG_WARN("KILL (%s): Systematic stopped, %zu queued orders and starts deleted", k->why.c_str(), n);
     return;
   }
   if (auto* s = std::get_if<Stop>(&m)) {
@@ -131,12 +161,6 @@ void Gateway::handle(GwMsg& m) {
     }
     r.run = run_view();
     if (st->reply) st->reply->set_value(std::move(r));
-    return;
-  }
-  if (auto* r = std::get_if<Rearm>(&m)) {
-    // Later: reset every order group; GROUPS fails until order_group_updates confirms them.
-    own_ = RunView{RunState::STOP, r->t_ms, 0, ""};
-    publish();
     return;
   }
   if (auto* pr = std::get_if<Probe>(&m)) {

@@ -64,10 +64,16 @@ std::optional<std::uint64_t> disk_free_bytes(const std::string& dir) {
   return static_cast<std::uint64_t>(v.f_bavail) * static_cast<std::uint64_t>(v.f_frsize);
 }
 
-Ops::Ops(std::string data_dir, std::int64_t window_ms, std::vector<const Worker*> watched, const Feeds& feeds)
-    : data_dir_(std::move(data_dir)), watched_(std::move(watched)), feeds_(feeds), rule_(window_ms) {
+Ops::Ops(std::string data_dir, std::int64_t window_ms, std::vector<const Worker*> watched, const Feeds& feeds,
+         ProbeFn web_probe, AlertFn alert)
+    : data_dir_(std::move(data_dir)),
+      watched_(std::move(watched)),
+      feeds_(feeds),
+      web_probe_(std::move(web_probe)),
+      alert_(std::move(alert)),
+      rule_(window_ms) {
   std::atomic_store(&withheld_, std::make_shared<const std::string>("starting"));
-  refresh_preflight(now_ms(), true);   // valid rows before the ops thread first runs
+  refresh_preflight(mono_ms(), true);   // valid rows before the ops thread first runs
 }
 
 std::vector<PreflightRow> Ops::preflight() const {
@@ -108,19 +114,37 @@ void Ops::run(Worker& self) {
   const std::string path = heartbeat_path();
   std::int64_t next_beat = 0, next_disk = 0;
   std::string last_silent = "starting", err;
+  bool web_was_ok = true;
   while (!self.stopping()) {
-    const std::int64_t now = now_ms();
+    std::int64_t now = mono_ms();
     if (now >= next_beat) {
       next_beat = now + 1000;
+      if (web_probe_) {
+        // at most 200 ms on this thread; the probe's own timeouts bound it
+        const bool ok = web_probe_();
+        (ok ? web_ok_ : web_failed_).fetch_add(1);
+        if (ok != web_was_ok) {
+          if (ok) DLOG_INFO("web answers /api/health again");
+          else DLOG_ERR("web did not answer /api/health within 200 ms");
+          web_was_ok = ok;
+        }
+        now = mono_ms();
+        rule_.observe("web", web_ok_.load(), now);
+      }
       for (const Worker* w : watched_) rule_.observe(w->name(), w->progress(), now);
       const std::string why = rule_.withheld(now), silent = rule_.silent_names(now);
       if (why.empty()) {
-        if (write_heartbeat(path, now / 1000, &err)) written_ms_.store(now);
+        const std::int64_t wall = now_ms();
+        if (write_heartbeat(path, wall / 1000, &err)) written_ms_.store(wall);
         else DLOG_ERR("heartbeat: %s", err.c_str());
       }
       if (silent != last_silent) {
-        if (!silent.empty()) DLOG_ERR("heartbeat withheld: %s", why.c_str());
-        else DLOG_INFO("heartbeat %s", last_silent == "starting" ? "started" : "resumed");
+        if (!silent.empty()) {
+          DLOG_ERR("heartbeat withheld: %s", why.c_str());
+          if (alert_) alert_("CRIT", "heartbeat withheld (" + why + "): the supervisor will restart deskd");
+        } else {
+          DLOG_INFO("heartbeat %s", last_silent == "starting" ? "started" : "resumed");
+        }
         last_silent = silent;
       }
       std::atomic_store(&withheld_, std::make_shared<const std::string>(why));

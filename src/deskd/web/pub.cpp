@@ -41,17 +41,18 @@ void Pub::broadcast_hb(std::int64_t now) {
   hb_sent_.fetch_add(1, std::memory_order_relaxed);
 }
 
-void Pub::maybe_hdr(std::int64_t now, bool force) {
-  if (!force && now - hdr_at_ < 250) return;   // at most 4/s
+void Pub::maybe_hdr(bool force) {
+  const std::int64_t mono = mono_ms();
+  if (!force && mono - hdr_at_ < 250) return;   // at most 4/s
   json h = hdr_json(hdr_fn_());
   std::string d = h.dump();
   if (d == hdr_dump_) return;                  // only on change
   const bool first = hdr_dump_.empty();
   hdr_ = std::move(h);
   hdr_dump_ = std::move(d);
-  hdr_at_ = now;
+  hdr_at_ = mono;
   if (!first) {
-    broadcast("hdr", hdr_dump_, now);
+    broadcast("hdr", hdr_dump_, now_ms());
     hdr_sent_.fetch_add(1, std::memory_order_relaxed);
   }
 }
@@ -71,7 +72,7 @@ void Pub::handle(PubMsg& m) {
       r.status = 409;
       r.body = err_body("BAD_STATE", "no open stream for sid " + s->sid.substr(0, 64));
     } else {
-      maybe_hdr(now, true);   // what the snapshot carries is what the stream has been sent
+      maybe_hdr(true);   // what the snapshot carries is what the stream has been sent
       r.body = snapshot_json(epoch_, s->sid, st->q.last_seq(), now, hdr_, alerts_json(), feeds_json(feeds_),
                              streams_.subs(s->sid));
     }
@@ -99,22 +100,24 @@ void Pub::handle(PubMsg& m) {
 }
 
 void Pub::run(Worker& self) {
-  maybe_hdr(now_ms(), true);
-  std::int64_t next_hb = now_ms() + 1000, next_forget = 0;
+  // the hb's schedule is on the steady clock, its srv_ms and ts_ms on the wall clock: a wall
+  // clock stepped back no longer stops the hb (and with it every page) for as long as the step
+  maybe_hdr(true);
+  std::int64_t next_hb = mono_ms() + 1000, next_forget = 0;
   while (!self.stopping()) {
-    std::int64_t now = now_ms();
-    const std::int64_t wait = std::max<std::int64_t>(0, std::min<std::int64_t>(next_hb - now, 250));
+    std::int64_t mono = mono_ms();
+    const std::int64_t wait = std::max<std::int64_t>(0, std::min<std::int64_t>(next_hb - mono, 250));
     if (auto m = inbox_.pop_for(std::chrono::milliseconds(wait))) handle(*m);
-    now = now_ms();
-    if (now >= next_hb) {
-      broadcast_hb(now);
+    mono = mono_ms();
+    if (mono >= next_hb) {
+      broadcast_hb(now_ms());
       next_hb += 1000;
-      if (next_hb <= now) next_hb = now + 1000;   // after a stall: no burst of catch-up beats
+      if (next_hb <= mono) next_hb = mono + 1000;   // after a stall: no burst of catch-up beats
     }
-    maybe_hdr(now, false);
-    if (now >= next_forget) {
-      next_forget = now + 1000;
-      streams_.forget_idle(now, kForgetSidMs);
+    maybe_hdr(false);
+    if (mono >= next_forget) {
+      next_forget = mono + 1000;
+      streams_.forget_idle(mono, kForgetSidMs);
     }
     self.beat();
   }

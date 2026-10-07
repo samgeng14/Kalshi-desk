@@ -93,21 +93,17 @@ struct ControlReply {
 };
 using ControlPromise = std::shared_ptr<std::promise<ControlReply>>;
 
-// KILL travels its own path (gw/kill.h, send-cx); gw hears of it to refuse new orders and to
-// delete every new order still queued.
-struct Kill {
-  std::int64_t t_ms = 0;
-  std::string why;
-};
+// KILL and its re-arm are no messages: the route trips the kill switch (gw/kill.h), and gw and
+// send-cx each watch its generation, woken by the trip. A KILL therefore needs no queue slot and
+// cannot be dropped, and gw applies a re-arm on its own thread before it handles a Start, so a
+// Start answered RUN is never flipped back to STOP by a re-arm message arriving after it (review,
+// 2026-10-06).
 struct Start {
   ControlPromise reply;
 };
 struct Stop {
   std::string why;
   ControlPromise reply;
-};
-struct Rearm {
-  std::int64_t t_ms = 0;
 };
 
 // A sender's answer for one write. 5xx, a timeout or no response is UNKNOWN, never "failed":
@@ -141,12 +137,11 @@ struct Probe {
   std::function<void()> fn;
 };
 
-using GwMsg = std::variant<PlaceIntent, AmendIntent, CancelIntent, Kill, Start, Stop, Rearm, SendResult,
-                           OrderEvent, Probe>;
+using GwMsg = std::variant<PlaceIntent, AmendIntent, CancelIntent, Start, Stop, SendResult, OrderEvent, Probe>;
 
-// Kill, Stop, cancels and private events go before new orders (plan section 2). Start and
-// amends wait in the normal lane with the orders, so a Stop sent after a Start overtakes it and
-// deletes it instead of being undone by it.
+// Stop goes in the control lane, which nothing else fills; cancels and private events go before
+// new orders (plan section 2). Start and amends wait in the normal lane with the orders, so a
+// Stop sent after a Start overtakes it and deletes it instead of being undone by it.
 Lane lane_of(const GwMsg& m);
 
 }  // namespace deskd

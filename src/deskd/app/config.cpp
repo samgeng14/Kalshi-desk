@@ -58,15 +58,16 @@ DeskdConfig load_deskd_config(const std::string& path) {
   if (!d.is_object()) throw std::runtime_error(where + ": not an object");
   // A misspelt key is an error, not a silently ignored default: "heartbeat_window" for
   // "heartbeat_window_ms" would otherwise leave the supervisor's rule unchanged.
-  static const std::set<std::string> known = {"data_dir",    "ui_dir",      "http_port",
-                                              "web_threads", "keepalive_s", "max_streams",
-                                              "heartbeat_window_ms", "daily_stop_dollars"};
+  static const std::set<std::string> known = {"data_dir",    "lock_dir",    "ui_dir",
+                                              "http_port",   "web_threads", "keepalive_s",
+                                              "max_streams", "heartbeat_window_ms", "daily_stop_dollars"};
   for (auto kv = d.begin(); kv != d.end(); ++kv) {
     if (kv.key() == "live")
       throw std::runtime_error(where + ": \"live\" is a command-line flag only (--live), never a file setting");
     if (!known.count(kv.key())) throw std::runtime_error(where + ": unknown key \"" + kv.key() + "\"");
   }
   take(d, "data_dir", c.data_dir, where);
+  take(d, "lock_dir", c.lock_dir, where);
   take(d, "ui_dir", c.ui_dir, where);
   take(d, "http_port", c.http_port, where);
   take(d, "web_threads", c.web_threads, where);
@@ -77,6 +78,10 @@ DeskdConfig load_deskd_config(const std::string& path) {
   take(d, "daily_stop_dollars", stop, where);
   if (stop >= 0) c.daily_stop = static_cast<Money>(std::llround(stop * 10000.0));
   c.data_dir = expand_home(c.data_dir);
+  c.lock_dir = expand_home(c.lock_dir);
+  // A relative lock dir would be a different file from every other working directory: the bug
+  // the fixed path exists to stop (app/lock.h).
+  if (!c.lock_dir.empty() && c.lock_dir[0] != '/') throw std::runtime_error(where + ": lock_dir must be an absolute path");
   c.ui_dir = expand_home(c.ui_dir);
   if (c.http_port < 0 || c.http_port > 65535) throw std::runtime_error(where + ": http_port out of range");
   if (c.web_threads < 4) throw std::runtime_error(where + ": web_threads below 4");

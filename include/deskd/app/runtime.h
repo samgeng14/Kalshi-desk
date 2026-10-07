@@ -10,7 +10,14 @@
 //   ops              heartbeat file, disk, preflight rows
 //   web              cpp-httplib, 16 request threads of its own
 //
-// The app owns the account lock for its whole life and will not start without it.
+// The app owns the account lock for its whole life and will not start without it; the KILL
+// file sits beside the lock (<lock dir>/kalshi-<env>.killed), so KILLED belongs to the account,
+// not to whichever data dir a restart happens to use.
+//
+// start() also makes the process safe to embed (tests, a replay or soak harness): SIGPIPE is
+// ignored process-wide (cpp-httplib 0.18.3 sends with flags 0 and never sets SO_NOSIGPIPE, so a
+// client that hangs up mid-write would end any process that did not), and log lines go through
+// the logger thread (app/log.h).
 #include <memory>
 #include <nlohmann/json.hpp>
 #include <string>
@@ -56,6 +63,7 @@ class Deskd {
   Ops& ops() { return *ops_; }
   Feeds& feeds() { return feeds_; }
   const SenderStats& cx_stats() const { return cx_stats_; }
+  BoundedQueue<SendJob>& cx_queue() { return q_cx_; }
   const SendGuard& send_guard() const { return guard_; }
   const Worker* worker(const std::string& name) const;
 

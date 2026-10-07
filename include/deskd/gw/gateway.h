@@ -4,8 +4,13 @@
 // It never blocks: it reads its two-lane inbox, and everything it says leaves as a message.
 //
 // Week 0 holds the run state and the queue rules only. There is no venue path yet, so every
-// new order is refused, but the lane order and the deletions are the real ones: Kill, Stop and
+// new order is refused, but the lane order and the deletions are the real ones: KILL, Stop and
 // cancels overtake new orders and delete the ones still queued behind them.
+//
+// KILL and re-arm reach gw through the kill switch, not its inbox: gw compares the switch's
+// generations before it handles each message (and the trip kicks its inbox awake), so a KILL
+// deletes every queued new order and Start before the next one is looked at, and a re-arm is
+// applied on this thread before any later Start sees the switch clear.
 #include <atomic>
 #include <cstdint>
 #include <functional>
@@ -24,6 +29,8 @@ class Gateway {
  public:
   using PreflightFn = std::function<std::vector<PreflightRow>()>;
 
+  // registers its inbox's kick with kill.on_trip: construct it before any thread can trip kill,
+  // and keep kill alive longer than it
   Gateway(KillSwitch& kill, PreflightFn preflight, std::size_t normal_cap = 4096, std::size_t priority_cap = 1024);
 
   // queues m in its lane (lane_of); false when that lane is full: dropped, gap marked
@@ -40,12 +47,15 @@ class Gateway {
     std::atomic<std::uint64_t> place_refused{0};
     std::atomic<std::uint64_t> erased_by_cancel{0};   // queued new orders a cancel deleted
     std::atomic<std::uint64_t> erased_by_stop{0};     // queued SYS orders and Starts a Stop deleted
-    std::atomic<std::uint64_t> erased_by_kill{0};     // queued new orders and Starts a Kill deleted
+    std::atomic<std::uint64_t> erased_by_kill{0};     // queued new orders and Starts a KILL deleted
+    std::atomic<std::uint64_t> kills_seen{0};         // KILL generations gw has applied
   };
   const Stats& stats() const { return stats_; }
 
  private:
   void handle(GwMsg& m);
+  // applies a KILL or re-arm the switch shows and gw has not seen yet; true when it applied a KILL
+  bool sync_kill();
   void publish();
 
   KillSwitch& kill_;
@@ -53,6 +63,7 @@ class Gateway {
   BoundedQueue<GwMsg> inbox_;
   Stats stats_;
   RunView own_;                                   // gw thread only
+  std::uint64_t kill_gen_seen_ = 0, kill_state_seen_ = 0;   // gw thread only
   std::shared_ptr<const RunView> view_;          // std::atomic_load / std::atomic_store
 };
 

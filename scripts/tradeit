@@ -50,6 +50,27 @@ def alive(pid):
     except ProcessLookupError:
         return False
 
+def account_lock_refusal(env):
+    """Why the account's lock cannot be taken now (deskd, or anything else that can send orders,
+    holds it), or ''. Nothing is held after this returns."""
+    sys.path.insert(0, str(ROOT / 'scripts'))
+    import account_lock
+    try:
+        path = account_lock.lock_path(env)
+    except RuntimeError as error:
+        return str(error)
+    if not os.path.exists(path):
+        return ''
+    fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        return ''
+    except BlockingIOError:
+        return (f'The {env} account is held by another program that can send orders '
+                f'({account_lock._holder_line(fd)}). Stop it first; two programs never trade one account.')
+    finally:
+        os.close(fd)
+
 SUPERVISOR = ROOT / 'scripts/desk_supervise.sh'
 SUP_PID = ROOT / 'data/desk_supervisor.pid'
 STOPFILE = ROOT / 'data/desk.stop'
@@ -145,6 +166,12 @@ def main():
         if not data:
             if not BINARY.is_file():
                 raise RuntimeError('Build is missing. Build kalshi-desk before launching.')
+            # The account lock (scripts/account_lock.py): refuse here, with the holder's name, rather
+            # than leave the supervisor waiting on it a minute at a time. The supervisor still takes it
+            # around the binary, so a race between this check and the start is refused too.
+            refusal = account_lock_refusal(cfg.get('env', 'demo'))
+            if refusal:
+                raise RuntimeError(refusal)
             if supervisor_pid():
                 raise RuntimeError('The supervisor is running but the desk is not answering yet. '
                                    'See data/supervisor.log and tradeit logs.')

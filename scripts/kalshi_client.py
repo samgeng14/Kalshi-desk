@@ -18,6 +18,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))   # account_lock beside this file
 # Perpetuals live under /margin/* on the external API host, NOT on the binary-contract
 # endpoints. prod and demo differ only by host, exactly as perps_api_probe.py resolves it.
 PROD_HOST = 'https://external-api.kalshi.com'
@@ -82,6 +83,18 @@ class Kalshi:
             raise SystemExit('signing key not found at the configured path')
         self._key = None
 
+    def _take_account_lock(self):
+        """Every write holds the account's lock first (scripts/account_lock.py; deskd's
+        app/lock.h), taken once and kept for the life of the process, so this client never sends
+        while deskd or the old desk trades the same account. A loopback base needs none."""
+        import account_lock
+        env = account_lock.env_for_base(self.base)
+        if env is not None:
+            try:
+                account_lock.acquire(env, 'kalshi_client.py (%s)' % os.path.basename(sys.argv[0] or 'python'))
+            except account_lock.LockHeld as e:
+                raise RuntimeError('not sent: %s' % e)
+
     def _sign(self, method, path):
         if self._key is None:
             with open(self.pem_path, 'rb') as f:
@@ -99,6 +112,8 @@ class Kalshi:
 
     def _call(self, method, path, body=None, timeout=30, tries=3):
         url = self.base + path
+        if method != 'GET':
+            self._take_account_lock()
         data = json.dumps(body).encode() if body is not None else None
         last = None
         for attempt in range(tries):

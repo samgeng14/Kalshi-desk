@@ -19,7 +19,10 @@ struct DeskdConfig {
   std::string key_id;
   std::string pem_path;
   // "deskd": { ... }
-  std::string data_dir = "data";     // holds kalshi-account.lock and deskd.heartbeat
+  std::string data_dir = "data";     // holds deskd.heartbeat; resolved to an absolute path at start
+  // The account lock's directory (app/lock.h): "" = $HOME/Library/Application Support/
+  // kalshi-desk/locks, the one every order-capable program uses. Absolute only; set it in tests.
+  std::string lock_dir;
   std::string ui_dir;                // "" = the repo's ui/desk (served from disk, no rebuild)
   int http_port = 8788;              // not the old desk's 8787: both may run while M0-M5 overlap
   int web_threads = 16;              // 9 threads once all sat in idle keep-alives: a 4.8 s stall

@@ -29,8 +29,8 @@ void Worker::start(std::function<void(Worker&)> body) {
     try {
       body(*this);
     } catch (const std::exception& e) {
-      // An owner that dies stops beating: ops then withholds the heartbeat (for gw, md-k and
-      // priv-k) and the supervisor restarts the whole desk, which is the recovery we want.
+      // An owner that dies stops beating: ops then withholds the heartbeat (for the watched ones,
+      // app/ops.h) and the supervisor restarts the whole desk, which is the recovery we want.
       DLOG_ERR("worker ended by an exception: %s", e.what());
     } catch (...) {
       DLOG_ERR("worker ended by an unknown exception");
@@ -44,10 +44,8 @@ void Worker::join() {
 }
 
 void Worker::beat() {
-  using namespace std::chrono;
   progress_.fetch_add(1, std::memory_order_relaxed);
-  last_beat_ms_.store(duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count(),
-                      std::memory_order_relaxed);
+  last_beat_ms_.store(mono_ms(), std::memory_order_relaxed);
 }
 
 }  // namespace deskd

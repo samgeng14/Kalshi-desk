@@ -24,7 +24,7 @@ namespace deskd {
 class Gateway;
 class KillSwitch;
 class Pub;
-struct SendJob;
+struct SenderStats;
 
 bool host_ok(const std::string& host, int port);                  // contract hostOk
 bool token_ok(const std::string& got, const std::string& want);   // constant time, never empty
@@ -41,7 +41,7 @@ struct WebDeps {
   Pub* pub = nullptr;
   Gateway* gw = nullptr;
   KillSwitch* kill = nullptr;
-  BoundedQueue<SendJob>* send_cx = nullptr;
+  const SenderStats* cx_stats = nullptr;   // KILL's route checks send-cx took the switch's generation
   std::function<nlohmann::json()> status;   // GET /ops/status (deskctl)
 };
 

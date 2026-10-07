@@ -39,7 +39,8 @@ std::string SendGuard::refuse(const std::string& host) const {
       return "";
     case HostClass::PRODUCTION:
       if (!live_) return host + " is a production host and deskd was not started with --live";
-      if (!lock_ || !lock_->held()) return host + " is a production host and the account lock is not held";
+      if (!lock_ || !lock_->held() || lock_->env() != "prod")
+        return host + " is a production host and the production account's lock is not held";
       return "";
     case HostClass::UNKNOWN:
       break;

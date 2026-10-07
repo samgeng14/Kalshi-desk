@@ -56,7 +56,7 @@ struct Desk {
     c.http_port = 0;
     c.max_streams = max_streams;
     std::string err;
-    auto lock = AccountLock::acquire(dir.path, &err);
+    auto lock = AccountLock::acquire(dir.path, "demo", "deskd-test-web", false, &err);
     d = std::make_unique<Deskd>(c, std::move(lock));
     if (!d->start(&err)) {
       std::fprintf(stderr, "deskd did not start: %s\n", err.c_str());

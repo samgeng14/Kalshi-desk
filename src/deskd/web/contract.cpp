@@ -1,5 +1,7 @@
 #include "deskd/web/contract.h"
 
+#include <cmath>
+#include <cstdio>
 #include <map>
 
 namespace deskd {
@@ -56,8 +58,67 @@ json subs_json(const Subs& s) {
   return json{{"ladders", ladders}, {"tops", s.tops_all ? json("ALL") : tops}};
 }
 
+// ---- ET dates ---------------------------------------------------------------------------------
+namespace {
+// days since 1970-01-01 of a civil date, and back (Howard Hinnant's algorithms)
+std::int64_t days_from_civil(std::int64_t y, unsigned m, unsigned d) {
+  y -= m <= 2;
+  const std::int64_t era = (y >= 0 ? y : y - 399) / 400;
+  const unsigned yoe = static_cast<unsigned>(y - era * 400);
+  const unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+  const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  return era * 146097 + static_cast<std::int64_t>(doe) - 719468;
+}
+void civil_from_days(std::int64_t z, std::int64_t* y, unsigned* m, unsigned* d) {
+  z += 719468;
+  const std::int64_t era = (z >= 0 ? z : z - 146096) / 146097;
+  const unsigned doe = static_cast<unsigned>(z - era * 146097);
+  const unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+  const unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+  const unsigned mp = (5 * doy + 2) / 153;
+  *d = doy - (153 * mp + 2) / 5 + 1;
+  *m = mp < 10 ? mp + 3 : mp - 9;
+  *y = static_cast<std::int64_t>(yoe) + era * 400 + (*m <= 2);
+}
+std::int64_t floor_div(std::int64_t a, std::int64_t b) { return a / b - ((a % b != 0) && ((a < 0) != (b < 0))); }
+// the n-th Sunday (1-based) of month m in year y, as days since the epoch
+std::int64_t nth_sunday(std::int64_t y, unsigned m, int n) {
+  const std::int64_t first = days_from_civil(y, m, 1);
+  const std::int64_t wd = ((first % 7) + 7 + 4) % 7;   // 1970-01-01 was a Thursday (4); 0 = Sunday
+  return first + (7 - wd) % 7 + 7 * (n - 1);
+}
+std::string ymd(std::int64_t days) {
+  std::int64_t y;
+  unsigned m, d;
+  civil_from_days(days, &y, &m, &d);
+  char b[16];
+  std::snprintf(b, sizeof b, "%04lld-%02u-%02u", static_cast<long long>(y), m, d);
+  return b;
+}
+}  // namespace
+
+std::string et_date(std::int64_t wall_ms) {
+  const std::int64_t utc_s = floor_div(wall_ms, 1000);
+  std::int64_t y;
+  unsigned m, d;
+  civil_from_days(floor_div(utc_s, 86400), &y, &m, &d);
+  // EDT from 02:00 EST (07:00 UTC) on the second Sunday of March to 02:00 EDT (06:00 UTC) on the
+  // first Sunday of November
+  const std::int64_t dst_on = nth_sunday(y, 3, 2) * 86400 + 7 * 3600;
+  const std::int64_t dst_off = nth_sunday(y, 11, 1) * 86400 + 6 * 3600;
+  const std::int64_t offset = (utc_s >= dst_on && utc_s < dst_off) ? -4 * 3600 : -5 * 3600;
+  return ymd(floor_div(utc_s + offset, 86400));
+}
+
+std::string et_date_after(const std::string& date) {
+  int y = 0;
+  unsigned m = 0, d = 0;
+  if (std::sscanf(date.c_str(), "%d-%u-%u", &y, &m, &d) != 3) return date;
+  return ymd(days_from_civil(y, m, d) + 1);
+}
+
 json hb_json(const std::string& epoch, const std::string& sid, std::int64_t srv_ms, const json& feeds) {
-  return json{{"epoch", epoch}, {"sid", sid}, {"srv_ms", srv_ms}, {"feeds", feeds}};
+  return json{{"epoch", epoch}, {"sid", sid}, {"srv_ms", srv_ms}, {"date", et_date(srv_ms)}, {"feeds", feeds}};
 }
 
 json hdr_json(const HdrInputs& in) {
@@ -92,6 +153,7 @@ json snapshot_json(const std::string& epoch, const std::string& sid, std::uint64
               {"seq", seq},
               {"srv_ms", srv_ms},
               {"hdr", hdr},
+              {"date", et_date(srv_ms)},
               {"markets", json::array()},
               {"books", json::array()},
               {"orders", json::array()},

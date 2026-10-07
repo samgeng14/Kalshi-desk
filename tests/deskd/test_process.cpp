@@ -1,5 +1,8 @@
-// deskd as processes: the built binaries, started the way the supervisor will start them.
-//   - a second deskd on the same data dir is refused (exit 3) while the first holds the lock
+// deskd as processes: the built binaries, started the way the supervisor will start them, each
+// with HOME pointed into a temporary directory, so the default lock dir is never the user's.
+//   - a second deskd on the same account is refused (exit 3) while the first holds the lock: from
+//     the same data dir, and from another working directory with a relative --data-dir (the
+//     review's case: until 2026-10-06 the lock sat in the data dir, and both came up)
 //   - a missing data dir is refused and not created; "live" in a config file is refused
 //   - the heartbeat file appears; deskctl status reads the workers; deskctl kill KILLs through
 //     the screen's route with its token
@@ -41,17 +44,32 @@ std::string slurp(const std::string& path) {
   return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
 }
 
-// runs argv with stdout and stderr in files; returns the pid
-pid_t spawn(const std::vector<std::string>& args, const std::string& out, const std::string& err) {
+// the children's environment: ours with HOME replaced
+std::vector<std::string> g_env;
+std::vector<char*> g_envp;
+void set_child_home(const std::string& home) {
+  g_env.clear();
+  for (char** e = environ; *e; ++e)
+    if (std::string(*e).compare(0, 5, "HOME=") != 0) g_env.push_back(*e);
+  g_env.push_back("HOME=" + home);
+  g_envp.clear();
+  for (auto& e : g_env) g_envp.push_back(const_cast<char*>(e.c_str()));
+  g_envp.push_back(nullptr);
+}
+
+// runs argv (in cwd, when given) with stdout and stderr in files; returns the pid
+pid_t spawn(const std::vector<std::string>& args, const std::string& out, const std::string& err,
+            const std::string& cwd = "") {
   posix_spawn_file_actions_t fa;
   posix_spawn_file_actions_init(&fa);
   posix_spawn_file_actions_addopen(&fa, 1, out.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
   posix_spawn_file_actions_addopen(&fa, 2, err.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  if (!cwd.empty()) posix_spawn_file_actions_addchdir_np(&fa, cwd.c_str());
   std::vector<char*> argv;
   for (const auto& a : args) argv.push_back(const_cast<char*>(a.c_str()));
   argv.push_back(nullptr);
   pid_t pid = -1;
-  if (posix_spawn(&pid, argv[0], &fa, nullptr, argv.data(), environ) != 0) pid = -1;
+  if (posix_spawn(&pid, argv[0], &fa, nullptr, argv.data(), g_envp.empty() ? environ : g_envp.data()) != 0) pid = -1;
   posix_spawn_file_actions_destroy(&fa);
   return pid;
 }
@@ -71,8 +89,8 @@ int wait_exit(pid_t pid, std::chrono::milliseconds limit) {
 }
 
 int run(const std::vector<std::string>& args, const TempDir& d, const std::string& tag, std::string* out = nullptr,
-        std::string* err = nullptr) {
-  const pid_t pid = spawn(args, d.file(tag + ".out"), d.file(tag + ".err"));
+        std::string* err = nullptr, const std::string& cwd = "") {
+  const pid_t pid = spawn(args, d.file(tag + ".out"), d.file(tag + ".err"), cwd);
   if (pid < 0) return -2;
   const int code = wait_exit(pid, 10s);
   if (out) *out = slurp(d.file(tag + ".out"));
@@ -115,6 +133,15 @@ int main() {
   const int port = free_port();
   const std::string P = std::to_string(port);
   const std::string ui = std::string(DESKD_SOURCE_DIR) + "/ui/desk";
+  // HOME for every child: the account lock's default dir is $HOME/Library/Application
+  // Support/kalshi-desk/locks, made if missing
+  const std::string home = d.file("home");
+  ::mkdir(home.c_str(), 0755);
+  set_child_home(home);
+  const std::string lock_dir = home + "/" + deskd::AccountLock::kDirUnderHome;
+  const std::string lock_file = lock_dir + "/kalshi-demo.lock";
+  // two working directories, each with its own relative "data"
+  for (const char* sub : {"a", "a/data", "b", "b/data"}) ::mkdir(d.file(sub).c_str(), 0755);
 
   // the first deskd
   const pid_t first = spawn({DESKD_BIN, "--data-dir", d.path, "--ui-dir", ui, "--port", P}, d.file("d1.out"), d.file("d1.err"));
@@ -125,7 +152,8 @@ int main() {
     up = healthy(port);
   }
   CHECK(up);
-  CHECK(slurp(d.file("kalshi-account.lock")).find("pid " + std::to_string(first)) == 0);
+  CHECK(slurp(lock_file).find("pid " + std::to_string(first) + " deskd DEMO since ") == 0);
+  CHECK(!exists(d.file("kalshi-account.lock")));   // nothing in the data dir decides the lock any more
 
   // a second deskd on the same data dir: refused before it binds anything
   std::string out, err;
@@ -133,6 +161,29 @@ int main() {
             &err) == 3);
   CHECK(err.find("held by another process") != std::string::npos);
   CHECK(err.find("pid " + std::to_string(first)) != std::string::npos);
+  // and from another working directory with its own relative data dir: the same account, the
+  // same file, refused (the review started two this way and both came up)
+  CHECK(run({DESKD_BIN, "--data-dir", "data", "--ui-dir", ui, "--port", std::to_string(free_port())}, d, "otherdir", &out,
+            &err, d.file("b")) == 3);
+  CHECK(err.find("held by another process") != std::string::npos);
+  CHECK(err.find("kalshi-demo.lock") != std::string::npos);
+  // the Python side takes the same file: the old desk's supervisor starts its binary under
+  // `account_lock.py hold`, and kalshi_client.py takes it before a write
+  if (std::string(DESKD_PYTHON).empty()) {
+    std::printf("python3 not found: account_lock.py checks skipped\n");
+  } else {
+    const std::string py = DESKD_PYTHON, script = std::string(DESKD_SOURCE_DIR) + "/scripts/account_lock.py";
+    CHECK(run({py, script, "hold", "demo", "old desk", "--", "/usr/bin/touch", d.file("old-desk-ran")}, d, "pyhold", &out, &err) == 3);
+    CHECK(!exists(d.file("old-desk-ran")));
+    CHECK(err.find("deskd DEMO") != std::string::npos);
+    CHECK(run({py, script, "status", "demo"}, d, "pystatus", &out) == 3);
+    CHECK(out.find("held: pid " + std::to_string(first) + " deskd DEMO") != std::string::npos);
+    // the prod account is another file, free while a non-live deskd runs (and held by the
+    // child it execs for that child's life)
+    CHECK(run({py, script, "hold", "prod", "py", "--", py, script, "status", "prod"}, d, "pyprod", &out) == 3);
+    CHECK(out.find(" py since ") != std::string::npos);
+    CHECK(run({py, script, "status", "prod"}, d, "pyprod2", &out) == 0);
+  }
 
   // a missing data dir: refused, and not created
   CHECK(run({DESKD_BIN, "--data-dir", d.file("absent"), "--port", "0"}, d, "absent", &out, &err) == 3);
@@ -214,17 +265,21 @@ int main() {
   std::printf("SIGTERM to exit: %.2f s\n", secs);
   CHECK(secs < 3.0);
   std::string lerr;
-  auto lock = deskd::AccountLock::acquire(d.path, &lerr);
+  auto lock = deskd::AccountLock::acquire(lock_dir, "demo", "test", false, &lerr);
   CHECK(lock && lock->held());
   const std::string log = slurp(d.file("d1.err"));
   CHECK(log.find("signal: shutting down") != std::string::npos);
   CHECK(log.find("stopped") != std::string::npos);
+  CHECK(log.find("/kalshi-demo.lock (demo account), data ") != std::string::npos);   // the real paths, logged
 
-  // KILLED survives a restart until someone re-arms
+  // KILLED survives a restart until someone re-arms: the account's, beside its lock, so a restart
+  // from another working directory with another data dir is KILLED too
   {
     CHECK(lock);
     lock.reset();   // the next deskd needs it
-    const pid_t again = spawn({DESKD_BIN, "--data-dir", d.path, "--ui-dir", ui, "--port", P}, d.file("d2.out"), d.file("d2.err"));
+    CHECK(exists(lock_dir + "/kalshi-demo.killed"));
+    const pid_t again = spawn({DESKD_BIN, "--data-dir", "data", "--ui-dir", ui, "--port", P}, d.file("d2.out"),
+                              d.file("d2.err"), d.file("a"));
     bool up2 = false;
     for (int i = 0; i < 100 && !up2; ++i) {
       std::this_thread::sleep_for(50ms);

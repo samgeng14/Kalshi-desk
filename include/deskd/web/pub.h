@@ -75,7 +75,7 @@ class Pub {
   void handle(PubMsg& m);
   void broadcast(const std::string& type, const std::string& data_json, std::int64_t now);
   void broadcast_hb(std::int64_t now);
-  void maybe_hdr(std::int64_t now, bool force);
+  void maybe_hdr(bool force);
   nlohmann::json alerts_json() const;
 
   const std::string epoch_;
@@ -89,7 +89,7 @@ class Pub {
   std::uint64_t alert_n_ = 0;
   nlohmann::json hdr_;
   std::string hdr_dump_;
-  std::int64_t hdr_at_ = 0;
+  std::int64_t hdr_at_ = 0;   // steady clock
   std::atomic<std::uint64_t> hb_sent_{0}, hdr_sent_{0};
 };
 

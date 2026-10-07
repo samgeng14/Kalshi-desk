@@ -3,9 +3,17 @@
 //
 // deskd starts non-live. A production venue host (Kalshi's *.kalshi.com, Polymarket's
 // *.polymarket.us and *.polymarket.com) is refused unless deskd was started with --live AND
-// holds the account lock; Kalshi's demo hosts (*.demo.kalshi.co) and loopback (the fake
+// holds the production account's lock (app/lock.h: a non-live deskd holds the demo one, so the
+// two conditions are independent); Kalshi's demo hosts (*.demo.kalshi.co) and loopback (the fake
 // exchange) are allowed in either mode. Anything else is refused: the list is an allow-list, so
 // a typo or a look-alike domain ("kalshi.com.example.net") never counts as either.
+//
+// Week 0 opens no venue socket, so nothing calls refuse() yet. Week 1's rule (review,
+// 2026-10-06): the net/ connection factory is the only way to open a venue socket (REST,
+// WebSocket, every reconnect); it takes this guard, asks it on every connect with redirects off,
+// refuses plain HTTP to anything but loopback, and a test shows a non-live deskd configured with
+// env prod and a production URL opens no connection. The old desk's HTTP and WebSocket clients
+// stay out of deskd's link (deskd_core links none of the desk library).
 #include <string>
 
 namespace deskd {

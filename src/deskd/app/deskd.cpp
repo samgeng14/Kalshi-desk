@@ -2,14 +2,22 @@
 //
 //   deskd [--config FILE] [--data-dir DIR] [--ui-dir DIR] [--port N] [--live]
 //
-// Starts non-live: production venue hosts are refused unless --live is given AND the account
-// lock is held (net/guard.h). No config file is read unless --config names one.
+// Starts non-live: production venue hosts are refused unless --live is given AND the production
+// account's lock is held (net/guard.h). No config file is read unless --config names one.
+//
+// The account lock is <lock dir>/kalshi-<prod|demo>.lock, one fixed absolute file (app/lock.h):
+// wherever deskd is started from, a second deskd on the same account is refused (exit 3). The
+// data dir may be given relative to the working directory; it is resolved to its real path and
+// logged, and never decides which lock is taken.
 //
 // Exit codes: 0 clean shutdown (SIGTERM, SIGINT), 2 bad arguments or config, 3 the account lock
-// is held elsewhere or the data dir is missing, 4 the web port or ui dir is unusable.
+// is held elsewhere (or cannot be taken) or the data dir is missing, 4 the web port or ui dir is
+// unusable.
 #include <signal.h>
+#include <sys/stat.h>
 
 #include <chrono>
+#include <climits>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
@@ -33,11 +41,13 @@ void usage() {
   std::fprintf(stderr,
                "usage: deskd [--config FILE] [--data-dir DIR] [--ui-dir DIR] [--port N] [--live]\n"
                "  --config FILE   JSON with comments: top-level key_id, pem_path, env and a \"deskd\" section\n"
-               "  --data-dir DIR  holds kalshi-account.lock and deskd.heartbeat (default data; must exist)\n"
+               "  --data-dir DIR  holds deskd.heartbeat (default data; must exist)\n"
                "  --ui-dir DIR    the screen, served from disk (default %s/ui/desk)\n"
                "  --port N        web port on 127.0.0.1 (default 8788)\n"
-               "  --live          allow the production venue hosts (never without the account lock)\n",
-               DESKD_SOURCE_DIR);
+               "  --live          allow the production venue hosts (never without the account lock)\n"
+               "The account lock is <lock dir>/kalshi-prod.lock with --live, else kalshi-demo.lock;\n"
+               "lock dir: the config's deskd.lock_dir, else $HOME/%s\n",
+               DESKD_SOURCE_DIR, deskd::AccountLock::kDirUnderHome);
 }
 
 }  // namespace
@@ -94,7 +104,7 @@ int main(int argc, char** argv) {
 
   // A write to a closed socket is an error to handle, never a reason to end the desk: TLS
   // writes go through write(2), which raises SIGPIPE, and its default action killed the old
-  // desk on a reconnect.
+  // desk on a reconnect. (Deskd::start does it again for every embedder.)
   std::signal(SIGPIPE, SIG_IGN);
   struct sigaction sa {};
   sa.sa_handler = on_stop_signal;
@@ -102,13 +112,32 @@ int main(int argc, char** argv) {
   sigaction(SIGTERM, &sa, nullptr);
   sigaction(SIGINT, &sa, nullptr);
 
-  // The lock before anything that could act on the account.
+  // The data dir as a real path: what the log and deskctl status show is where the files are.
+  {
+    char real[PATH_MAX];
+    struct stat st {};
+    if (::stat(cfg.data_dir.c_str(), &st) != 0 || !S_ISDIR(st.st_mode) || !::realpath(cfg.data_dir.c_str(), real)) {
+      std::fprintf(stderr, "deskd: refusing to start: data dir %s does not exist (deskd never creates it)\n",
+                   cfg.data_dir.c_str());
+      return 3;
+    }
+    cfg.data_dir = real;
+  }
+
+  // The lock before anything that could act on the account: one fixed file per account.
   std::string err;
-  std::unique_ptr<AccountLock> lock = AccountLock::acquire(cfg.data_dir, &err);
+  std::string lock_dir = cfg.lock_dir;
+  const bool default_dir = lock_dir.empty();
+  if (default_dir) lock_dir = AccountLock::default_dir(&err);
+  std::unique_ptr<AccountLock> lock;
+  if (!lock_dir.empty())
+    lock = AccountLock::acquire(lock_dir, cfg.live ? "prod" : "demo", cfg.live ? "deskd LIVE" : "deskd DEMO",
+                                default_dir, &err);
   if (!lock) {
     std::fprintf(stderr, "deskd: refusing to start: %s\n", err.c_str());
     return 3;
   }
+  DLOG_INFO("account lock %s (%s account), data %s", lock->path().c_str(), lock->env().c_str(), cfg.data_dir.c_str());
   if (!cfg.live && cfg.env == "prod")
     DLOG_WARN("%s says env prod, but deskd follows --live: production hosts stay refused", cfg.config_path.c_str());
   if (cfg.live) DLOG_WARN("--live: production venue hosts allowed while %s is held", lock->path().c_str());

@@ -13,8 +13,8 @@
 # from sleep reads stale once and then catches up on its own.
 #
 # Exit codes from the desk: 0 is a clean shutdown (restarted unless a stop was asked for), 3 is
-# "another desk holds the database lock" (wait, do not fight it), 75 is the desk asking for a
-# fresh process after repeated storage failures. Anything else is a crash.
+# "another desk holds the database lock" or the account lock (wait, do not fight it), 75 is the
+# desk asking for a fresh process after repeated storage failures. Anything else is a crash.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 ROOT="$PWD"
@@ -112,7 +112,13 @@ while [ ! -f "$STOPFILE" ]; do
   fi
   STARTED=$(date +%s)
   log "starting desk"
-  "$BINARY" --config "$CONFIG" serve >> "$DESK_LOG" 2>&1 &
+  # The account lock (scripts/account_lock.py; deskd's app/lock.h): the old binary never takes it
+  # itself, so it starts under `account_lock.py hold`, which takes kalshi-<env>.lock and execs the
+  # binary with the lock's descriptor: the same pid, holding it for its whole life. While deskd
+  # (or anything else that can send orders) holds it, that exits 3, which the loop below already
+  # reads as "another desk holds the lock; wait". Added 2026-10-07: two programs on one account.
+  python3 "$ROOT/scripts/account_lock.py" hold "$ENV" "kalshi-desk (old desk)" -- \
+    "$BINARY" --config "$CONFIG" serve >> "$DESK_LOG" 2>&1 &
   CHILD=$!
   STRIKES=0
   while kill -0 "$CHILD" 2>/dev/null; do
@@ -150,7 +156,7 @@ while [ ! -f "$STOPFILE" ]; do
   log "desk exited code=$CODE after ${LIVED}s"
   [ -f "$STOPFILE" ] && break
   if [ "$CODE" -eq 3 ]; then
-    log "another desk holds the database lock; waiting 60s"
+    log "another desk holds the database or account lock; waiting 60s"
     sleep 60 & wait $!
     continue
   fi

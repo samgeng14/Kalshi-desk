@@ -38,7 +38,7 @@ struct Stream {
   Stream(std::string sid_, std::size_t cap, std::int64_t opened) : sid(std::move(sid_)), q(cap), opened_ms(opened) {}
   const std::string sid;
   StreamQueue q;
-  const std::int64_t opened_ms;
+  const std::int64_t opened_ms;   // steady clock
 };
 
 class StreamRegistry {
@@ -48,8 +48,9 @@ class StreamRegistry {
   // Makes s the open stream of its sid. Refused (false, *why set) when max_open other sids are
   // open. A stream already open for the sid is closed: the takeover.
   bool open(const std::shared_ptr<Stream>& s, std::string* why);
-  // the connection of s ended; its sid keeps its subscription until forget_idle
-  void closed(const std::shared_ptr<Stream>& s, std::int64_t now_ms);
+  // the connection of s ended; its sid keeps its subscription until forget_idle (both times on
+  // the steady clock)
+  void closed(const std::shared_ptr<Stream>& s, std::int64_t mono_ms);
 
   std::vector<std::shared_ptr<Stream>> open_streams() const;
   std::shared_ptr<Stream> stream_for(const std::string& sid) const;   // null unless open

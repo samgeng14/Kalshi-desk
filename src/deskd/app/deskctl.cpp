@@ -7,9 +7,14 @@
 //
 // KILL reads the token the way the page refreshes it: GET / and take <meta name="desk-token">.
 // If deskd does not answer, deskctl says so and exits 1. Cancelling at the exchange without
-// deskd (plan section 2, "if deskd hangs") arrives with the senders and order groups in week 2.
+// deskd (plan section 2, "if deskd hangs") arrives with the senders and order groups in week 2,
+// and must land before the first real order (review, 2026-10-06). Its rule, decided now: it
+// cannot take the account lock (a hung deskd holds it), so it sends to a production host only
+// with an explicit --live AND when the lock file's holder line (app/lock.h) or /ops/status says
+// the holder is "deskd LIVE"; it signs with the same key and asks the same send guard.
 #include <httplib.h>
 
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <nlohmann/json.hpp>
@@ -129,6 +134,7 @@ int main(int argc, char** argv) {
     usage();
     return 2;
   }
+  std::signal(SIGPIPE, SIG_IGN);            // deskd closing mid-write is an error, not our death
   httplib::Client cli("127.0.0.1", port);   // Host: 127.0.0.1:<port>, the only Host deskd answers
   cli.set_connection_timeout(1, 0);
   cli.set_read_timeout(3, 0);
