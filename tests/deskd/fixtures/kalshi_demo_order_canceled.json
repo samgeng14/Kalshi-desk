@@ -1,0 +1,29 @@
+{
+ "order": {
+  "action": "buy",
+  "book_side": "bid",
+  "client_order_id": "P-3ac020a91527c01b",
+  "created_time": "2026-10-07T07:36:31.592935Z",
+  "exchange_index": 0,
+  "expiration_time": "2026-10-07T07:36:46Z",
+  "fill_count_fp": "0.00",
+  "initial_count_fp": "1.00",
+  "last_update_time": "2026-10-07T07:36:32.694826Z",
+  "maker_fees_dollars": "0.000000",
+  "maker_fill_cost_dollars": "0.000000",
+  "no_price_dollars": "0.9900",
+  "order_id": "01a1154a-e018-71cd-8da9-18c8d211e976",
+  "outcome_side": "yes",
+  "remaining_count_fp": "0.00",
+  "self_trade_prevention_type": "maker",
+  "side": "yes",
+  "status": "canceled",
+  "subaccount_number": 0,
+  "taker_fees_dollars": "0.000000",
+  "taker_fill_cost_dollars": "0.000000",
+  "ticker": "KXTTSTARMATCH-26OCT070230FRALOS-FRA",
+  "type": "limit",
+  "user_id": "00000000-0000-4000-8000-000000000000",
+  "yes_price_dollars": "0.0100"
+ }
+}
