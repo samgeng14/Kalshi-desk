@@ -441,6 +441,13 @@ function bootPage(opts) {
   {
     const arows = () => P.rows('s-act-body').filter(r => /^a-/.test(r.className));
     eq(P.heads('s-act-body').join('|'), 'Time|Lane|Ev|Side|Qty|Market|Px|Info', 'SYSTEMATIC has an ACTIVITY tape with the lane');
+    // 2026-10-06 review: under ALL the lanes' requotes (a sent and a cancel, ~600 a minute) were a
+    // waterfall; the tape opens on FILLS (fills, exits) and ALL is one click away
+    const kindBtn = t => P.$('s-act-tools')._children.find(b => b.textContent === t);
+    check(/\bon\b/.test(kindBtn('FILLS').className) && arows().length > 0 && arows().every(r => /^(FILL|PART|EXIT|HALT)$/.test(r._children[2].textContent)),
+      'the lanes\' tape opens on FILLS: fills and exits only', arows().slice(0, 5).map(r => r._children[2].textContent));
+    fire(P.doc, kindBtn('ALL'), 'pointerdown', { button: 0, pointerType: 'mouse' }); P.click(kindBtn('ALL')); P.flush();
+    eq(D.storage.get('act.SYS'), 'ALL', 'ALL is one click away, and remembered');
     const evs = new Set(arows().map(r => r._children[2].textContent));
     check(arows().length > 20 && evs.has('SUB') && (evs.has('FILL') || evs.has('PART')) && evs.has('CXL'), 'it shows the lanes\' orders sent, filled and cancelled', [...evs]);
     check(arows().every(r => /^[A-Z]\d$/.test(r._children[1].textContent) || r._children[2].textContent === 'EXIT'), 'every order row names its lane');
@@ -732,9 +739,12 @@ function bootPage(opts) {
     const pu = el => fire(P.doc, el, 'pointerup', { button: 0 });
     D.tabs.set('systematic'); P.flush();
     pd(start); P.flush();
-    check(/\bprs\b/.test(start.className) && P.text($('s-run')) === 'STOPPED', 'START shows pressed at pointerdown and does not start yet', [start.className, P.text($('s-run'))]);
+    check(start.hasAttribute('data-prs') && P.text($('s-run')) === 'STOPPED', 'START shows pressed at pointerdown and does not start yet', [start.className, P.text($('s-run'))]);
+    // 2026-10-06 review: the strip's next paint rewrote START's className and dropped the press
+    D.render.mark('hdr'); D.render.mark('clock'); D.render.mark('sys'); P.flush(); P.flush();
+    check(start.hasAttribute('data-prs'), 'START stays pressed through the frames that repaint the strip, until pointerup', start.className);
     pu(start);
-    check(!/\bprs\b/.test(start.className), 'pointerup clears it');
+    check(!start.hasAttribute('data-prs'), 'pointerup clears it');
     P.click(start); P.flush();
     eq(P.text($('s-run')), 'STARTING', 'START acts on the click');
     await P.advance(1500);
@@ -746,6 +756,9 @@ function bootPage(opts) {
     const tg = tgOf('M2'), on0 = D.store.lanes.get('M2').on;
     pd(tg); P.flush();
     check(D.store.lanes.get('M2').pendOn === null && tgOf('M2').textContent === (on0 ? 'ON' : 'OFF'), 'the lane toggle does nothing at pointerdown');
+    D.render.mark('lane'); D.render.mark('hdr'); D.render.mark('ord'); D.render.mark('clock'); P.flush(); P.flush();
+    check(tgOf('M2') === tg && tg.hasAttribute('data-prs'), 'the lane ON cell stays pressed while the lanes grid repaints', tg.className);
+    pu(tg);
     pd(stop); P.flush();
     eq(P.text($('s-run')), 'STOPPING', 'STOP acts at pointerdown (it only takes risk off)');
     P.click(stop);
@@ -808,6 +821,34 @@ function bootPage(opts) {
     D.ui.setFlash('subtle');
     D.act.stop(); await P.advance(1500);
     proto.animate = anim0; D.render.flush = flush0;
+  }
+
+  // ---- switching tabs (2026-10-06 review: SYSTEMATIC with the lanes running took 12-19 ms of
+  // script, style and layout before its paint, every panel redrawn in full): the hidden tab keeps
+  // what it missed and catches up about once a second in a task of its own, with no flashes; the
+  // frame that shows it draws only the rest
+  {
+    const proto = Object.getPrototypeOf(P.$('kill')), anim0 = proto.animate;
+    let bgFlashes = 0;
+    proto.animate = function () { let e = this; while (e && e.id !== 'tab-systematic') e = e.parentNode; if (e) bgFlashes++; return {}; };
+    D.tabs.set('systematic'); P.flush();
+    D.act.start(); await P.advance(2000, 250);
+    D.tabs.set('manual'); P.flush();
+    const runs0 = D.render.bgRuns;
+    await P.advance(6000, 250);
+    check(D.render.bgRuns - runs0 >= 4, 'while MANUAL shows, the SYSTEMATIC panels catch up about once a second', D.render.bgRuns - runs0);
+    eq(bgFlashes, 0, 'and flash nothing nobody can see');
+    const lr = laneRow('M1'), fillsCell = P.cell(lr, 'Fills', 's-lanes-body');
+    D.render.bg();
+    eq(fillsCell.textContent, String(S.lanes.get('M1').fills), 'the hidden lanes grid is current (M1 fills)');
+    const sysR = D.render.renderers.filter(r => r.tab === 'systematic'), seen = [];
+    const fns = sysR.map(r => r.fn);
+    sysR.forEach((r, i) => { r.fn = d => { seen.push(r.id + ':' + (d.all ? 'ALL' : 'part')); return fns[i](d); }; });
+    D.tabs.set('systematic'); P.flush();
+    check(seen.length > 0 && seen.every(x => /:part$/.test(x)), 'the switch frame draws what changed since the last catch-up, never every panel in full', seen);
+    sysR.forEach((r, i) => { r.fn = fns[i]; });
+    D.act.stop(); await P.advance(1500);
+    proto.animate = anim0;
   }
 
   // ---- the page stayed healthy

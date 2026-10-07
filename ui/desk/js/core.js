@@ -370,7 +370,7 @@
     } catch (e) { /* old engine */ }
   }
   /* Flashes (the FLASH setting, Desk.ui.flash):
-   *   'off'     none at all
+   *   'off'     no value flashes (the amber 'warn' cue below still shows)
    *   'subtle'  the default: a soft highlight that fades over 500 ms, only for what the operator
    *             must notice (the last-trade price row, our own orders changing state, fills, P&L);
    *             a cell that flashed less than 0.4 s ago does not flash again, so a busy level is
@@ -379,19 +379,35 @@
    *             sizes, LTQ, watchlist prices), still at most one flash per cell per 0.25 s
    * flash(el, kind, level, gap): kind 'up' | 'dn' | 'sz' | 'warn'; level 'full' = a routine update
    * that flashes only in FULL; gap = a longer quiet time for this cell (P&L: 1.5 s). Returns true
-   * when it flashed. */
+   * when it flashed.
+   * 'warn' is a safety cue, not decoration: the amber flash on a refused click (QTY 0, STALE,
+   * CLOSING, ROLLED, a refused ticket send) and on a ladder that rolled to the next window shows
+   * in every FLASH mode, OFF included. Under the system's Reduce Motion it is a static amber
+   * outline for 600 ms instead of an animation (the value flashes stay off there). */
   var FLASHES = {
     subtle: { up: 'rgba(63,185,80,.16)', dn: 'rgba(248,81,73,.16)', sz: 'rgba(230,232,235,.08)', warn: 'rgba(227,160,8,.30)', ms: 500, gap: 400 },
     full: { up: 'rgba(63,185,80,.22)', dn: 'rgba(248,81,73,.22)', sz: 'rgba(230,232,235,.10)', warn: 'rgba(227,160,8,.35)', ms: 300, gap: 250 }
   };
+  var WARN_MS = 600;
+  // an attribute, not a class: the ladder repaints the refused cell's className on the next frame
+  function warnStatic(el) {
+    if (!el.setAttribute) return false;
+    el.setAttribute('data-warn', '');
+    if (el._flW) clearTimeout(el._flW);
+    el._flW = setTimeout(function () { el._flW = null; el.removeAttribute('data-warn'); }, WARN_MS);
+    return true;
+  }
   function flash(el, kind, level, gap) {
-    if (!el || reduceMotion) return false;
+    if (!el || (R && R.inBg)) return false;
     var mode = Desk.ui && Desk.ui.flash ? Desk.ui.flash : 'subtle';
-    if (mode === 'off' || (level === 'full' && mode !== 'full')) return false;
+    if (kind === 'warn') {
+      if (reduceMotion) return warnStatic(el);
+      if (mode === 'off') mode = 'subtle';
+    } else if (reduceMotion || mode === 'off' || (level === 'full' && mode !== 'full')) return false;
     var P = FLASHES[mode] || FLASHES.subtle, c = P[kind] || P.sz, now = perf.now();
     if (kind !== 'warn' && el._flT && now - el._flT < Math.max(P.gap, gap || 0)) return false;
     el._flT = now;
-    var dur = kind === 'warn' ? 600 : P.ms;
+    var dur = kind === 'warn' ? WARN_MS : P.ms;
     if (el.animate) {
       // an inset shadow over the cell, not its background: the bid/ask tint and depth bar stay put
       try {
@@ -523,6 +539,8 @@
     $: byId,
     setText: setText, setHTML: setHTML, setClass: setClass, setAttr: setAttr, setVar: setStyleVar,
     keyedRows: keyedRows, emptyRow: emptyRow, flash: flash,
+    // tests: the system's Reduce Motion as the flashes see it
+    setReduceMotion: function (on) { reduceMotion = !!on; },
     rowPx: rowPx, rowPxReset: function () { rowPxC = 0; },
     // build a <table> with a <thead> from column specs [{h:'Px', w:44, cls:'n'}]; returns tbody
     table: function (host, cols, cls) {
@@ -545,8 +563,13 @@
   // Instant controls (2026-10-06: "every button must feel instant").
   //   Desk.press.attach()   at boot: every pressable control (a button, a [data-act]/[data-a]
   //                         control, a ladder or grid cell that does something, a linked row) gets
-  //                         the class 'prs' on pointerdown, in the same event, so the next frame
-  //                         shows it pressed whatever the action; pointerup anywhere clears it.
+  //                         the attribute data-prs on pointerdown, in the same event, so the next
+  //                         frame shows it pressed whatever the action; pointerup anywhere clears
+  //                         it. An attribute, not a class: renderers rewrite className (a ladder
+  //                         cell's 'bq has', the ticket's 'buy', KILL's state), and keyedRows writes
+  //                         only the attributes a cell lists, so nothing a frame paints can drop
+  //                         the press before the pointer is released.
+  //   Desk.press.is(el)     true while el shows pressed
   //   Desk.dom.onPress(host, fn, fastFn)
   //                         one delegated handler for a panel's controls. fastFn(ev) returns true for
   //                         a control that is safe to act on at pointerdown (a tab, a filter, a
@@ -559,9 +582,11 @@
   // ---------------------------------------------------------------------------------------------
   var PRESSABLE = 'button, [data-act], [data-a], [data-cid], [data-flat], td.bq, td.aq, td.wb, td.ws, td.px, tr[data-mkt], tr[data-grp], tr[data-lane], tr[data-uk]';
   var pressed = null;
-  function unpress() { if (pressed) { pressed.classList.remove('prs'); pressed = null; } }
+  function unpress() { if (pressed) { pressed.removeAttribute('data-prs'); pressed = null; } }
   Desk.press = {
     sel: PRESSABLE,
+    is: function (el) { return !!el && !!el.hasAttribute && el.hasAttribute('data-prs'); },
+    get el() { return pressed; },
     attach: function () {
       if (!hasDoc || Desk.press.attached) return;
       Desk.press.attached = true;
@@ -570,7 +595,7 @@
         if (ev.button !== 0) return;
         var t = ev.target, el = t && t.closest ? t.closest(PRESSABLE) : null;
         if (!el || el.disabled || (el.classList && el.classList.contains('dis'))) return;
-        pressed = el; el.classList.add('prs');
+        pressed = el; el.setAttribute('data-prs', '');
       }, true);
       document.addEventListener('pointerup', unpress, true);
       document.addEventListener('pointercancel', unpress, true);
@@ -784,19 +809,43 @@
   // ---------------------------------------------------------------------------------------------
   // Render scheduler. Event handlers only write into the store and mark topics dirty; one
   // requestAnimationFrame pass then runs the renderers. A renderer bound to a tab that is hidden
-  // is skipped and redrawn in full the next time its tab shows.
+  // is skipped in the frames; it keeps the topics it missed (r.pend) and catches up about once a
+  // second in a task of its own (R.bg: no flashes, nobody sees them), so the frame that shows its
+  // tab only draws the last second's changes instead of every panel in full (2026-10-06 review:
+  // switching to a busy SYSTEMATIC took 12-19 ms before its paint).
   //
   //   Desk.render.mark('book:K|TK')     mark a topic (and schedule a frame)
   //   Desk.render.add({id, tab, fn})    tab: 'manual' | 'systematic' | null (always)
   //                                     fn(d) with d.has(topic), d.any(prefix), d.all (full redraw)
   //   Desk.render.flush()               run a frame now (tests, boot)
+  //   Desk.render.bg()                  the hidden tab's catch-up now (tests; the clock calls it)
   //
-  // Topics the store marks: hdr, mkt, book, book:<key>, ord, ord:<key>, mord:<key> (a MAN or EXT
-  // order changed: the ladders paint it on the next frame, never coalesced), fill, pos, lane, risk, mo,
-  // alert, feeds, stale, snapshot (with all of them). Others: clock (250 ms), focus, tab, hk,
+  // Topics the store marks: hdr, mkt, mkt:<key>, book, book:<key>, ord, ord:<key>, mord:<key> (a MAN
+  // or EXT order changed: the ladders paint it on the next frame, never coalesced), fill, pos,
+  // pos:<key>, lane, risk, mo, alert, feeds, stale, snapshot (with all of them). Others: clock (250 ms), focus, tab, hk,
   // layout, ui (density/colour), lat.
   // ---------------------------------------------------------------------------------------------
   var raf = (hasDoc && root.requestAnimationFrame) ? function (f) { root.requestAnimationFrame(f); } : function (f) { setTimeout(function () { f(perf.now()); }, 16); };
+  var PEND_MAX = 4000, BG_MS = 1000;
+  // the frame's view of the dirty topics, plus the ones a hidden renderer missed
+  function view(set, pend) {
+    return {
+      set: set, all: false,
+      has: function (t) { return this.all || set.has(t) || (!!pend && pend.has(t)); },
+      any: function (p) {
+        if (this.all) return true;
+        var hit = false, f = function (t) { if (!hit && t.indexOf(p) === 0) hit = true; };
+        set.forEach(f); if (pend && !hit) pend.forEach(f); return hit;
+      }
+    };
+  }
+  function runOne(r, d) {
+    try { r.fn(d); } catch (e) {
+      R.errors++; R.lastError = (r.id || '?') + ': ' + (e && e.message);
+      if (root.console) console.error('[desk render]', r.id, e);
+    }
+  }
+  function hiddenR(r) { return !!r.tab && !!R.tab && r.tab !== R.tab; }
   var R = Desk.render = {
     tab: null,                         // the visible tab, set by header.js
     dirty: new Set(),
@@ -818,24 +867,23 @@
       R.scheduled = false;
       var set = R.dirty; R.dirty = new Set();
       var snapAll = set.has('snapshot');
-      var d = {
-        set: set, all: false,
-        has: function (t) { return this.all || set.has(t); },
-        any: function (p) {
-          if (this.all) return true;
-          var hit = false; set.forEach(function (t) { if (!hit && t.indexOf(p) === 0) hit = true; }); return hit;
-        }
-      };
+      var d = view(set, null);
       var f0 = perf.now();
       for (var i = 0; i < R.renderers.length; i++) {
         var r = R.renderers[i];
-        if (r.tab && R.tab && r.tab !== R.tab) { if (set.size) r.missed = true; continue; }
-        d.all = r.missed || snapAll;
-        r.missed = false;
-        try { r.fn(d); } catch (e) {
-          R.errors++; R.lastError = (r.id || '?') + ': ' + (e && e.message);
-          if (root.console) console.error('[desk render]', r.id, e);
+        if (hiddenR(r)) {
+          // hidden: keep what it missed (a full redraw only if that grows past PEND_MAX)
+          if (set.size && !r.missed) {
+            if (!r.pend) r.pend = new Set();
+            set.forEach(function (t) { r.pend.add(t); });
+            if (r.pend.size > PEND_MAX) { r.missed = true; r.pend = null; }
+          }
+          continue;
         }
+        var dd = r.pend ? view(set, r.pend) : d;
+        dd.all = r.missed || snapAll || (!!r.pend && r.pend.has('snapshot'));
+        r.missed = false; r.pend = null;
+        runOne(r, dd);
       }
       R.lastMs = perf.now() - f0;
       if (R.lastMs > R.maxMs) R.maxMs = R.lastMs;
@@ -843,7 +891,33 @@
       P.framed();
       laterAfterFrame();
     },
-    flush: function () { R.frame(); }
+    flush: function () { R.frame(); },
+    // the hidden tab's renderers catch up on what they missed, outside any frame
+    inBg: false, bgAt: 0, bgRuns: 0, bgArmed: false,
+    bg: function () {
+      R.bgArmed = false;
+      if (!R.tab) return 0;
+      var n = 0;
+      R.inBg = true;
+      try {
+        for (var i = 0; i < R.renderers.length; i++) {
+          var r = R.renderers[i];
+          if (!hiddenR(r) || !(r.missed || (r.pend && r.pend.size))) continue;
+          var dd = view(new Set(), r.pend);
+          dd.all = r.missed || (!!r.pend && r.pend.has('snapshot'));
+          r.missed = false; r.pend = null;
+          runOne(r, dd); n++;
+        }
+      } finally { R.inBg = false; }
+      R.bgRuns++;
+      return n;
+    },
+    // from the clock: at most once per BG_MS, in a task of its own (never inside a frame)
+    bgTick: function (now) {
+      if (R.bgArmed || now - R.bgAt < BG_MS || !R.tab) return;
+      R.bgAt = now; R.bgArmed = true;
+      setTimeout(R.bg, 0);
+    }
   };
 
   // ---------------------------------------------------------------------------------------------
@@ -852,7 +926,7 @@
   var tickFns = [], tickTimer = null;
   Desk.tick = {
     on: function (fn) { tickFns.push(fn); },
-    run: function () { var now = Date.now(); tickFns.forEach(function (f) { try { f(now); } catch (e) { if (root.console) console.error('[desk tick]', e); } }); R.mark('clock'); },
+    run: function () { var now = Date.now(); tickFns.forEach(function (f) { try { f(now); } catch (e) { if (root.console) console.error('[desk tick]', e); } }); R.mark('clock'); R.bgTick(now); },
     start: function () { if (!tickTimer) tickTimer = setInterval(Desk.tick.run, 250); },
     stop: function () { if (tickTimer) clearInterval(tickTimer); tickTimer = null; }
   };

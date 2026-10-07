@@ -9,31 +9,46 @@
  *   FILL  a fill that completed its order;  PART  a fill that left some of it working
  *   CXL   cancelled (the why: USER, PULL, IOC_REST, KILL, STOP ...);  EXP  the venue's expiry
  *   REJ   rejected;  EXIT  a position went flat (closed, or settled), with the market's P&L
+ *   HALT  Systematic halted (the daily stop), from the header's run state
  * MAN is the operator's (EXT orders, placed outside the desk, count as his); SYS the lanes'.
  * A snapshot never makes events (a resync is not news); it only resets what the tape compares.
  *
  *   Desk.activity.list(mode, kind)  newest first; kind 'ALL' | 'FILLS' (FILL PART EXIT) | 'ORDERS'
+ *                                   (a HALT shows in all three)
  *   Desk.activity.unseen            {SYS: n, MAN: n}: events that pass that mode's alert filter
  *                                   and arrived while its tab was not on screen; .seen(mode)
  *   Desk.activity.cfg               {on (desktop notifications), sound, when: 'hidden' | 'always',
  *                                   SYS: [types], MAN: [types]} saved in this browser; defaults:
- *                                   off, no sound, only while the page is hidden, FILL and EXIT
+ *                                   off, no sound, only while the page is hidden; MAN every fill
+ *                                   (FILL, PART) and exit; SYS exits, rejects and a halt only (the
+ *                                   lanes fill 10-30 times a minute: their fills are on the tape,
+ *                                   not on the desktop, and not in the header's count)
  *   Desk.activity.enable()          asks for the browser's permission (call it from a click:
  *                                   Safari shows its prompt only for a user gesture)
- * Rate limit: at most one notification (and one sound) per mode every 4 s; what arrives in
- * between is batched into the next one ('SYS: 3 fills, 1 exit').
+ *   Desk.activity.test(mode)        a test alert now; returns what happened, for the drawer
+ *                                   ('shown', 'blocked (Safari settings)', 'off: turn Desktop or
+ *                                   Sound on', ...)
+ * Rate limit: MAN at most one notification (and one sound) every 4 s; SYS one digest every 30 s
+ * ('SYS: 4 exits, real +1.20'); what arrives in between is batched into the next one. A HALT is
+ * never held back.
+ * Sound: Safari starts an AudioContext suspended unless it is made inside a user gesture, so a
+ * SOUND ON restored from storage waits for the operator's first click or key to start it (the
+ * drawer says 'tap to enable' until then).
  */
 (function (root) {
   'use strict';
   var Desk = root.Desk = root.Desk || {};
   var hasDoc = typeof document !== 'undefined';
-  var MAX = 2000, RATE_MS = 4000;           // events kept per mode (busy lanes write ~350 a minute)
-  var TYPES = ['SUB', 'FILL', 'PART', 'CXL', 'EXP', 'REJ', 'EXIT'];
-  var KIND = { FILLS: { FILL: 1, PART: 1, EXIT: 1 }, ORDERS: { SUB: 1, CXL: 1, EXP: 1, REJ: 1 } };
+  var MAX = 2000;                          // events kept per mode (busy lanes write ~600 a minute)
+  var RATE = { MAN: 4000, SYS: 30000 };     // one alert per mode per this long (SYS: a digest)
+  var CFG_V = 2;                            // 2: MAN fills include PART; SYS exits, rejects, halts
+  var TYPES = ['SUB', 'FILL', 'PART', 'CXL', 'EXP', 'REJ', 'EXIT', 'HALT'];
+  var KIND = { FILLS: { FILL: 1, PART: 1, EXIT: 1, HALT: 1 }, ORDERS: { SUB: 1, CXL: 1, EXP: 1, REJ: 1, HALT: 1 } };
+  var DEF = { SYS: ['EXIT', 'REJ', 'HALT'], MAN: ['FILL', 'PART', 'EXIT'] };
   var A = {
     lists: { SYS: [], MAN: [] }, unseen: { SYS: 0, MAN: 0 }, n: 0, subbed: new Set(), sent: { SYS: 0, MAN: 0 }, pend: { SYS: [], MAN: [] }, timers: {},
-    cfg: { on: false, sound: false, when: 'hidden', SYS: ['FILL', 'EXIT'], MAN: ['FILL', 'EXIT'] },
-    notified: 0, beeps: 0, TYPES: TYPES, RATE_MS: RATE_MS
+    cfg: { v: CFG_V, on: false, sound: false, when: 'hidden', SYS: DEF.SYS.slice(), MAN: DEF.MAN.slice() },
+    notified: 0, beeps: 0, TYPES: TYPES, RATE: RATE, RATE_MS: RATE.MAN, DEF: DEF, lastTest: '', runState: null
   };
 
   function now() { return Date.now(); }
@@ -95,6 +110,12 @@
            px: m && m.status === 'SETTLED' ? (m.result === 'YES' ? 10000 : 0) : p.mark, real: p.real, why: m && m.status === 'SETTLED' ? 'SETTLED ' + m.result : '',
            lane: null, ts: now() });
   };
+  // the header's run state: Systematic halted by the daily stop (a KILL is the operator's own act)
+  A.onRun = function (run, fromSnap) {
+    var was = A.runState; A.runState = run.state;
+    if (fromSnap || was === null || was === run.state || run.state !== 'HALTED') return;
+    push({ mode: 'SYS', type: 'HALT', key: null, v: null, tk: '', side: '', why: run.why || 'daily stop', lane: null, ts: now() });
+  };
   function trim() { if (A.subbed.size > 20000) { var it = A.subbed.values(); for (var i = 0; i < 10000; i++) A.subbed.delete(it.next().value); } }
 
   A.list = function (mode, kind) {
@@ -111,6 +132,7 @@
   function mname(e) { var m = Desk.store ? Desk.store.market(e.key) : null; return m ? m.short : e.tk; }
   A.line = function (e) {
     var f = F(), px = e.px === null || e.px === undefined ? '' : ' @' + f.px(e.px);
+    if (e.type === 'HALT') return 'HALT Systematic: ' + e.why;
     if (e.type === 'EXIT') return 'EXIT ' + f.size(e.qty) + ' ' + mname(e) + (e.why ? ' ' + e.why : '') + ' real ' + f.pnl(e.real);
     return e.type + ' ' + (e.lane ? e.lane + ' ' : '') + e.side + ' ' + f.size(e.qty) + ' ' + mname(e) + px + (e.liq ? ' ' + e.liq : '') + (e.why && e.type !== 'FILL' ? ' ' + e.why : '');
   };
@@ -123,10 +145,22 @@
     if (!(A.cfg.on || A.cfg.sound)) return;
     var mode = ev.mode;
     A.pend[mode].push(ev);
-    var wait = A.sent[mode] + RATE_MS - now();
-    if (wait <= 0) { flush(mode); return; }
+    var wait = A.sent[mode] + RATE[mode] - now();
+    if (wait <= 0 || ev.type === 'HALT') { flush(mode); return; }
     if (!A.timers[mode]) A.timers[mode] = setTimeout(function () { A.timers[mode] = null; flush(mode); }, wait);
   }
+  var PLURAL = { EXIT: 'exits', FILL: 'fills', PART: 'part fills', REJ: 'rejects', HALT: 'halts', SUB: 'sent', CXL: 'cancels', EXP: 'expiries' };
+  var ONE = { EXIT: 'exit', FILL: 'fill', PART: 'part fill', REJ: 'reject', HALT: 'halt', SUB: 'sent', CXL: 'cancel', EXP: 'expiry' };
+  // the digest's title: 'SYS: 4 exits, 1 reject, real +1.20' (real: the exits' realized P&L)
+  A.digest = function (mode, evs) {
+    var cnt = {}, order = [], real = 0, exits = 0;
+    evs.forEach(function (e) {
+      if (!cnt[e.type]) { cnt[e.type] = 0; order.push(e.type); }
+      cnt[e.type]++;
+      if (e.type === 'EXIT' && typeof e.real === 'number') { real += e.real; exits++; }
+    });
+    return mode + ': ' + order.map(function (k) { return cnt[k] + ' ' + (cnt[k] > 1 ? PLURAL[k] : ONE[k]); }).join(', ') + (exits ? ', real ' + F().pnl(real) : '');
+  };
   function flush(mode) {
     var evs = A.pend[mode]; A.pend[mode] = [];
     if (!evs.length || !wanted()) return;
@@ -134,9 +168,7 @@
     var title, body;
     if (evs.length === 1) { title = mode + ' ' + evs[0].type + (evs[0].lane ? ' ' + evs[0].lane : ''); body = A.line(evs[0]); }
     else {
-      var cnt = {};
-      evs.forEach(function (e) { cnt[e.type] = (cnt[e.type] || 0) + 1; });
-      title = mode + ': ' + Object.keys(cnt).map(function (k) { return cnt[k] + ' ' + k.toLowerCase() + (cnt[k] > 1 ? 's' : ''); }).join(', ');
+      title = A.digest(mode, evs);
       body = evs.slice(0, 3).map(A.line).join('\n') + (evs.length > 3 ? '\n+' + (evs.length - 3) + ' more' : '');
     }
     var N = root.Notification;
@@ -155,21 +187,45 @@
     }
     if (A.cfg.sound) beep(evs[0].type);
   }
-  // a short tone (Web Audio, no files): fills high, exits middle, rejects low
+  // a short tone (Web Audio, no files): fills high, exits middle, rejects and halts low
   var actx = null;
   function audio() {
     if (actx) return actx;
     var AC = root.AudioContext || root.webkitAudioContext;
     if (!AC) return null;
     try { actx = new AC(); } catch (e) { actx = null; }
+    if (actx) try { actx.onstatechange = function () { if (Desk.render) Desk.render.mark('set'); }; } catch (e2) { /* old engine */ }
     return actx;
   }
+  // 'running' | 'suspended' (Safari: not started from a click yet) | 'none' (no Web Audio) | 'off'
+  A.audioState = function () {
+    if (!A.cfg.sound) return 'off';
+    if (!(root.AudioContext || root.webkitAudioContext)) return 'none';
+    return actx ? actx.state : 'suspended';
+  };
+  // a saved SOUND ON: start the audio on the operator's first pointer release or key (Safari only
+  // starts it inside a gesture; not on pointerdown, so the press itself carries no extra work)
+  var armed = false;
+  A.armAudio = function () {
+    if (!hasDoc || armed || !A.cfg.sound) return;
+    armed = true;
+    var go = function () {
+      if (!A.cfg.sound) { off(); return; }
+      var c = audio();
+      if (!c) { off(); return; }
+      try { if (c.state !== 'running' && c.resume) { var p = c.resume(); if (p && p.then) p.then(function () { if (c.state === 'running') off(); if (Desk.render) Desk.render.mark('set'); }, function () {}); } } catch (e) { /* the next gesture */ }
+      if (c.state === 'running') off();
+    };
+    var off = function () { armed = false; document.removeEventListener('pointerup', go, true); document.removeEventListener('keydown', go, true); };
+    document.addEventListener('pointerup', go, true);
+    document.addEventListener('keydown', go, true);
+  };
   function beep(type) {
     var c = audio(); if (!c) return;
     try {
       if (c.state === 'suspended' && c.resume) c.resume();
       var o = c.createOscillator(), g = c.createGain(), t = c.currentTime;
-      o.frequency.value = type === 'REJ' ? 330 : (type === 'EXIT' ? 660 : 880);
+      o.frequency.value = type === 'REJ' || type === 'HALT' ? 330 : (type === 'EXIT' ? 660 : 880);
       g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(0.06, t + 0.01); g.gain.exponentialRampToValueAtTime(0.0001, t + 0.09);
       o.connect(g); g.connect(c.destination); o.start(t); o.stop(t + 0.1);
       A.beeps++;
@@ -184,7 +240,9 @@
     var s = Desk.storage ? Desk.storage.getJSON('alerts', null) : null;
     if (!s || typeof s !== 'object') return;
     A.cfg.on = !!s.on; A.cfg.sound = !!s.sound; A.cfg.when = s.when === 'always' ? 'always' : 'hidden';
-    ['SYS', 'MAN'].forEach(function (m) { if (Array.isArray(s[m])) A.cfg[m] = s[m].filter(function (t) { return TYPES.indexOf(t) >= 0; }); });
+    // filters saved before version 2 were the old defaults (SYS every fill): they take the new ones
+    if (s.v === CFG_V) ['SYS', 'MAN'].forEach(function (m) { if (Array.isArray(s[m])) A.cfg[m] = s[m].filter(function (t) { return TYPES.indexOf(t) >= 0; }); });
+    if (A.cfg.sound) A.armAudio();
   };
   A.toggleType = function (mode, type) {
     var l = A.cfg[mode], i = l.indexOf(type);
@@ -209,7 +267,32 @@
   A.disable = function () { A.cfg.on = false; A.save(); };
   A.setSound = function (on) { A.cfg.sound = !!on; if (on) { audio(); if (actx && actx.resume) try { actx.resume(); } catch (e) { /* later */ } } A.save(); };
   A.setWhen = function (w) { A.cfg.when = w === 'always' ? 'always' : 'hidden'; A.save(); };
-  A.test = function (mode) { A.sent[mode] = 0; var keep = A.cfg.when; A.cfg.when = 'always'; queue({ mode: mode, type: 'FILL', side: 'BUY', qty: 1, px: 5000, tk: 'TEST', key: 'K|TEST', ts: now() }); A.cfg.when = keep; };
+  // why desktop alerts cannot show: '' when they can
+  A.blocked = function () {
+    var p = A.permission();
+    if (p === 'granted') return '';
+    if (p === 'unsupported') return 'not in this browser';
+    var file = !!(root.location && root.location.protocol === 'file:');
+    if (p === 'denied') return file ? 'needs the served page (127.0.0.1)' : 'blocked (Safari settings)';
+    return 'not allowed yet: Desktop ON asks';
+  };
+  // a test alert now (a click on TEST); returns what happened, for the drawer's status cell
+  A.test = function (mode) {
+    var out;
+    if (!A.cfg.on && !A.cfg.sound) out = 'off: turn Desktop or Sound on';
+    else {
+      var n0 = A.notified, b0 = A.beeps;
+      A.sent[mode] = 0; var keep = A.cfg.when; A.cfg.when = 'always';
+      queue({ mode: mode, type: 'FILL', side: 'BUY', qty: 1, px: 5000, tk: 'TEST', key: 'K|TEST', ts: now() });
+      A.cfg.when = keep;
+      var shown = A.notified > n0, rang = A.beeps > b0, parts = [];
+      if (A.cfg.on) parts.push(shown ? 'shown' : (A.blocked() || 'not shown'));
+      if (A.cfg.sound) parts.push(rang ? (A.audioState() === 'running' ? 'sound played' : 'sound: tap to enable') : 'no sound (no Web Audio)');
+      out = parts.join(', ');
+    }
+    A.lastTest = mode + ': ' + out;
+    return out;
+  };
 
   // ---------------------------------------------------------------------------------------------
   // the ACTIVITY tape (one panel per tab): newest first, every kept event (virtual rows), coloured
@@ -242,11 +325,13 @@
   }
   // a new row on the tape is news (a short highlight) when it is a fill, an exit or a reject; the
   // quoting churn (sent, cancelled, expired: ten a second from busy lanes) flashes only with FLASH FULL
-  var NEWS = { FILL: 1, PART: 1, EXIT: 1, REJ: 1 };
+  var NEWS = { FILL: 1, PART: 1, EXIT: 1, REJ: 1, HALT: 1 };
   A.news = function (e) { return !!NEWS[e.type] || (!!Desk.ui && Desk.ui.flash === 'full'); };
   A.mount = function (o) {
     if (!hasDoc || !o.body) return function () {};
-    var D = Desk.dom, T = { kind: 'ALL', lastAt: 0, dirty: true };
+    // SYS opens on FILLS: its quoting churn (a requote is a sent and a cancel, ten a second from
+    // busy lanes) is a waterfall under ALL; MAN on ALL (his own orders); a stored choice wins
+    var D = Desk.dom, T = { kind: o.mode === 'SYS' ? 'FILLS' : 'ALL', lastAt: 0, dirty: true };
     var saved = Desk.storage ? Desk.storage.get('act.' + o.mode) : null;
     if (saved && KIND[saved] || saved === 'ALL') T.kind = saved;
     // widths for Safari's SF Mono: 'HH:MM:SS' at 11 px is 54 px, plus padding
@@ -273,7 +358,8 @@
     }
     T.render = function (d) {
       var t = now();
-      if (hasDoc && !document.hidden) A.seen(o.mode);
+      // seen only when the tape is on screen (not the hidden tab's background catch-up)
+      if (hasDoc && !document.hidden && !(Desk.render && Desk.render.inBg)) A.seen(o.mode);
       if (!(d.all || T.dirty || ((d.has('act') || d.has('mkt')) && t - T.lastAt >= 250) || (T.due && t - T.lastAt >= 250))) {
         if (d.has('act')) T.due = true;
         return;

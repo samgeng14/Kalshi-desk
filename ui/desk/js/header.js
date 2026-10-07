@@ -34,7 +34,8 @@
       R.tab = name;
       Desk.storage.set('tab', name);
       if (Desk.activity) Desk.activity.seen(name === 'systematic' ? 'SYS' : 'MAN');
-      R.force(name);
+      // no full redraw: the tab's renderers kept what they missed while hidden and caught up in
+      // the background about once a second (Desk.render.bg), so this frame draws only the rest
       R.mark('tab');
     },
     toggle: function () { tabs.set(tabs.cur === 'manual' ? 'systematic' : 'manual'); },
@@ -45,7 +46,7 @@
   // overlays
   // ---------------------------------------------------------------------------------------------
   var H = Desk.header = {
-    logOpen: false, keysOpen: false, setOpen: false, rearmAt: 0, rearmPend: false, dayCents: null,
+    logOpen: false, keysOpen: false, setOpen: false, rearmAt: 0, rearmPend: false, dayCents: null, realCents: null,
     openLog: function (on) {
       H.logOpen = on === undefined ? !H.logOpen : !!on;
       D.setClass(document.body, 'log', H.logOpen);
@@ -106,6 +107,9 @@
   // ---------------------------------------------------------------------------------------------
   // render
   // ---------------------------------------------------------------------------------------------
+  // today's realized P&L, both owners, net of fees: the positions' real (the backend's own figure;
+  // the header's day.total adds the marks and the LIP accrual)
+  function realToday(S) { var t = 0; S.pos.forEach(function (P) { t += P.real || 0; }); return t; }
   function cell(id, text, cls) { var el = $(id); if (!el) return; D.setText(el, text); if (cls !== undefined && el.className !== cls) el.className = cls; }
   function sum(a, b) { return (a || 0) + (b || 0); }
   function health(id, label, state, valueText) {
@@ -132,7 +136,7 @@
       var mw = S.manWorking();
       cell('tab-man-n', String(mw), 'tst ' + (mw ? '' : 'dim'));
     }
-    if (h && (d.has('hdr') || d.all || d.has('snapshot'))) {
+    if (h && (d.has('hdr') || d.has('pos') || d.all || d.has('snapshot'))) {
       cell('h-kal', F.money(h.cash.K.total));
       cell('h-kal-free', 'free ' + F.money(h.cash.K.free));
       D.setAttr($('hc-kal'), 'title', 'free ' + F.money(h.cash.K.free) + '  ' + h.cash.K.shards.map(function (x) { return x.id + ' ' + F.money(x.cash) + '/' + F.money(x.free); }).join(' '));
@@ -141,10 +145,13 @@
       cell('h-pm-free', h.cash.P.ro || Math.abs(h.cash.P.total - h.cash.P.free) < 100 ? '' : 'free ' + F.money(h.cash.P.free));
       D.setAttr($('hc-pm'), 'title', h.cash.P.ro ? 'read-only: PM key failing' : 'free ' + F.money(h.cash.P.free));
       D.setClass($('h-pm-ro'), 'on', h.cash.P.ro);
-      // the day's P&L flashes when it moves by a cent or more (green up, red down), calmly
-      var dayCents = Math.round(h.day.total / 100);
-      if (H.dayCents !== null && dayCents !== H.dayCents) D.flash($('hc-day'), dayCents > H.dayCents ? 'up' : 'dn', null, 1500);
-      H.dayCents = dayCents;
+      // the day's P&L flashes when its realized part moves by a cent (a fill that closed, an exit,
+      // a settlement: green up, red down), at most once every 1.5 s; marks and the LIP accrual
+      // move it every second while the lanes run, so a move of the total flashes only with FULL
+      var dayCents = Math.round(h.day.total / 100), realCents = Math.round(realToday(S) / 100), hcDay = $('hc-day');
+      if (H.realCents !== null && realCents !== H.realCents) D.flash(hcDay, realCents > H.realCents ? 'up' : 'dn', null, 1500);
+      else if (H.dayCents !== null && dayCents !== H.dayCents) D.flash(hcDay, dayCents > H.dayCents ? 'up' : 'dn', 'full', 1500);
+      H.dayCents = dayCents; H.realCents = realCents;
       cell('h-day', F.pnl(h.day.total), 'hv ' + F.sign(h.day.total));
       cell('h-day-split', 'S ' + F.pnl(h.day.sys) + ' M ' + F.pnl(h.day.man));
       D.setAttr($('hc-day'), 'title', 'S ' + F.pnl(h.day.sys) + ' M ' + F.pnl(h.day.man) + ' LIP ' + F.pnl(h.day.lip));
@@ -342,8 +349,13 @@
     SU.when = setRow(host, 'When', [['hidden', 'HIDDEN'], ['always', 'ALWAYS']], 'when');
     SU.sys = setRow(host, 'SYS', T.map(function (t) { return [t, t]; }), 'tsys');
     SU.man = setRow(host, 'MAN', T.map(function (t) { return [t, t]; }), 'tman');
+    SU.soundSt = mk('span', 'st'); SU.sound.row.appendChild(SU.soundSt);
     SU.test = setRow(host, 'Test', [['SYS', 'SYS'], ['MAN', 'MAN']], 'atest');
-    SU.rate = mk('span', 'st', 'max 1 per mode per 4 s'); SU.test.row.appendChild(SU.rate);
+    // what the last TEST did: 'shown', 'blocked (Safari settings)', 'off: turn Desktop or Sound on'
+    SU.testSt = mk('span', 'st'); SU.test.row.appendChild(SU.testSt);
+    var rateRow = mk('div', 'set-row'); rateRow.appendChild(mk('span', 'lb', 'Rate'));
+    SU.rate = mk('span', 'st', 'MAN 1 per 4 s; SYS a digest per 30 s'); rateRow.appendChild(SU.rate);
+    host.appendChild(rateRow);
     // choices act on pointerdown; the permission request (Desktop ON) and the sound keep the click:
     // Safari shows its prompt, and starts audio, only for a click
     D.onPress(host, onSetUi, function (ev) {
@@ -363,7 +375,7 @@
     else if (a === 'when' && A) A.setWhen(v);
     else if (a === 'tsys' && A) A.toggleType('SYS', v);
     else if (a === 'tman' && A) A.toggleType('MAN', v);
-    else if (a === 'atest' && A) A.test(v);
+    else if (a === 'atest' && A) SU.lastTest = A.test(v);
     R.mark('set'); R.mark('act');
   }
   function onOf(r, v) { if (r) r.btns.forEach(function (b) { D.setClass(b, 'on', b.getAttribute('data-v') === String(v)); }); }
@@ -373,11 +385,17 @@
     onOf(SU.perf, Desk.perf.on ? '1' : '0');
     var A = Desk.activity;
     if (A && SU.desk) {
-      var perm = A.permission();
+      var perm = A.permission(), file = !!(root.location && root.location.protocol === 'file:');
       onOf(SU.desk, A.cfg.on ? 'on' : 'off');
-      D.setText(SU.deskSt, perm === 'granted' ? 'allowed' : perm === 'denied' ? 'blocked (Safari settings)' : perm === 'default' ? 'not asked' : 'not in this browser');
+      // Safari keeps the permission per website: a page opened from a file may never be granted
+      D.setText(SU.deskSt, perm === 'granted' ? 'allowed' : perm === 'denied' ? (file ? 'needs the served page (127.0.0.1)' : 'blocked (Safari settings)') : perm === 'default' ? 'not asked' : 'not in this browser');
       SU.deskSt.className = 'st' + (perm === 'denied' || perm === 'unsupported' ? ' warn' : (perm === 'granted' ? ' ok' : ''));
       onOf(SU.sound, A.cfg.sound ? '1' : '0');
+      var as = A.audioState ? A.audioState() : 'off';
+      D.setText(SU.soundSt, as === 'suspended' ? 'tap to enable' : (as === 'none' ? 'no Web Audio' : ''));
+      SU.soundSt.className = 'st' + (as === 'suspended' || as === 'none' ? ' warn' : '');
+      D.setText(SU.testSt, SU.lastTest || '');
+      SU.testSt.className = 'st' + (!SU.lastTest ? '' : (/blocked|off:|not |needs|tap to|no sound|no Web/.test(SU.lastTest) ? ' warn' : ' ok'));
       onOf(SU.when, A.cfg.when);
       [[SU.sys, 'SYS'], [SU.man, 'MAN']].forEach(function (x) { x[0].btns.forEach(function (b) { D.setClass(b, 'on', A.cfg[x[1]].indexOf(b.getAttribute('data-v')) >= 0); }); });
     }
