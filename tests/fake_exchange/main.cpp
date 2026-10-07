@@ -2,10 +2,12 @@
 //
 //   fake-kalshi [--port N] [--tape FILE.csv[.gz] [--series KXNATGAS15M] [--speed X]]
 //               [--scenario FILE.jsonl] [--cash SHARD:DOLLARS,...] [--auth off|presence]
-//               [--no-rate-limits] [--advanced]
+//               [--no-rate-limits] [--advanced] [--tls DIR [--no-close-notify]] [--idle-close-ms N]
 //
 // Listens on 127.0.0.1 only and prints its REST and WebSocket addresses. SIGINT or SIGTERM stops
-// it. Cash defaults to $100 on shards 0 and 2.
+// it. Cash defaults to $100 on shards 0 and 2. --tls makes a test CA and a 127.0.0.1 certificate
+// in DIR (an existing directory; tls_pki.h) and serves https:// and wss://; a client trusts
+// DIR/ca.pem for loopback only.
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
@@ -14,6 +16,7 @@
 #include <thread>
 
 #include "fake_kalshi.h"
+#include "tls_pki.h"
 
 using namespace fakex;
 
@@ -24,7 +27,7 @@ static int usage() {
   std::fprintf(stderr,
                "usage: fake-kalshi [--port N] [--tape FILE [--series S] [--speed X]] [--scenario FILE]\n"
                "                   [--cash SHARD:DOLLARS,...] [--auth off|presence] [--no-rate-limits]\n"
-               "                   [--advanced]\n");
+               "                   [--advanced] [--tls DIR [--no-close-notify]] [--idle-close-ms N]\n");
   return 2;
 }
 
@@ -33,6 +36,7 @@ int main(int argc, char** argv) {
   std::string tape_path, scenario_path, cash = "0:100,2:100,3:0";
   TapeFilter filter;
   double speed = 1.0;
+  std::string tls_dir;
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
     auto value = [&]() -> const char* { return i + 1 < argc ? argv[++i] : nullptr; };
@@ -60,12 +64,28 @@ int main(int argc, char** argv) {
       cfg.rate_limits = false;
     } else if (a == "--advanced") {
       cfg.tier = advanced_tier();
+    } else if (a == "--tls" && (v = value())) {
+      tls_dir = v;
+    } else if (a == "--no-close-notify") {
+      cfg.tls_close_notify = false;
+    } else if (a == "--idle-close-ms" && (v = value())) {
+      cfg.idle_close_ms = std::atoi(v);
     } else {
       return usage();
     }
   }
   Tape tape;
   std::string err;
+  if (!tls_dir.empty()) {
+    TestPki pki;
+    if (!make_test_pki(tls_dir, &pki, &err)) {
+      std::fprintf(stderr, "fake-kalshi: %s\n", err.c_str());
+      return 1;
+    }
+    cfg.tls_cert_file = pki.server_chain;
+    cfg.tls_key_file = pki.server_key;
+    std::printf("fake-kalshi: TLS, trust %s for 127.0.0.1 only\n", pki.ca_cert.c_str());
+  }
   if (!tape_path.empty() && !load_archive_csv(tape_path, tape, &err, filter)) {
     std::fprintf(stderr, "fake-kalshi: %s\n", err.c_str());
     return 1;

@@ -26,7 +26,8 @@
 //   PUT    /portfolio/order_groups/{id}/trigger|reset|limit, DELETE /portfolio/order_groups/{id}
 //                                                      ?subaccount&exchange_index (default 0): 200 {}
 //   POST   /portfolio/intra_exchange_instance_transfer moves cash between shards (src/client.cpp's body)
-//   GET    /markets/{ticker}, /markets/{ticker}/orderbook, /exchange/status   (no auth)
+//   GET    /markets (paged by ticker), /markets/{ticker}, /markets/{ticker}/orderbook,
+//          /exchange/status                                                     (no auth)
 // Errors are {"error":{"code","message","details"?}} (what the venue sent the old desk:
 // src/executor.cpp kalshi_error_body; the docs' ErrorResponse is the inner object), except a 429,
 // whose body is {"error": "too many requests"} (getting_started/rate_limits.md).
@@ -67,8 +68,19 @@
 // bucket and every nonzero shard's Write bucket"). So an auto-routed shard-0 order spends shard 2's
 // budget too: deskd names the shard on every write.
 //
-// Threads: one per connection, one writer per socket, a timer. The engine sits behind one mutex.
-// Nothing here talks to anything but 127.0.0.1.
+// TLS (week-0 review issue 10(a), added 2026-10-07): with tls_cert_file and tls_key_file set the
+// listener speaks TLS 1.2+ (https:// and wss://), so a client's real TLS path runs against the
+// fake: the handshake and its verification (tests/fake_exchange/tls_pki.h makes a CA and a leaf at
+// run time), TLS 1.3's session tickets arriving after the handshake, resumption, close_notify, a
+// bare FIN without one (tls_close_notify false: a load balancer that just drops), and the idle
+// close of a kept-open connection. Each TLS connection runs a pump thread between the TLS socket
+// and a local socketpair whose other end is served exactly like a plain connection, so every
+// fault, the wire log and the idle close behave the same in both modes. One difference: the order
+// between two connections' bytes (EVENTS_FIRST, REPLY_FIRST) holds for what the fake hands its
+// pumps; the two pumps then forward in parallel, microseconds apart.
+//
+// Threads: one per connection (two with TLS), one writer per socket, a timer. The engine sits
+// behind one mutex. Nothing here talks to anything but 127.0.0.1.
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
@@ -156,8 +168,12 @@ struct FakeConfig {
   bool rate_limits = true;
   RateTier tier = basic_tier();
   // Kalshi's load balancer closed a kept-open connection idle 65 s and kept one idle 30 s
-  // (v3_research fills F10, 2026-10-06).
+  // (v3_research fills F10, 2026-10-06). An idle close is logged "http idle-close".
   int idle_close_ms = 60000;
+  // TLS: both set, the listener speaks TLS with this chain (leaf first) and key, PEM files.
+  std::string tls_cert_file, tls_key_file;
+  bool tls_close_notify = true;      // false: every close is a bare TCP FIN, no close_notify
+  int tls_handshake_ms = 5000;       // a client that does not finish its handshake is dropped
   int ws_ping_ms = 0;                // the server pings every so often; 0: never
   // WebSocket limits (errors 25-27 above); 0 turns one off. 5,000 unwritten messages on one
   // subscription is far past what a reader that keeps up leaves queued (a 2,600-market snapshot
@@ -181,8 +197,9 @@ class FakeKalshi {
   bool start(std::string* err);
   void stop();
   int port() const { return port_; }
-  std::string rest_base() const;  // http://127.0.0.1:<port>/trade-api/v2
-  std::string ws_url() const;     // ws://127.0.0.1:<port>/trade-api/ws/v2
+  std::string rest_base() const;  // http(s)://127.0.0.1:<port>/trade-api/v2
+  std::string ws_url() const;     // ws(s)://127.0.0.1:<port>/trade-api/ws/v2
+  bool tls() const { return tls_ctx_ != nullptr; }
 
   // ---- time
   std::int64_t now_ms() const;
@@ -233,6 +250,10 @@ class FakeKalshi {
   std::size_t ws_connections() const;
   std::uint64_t http_requests() const { return requests_.load(); }
   std::uint64_t connections_accepted() const { return accepted_.load(); }
+  std::uint64_t idle_closes() const { return idle_closes_.load(); }
+  std::uint64_t tls_handshakes() const { return tls_ok_.load(); }        // completed
+  std::uint64_t tls_handshake_failures() const { return tls_failed_.load(); }
+  std::uint64_t tls_resumed() const { return tls_resumed_.load(); }
   // Waits until every queued socket message is written (or `ms` passes).
   bool wait_ws_flushed(int ms = 2000);
 
@@ -286,6 +307,7 @@ class FakeKalshi {
   void accept_loop();
   void tick_loop();
   void serve(int fd);
+  void serve_tls(int tcp_fd, std::shared_ptr<std::atomic<bool>> done);   // the pump; serve() on a socketpair
   void serve_ws(int fd, const net::Request& req);
   void writer_loop(const std::shared_ptr<Session>& s);
   void log_wire(const std::string& line);
@@ -323,6 +345,8 @@ class FakeKalshi {
   void* pubkey_ = nullptr;  // EVP_PKEY*
 
   int listen_fd_ = -1, port_ = 0;
+  void* tls_ctx_ = nullptr;  // SSL_CTX*, when TLS
+  std::string tls_err_;
   std::atomic<bool> running_{false}, stopping_{false};
   std::thread acceptor_, ticker_;
   struct Conn {
@@ -353,7 +377,8 @@ class FakeKalshi {
 
   mutable std::mutex log_mu_;
   std::deque<std::string> wire_;
-  std::atomic<std::uint64_t> requests_{0}, accepted_{0};
+  std::atomic<std::uint64_t> requests_{0}, accepted_{0}, idle_closes_{0};
+  std::atomic<std::uint64_t> tls_ok_{0}, tls_failed_{0}, tls_resumed_{0};
 };
 
 }  // namespace fakex

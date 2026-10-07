@@ -198,10 +198,9 @@ RestReply cancel_one(Engine& e, const net::Request& r, const std::string& id, st
   if (!subaccount_of(r, &sub, &err)) return err;
   const CancelResult c = e.cancel(id, qstr(r, "market_ticker"), idx ? static_cast<int>(*idx) : -2, sub.value_or(0), now);
   if (c.err) return refused(c.err);
-  return ok(200, json{{"order_id", c.order_id},
-                      {"client_order_id", c.client_order_id},
-                      {"reduced_by", qty_str(c.reduced_by)},
-                      {"ts_ms", c.ts_ms}});
+  // no client_order_id: demo left it out of the reply to a cancel of an order that had one
+  // (2026-10-07, tests/deskd/fixtures/kalshi_demo_cancel.json; the docs call it optional)
+  return ok(200, json{{"order_id", c.order_id}, {"reduced_by", qty_str(c.reduced_by)}, {"ts_ms", c.ts_ms}});
 }
 
 RestReply cancel_batch(Engine& e, const json& b, std::int64_t now) {
@@ -590,6 +589,45 @@ json market_json(const Engine& e, const Market& m) {
   return j;
 }
 
+// GET /markets (get-markets.md): limit 1-1000 (default 100), cursor, tickers (comma-separated),
+// event_ticker, series_ticker, status (unopened | open | paused | closed | settled); ordered by
+// ticker here, a cursor naming the last ticker sent. The venue's order is its own; deskd pages
+// to the empty cursor and never relies on one.
+RestReply list_markets(const Engine& e, const net::Request& r) {
+  bool b = false;
+  const auto l = qint(r, "limit", &b);
+  if (b || (l && (*l < 1 || *l > 1000))) return bad("limit must be an integer from 1 to 1000");
+  const int limit = l ? static_cast<int>(*l) : 100;
+  std::string after;
+  const std::string cursor = qstr(r, "cursor");
+  if (!cursor.empty() && (cursor[0] != 'm' || !unhex(cursor.substr(1), &after))) return bad("invalid cursor");
+  const auto tickers = split(qstr(r, "tickers"), ',');
+  const std::string event = qstr(r, "event_ticker"), series = qstr(r, "series_ticker"), status = qstr(r, "status");
+  if (!status.empty() && status != "unopened" && status != "open" && status != "paused" && status != "closed" &&
+      status != "settled")
+    return bad("status must be unopened, open, paused, closed or settled");
+  json out = json::array();
+  std::string last;
+  bool more = false;
+  for (const auto& [ticker, m] : e.markets()) {   // std::map: by ticker
+    if (!after.empty() && ticker <= after) continue;
+    if (!tickers.empty() && std::find(tickers.begin(), tickers.end(), ticker) == tickers.end()) continue;
+    if (!event.empty() && m.spec.event_ticker != event) continue;
+    if (!series.empty() && ticker.compare(0, series.size() + 1, series + "-") != 0) continue;
+    if (status == "open" && m.state != Market::State::OPEN) continue;
+    if (status == "paused" && m.state != Market::State::PAUSED) continue;
+    if (status == "closed" && m.state != Market::State::CLOSED) continue;
+    if (status == "unopened" || status == "settled") continue;   // the fake has neither
+    if (static_cast<int>(out.size()) == limit) {
+      more = true;
+      break;
+    }
+    out.push_back(market_json(e, m));
+    last = ticker;
+  }
+  return ok(200, json{{"markets", out}, {"cursor", more ? "m" + hex(last) : ""}});
+}
+
 }  // namespace
 
 RestReply rest_error(int status, const std::string& code, const std::string& message, const std::string& details) {
@@ -614,9 +652,11 @@ bool read_cursor(const std::string& c, std::uint64_t* key) {
 }
 
 // The fields get-orders.md lists, and only those: the deprecated `side` and `action` are left out,
-// so deskd cannot come to rely on them.
+// so deskd cannot come to rely on them. As demo sent them on 2026-10-07 (tests/deskd/fixtures/
+// kalshi_demo_order*.json): a field with no value is left out, not null (expiration_time,
+// order_group_id), and cancel_order_on_pause is never echoed, even for an order sent with it.
 json rest_order_json(const Order& o, const std::string& user_id) {
-  return json{{"order_id", o.order_id},
+  json j{{"order_id", o.order_id},
               {"user_id", user_id},
               {"client_order_id", o.client_order_id},
               {"ticker", o.ticker},
@@ -633,14 +673,14 @@ json rest_order_json(const Order& o, const std::string& user_id) {
               {"maker_fees_dollars", usd4(o.maker_fees)},
               {"taker_fill_cost_dollars", usd4(o.taker_cost)},
               {"maker_fill_cost_dollars", usd4(o.maker_cost)},
-              {"expiration_time", o.expiration_s > 0 ? json(rfc3339(o.expiration_s * 1000)) : json(nullptr)},
               {"created_time", rfc3339(o.created_ms)},
               {"last_update_time", rfc3339(o.updated_ms)},
               {"self_trade_prevention_type", stp_name(o.stp)},
-              {"order_group_id", o.order_group_id.empty() ? json(nullptr) : json(o.order_group_id)},
-              {"cancel_order_on_pause", o.cancel_on_pause},
               {"subaccount_number", o.subaccount},
               {"exchange_index", o.exchange_index}};
+  if (o.expiration_s > 0) j["expiration_time"] = rfc3339(o.expiration_s * 1000);
+  if (!o.order_group_id.empty()) j["order_group_id"] = o.order_group_id;
+  return j;
 }
 
 RestReply rest_route(Engine& e, const net::Request& r, const std::string& path, const json& body, std::int64_t now,
@@ -697,6 +737,7 @@ RestReply rest_route(Engine& e, const net::Request& r, const std::string& path, 
     }
     return rest_error(404, "not_found", "no such route");
   }
+  if (seg[0] == "markets" && r.method == "GET" && seg.size() == 1) return list_markets(e, r);
   if (seg[0] == "markets" && r.method == "GET" && seg.size() >= 2) {
     const Market* m = e.market(seg[1]);
     if (!m) return rest_error(404, "not_found", "market not found");

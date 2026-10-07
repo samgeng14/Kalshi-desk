@@ -376,9 +376,10 @@ add_library(fake_kalshi STATIC
   tests/fake_exchange/rest.cpp
   tests/fake_exchange/tape.cpp
   tests/fake_exchange/fake_kalshi.cpp
-  tests/fake_exchange/client.cpp)
+  tests/fake_exchange/client.cpp
+  tests/fake_exchange/tls_pki.cpp)
 target_include_directories(fake_kalshi PUBLIC tests/fake_exchange)
-target_link_libraries(fake_kalshi PUBLIC deskd_flags OpenSSL::Crypto ZLIB::ZLIB)
+target_link_libraries(fake_kalshi PUBLIC deskd_flags OpenSSL::SSL OpenSSL::Crypto ZLIB::ZLIB)
 target_precompile_headers(fake_kalshi REUSE_FROM deskd_core)
 
 add_executable(fake-kalshi tests/fake_exchange/main.cpp)

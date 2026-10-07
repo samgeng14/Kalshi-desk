@@ -5,7 +5,10 @@
 #include <openssl/bio.h>
 #include <openssl/evp.h>
 #include <openssl/pem.h>
+#include <openssl/err.h>
 #include <openssl/rsa.h>
+#include <openssl/ssl.h>
+#include <fcntl.h>
 #include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -96,15 +99,36 @@ FakeKalshi::FakeKalshi(FakeConfig cfg)
     pubkey_ = PEM_read_bio_PUBKEY(bio, nullptr, nullptr, nullptr);
     BIO_free(bio);
   }
+  if (!cfg_.tls_cert_file.empty() || !cfg_.tls_key_file.empty()) {
+    SSL_CTX* ctx = SSL_CTX_new(TLS_server_method());
+    if (ctx && SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION) == 1 &&
+        SSL_CTX_use_certificate_chain_file(ctx, cfg_.tls_cert_file.c_str()) == 1 &&
+        SSL_CTX_use_PrivateKey_file(ctx, cfg_.tls_key_file.c_str(), SSL_FILETYPE_PEM) == 1 &&
+        SSL_CTX_check_private_key(ctx) == 1) {
+      SSL_CTX_set_mode(ctx, SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
+      tls_ctx_ = ctx;
+    } else {
+      char buf[256];
+      ERR_error_string_n(ERR_get_error(), buf, sizeof buf);
+      tls_err_ = "TLS listener: cannot load " + cfg_.tls_cert_file + " / " + cfg_.tls_key_file + ": " + buf;
+      ERR_clear_error();
+      if (ctx) SSL_CTX_free(ctx);
+    }
+  }
 }
 
 FakeKalshi::~FakeKalshi() {
   stop();
   if (pubkey_) EVP_PKEY_free(static_cast<EVP_PKEY*>(pubkey_));
+  if (tls_ctx_) SSL_CTX_free(static_cast<SSL_CTX*>(tls_ctx_));
 }
 
-std::string FakeKalshi::rest_base() const { return "http://127.0.0.1:" + std::to_string(port_) + kRestPrefix; }
-std::string FakeKalshi::ws_url() const { return "ws://127.0.0.1:" + std::to_string(port_) + kWsPath; }
+std::string FakeKalshi::rest_base() const {
+  return std::string(tls_ctx_ ? "https" : "http") + "://127.0.0.1:" + std::to_string(port_) + kRestPrefix;
+}
+std::string FakeKalshi::ws_url() const {
+  return std::string(tls_ctx_ ? "wss" : "ws") + "://127.0.0.1:" + std::to_string(port_) + kWsPath;
+}
 
 std::int64_t FakeKalshi::now_locked() const {
   clock_ms_ = std::max(clock_ms_, cfg_.manual_clock ? manual_now_ : wall_ms());
@@ -119,6 +143,10 @@ bool FakeKalshi::start(std::string* err) {
   if (running_) return true;
   if (cfg_.auth == AuthMode::VERIFY && !pubkey_) {
     if (err) *err = "AuthMode::VERIFY needs a readable public_key_pem";
+    return false;
+  }
+  if (!tls_err_.empty()) {
+    if (err) *err = tls_err_;
     return false;
   }
   listen_fd_ = net::listen_loopback(cfg_.port, &port_, err);
@@ -175,6 +203,19 @@ void FakeKalshi::accept_loop() {
       } else {
         ++it;
       }
+    }
+    if (tls_ctx_) {
+      // the TLS socket belongs to its pump; the pump's socketpair end is what serve() reads. Until
+      // the server side of the handshake ends the TCP socket is listed (kind 3), so a drop or a
+      // stop landing between the client's Finished and the server's still reaches it.
+      conn_fds_[fd] = 3;
+      conns_.push_back(Conn{std::thread([this, fd, done] {
+                              serve_tls(fd, done);
+                              ::close(fd);
+                              done->store(true);
+                            }),
+                            done});
+      continue;
     }
     conn_fds_[fd] = 1;
     conns_.push_back(Conn{std::thread([this, fd, done] {
@@ -336,8 +377,10 @@ void FakeKalshi::drop_http_connections() {
   // Under conn_mu_: a connection's thread takes its fd out of conn_fds_ before closing it, so a
   // number listed here is still that connection's.
   std::lock_guard<std::mutex> lk(conn_mu_);
-  for (const auto& [fd, kind] : conn_fds_)
+  for (auto& [fd, kind] : conn_fds_) {
     if (kind == 1) ::shutdown(fd, SHUT_RDWR);
+    if (kind == 3) kind = 4;   // a TLS handshake still ending: dropped as soon as it is served
+  }
 }
 void FakeKalshi::drop_ws_messages(const std::string& channel, int n) {
   std::lock_guard<std::mutex> lk(mu_);
@@ -837,14 +880,19 @@ std::string FakeKalshi::auth_refusal(const net::Request& req, std::int64_t now) 
     const std::string raw = base64_decode(sig);
     EVP_MD_CTX* ctx = EVP_MD_CTX_new();
     EVP_PKEY_CTX* pctx = nullptr;
-    const bool ok =
-        !raw.empty() &&
-        EVP_DigestVerifyInit(ctx, &pctx, EVP_sha256(), nullptr, static_cast<EVP_PKEY*>(pubkey_)) == 1 &&
-        EVP_PKEY_CTX_set_rsa_padding(pctx, RSA_PKCS1_PSS_PADDING) == 1 &&
-        EVP_PKEY_CTX_set_rsa_pss_saltlen(pctx, RSA_PSS_SALTLEN_DIGEST) == 1 &&
-        EVP_DigestVerify(ctx, reinterpret_cast<const unsigned char*>(raw.data()), raw.size(),
-                         reinterpret_cast<const unsigned char*>(text.data()), text.size()) == 1;
+    EVP_PKEY* pk = static_cast<EVP_PKEY*>(pubkey_);
+    // an Ed25519 key signs the message itself (api_keys.md, keys allowed since the 2026-10-01
+    // changelog); an RSA key signs it with PSS over SHA-256, salt the digest's length
+    const bool ed = EVP_PKEY_get_base_id(pk) == EVP_PKEY_ED25519;
+    const bool init = ed ? EVP_DigestVerifyInit(ctx, &pctx, nullptr, nullptr, pk) == 1
+                         : EVP_DigestVerifyInit(ctx, &pctx, EVP_sha256(), nullptr, pk) == 1 &&
+                               EVP_PKEY_CTX_set_rsa_padding(pctx, RSA_PKCS1_PSS_PADDING) == 1 &&
+                               EVP_PKEY_CTX_set_rsa_pss_saltlen(pctx, RSA_PSS_SALTLEN_DIGEST) == 1;
+    const bool ok = !raw.empty() && init &&
+                    EVP_DigestVerify(ctx, reinterpret_cast<const unsigned char*>(raw.data()), raw.size(),
+                                     reinterpret_cast<const unsigned char*>(text.data()), text.size()) == 1;
     EVP_MD_CTX_free(ctx);
+    ERR_clear_error();
     if (!ok) return "signature does not verify";
   }
   return "";
@@ -917,6 +965,13 @@ void FakeKalshi::serve(int fd) {
     net::Request req;
     std::string why;
     const net::ReadResult rr = net::read_request(fd, buf, req, cfg_.idle_close_ms, &why);
+    if (rr == net::ReadResult::TIMEOUT && !stopping_) {
+      // the load balancer's idle close of a kept-open connection (with TLS: close_notify, unless
+      // tls_close_notify is off)
+      ++idle_closes_;
+      log_wire("http idle-close");
+      return;
+    }
     if (rr == net::ReadResult::CLOSED || rr == net::ReadResult::TIMEOUT || stopping_) return;
     if (rr == net::ReadResult::BAD) {
       const RestReply e = rest_error(400, "bad_request", why.empty() ? "malformed request" : why);
@@ -1047,6 +1102,141 @@ void FakeKalshi::serve(int fd) {
     }
     if (close_after) return;
   }
+}
+
+// One TLS connection: the handshake, then a pump between the TLS socket and one end of a
+// socketpair while serve() reads the other end as it would a plain connection. Both sockets are
+// non-blocking and the pump is the only thread that touches the SSL object.
+void FakeKalshi::serve_tls(int tcp, std::shared_ptr<std::atomic<bool>> done) {
+  (void)done;
+  ::fcntl(tcp, F_SETFL, ::fcntl(tcp, F_GETFL, 0) | O_NONBLOCK);
+  SSL* ssl = SSL_new(static_cast<SSL_CTX*>(tls_ctx_));
+  if (!ssl) return;
+  SSL_set_fd(ssl, tcp);
+  const std::int64_t hs_deadline = steady_ms() + cfg_.tls_handshake_ms;
+  for (;;) {
+    ERR_clear_error();
+    const int r = SSL_accept(ssl);
+    if (r == 1) break;
+    const int e = SSL_get_error(ssl, r);
+    const short ev = e == SSL_ERROR_WANT_READ ? POLLIN : e == SSL_ERROR_WANT_WRITE ? POLLOUT : 0;
+    const std::int64_t left = hs_deadline - steady_ms();
+    pollfd p{tcp, ev, 0};
+    if (ev == 0 || left <= 0 || stopping_ || ::poll(&p, 1, static_cast<int>(std::min<std::int64_t>(left, 50))) < 0) {
+      ++tls_failed_;
+      log_wire("tls handshake-failed");
+      ERR_clear_error();
+      SSL_free(ssl);
+      std::lock_guard<std::mutex> lk(conn_mu_);
+      conn_fds_.erase(tcp);   // before the caller's close, so stop() never shuts a reused number
+      return;
+    }
+  }
+  ++tls_ok_;
+  if (SSL_session_reused(ssl)) ++tls_resumed_;
+  int sp[2];
+  if (::socketpair(AF_UNIX, SOCK_STREAM, 0, sp) != 0) {
+    SSL_free(ssl);
+    std::lock_guard<std::mutex> lk(conn_mu_);
+    conn_fds_.erase(tcp);
+    return;
+  }
+  const int inner = sp[0], srv_fd = sp[1];
+  net::no_sigpipe(inner);
+  net::no_sigpipe(srv_fd);
+  ::fcntl(inner, F_SETFL, ::fcntl(inner, F_GETFL, 0) | O_NONBLOCK);
+  bool dropped = false;   // a drop that reached the TCP socket during the handshake
+  {
+    std::lock_guard<std::mutex> lk(conn_mu_);
+    dropped = conn_fds_.count(tcp) && conn_fds_[tcp] == 4;
+    conn_fds_.erase(tcp);
+    conn_fds_[srv_fd] = 1;
+  }
+  if (dropped) ::shutdown(srv_fd, SHUT_RDWR);
+  std::thread srv([this, srv_fd] {
+    serve(srv_fd);
+    {
+      std::lock_guard<std::mutex> g(conn_mu_);
+      conn_fds_.erase(srv_fd);
+    }
+    ::close(srv_fd);
+  });
+
+  std::string to_inner, to_tls;
+  bool client_done = false;   // close_notify or EOF from the client: nothing more will come
+  bool tls_dead = false;      // a reset or a TLS error: nothing more can go out either
+  bool inner_eof = false;     // serve() closed its end: the reply is all in to_tls
+  bool inner_wr_shut = false;
+  char buf[16384];
+  while (!stopping_) {
+    while (!client_done) {
+      ERR_clear_error();
+      const int r = SSL_read(ssl, buf, sizeof buf);
+      if (r > 0) {
+        to_inner.append(buf, static_cast<std::size_t>(r));
+        continue;
+      }
+      const int e = SSL_get_error(ssl, r);
+      if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE) break;
+      client_done = true;
+      if (e != SSL_ERROR_ZERO_RETURN) tls_dead = true;
+      ERR_clear_error();
+    }
+    while (!to_inner.empty()) {
+      const ssize_t n = ::send(inner, to_inner.data(), to_inner.size(), 0);
+      if (n > 0) {
+        to_inner.erase(0, static_cast<std::size_t>(n));
+        continue;
+      }
+      if (n < 0 && (errno == EAGAIN || errno == EINTR)) break;
+      to_inner.clear();   // serve() is gone
+      break;
+    }
+    if (client_done && to_inner.empty() && !inner_wr_shut) {
+      ::shutdown(inner, SHUT_WR);   // serve() sees the client's close
+      inner_wr_shut = true;
+    }
+    while (!inner_eof && to_tls.size() < (1u << 20)) {
+      const ssize_t n = ::recv(inner, buf, sizeof buf, 0);
+      if (n > 0) {
+        to_tls.append(buf, static_cast<std::size_t>(n));
+        continue;
+      }
+      if (n < 0 && (errno == EAGAIN || errno == EINTR)) break;
+      inner_eof = true;
+    }
+    while (!to_tls.empty() && !tls_dead) {
+      ERR_clear_error();
+      const int r = SSL_write(ssl, to_tls.data(), static_cast<int>(to_tls.size()));
+      if (r > 0) {
+        to_tls.erase(0, static_cast<std::size_t>(r));
+        continue;
+      }
+      const int e = SSL_get_error(ssl, r);
+      if (e == SSL_ERROR_WANT_WRITE || e == SSL_ERROR_WANT_READ) break;
+      tls_dead = true;
+      ERR_clear_error();
+    }
+    if (tls_dead) to_tls.clear();
+    if (inner_eof && to_tls.empty()) break;   // the reply is out: close the TLS side
+    if (tls_dead && client_done) break;
+    pollfd p[2] = {{tcp, 0, 0}, {inner, 0, 0}};
+    if (!client_done) p[0].events |= POLLIN;
+    if (!to_tls.empty()) p[0].events |= POLLOUT;
+    if (!inner_eof && to_tls.size() < (1u << 20)) p[1].events |= POLLIN;
+    if (!to_inner.empty()) p[1].events |= POLLOUT;
+    ::poll(p, 2, 50);
+  }
+  if (!tls_dead && cfg_.tls_close_notify) {
+    ERR_clear_error();
+    SSL_shutdown(ssl);   // close_notify; the peer's is not waited for
+  }
+  ERR_clear_error();
+  ::shutdown(tcp, SHUT_RDWR);
+  ::shutdown(inner, SHUT_RDWR);   // serve() ends if it has not
+  srv.join();
+  ::close(inner);
+  SSL_free(ssl);
 }
 
 void FakeKalshi::serve_ws(int fd, const net::Request& req) {

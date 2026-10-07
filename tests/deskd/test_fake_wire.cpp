@@ -245,11 +245,13 @@ void test_rest() {
 
   // one order
   r = call(c, "GET", "/portfolio/orders/" + m1);
-  CHECK(r.status() == 200 && keys(r.j["order"]) == kOrderFields);
+  // the documented fields, less those with no value and cancel_order_on_pause, as demo sent them
+  CHECK(r.status() == 200 && subset(keys(r.j["order"]), kOrderFields) && keys(r.j["order"]).size() == kOrderFields.size() - 3);
   const json o = r.j["order"];
   CHECK(o["status"] == "resting" && o["yes_price_dollars"] == "0.3900" && o["no_price_dollars"] == "0.6100");
-  CHECK(o["remaining_count_fp"] == "2.00" && o["client_order_id"] == "M-1" && o["expiration_time"].is_null());
-  CHECK(o["order_group_id"].is_null() && o["type"] == "limit" && o["book_side"] == "bid" && o["outcome_side"] == "yes");
+  CHECK(o["remaining_count_fp"] == "2.00" && o["client_order_id"] == "M-1" && !o.contains("expiration_time"));
+  CHECK(!o.contains("order_group_id") && !o.contains("cancel_order_on_pause") && o["type"] == "limit" &&
+        o["book_side"] == "bid" && o["outcome_side"] == "yes");
   CHECK(call(c, "GET", "/portfolio/orders/nope").status() == 404);
 
   // GET /portfolio/orders: newest first, limit and cursor until the cursor is ""
@@ -320,8 +322,8 @@ void test_rest() {
 
   // cancel one: routed by market_ticker; without it, to shard 0
   r = call(c, "DELETE", ORDERS + "/" + m1 + "?market_ticker=" + T);
-  CHECK(r.status() == 200 && keys(r.j) == std::set<std::string>({"order_id", "client_order_id", "reduced_by", "ts_ms"}));
-  CHECK(r.j["reduced_by"] == "2.00" && r.j["client_order_id"] == "M-1" && r.j["order_id"] == m1);
+  CHECK(r.status() == 200 && keys(r.j) == std::set<std::string>({"order_id", "reduced_by", "ts_ms"}));   // demo, 2026-10-07
+  CHECK(r.j["reduced_by"] == "2.00" && r.j["order_id"] == m1);
   CHECK(call(c, "DELETE", ORDERS + "/" + m1 + "?market_ticker=" + T).status() == 404);
   r = call(c, "POST", ORDERS, post_only(G, "1", "0.30", "G-1"));
   const std::string g1 = r.j.value("order_id", "");
