@@ -295,6 +295,9 @@ add_library(deskd_core STATIC
   src/deskd/md/feed.cpp
   src/deskd/md/subscribe.cpp
   src/deskd/net/guard.cpp
+  src/deskd/net/http.cpp
+  src/deskd/net/conn.cpp
+  src/deskd/net/pool.cpp
   src/deskd/net/send.cpp
   src/deskd/gw/gateway.cpp
   src/deskd/gw/kill.cpp
@@ -305,7 +308,8 @@ add_library(deskd_core STATIC
   src/deskd/web/contract.cpp
   src/deskd/web/pub.cpp
   src/deskd/web/server.cpp)
-target_link_libraries(deskd_core PUBLIC deskd_flags)
+# net/ speaks TLS through OpenSSL 3 (Homebrew's openssl@3 on macOS)
+target_link_libraries(deskd_core PUBLIC deskd_flags OpenSSL::SSL OpenSSL::Crypto)
 target_precompile_headers(deskd_core PRIVATE
   <nlohmann/json.hpp> <httplib.h>
   <atomic> <chrono> <condition_variable> <deque> <functional> <future> <map> <memory> <mutex>
@@ -409,5 +413,27 @@ foreach(t engine wire)
 endforeach()
 add_dependencies(deskd-test-fake-wire fake-kalshi)  # it starts the binary once
 
+# ---- week 1: net/ (plan sections 2-3) ---------------------------------------------------------------
+#   http   the strict HTTP/1.1 response parser, no sockets: every split of every reply, chunked with
+#          extensions and trailers, Content-Length rules, 1xx, no-body statuses, the close-framed
+#          body, every refusal (bare LF, folding, TE + CL, oversize ...), and cuts at every byte
+#   net    deskd's connections against loopback servers and the fake's TLS listener (a CA made at
+#          run time): verification refusals, the guard on every connect, one request per
+#          connection, cut and dropped replies as UNKNOWN, close_notify and a bare FIN, idle closes,
+#          the spare pool's counters, SO_NOSIGPIPE, latency on loopback
+foreach(t http)
+  add_executable(deskd-test-${t} tests/deskd/test_${t}.cpp)
+  target_link_libraries(deskd-test-${t} PRIVATE deskd_core)
+  target_precompile_headers(deskd-test-${t} REUSE_FROM deskd_core)
+  add_test(NAME deskd-${t} COMMAND deskd-test-${t})
+endforeach()
+foreach(t net)
+  add_executable(deskd-test-${t} tests/deskd/test_${t}.cpp)
+  target_link_libraries(deskd-test-${t} PRIVATE deskd_core fake_kalshi)
+  target_precompile_headers(deskd-test-${t} REUSE_FROM deskd_core)
+  add_test(NAME deskd-${t} COMMAND deskd-test-${t})
+endforeach()
+
 add_custom_target(deskd-all DEPENDS deskd deskctl deskd-test-bus deskd-test-ops deskd-test-web deskd-test-process
-                                    fake-kalshi deskd-test-fake-engine deskd-test-fake-wire)
+                                    fake-kalshi deskd-test-fake-engine deskd-test-fake-wire
+                                    deskd-test-http deskd-test-net)
