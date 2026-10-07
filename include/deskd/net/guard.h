@@ -12,8 +12,11 @@
 // 2026-10-06): the net/ connection factory is the only way to open a venue socket (REST,
 // WebSocket, every reconnect); it takes this guard, asks it on every connect with redirects off,
 // refuses plain HTTP to anything but loopback, and a test shows a non-live deskd configured with
-// env prod and a production URL opens no connection. The old desk's HTTP and WebSocket clients
-// stay out of deskd's link (deskd_core links none of the desk library).
+// env prod and a production URL opens no connection. It also sets SO_NOSIGPIPE on every socket
+// before OpenSSL gets it: the old desk died of SIGPIPE on a TLS reconnect, and Deskd::start's
+// SIG_IGN covers deskd but not every embedder's handler. Its reads time out at 250 ms or less,
+// so a quiet feed still comes back to beat() (app/ops.h). The old desk's HTTP and WebSocket
+// clients stay out of deskd's link (deskd_core links none of the desk library).
 #include <string>
 
 namespace deskd {
