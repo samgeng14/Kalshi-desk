@@ -318,6 +318,7 @@ bool State::listing(Snapshot& next, std::string* why, Worker* worker) {
 
 bool State::refresh_once() { return refresh(nullptr); }
 bool State::refresh(Worker* worker) {
+  const auto fence = begin_ ? begin_() : 0;
   Snapshot next = *snapshot();
   next.error.clear();
   std::string why;
@@ -330,6 +331,12 @@ bool State::refresh(Worker* worker) {
     }
   }
   next.ts_ms = now_ms();
+  if (next.account_ready && commit_ && !commit_(fence)) {
+    next.account_ready = false;
+    if (!next.error.empty()) next.error += "; ";
+    next.error += "private feed changed during account read; reconciling again";
+    if (fence) request_refresh(); // a disconnected socket requests a refresh after subscribing
+  }
   next.clock = clock_.estimate(next.ts_ms);
   next.ready = next.account_ready && next.listing_ready;
   const bool ready = next.ready;
@@ -339,9 +346,13 @@ bool State::refresh(Worker* worker) {
 
 void State::run(Worker& worker) {
   auto next = mono_ms();
+  std::int64_t last_attempt = 0;
   while (!worker.stopping()) {
     worker.beat();
-    if (refresh_requested_.exchange(false) || mono_ms() >= next) {
+    const auto now = mono_ms();
+    if ((refresh_requested_.load() && now - last_attempt >= 1000) || now >= next) {
+      refresh_requested_.store(false);
+      last_attempt = now;
       refresh(&worker);
       next = mono_ms() + options_.poll_ms;
     }

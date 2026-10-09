@@ -5,6 +5,7 @@
 #include "deskd/gw/kalshi_sign.h"
 #include "deskd/md/kalshi_md.h"
 #include "deskd/rest/state.h"
+#include "deskd/priv/kalshi_private.h"
 
 namespace deskd {
 using json = nlohmann::json;
@@ -27,6 +28,15 @@ bool Deskd::init_venue(std::string* err) {
                                   [this](const MdBook& b) { on_book(b); });
   rest_ = std::make_unique<rest::State>(*factory_, *re, signer_.get(),
       [this](std::shared_ptr<const rest::Snapshot> s) { on_rest(std::move(s)); });
+  private_ = std::make_unique<KalshiPrivate>(*we,*factory_,*signer_,feeds_.KXP,
+      [this](const PrivateEvent&) {
+        // Until the Manual ledger owns incremental fills, reconcile instead of pretending
+        // a queued update has already been applied to positions and reservations.
+        rest_->request_refresh();
+        return false;
+      },[this] { rest_->request_refresh(); });
+  rest_->set_reconcile_guard([this] { return private_->fence(); },
+                            [this](std::uint64_t fence) { return private_->reconcile(fence); });
   return true;
 }
 
@@ -53,10 +63,10 @@ HdrInputs Deskd::header() const {
     shards.push_back({{"id","S" + std::to_string(b.first)},
                       {"cash",money_str(b.second)},
                       {"free",money_str(unknown_shard ? 0 : std::max<Money>(0,b.second-reserved[b.first]))}});
-  const bool fresh = s->account_ready && now_ms() - s->account_ms < 30000;
   h.cash_k = {{"total",money_str(s->balance.available)},
               {"free",money_str(std::max<Money>(0,s->balance.available-total_reserved))},
-              {"ro",!fresh},{"shards",shards}};
+              // Venue data is connected, but the Manual write/ledger path is not enabled yet.
+              {"ro",true},{"shards",shards}};
   h.clk_off_ms = s->clock.offset_ms;
   return h;
 }
@@ -163,7 +173,8 @@ json Deskd::watch(const json& request) {
   if (it == s->markets.end()) return err_body("UNKNOWN_MARKET",tk);
   const bool pin = request.at("pin").get<bool>();
   const auto row = rest::market_json(it->second,pin,true,now_ms());
-  if (pin && row.at("status") != "OPEN") return err_body("MARKET_CLOSED",tk);
+  if (pin && (row.at("status") != "OPEN" || !it->second.close_ms || *it->second.close_ms <= now_ms()))
+    return err_body("MARKET_CLOSED",tk);
   std::set<std::string> pins;
   {
     std::lock_guard<std::mutex> lk(live_mu_);

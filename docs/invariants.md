@@ -35,3 +35,21 @@ Validation: `nice -n 15 ninja -C build-deskd -j 4 deskd-all` completed without w
 `ctest --test-dir build-deskd -R 'deskd-|ui-desk' --output-on-failure --timeout 240`
 passed all 16 suites in 253 seconds. The process/socket suites were run outside the sandbox
 after the sandboxed ops run stalled; the bounded rerun passed.
+
+## Stage 3 private-feed prerequisite — 2026-10-08
+
+- Private account channels subscribe without market filters and use the guarded signed socket.
+  Subscription acknowledgements and matching ping/pong are required; reconnects invalidate
+  account readiness. These private channels have no sequence field, unlike public books.
+- A generation captured before the first account REST request must still match after every
+  account page succeeds. Every private order/fill and every reconnect changes that generation.
+  Failed fencing requests another read (throttled to at most one attempt per second).
+- Private fills retain exact centi-contract quantities and micro-dollar fees. trade_id is the
+  stable execution identity; malformed units, missing identity and invalid sides are refused.
+- Until gateway event accounting is connected, each private event requires REST reconciliation.
+  The header stays read-only even when both feeds are healthy.
+
+The seven focused private/REST/MD/publisher/web/process/ops suites pass. A demo run using
+`deskd_read_probe.py --require-private` passed five contract checks with eight live books,
+KX and KXP up without gaps, and no exchange orders sent. The observed clock offset was -44 ms;
+this is read-path evidence, not a click-to-ack measurement. Manual submission remains pending.

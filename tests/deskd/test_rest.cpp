@@ -105,6 +105,11 @@ void reconcile() {
   CHECK(!state.refresh_once());
   CHECK(!state.snapshot()->account_ready && state.snapshot()->balances==s->balances);
   CHECK(state.refresh_once());
+  state.set_reconcile_guard([] { return std::uint64_t{7}; }, [](std::uint64_t) { return false; });
+  CHECK(!state.refresh_once() && !state.snapshot()->account_ready);
+  CHECK(state.snapshot()->error.find("private feed changed") != std::string::npos);
+  state.set_reconcile_guard([] { return std::uint64_t{8}; }, [](std::uint64_t fence) { return fence == 8; });
+  CHECK(state.refresh_once());
   opts.max_pages=1;
   rest::State capped(factory,*endpoint,signer.get(),{},opts);
   CHECK(!capped.refresh_once());

@@ -43,6 +43,7 @@
 namespace deskd {
 class KalshiSigner;
 class KalshiMd;
+class KalshiPrivate;
 struct MdBook;
 namespace rest { class State; struct Snapshot; }
 
@@ -93,6 +94,7 @@ class Deskd {
   std::unique_ptr<KalshiSigner> signer_;
   std::unique_ptr<rest::State> rest_;
   std::unique_ptr<KalshiMd> md_;
+  std::unique_ptr<KalshiPrivate> private_;
   std::string key_error_;
   mutable std::mutex live_mu_;
   std::set<std::string> pins_, live_;

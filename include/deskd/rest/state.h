@@ -75,6 +75,12 @@ class State {
   void set_pins(std::set<std::string> pins);  // immediate immutable publication; no network
   void set_live(std::set<std::string> live);  // ladders/lanes; positions/orders are also included
   void request_refresh();
+  // Set before run(). A private-event generation fences the whole paged read: an event or
+  // reconnect during it means those pages cannot be accepted as one reconciled account.
+  void set_reconcile_guard(std::function<std::uint64_t()> begin,
+                           std::function<bool(std::uint64_t)> commit) {
+    begin_ = std::move(begin); commit_ = std::move(commit);
+  }
 
  private:
   bool refresh(Worker* worker);
@@ -88,6 +94,8 @@ class State {
   const KalshiSigner* signer_;
   Callback callback_;
   Options options_;
+  std::function<std::uint64_t()> begin_;
+  std::function<bool(std::uint64_t)> commit_;
   std::shared_ptr<const Snapshot> published_;
   std::mutex controls_mu_;  // controls/publication only, never held over I/O or callbacks
   std::set<std::string> pins_, live_;

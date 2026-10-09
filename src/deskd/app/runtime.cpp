@@ -12,6 +12,7 @@
 #include "deskd/gw/kalshi_sign.h"
 #include "deskd/rest/state.h"
 #include "deskd/md/kalshi_md.h"
+#include "deskd/priv/kalshi_private.h"
 
 namespace deskd {
 
@@ -112,7 +113,9 @@ bool Deskd::start(std::string* err) {
       w.beat(); std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
   });
-  by("priv-k")->start([this](Worker& w) { run_feed_placeholder(w, feeds_.KXP); });
+  by("priv-k")->start([this](Worker& w) {
+    if (private_) private_->run(w); else run_feed_placeholder(w, feeds_.KXP);
+  });
   by("gw")->start([this](Worker& w) { gw_->run(w); });
   const AlertFn alert = [this](const std::string& lvl, const std::string& src, const std::string& msg) {
     pub_->alert(lvl, src, msg);

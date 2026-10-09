@@ -21,6 +21,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base", required=True)
     parser.add_argument("--out", required=True, type=Path)
+    parser.add_argument("--require-private", action="store_true",
+                        help="also require a subscribed, reconciled private account feed")
     args = parser.parse_args()
     url = urllib.parse.urlsplit(args.base)
     if url.scheme != "http" or url.hostname not in {"127.0.0.1", "localhost"} or not url.port or url.username or url.password:
@@ -48,10 +50,12 @@ def main():
         end = time.monotonic() + 40
         while True:
             snapshot = get("/api/snapshot?sid=" + sid)
-            if snapshot["markets"] and snapshot["feeds"]["KX"]["up"] and not snapshot["feeds"]["KX"]["gap"]:
+            feeds = ("KX", "KXP") if args.require_private else ("KX",)
+            if snapshot["markets"] and all(snapshot["feeds"][name]["up"] and
+                                           not snapshot["feeds"][name]["gap"] for name in feeds):
                 break
             if time.monotonic() >= end:
-                raise RuntimeError("demo market-data startup did not become ready")
+                raise RuntimeError("demo feeds did not become ready: " + ", ".join(feeds))
             time.sleep(0.2)
         ticker = snapshot["markets"][0]["tk"]
         body = {"sid": sid, "ladders": [{"v": "K", "tk": ticker}], "tops": "ALL"}

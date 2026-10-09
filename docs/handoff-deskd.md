@@ -32,7 +32,13 @@ Nothing is pushed. `ui/desk/js/contract.js` is the API contract deskd must serve
   T/T+1 universe and watch pins; per-tab FULL/TOP book publication and account projections;
   bounded clock-offset estimates in hdr.lat and /ops/status. Demo read probe validated actual
   responses against contract 1.5.0: eight live books, $500 on shard S0, no orders sent.
-  Private feed remains DOWN and Manual submission remains disabled until stage 3 integration.
+  Manual submission remains disabled until stage 3 integration.
+- Stage 3 prerequisite (2026-10-08): authenticated private user_orders/fill WebSocket,
+  reconnect and heartbeat handling, strict private-event adapters, and an account-read fence.
+  An intervening private event or reconnect invalidates the paginated REST read; KXP stays
+  stale until a complete consistent read succeeds. Demo proof: KX and KXP up without gaps,
+  eight books, contract 1.5.0 captures pass, zero orders sent. Manual still read-only; incremental
+  gateway order/fill accounting and the write path remain to implement.
 - Oracle VM `deskd-recorder` for the recorder: `ssh -i ~/.ssh/oracle_deskd ubuntu@64.181.211.165` (Ubuntu 24.04 aarch64, 1 OCPU, 6 GB, 145 GB). Nothing installed yet.
 
 ## Next, in order
@@ -68,6 +74,8 @@ Read-only demo verification after launch (use the port deskd prints):
 
 ```sh
 python3 tools/deskd_read_probe.py --base http://127.0.0.1:PORT --out build-deskd/demo-read-capture.json
+# Stage 3 private-feed readiness as well:
+python3 tools/deskd_read_probe.py --base http://127.0.0.1:PORT --require-private --out build-deskd/demo-private-read-capture.json
 ```
 
 This changes only the probe's local book subscription and validates captured responses with
