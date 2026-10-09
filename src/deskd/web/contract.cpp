@@ -124,7 +124,7 @@ json hb_json(const std::string& epoch, const std::string& sid, std::int64_t srv_
 json hdr_json(const HdrInputs& in) {
   const std::string zero = money_str(0);
   const json venue_sys = {{"used", zero}, {"ceiling", zero}, {"eff", zero}};
-  return json{
+  json result{
       {"mode", in.live ? "LIVE" : "DEMO"},
       {"cash",
        {{"K", {{"total", zero}, {"free", zero}, {"ro", true}, {"shards", json::array()}}},
@@ -138,6 +138,11 @@ json hdr_json(const HdrInputs& in) {
       {"run", run_json(in.run)},
       {"preflight", preflight_json(in.preflight)},
       {"lat", {{"kx_lag_ms", nullptr}, {"pm_lag_ms", nullptr}, {"gw_ack_ms", nullptr}, {"clk_off_ms", nullptr}}}};
+  if (in.cash_k.is_object()) result["cash"]["K"] = in.cash_k;
+  if (in.kx_lag_ms) result["lat"]["kx_lag_ms"] = *in.kx_lag_ms;
+  if (in.clk_off_ms) result["lat"]["clk_off_ms"] = *in.clk_off_ms;
+  if (in.gw_ack_ms) result["lat"]["gw_ack_ms"] = *in.gw_ack_ms;
+  return result;
 }
 
 json alert_json(const std::string& id, const std::string& lvl, const std::string& src, const std::string& msg,

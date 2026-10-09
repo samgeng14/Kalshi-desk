@@ -292,10 +292,15 @@ add_library(deskd_core STATIC
   src/deskd/app/config.cpp
   src/deskd/app/ops.cpp
   src/deskd/app/runtime.cpp
+  src/deskd/app/venue.cpp
+  src/deskd/app/projection.cpp
   src/deskd/md/feed.cpp
   src/deskd/md/subscribe.cpp
+  src/deskd/md/kalshi_md.cpp
+  src/deskd/rest/state.cpp
   src/deskd/net/guard.cpp
   src/deskd/net/http.cpp
+  src/deskd/net/ws.cpp
   src/deskd/net/conn.cpp
   src/deskd/net/pool.cpp
   src/deskd/net/send.cpp
@@ -428,13 +433,13 @@ add_dependencies(deskd-test-fake-wire fake-kalshi)  # it starts the binary once
 #   wire   the signer (RSA-PSS and Ed25519, verified by the fake), the builders and parsers against
 #          the documented shapes and the fake over TLS, what each write reply means, and the demo
 #          probe binary run against the fake
-foreach(t http)
+foreach(t http pub_data)
   add_executable(deskd-test-${t} tests/deskd/test_${t}.cpp)
   target_link_libraries(deskd-test-${t} PRIVATE deskd_core)
   target_precompile_headers(deskd-test-${t} REUSE_FROM deskd_core)
   add_test(NAME deskd-${t} COMMAND deskd-test-${t})
 endforeach()
-foreach(t net wire)
+foreach(t net wire md rest)
   add_executable(deskd-test-${t} tests/deskd/test_${t}.cpp)
   target_link_libraries(deskd-test-${t} PRIVATE deskd_core fake_kalshi)
   target_precompile_headers(deskd-test-${t} REUSE_FROM deskd_core)
@@ -452,4 +457,5 @@ add_dependencies(deskd-test-wire kalshi-demo-probe)
 
 add_custom_target(deskd-all DEPENDS deskd deskctl deskd-test-bus deskd-test-ops deskd-test-web deskd-test-process
                                     fake-kalshi deskd-test-fake-engine deskd-test-fake-wire
-                                    deskd-test-http deskd-test-net deskd-test-wire kalshi-demo-probe)
+                                    deskd-test-http deskd-test-net deskd-test-wire deskd-test-md
+                                    deskd-test-pub_data deskd-test-rest kalshi-demo-probe)

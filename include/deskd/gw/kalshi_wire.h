@@ -235,10 +235,11 @@ struct PriceRange {
 };
 struct MarketRow {
   std::string ticker, event_ticker, status, market_type, price_level_structure;
+  std::string title, subtitle, yes_sub_title, category, result;
   std::optional<int> exchange_index;
   std::optional<Px> yes_bid, yes_ask, no_bid, no_ask, last;
-  std::optional<Qty> yes_bid_size, yes_ask_size, volume, open_interest;
-  std::optional<std::int64_t> close_ms;
+  std::optional<Qty> yes_bid_size, yes_ask_size, volume, volume_24h, open_interest;
+  std::optional<std::int64_t> open_ms, close_ms, expected_expiration_ms, expiration_ms;
   std::vector<PriceRange> price_ranges;
 };
 struct Orderbook {

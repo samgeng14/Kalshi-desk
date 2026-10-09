@@ -12,6 +12,7 @@
 // (deskd sends none until gw has a universe); POST /api/watch may refuse MARKET_CLOSED.
 #include <cstdint>
 #include <nlohmann/json.hpp>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -55,6 +56,9 @@ struct HdrInputs {
   RunView run;
   std::vector<PreflightRow> preflight;
   Money daily_stop = 0;
+  // Unknown account data stays read-only; known data is an exact cash.K contract object.
+  nlohmann::json cash_k;
+  std::optional<std::int64_t> kx_lag_ms, clk_off_ms, gw_ack_ms;
 };
 nlohmann::json hdr_json(const HdrInputs& in);
 

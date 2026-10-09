@@ -405,7 +405,7 @@ void WebServer::Impl::routes() {
 
   // THE UNIVERSE, paged (contract 1.5). Until gw has a universe the reply is an empty page for
   // the day asked, after the same query check contract.js makes.
-  svr.Get("/api/universe", [](const httplib::Request& req, httplib::Response& res) {
+  svr.Get("/api/universe", [this](const httplib::Request& req, httplib::Response& res) {
     json q = json::object();
     for (const auto& kv : req.params) {   // contract.js parseQuery: the last value of a key wins
       const std::string& v = kv.second;
@@ -414,7 +414,7 @@ void WebServer::Impl::routes() {
     }
     const std::vector<std::string> errs = check_universe_query(q);
     if (!errs.empty()) return reply_err(res, "BAD_REQUEST", errs[0]);
-    reply_json(res, 200, universe_json(q, now_ms()));
+    reply_json(res, 200, d.universe ? d.universe(q) : universe_json(q, now_ms()));
   });
 
   // deskctl status. Outside /api/: not part of the screen's contract, and never the token.
@@ -512,8 +512,10 @@ void WebServer::Impl::routes() {
   svr.Post("/api/release", post("POST /api/release", [](const httplib::Request&, httplib::Response& res, const json&) {
     reply_err(res, "UNKNOWN_MARKET", "no markets are listed in this stage");
   }));
-  svr.Post("/api/watch", post("POST /api/watch", [](const httplib::Request&, httplib::Response& res, const json&) {
-    reply_err(res, "UNKNOWN_MARKET", "no markets are listed in this stage");
+  svr.Post("/api/watch", post("POST /api/watch", [this](const httplib::Request&, httplib::Response& res, const json& b) {
+    if (!d.watch) return reply_err(res, "UNKNOWN_MARKET", "no markets are listed in this stage");
+    const json answer = d.watch(b);
+    reply_json(res, answer.value("ok", false) ? 200 : err_http(answer.at("err").at("code")), answer);
   }));
   svr.Post("/api/transfer", post("POST /api/transfer", [](const httplib::Request&, httplib::Response& res, const json&) {
     reply_err(res, "NO_CASH", "no shard balances in this stage");

@@ -65,12 +65,13 @@ std::optional<std::uint64_t> disk_free_bytes(const std::string& dir) {
 }
 
 Ops::Ops(std::string data_dir, std::int64_t window_ms, std::vector<const Worker*> watched, const Feeds& feeds,
-         ProbeFn web_probe, AlertFn alert)
+         ProbeFn web_probe, AlertFn alert, StateFn state)
     : data_dir_(std::move(data_dir)),
       watched_(std::move(watched)),
       feeds_(feeds),
       web_probe_(std::move(web_probe)),
       alert_(std::move(alert)),
+      state_(std::move(state)),
       rule_(window_ms) {
   std::atomic_store(&withheld_, std::make_shared<const std::string>("starting"));
   refresh_preflight(mono_ms(), true);   // valid rows before the ops thread first runs
@@ -107,6 +108,13 @@ void Ops::refresh_preflight(std::int64_t now_ms, bool disk) {
   rows.push_back({"FEED", kx.up && !kx.gap, kx.up ? (kx.gap ? "KX gap" : "") : "KX down"});
   rows.push_back({"PRIV", kxp.up && !kxp.gap, kxp.up ? (kxp.gap ? "KXP gap" : "") : "KXP down"});
   rows.push_back({"GROUPS", false, "none"});
+  // Runtime supplies immutable account/clock facts. Feed and disk rows stay owned here.
+  if (state_) {
+    for (const auto& update : state_()) {
+      if (update.id == "FEED" || update.id == "PRIV" || update.id == "DISK") continue;
+      for (auto& row : rows) if (row.id == update.id) row = update;
+    }
+  }
   std::atomic_store(&rows_, std::make_shared<const std::vector<PreflightRow>>(std::move(rows)));
 }
 

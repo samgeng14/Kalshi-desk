@@ -27,16 +27,51 @@ Nothing is pushed. `ui/desk/js/contract.js` is the API contract deskd must serve
 - Week 0: skeleton (bus, owner threads, gw run state, KILL path, ops heartbeat, per-account lock, web/SSE on 127.0.0.1:8788 with Host/Origin/X-Desk guards), fake Kalshi (REST, WebSocket, matching engine, tape, faults, TLS), 10 test suites.
 - Week 1 stage 1 (`net/`, `gw/kalshi_sign`, `gw/kalshi_wire`, `tools/kalshi_demo_probe`): TLS factory with verification and the guard on every connect, one request per connection, spare pool, strict HTTP/1.1 parser, RSA-PSS and Ed25519 signer, create order V2 and every read route, refusal classes. Proven against demo: signed reads, one post-only order placed and cancelled.
 - Frontend round 2 merged (contract 1.5.0): darker theme, instant controls, calm flashes, the T/T+1 universe with search, frequent Systematic demo, ACTIVITY tapes and alerts, until-close orders.
+- Week 1 stage 2 (2026-10-08): guarded RFC6455 transport and demo market-data worker; per-sid
+  sequence validation and reconnect/resubscribe; complete paginated REST account/listing state;
+  T/T+1 universe and watch pins; per-tab FULL/TOP book publication and account projections;
+  bounded clock-offset estimates in hdr.lat and /ops/status. Demo read probe validated actual
+  responses against contract 1.5.0: eight live books, $500 on shard S0, no orders sent.
+  Private feed remains DOWN and Manual submission remains disabled until stage 3 integration.
 - Oracle VM `deskd-recorder` for the recorder: `ssh -i ~/.ssh/oracle_deskd ubuntu@64.181.211.165` (Ubuntu 24.04 aarch64, 1 OCPU, 6 GB, 145 GB). Nothing installed yet.
 
 ## Next, in order
 
-1. **Week 1 stage 2, market data and REST state:** `md-k` on the demo WebSocket (per-sid sequence numbers, STALE on a gap with resubscribe, never an empty subscription list, reconnect with backoff; lessons in `src/reference_feed.cpp` and `src/ws_client.cpp`), books as integer levels published to pub and gw; `rest`/`poll` for balance per shard, positions and open orders (cursor paged) every 10-15 s, exchange status, a startup reconcile before any order; the universe for `GET /api/universe` (markets settling today and tomorrow, category, close time, exchange_index, tick) and `POST /api/watch` pins; clock offset in health, over 0.5 s blocks Post.
+1. **Stage 2 is implemented; carry its state into gw in stage 3.** The feed currently publishes
+   to pub; gw's Manual owner must receive the same books and REST revisions before accepting
+   orders. The strict /api/health schema stays unchanged; clock detail is in hdr.lat and
+   /ops/status. Browser access was declined, so the real-page visual check is still open.
 2. **Stage 3, the Manual order path** (plan section 3): PlaceIntent validation, fat-finger guard, worst-case reservation per shard, cid prefix `M-`, journal, `send-k1`; Take = IOC at the touch plus slippage cap; Post = post_only + GTC + expiration_time + cancel_order_on_pause with a backup client cancel; Flatten = IOC reduce_only; cancels on `send-cx`; `exchange_index` on every write; UNKNOWN on 5xx/timeout/cut body, which blocks the market until a REST read clears it; fills de-duplicated by trade_id; token bucket per shard; web routes wait at most 50 ms for gw then answer queued; the latency timeline per order and `tools/latency_report.py`.
 3. **Stage 4, prove it:** the real page against the fake (browser pane) and against demo; `tools/demo_checks` (duplicate client_order_id, shortest expiry, post_only cross refusal, reduce_only, group trigger/reset, self-trade shapes); 50+ demo orders; `docs/invariants.md` entries. Done when: click-to-ack p90 under 100 ms, Take fills at the shown price 90%+ in 1c books, nothing lives 2 s past expiry.
 4. Then four reviews (orders, safety, latency/UI/contract, plan conformance), fixes, a final verification.
 5. **Recorder** (plan section 7) on `desk/recorder`: asyncio, explicit subscription lists, hourly zstd Parquet with manifest and gaps, R2 uploader, deploy kit for the VM (setup.sh, systemd, deploy.sh). Soak an hour locally before deploying. The operator still has to create a production read-only Kalshi key, an R2 bucket with a write-only token, and a healthchecks.io check.
 6. Week 2 (plan section 9): private socket, UNKNOWN table, risk book, Kill and order groups, Stop.
+
+### Stage 3 integration notes
+
+- Contract 1.5 permits Manual TTLs of 300/1800 seconds and expiry through close; the plan's
+  60-second strategy limit must not override Manual until-close orders.
+- Preserve frontend `M<session>-n` client IDs (`M-` is also valid); do not require a literal `M-`.
+- UNKNOWN is `ord.st=PEND`, `why=''`, with an EXCHANGE response carrying the pending order.
+  A transport failure never proves an order was rejected.
+- The page requires KX and KXP. Pull a real minimal private order/fill feed plus reconnect
+  reconciliation into stage 3; do not advertise KXP up merely because REST succeeded.
+- `rest_position_json` is a startup cost projection. REST realized/fees are lifetime totals;
+  the Manual execution ledger must supply daily P&L and own order revisions once enabled.
+- Series category fallback is conservative prefix classification when market metadata omits
+  category. Fee fallback is QUAD x1; LIP/model values are not invented. Integrate authoritative
+  series fees before relying on this presentation fallback for cash admission.
+- Publisher inbox overflow latches its header read-only and requires a restart. The gateway
+  must include `pub.healthy()` in its entry prerequisites when Manual writes are wired.
+
+Read-only demo verification after launch (use the port deskd prints):
+
+```sh
+python3 tools/deskd_read_probe.py --base http://127.0.0.1:PORT --out build-deskd/demo-read-capture.json
+```
+
+This changes only the probe's local book subscription and validates captured responses with
+the frontend contract; it has no exchange write path. The captured token is never persisted.
 
 ## Edge research so far (`docs/edge_results.json`)
 

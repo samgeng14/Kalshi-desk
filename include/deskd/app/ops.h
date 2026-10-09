@@ -67,9 +67,10 @@ class Ops {
 
   using ProbeFn = std::function<bool()>;   // true when web answered GET /api/health
   using AlertFn = std::function<void(const std::string& lvl, const std::string& msg)>;
+  using StateFn = std::function<std::vector<PreflightRow>()>;
 
   Ops(std::string data_dir, std::int64_t window_ms, std::vector<const Worker*> watched, const Feeds& feeds,
-      ProbeFn web_probe = nullptr, AlertFn alert = nullptr);
+      ProbeFn web_probe = nullptr, AlertFn alert = nullptr, StateFn state = nullptr);
 
   void run(Worker& self);
 
@@ -88,6 +89,7 @@ class Ops {
   const Feeds& feeds_;
   const ProbeFn web_probe_;
   const AlertFn alert_;
+  const StateFn state_;
   HeartbeatRule rule_;
   std::optional<std::uint64_t> disk_free_;      // ops thread only
   std::shared_ptr<const std::vector<PreflightRow>> rows_;   // std::atomic_load / store

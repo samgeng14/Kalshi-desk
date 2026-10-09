@@ -19,7 +19,9 @@
 // client that hangs up mid-write would end any process that did not), and log lines go through
 // the logger thread (app/log.h).
 #include <memory>
+#include <mutex>
 #include <nlohmann/json.hpp>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -32,16 +34,29 @@
 #include "deskd/gw/kill.h"
 #include "deskd/md/feed.h"
 #include "deskd/net/guard.h"
+#include "deskd/net/conn.h"
 #include "deskd/net/send.h"
 #include "deskd/store/store.h"
 #include "deskd/web/pub.h"
 #include "deskd/web/server.h"
 
 namespace deskd {
+class KalshiSigner;
+class KalshiMd;
+struct MdBook;
+namespace rest { class State; struct Snapshot; }
+
+// Endpoint injection for loopback integration tests. The same SendGuard applies to every
+// connection; this cannot grant production access. Normal runs use the demo defaults.
+struct RuntimeOptions {
+  std::string rest_url = "https://demo-api.kalshi.co/trade-api/v2";
+  std::string ws_url = "https://demo-api.kalshi.co/trade-api/ws/v2";
+  net::FactoryOptions factory;
+};
 
 class Deskd {
  public:
-  Deskd(DeskdConfig cfg, std::unique_ptr<AccountLock> lock);
+  Deskd(DeskdConfig cfg, std::unique_ptr<AccountLock> lock, RuntimeOptions options = {});
   ~Deskd();
   Deskd(const Deskd&) = delete;
   Deskd& operator=(const Deskd&) = delete;
@@ -69,10 +84,18 @@ class Deskd {
 
  private:
   DeskdConfig cfg_;
+  RuntimeOptions options_;
   std::unique_ptr<AccountLock> lock_;
   std::string epoch_, token_;
   std::int64_t started_ms_ = 0;
   SendGuard guard_;
+  std::unique_ptr<net::ConnFactory> factory_;
+  std::unique_ptr<KalshiSigner> signer_;
+  std::unique_ptr<rest::State> rest_;
+  std::unique_ptr<KalshiMd> md_;
+  std::string key_error_;
+  mutable std::mutex live_mu_;
+  std::set<std::string> pins_, live_;
   Feeds feeds_;
   KillSwitch kill_;
   BoundedQueue<SendJob> q_k1_{256, 64}, q_k2_{1024, 64}, q_k3_{1024, 64}, q_cx_{256, 256};
@@ -84,6 +107,13 @@ class Deskd {
   std::unique_ptr<Pub> pub_;
   std::unique_ptr<WebServer> web_;
   bool started_ = false, stopped_ = false;
+  bool init_venue(std::string* err);
+  void refresh_live();
+  void on_rest(std::shared_ptr<const rest::Snapshot> state);
+  void on_book(const MdBook& book);
+  nlohmann::json watch(const nlohmann::json& request);
+  HdrInputs header() const;
+  std::vector<PreflightRow> venue_preflight() const;
 };
 
 }  // namespace deskd

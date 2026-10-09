@@ -9,20 +9,23 @@
 #include "deskd/app/log.h"
 #include "deskd/strat/strat.h"
 #include "deskd/web/contract.h"
+#include "deskd/gw/kalshi_sign.h"
+#include "deskd/rest/state.h"
+#include "deskd/md/kalshi_md.h"
 
 namespace deskd {
 
 using json = nlohmann::json;
 
-Deskd::Deskd(DeskdConfig cfg, std::unique_ptr<AccountLock> lock)
-    : cfg_(std::move(cfg)), lock_(std::move(lock)), guard_(cfg_.live, lock_.get()) {
+Deskd::Deskd(DeskdConfig cfg, std::unique_ptr<AccountLock> lock, RuntimeOptions options)
+    : cfg_(std::move(cfg)), options_(std::move(options)), lock_(std::move(lock)), guard_(cfg_.live, lock_.get()) {
   started_ms_ = now_ms();
   // changes on every start: the page resyncs, and re-reads the token, when hb.epoch changes
   epoch_ = "e-" + std::to_string(started_ms_) + "-" + std::to_string(::getpid());
   token_ = random_token();
   if (lock_) kill_.persist_to(lock_->sibling(".killed"));
   for (const char* n : {"md-k", "priv-k", "gw", "send-k1", "send-k2", "send-k3", "send-cx", "strat", "store", "pub",
-                        "ops", "web"})
+                        "rest", "ops", "web"})
     workers_.push_back(std::make_unique<Worker>(n));
 
   // The heartbeat's owners (app/ops.h): the gateway, both Kalshi feeds, KILL's sender, the
@@ -43,24 +46,13 @@ Deskd::Deskd(DeskdConfig cfg, std::unique_ptr<AccountLock> lock)
   ops_ = std::make_unique<Ops>(
       cfg_.data_dir, cfg_.heartbeat_window_ms,
       std::vector<const Worker*>{worker("gw"), worker("md-k"), worker("priv-k"), worker("send-cx"), worker("pub")}, feeds_,
-      probe, ops_alert);
+      probe, ops_alert, [this] { return venue_preflight(); });
   Ops* ops = ops_.get();
   gw_ = std::make_unique<Gateway>(kill_, [ops] { return ops->preflight(); });   // gw's kick on every trip
   watch_kill(kill_, q_cx_);                                                       // send-cx's kick
-  Gateway* gw = gw_.get();
-  const bool live = cfg_.live;
-  const Money stop = cfg_.daily_stop;
   pub_ = std::make_unique<Pub>(
-      epoch_, feeds_,
-      [gw, ops, live, stop] {
-        HdrInputs h;
-        h.live = live;
-        h.run = gw->run_view();
-        h.preflight = ops->preflight();
-        h.daily_stop = stop;
-        return h;
-      },
-      cfg_.max_streams);
+      epoch_, feeds_, [this] { return header(); }, cfg_.max_streams);
+  pub_->set_subs_callback([this](const std::string&, const Subs&) { refresh_live(); });
 
   WebDeps wd;
   wd.ui_dir = cfg_.ui_dir;
@@ -72,6 +64,10 @@ Deskd::Deskd(DeskdConfig cfg, std::unique_ptr<AccountLock> lock)
   wd.kill = &kill_;
   wd.cx_stats = &cx_stats_;
   wd.status = [this] { return status(); };
+  wd.universe = [this](const json& q) {
+    return rest_ ? rest::universe(*rest_->snapshot(), q, now_ms()) : universe_json(q, now_ms());
+  };
+  wd.watch = [this](const json& q) { return watch(q); };
   web_ = std::make_unique<WebServer>(std::move(wd));
 }
 
@@ -96,6 +92,7 @@ bool Deskd::start(std::string* err) {
     if (err) *err = "no index.html in the ui dir " + cfg_.ui_dir;
     return false;
   }
+  if (!init_venue(err)) return false;
   // KILLED before this start stays KILLED until someone re-arms; restored before the port is
   // bound, so no request ever sees the desk un-killed. send-cx and gw see the restored
   // generation on their first turn: send-cx cancels again (orders may have been placed by hand
@@ -107,7 +104,14 @@ bool Deskd::start(std::string* err) {
     return false;
   }
   auto by = [this](const char* n) { return const_cast<Worker*>(worker(n)); };
-  by("md-k")->start([this](Worker& w) { run_feed_placeholder(w, feeds_.KX); });
+  by("md-k")->start([this](Worker& w) {
+    if (md_) md_->run(w); else run_feed_placeholder(w, feeds_.KX);
+  });
+  by("rest")->start([this](Worker& w) {
+    if (rest_) rest_->run(w); else while (!w.stopping()) {
+      w.beat(); std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+  });
   by("priv-k")->start([this](Worker& w) { run_feed_placeholder(w, feeds_.KXP); });
   by("gw")->start([this](Worker& w) { gw_->run(w); });
   const AlertFn alert = [this](const std::string& lvl, const std::string& src, const std::string& msg) {
@@ -129,7 +133,8 @@ bool Deskd::start(std::string* err) {
     DLOG_WARN("KILLED since %s (before this start): re-arm to trade", iso_ms(killed).c_str());
   }
   pub_->alert("INFO", "OPS",
-              std::string("deskd up: ") + (cfg_.live ? "LIVE" : "DEMO") + ", no venue connections in this stage");
+              std::string("deskd up: ") + (cfg_.live ? "LIVE" : "DEMO") +
+              (rest_ ? ", reconciling account and market data" : ", no demo credentials configured"));
   DLOG_INFO("up on http://127.0.0.1:%d/ (%s) ui=%s data=%s lock=%s", port(), cfg_.live ? "LIVE" : "DEMO",
             cfg_.ui_dir.c_str(), cfg_.data_dir.c_str(), lock_->path().c_str());
   return true;
@@ -155,7 +160,7 @@ json Deskd::status() const {
                            {"quiet_ms", w->last_beat_ms() ? mono - w->last_beat_ms() : -1}});
   }
   const auto& gs = gw_->stats();
-  return json{{"epoch", epoch_},
+  json result{{"epoch", epoch_},
               {"pid", static_cast<int>(::getpid())},
               {"mode", cfg_.live ? "LIVE" : "DEMO"},
               {"started_ms", started_ms_},
@@ -186,6 +191,17 @@ json Deskd::status() const {
               {"kill", {{"generation", kill_.generation()}, {"active", kill_.active()}}},
               {"log", {{"dropped", log_dropped()}}},
               {"workers", workers}};
+  result["feeds"] = feeds_json(feeds_);
+  result["publisher_healthy"] = pub_->healthy();
+  if (rest_) {
+    const auto s = rest_->snapshot();
+    result["rest"] = {{"ready",s->ready},{"account_ms",s->account_ms},{"listing_ms",s->listing_ms},
+                       {"markets",s->markets.size()},{"revision",s->revision},{"error",s->error}};
+    result["clock"] = {{"offset_ms",s->clock.offset_ms ? json(*s->clock.offset_ms) : json(nullptr)},
+                        {"uncertainty_ms",s->clock.uncertainty_ms ? json(*s->clock.uncertainty_ms) : json(nullptr)},
+                        {"measured_ms",s->clock.measured_ms},{"post_trusted",s->clock.post_trusted}};
+  }
+  return result;
 }
 
 }  // namespace deskd

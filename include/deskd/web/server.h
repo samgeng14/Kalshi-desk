@@ -58,6 +58,9 @@ struct WebDeps {
   KillSwitch* kill = nullptr;
   const SenderStats* cx_stats = nullptr;   // KILL's route checks send-cx took the switch's generation
   std::function<nlohmann::json()> status;   // GET /ops/status (deskctl)
+  std::function<nlohmann::json(const nlohmann::json&)> universe;
+  // {ok,mkt} or the contract's error body. No network I/O on a web request.
+  std::function<nlohmann::json(const nlohmann::json&)> watch;
 };
 
 class WebServer {

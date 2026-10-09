@@ -262,6 +262,11 @@ MarketRow read_market(Rd& r) {
   m.status = r.str("status");
   m.market_type = r.str_or_empty("market_type");
   m.price_level_structure = r.str_or_empty("price_level_structure");
+  m.title = r.str_or_empty("title");
+  m.subtitle = r.str_or_empty("subtitle");
+  m.yes_sub_title = r.str_or_empty("yes_sub_title");
+  m.category = r.str_or_empty("category");
+  m.result = r.str_or_empty("result");
   if (auto v = r.oint("exchange_index")) m.exchange_index = static_cast<int>(*v);
   m.yes_bid = r.opx("yes_bid_dollars");
   m.yes_ask = r.opx("yes_ask_dollars");
@@ -271,8 +276,12 @@ MarketRow read_market(Rd& r) {
   m.yes_bid_size = r.ocount("yes_bid_size_fp");
   m.yes_ask_size = r.ocount("yes_ask_size_fp");
   m.volume = r.ocount("volume_fp");
+  m.volume_24h = r.ocount("volume_24h_fp");
   m.open_interest = r.ocount("open_interest_fp");
   m.close_ms = r.otime("close_time");
+  m.open_ms = r.otime("open_time");
+  m.expected_expiration_ms = r.otime("expected_expiration_time");
+  m.expiration_ms = r.otime("expiration_time");
   if (const json* pr = r.at("price_ranges")) {
     if (!pr->is_array()) {
       r.fail("price_ranges", "not an array");
