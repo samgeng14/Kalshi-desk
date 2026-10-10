@@ -57,7 +57,7 @@ std::string espn_et_date(std::int64_t ms) {
   const std::time_t noon = static_cast<std::time_t>((et_midnight_ms(ms) + 12 * 3600000LL) / 1000);
   std::tm tm{};
   gmtime_r(&noon, &tm);
-  char buf[16];
+  char buf[32];   // room for any int the compiler cannot rule out
   std::snprintf(buf, sizeof buf, "%04d-%02d-%02d", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
   return buf;
 }
