@@ -121,10 +121,16 @@ Nothing is pushed. `ui/desk/js/contract.js` is the API contract deskd must serve
    favourites post-only (5 a market, $15 a city-day, paused at -$20; `deskd.band_series`, default
    five weather cities; the plan's replay gate is the operator's call); `deskd-soak` runs LIP-15
    against the fake with a wandering street and checks the invariants every second (60 s under
-   ctest; `DESKD_SOAK_SECONDS=14400` in a `-DDESKD_TSAN=ON` build for the plan's 4 hours). Not
-   done yet: S1 ARB (needs event exclusivity), C1 (needs the trained women's college basketball
-   model), X1, race tests, the order_group_updates channel (REST acks confirm groups for now), LIP
-   share estimates, markouts.
+   ctest; `DESKD_SOAK_SECONDS=14400` in a `-DDESKD_TSAN=ON` build for the plan's 4 hours). An
+   18-minute soak here: 2 windows, 1355 quotes, 134 fills, 0 violations; it found series fee
+   metadata expiring between polls (refused quotes for one poll every 5 minutes; now fetched again
+   a minute early). Markouts: every fill's 1/10/60 s markout from md's mid history (`mo` events,
+   per-lane means in `/ops/status`); the plan's markout rules stop BAND (-1c after 100 fills)
+   and LIP-15 (-1.5c after 200). Systematic race tests (hit before the 201, fill during a cancel,
+   Stop over an in-flight create). `order_group_updates` (its own subscribe command) tells gw of
+   a venue-triggered group: the lane is BLOCKED until a Stop lets gw reset it. Not done yet: S1
+   ARB (needs event exclusivity), C1 (needs the trained women's college basketball model), X1, LIP
+   share estimates, the 4-hour TSan soak itself (run it on the Mac).
    Next: the demo proof on the Mac (set manual_orders, small sizes), then latency timelines,
    per-shard token buckets, the journal, and positions from the execution ledger. Then: wire `gw/order_ledger` into the gateway
    alongside the execution/position ledger; authoritative series fees; PlaceIntent validation,
