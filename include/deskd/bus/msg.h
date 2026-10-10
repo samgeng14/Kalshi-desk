@@ -163,7 +163,14 @@ struct ManualWrite {
   std::shared_ptr<const KalshiWriteReply> reply;
 };
 
-using GwMsg = std::variant<PlaceIntent, AmendIntent, CancelIntent, Start, Stop, SendResult, OrderEvent, Probe, ManualWrite>;
+// One parsed private-feed event (priv/kalshi_private.h): an order update or a fill.
+struct PrivateEvent;
+struct PrivateMsg {
+  std::shared_ptr<const PrivateEvent> event;
+};
+
+using GwMsg = std::variant<PlaceIntent, AmendIntent, CancelIntent, Start, Stop, SendResult, OrderEvent, Probe, ManualWrite,
+                           PrivateMsg>;
 
 // Stop goes in the control lane, which nothing else fills; cancels and private events go before
 // new orders (plan section 2). Start and amends wait in the normal lane with the orders, so a

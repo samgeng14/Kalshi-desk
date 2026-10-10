@@ -18,6 +18,7 @@
 // ignored process-wide (cpp-httplib 0.18.3 sends with flags 0 and never sets SO_NOSIGPIPE, so a
 // client that hangs up mid-write would end any process that did not), and log lines go through
 // the logger thread (app/log.h).
+#include <map>
 #include <memory>
 #include <mutex>
 #include <nlohmann/json.hpp>
@@ -33,6 +34,9 @@
 #include "deskd/gw/gateway.h"
 #include "deskd/gw/kill.h"
 #include "deskd/md/feed.h"
+#include "deskd/md/kalshi_md.h"
+#include "deskd/net/kalshi_sender.h"
+#include "deskd/net/pool.h"
 #include "deskd/net/guard.h"
 #include "deskd/net/conn.h"
 #include "deskd/net/send.h"
@@ -53,6 +57,7 @@ struct RuntimeOptions {
   std::string rest_url = "https://demo-api.kalshi.co/trade-api/v2";
   std::string ws_url = "https://demo-api.kalshi.co/trade-api/ws/v2";
   net::FactoryOptions factory;
+  int rest_poll_ms = 0;   // 0 = the REST owner's default; tests shorten it
 };
 
 class Deskd {
@@ -101,6 +106,12 @@ class Deskd {
   Feeds feeds_;
   KillSwitch kill_;
   BoundedQueue<SendJob> q_k1_{256, 64}, q_k2_{1024, 64}, q_k3_{1024, 64}, q_cx_{256, 256};
+  // With a venue credential: send-k1 and send-cx run KalshiSenders on these, each on its own
+  // pool of pre-opened connections; send-cx's KILL is then a real cancel-all.
+  BoundedQueue<KalshiWriteJob> q_man_{256, 64}, q_mcx_{256, 256};
+  std::unique_ptr<net::SparePool> pool_k1_, pool_cx_;
+  std::unique_ptr<KalshiSender> man_sender_, cx_sender_;
+  std::shared_ptr<const std::map<std::string, MdBook>> books_;   // std::atomic_load / std::atomic_store
   SenderStats k1_stats_, k2_stats_, k3_stats_, cx_stats_;
   StoreWorker store_;
   std::vector<std::unique_ptr<Worker>> workers_;   // in start order; web last
@@ -110,6 +121,7 @@ class Deskd {
   std::unique_ptr<WebServer> web_;
   bool started_ = false, stopped_ = false;
   bool init_venue(std::string* err);
+  void attach_manual();
   void refresh_live();
   void on_rest(std::shared_ptr<const rest::Snapshot> state);
   void on_book(const MdBook& book);

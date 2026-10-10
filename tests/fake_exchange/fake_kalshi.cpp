@@ -2,6 +2,8 @@
 
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+
+#include <ctime>
 #include <openssl/bio.h>
 #include <openssl/evp.h>
 #include <openssl/pem.h>
@@ -1075,6 +1077,14 @@ void FakeKalshi::serve(int fd) {
     } else {
       std::vector<std::pair<std::string, std::string>> h;
       if (rep.status != 204) h.emplace_back("Content-Type", "application/json");
+      {   // as Kalshi does: whole seconds, which deskd's clock check reads (rest/state.h)
+        char date[64];
+        const std::time_t t = std::time(nullptr);
+        std::tm g{};
+        gmtime_r(&t, &g);
+        std::strftime(date, sizeof date, "%a, %d %b %Y %H:%M:%S GMT", &g);
+        h.emplace_back("Date", date);
+      }
       if (is(K::CHUNKED))
         h.emplace_back("Transfer-Encoding", "chunked");
       else if (rep.status != 204)

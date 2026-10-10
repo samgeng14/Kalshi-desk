@@ -90,6 +90,9 @@ void KalshiSender::take_kill(Worker& self) {
   // Independent of gw and of every inbox slot. A second click advances the generation and
   // explicitly retries an unconfirmed cancel-all; uncertain writes are never silently retried.
   kill_seen_.store(generation);
+  if(stats_) {
+    stats_->kills.fetch_add(1); stats_->last_kill_ms.store(now_ms()); stats_->kill_gen_seen.store(generation);
+  }
   auto reply=execute(kalshi::build_cancel_all(),"",self,nullptr);
   if(reply.outcome.kind==kalshi::WriteOutcome::Kind::ACK) kill_.cancel_all_done(now_ms(),mono_ms());
   else fail_closed("KILL cancel-all unconfirmed; reconcile and press KILL again");

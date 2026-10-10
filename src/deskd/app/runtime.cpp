@@ -120,10 +120,15 @@ bool Deskd::start(std::string* err) {
   const AlertFn alert = [this](const std::string& lvl, const std::string& src, const std::string& msg) {
     pub_->alert(lvl, src, msg);
   };
-  by("send-k1")->start([this, alert](Worker& w) { run_sender(w, q_k1_, k1_stats_, alert); });
+  if (pool_k1_) { pool_k1_->start(); pool_cx_->start(); }
+  by("send-k1")->start([this, alert](Worker& w) {
+    if (man_sender_) man_sender_->run(w); else run_sender(w, q_k1_, k1_stats_, alert);
+  });
   by("send-k2")->start([this, alert](Worker& w) { run_sender(w, q_k2_, k2_stats_, alert); });
   by("send-k3")->start([this, alert](Worker& w) { run_sender(w, q_k3_, k3_stats_, alert); });
-  by("send-cx")->start([this, alert](Worker& w) { run_cancel_sender(w, q_cx_, cx_stats_, kill_, alert); });
+  by("send-cx")->start([this, alert](Worker& w) {
+    if (cx_sender_) cx_sender_->run(w); else run_cancel_sender(w, q_cx_, cx_stats_, kill_, alert);
+  });
   by("strat")->start([](Worker& w) { run_strat(w); });
   by("store")->start([this](Worker& w) { store_.run(w); });
   by("pub")->start([this](Worker& w) { pub_->run(w); });
@@ -149,6 +154,7 @@ void Deskd::stop() {
   web_->stop();   // streams end, the listener closes, the handlers drain
   for (auto& w : workers_) w->request_stop();
   for (auto& w : workers_) w->join();
+  if (pool_k1_) { pool_k1_->stop(); pool_cx_->stop(); }
   DLOG_INFO("stopped");
   flush_logger(500);
 }
@@ -184,6 +190,10 @@ json Deskd::status() const {
                 {"queued", gw_->inbox().size()},
                 {"dropped", gw_->inbox().dropped()},
                 {"place_refused", gs.place_refused.load()},
+                {"manual_sent", gs.manual_sent.load()},
+                {"manual_cancels", gs.manual_cancels.load()},
+                {"private_applied", gs.private_applied.load()},
+                {"manual_orders", cfg_.manual_orders && man_sender_ != nullptr},
                 {"kills_seen", gs.kills_seen.load()}}},
               {"send_cx",
                {{"kills", cx_stats_.kills.load()},
@@ -208,6 +218,10 @@ json Deskd::status() const {
       if(it!=s->markets.end() && rest::fee_ready(it->second,now)) ++fee_ready;
     }
     result["rest"]["fee_ready_live"]=fee_ready;
+    std::size_t books_live=0;   // the book board gw reads: markets with a current (not stale) book
+    if (const auto books = std::atomic_load(&books_))
+      for (const auto& b : *books) if (!b.second.stale) ++books_live;
+    result["books_live"]=books_live;
     result["clock"] = {{"offset_ms",s->clock.offset_ms ? json(*s->clock.offset_ms) : json(nullptr)},
                         {"uncertainty_ms",s->clock.uncertainty_ms ? json(*s->clock.uncertainty_ms) : json(nullptr)},
                         {"measured_ms",s->clock.measured_ms},{"post_trusted",s->clock.post_trusted}};

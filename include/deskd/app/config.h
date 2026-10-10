@@ -34,6 +34,9 @@ struct DeskdConfig {
   int max_streams = 4;               // SSE streams; leaves 12 of the 16 threads for requests
   int heartbeat_window_ms = 5000;    // gw, md-k and priv-k must each move within this
   Money daily_stop = 30 * 10000;     // u; decision 1, the recommended $30
+  // Manual orders to the (demo) venue. Off by default: gw still admits and answers, but every
+  // order is refused RO and the header stays read-only until the operator turns it on.
+  bool manual_orders = false;
   // from the command line only
   bool live = false;
 };

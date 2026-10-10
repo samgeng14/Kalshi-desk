@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <set>
 #include <string>
 #include <memory>
 #include <vector>
@@ -29,6 +30,7 @@ class Worker;
 class ManualBook;
 struct ManualPath;
 struct KalshiWriteReply;
+struct PrivateEvent;
 namespace rest { struct Snapshot; }
 
 class Gateway {
@@ -45,6 +47,9 @@ class Gateway {
   void attach_manual(const ManualPath& path);
   // gw thread only (inside a Probe): the Manual book, or nullptr
   ManualBook* manual_book() { return manual_.get(); }
+  // Any thread: the cids gw's order book owns. Their rows come from gw alone (contract ORDER
+  // REVISIONS: the page keeps the highest rev), so the REST publisher leaves them out.
+  std::shared_ptr<const std::set<std::string>> manual_cids() const { return std::atomic_load(&owned_); }
 
   // queues m in its lane (lane_of); false when that lane is full: dropped, gap marked
   bool post(GwMsg m);
@@ -64,6 +69,7 @@ class Gateway {
     std::atomic<std::uint64_t> kills_seen{0};         // KILL generations gw has applied
     std::atomic<std::uint64_t> manual_sent{0};        // Manual orders handed to send-k1
     std::atomic<std::uint64_t> manual_cancels{0};     // Manual cancels handed to the cancel sender
+    std::atomic<std::uint64_t> private_applied{0};    // private order updates and fills applied to Manual orders
   };
   const Stats& stats() const { return stats_; }
 
@@ -74,6 +80,7 @@ class Gateway {
   void publish();
   void place_manual(PlaceIntent& p);
   void manual_reply(const KalshiWriteReply& r);
+  void manual_private(const PrivateEvent& e);
   std::vector<std::string> cancel_manual(const CancelIntent& c);
   void send_cancel(const std::string& cid);
   void publish_order(const std::string& cid);
@@ -90,6 +97,8 @@ class Gateway {
   std::unique_ptr<ManualBook> manual_;
   std::shared_ptr<const rest::Snapshot> snapshot_seen_;
   std::map<std::string, OrderPromise> pending_;  // web threads waiting on a Manual order's write
+  std::set<std::string> cancel_sent_;            // cids whose cancel went to the cancel sender
+  std::shared_ptr<const std::set<std::string>> owned_;   // std::atomic_load / std::atomic_store
 };
 
 }  // namespace deskd

@@ -6,6 +6,7 @@
 #include "deskd/app/worker.h"
 #include "deskd/gw/kill.h"
 #include "deskd/gw/manual_book.h"
+#include "deskd/priv/kalshi_private.h"
 #include "deskd/rest/state.h"
 
 namespace deskd {
@@ -139,6 +140,10 @@ void Gateway::handle(GwMsg& m) {
     if (w->reply) manual_reply(*w->reply);
     return;
   }
+  if (auto* e = std::get_if<PrivateMsg>(&m)) {
+    if (e->event && manual_) manual_private(*e->event);
+    return;
+  }
   if (auto* c = std::get_if<CancelIntent>(&m)) {
     const CancelIntent cx = *c;
     std::vector<GwMsg> gone;
@@ -246,6 +251,12 @@ void Gateway::place_manual(PlaceIntent& p) {
     return;
   }
   const std::string cid = a.intent.cid;
+  {
+    auto owned = std::make_shared<std::set<std::string>>();
+    if (auto old = std::atomic_load(&owned_)) *owned = *old;
+    owned->insert(cid);
+    std::atomic_store(&owned_, std::shared_ptr<const std::set<std::string>>(std::move(owned)));
+  }
   publish_order(cid);   // PEND, with its reservation
   if (!path_->send || !path_->send(std::move(*placed.job))) {
     KalshiWriteReply r;
@@ -279,7 +290,7 @@ void Gateway::manual_reply(const KalshiWriteReply& r) {
   publish_order(r.cid);
   // A cancel asked for while the write was in flight goes out once the order id is known.
   if (const auto* o = manual_->ledger().find(r.cid))
-    if (o->cancel_requested && !o->terminal() && !o->oid.empty()) send_cancel(r.cid);
+    if (o->cancel_requested && !o->terminal() && !o->oid.empty() && !cancel_sent_.count(r.cid)) send_cancel(r.cid);
   const auto it = pending_.find(r.cid);
   if (it == pending_.end()) return;
   OrderReply out;
@@ -301,6 +312,43 @@ void Gateway::manual_reply(const KalshiWriteReply& r) {
   }
   answer(it->second, std::move(out));
   pending_.erase(it);
+}
+
+// The private feed's order updates and fills, for the orders gw placed. Positions themselves come
+// from the REST revision each event asks for; here they settle UNKNOWN, resting, expired and
+// cancelled orders, and dedupe executions by trade id. Foreign orders and fills are not ours.
+void Gateway::manual_private(const PrivateEvent& e) {
+  auto& ledger = manual_->ledger();
+  const bool healthy = ledger.healthy();
+  const std::int64_t at = e.received_ms ? e.received_ms : now_ms();
+  std::string cid;
+  if (e.kind == PrivateEvent::Kind::ORDER) {
+    if (!ledger.observed(e.order, at)) {
+      if (healthy && !ledger.healthy())
+        DLOG_ERR("private order update for %s contradicts the order book: reconcile before trading", e.order.order_id.c_str());
+      return;
+    }
+    const auto* o = ledger.find(e.order.client_order_id);
+    cid = o ? o->intent.cid : e.cid;
+  } else {
+    const auto r = ledger.fill(e.fill, e.cid, at);
+    if (r == OrderLedger::FillResult::INVALID) {
+      DLOG_ERR("private fill %s contradicts the order book: reconcile before trading", e.fill.trade_id.c_str());
+      return;
+    }
+    if (r != OrderLedger::FillResult::APPLIED) return;
+    cid = e.cid;
+  }
+  stats_.private_applied.fetch_add(1);
+  if (cid.empty()) {
+    for (const auto& [c, o] : ledger.orders())
+      if (o.oid == (e.kind == PrivateEvent::Kind::ORDER ? e.order.order_id : e.fill.order_id)) cid = c;
+  }
+  if (!cid.empty()) {
+    publish_order(cid);
+    if (const auto* o = ledger.find(cid))
+      if (o->cancel_requested && !o->terminal() && !o->oid.empty() && !cancel_sent_.count(cid)) send_cancel(cid);
+  }
 }
 
 std::vector<std::string> Gateway::cancel_manual(const CancelIntent& c) {
@@ -328,6 +376,7 @@ void Gateway::send_cancel(const std::string& cid) {
   j.ticker = o->intent.ticker;
   j.shard = o->shard;
   if (path_->cancel && path_->cancel(std::move(j))) {
+    cancel_sent_.insert(cid);
     stats_.manual_cancels.fetch_add(1);
     return;
   }

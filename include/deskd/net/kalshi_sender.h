@@ -8,6 +8,7 @@
 #include "deskd/bus/queue.h"
 #include "deskd/gw/kalshi_wire.h"
 #include "deskd/net/pool.h"
+#include "deskd/net/send.h"
 
 namespace deskd {
 class KillSwitch;
@@ -46,6 +47,9 @@ class KalshiSender {
                const KalshiSigner& signer, KillSwitch& kill, ReplyFn reply, AlertFn alert);
   KalshiSender(Role role, BoundedQueue<KalshiWriteJob>& inbox, net::SparePool& pool,
                const KalshiSigner& signer, KillSwitch& kill, ReplyFn reply, AlertFn alert, Options options);
+  // CANCEL role: also report each KILL generation taken (before its cancel-all goes out) into
+  // stats, which the web's KILL route waits on. Call before run().
+  void set_stats(SenderStats* stats) { stats_ = stats; }
   void run(Worker& self);
   bool healthy() const { return healthy_.load(); }
   std::uint64_t kill_seen() const { return kill_seen_.load(); }
@@ -60,6 +64,7 @@ class KalshiSender {
   AlertFn alert_;
   Options options_;
   std::atomic<bool> healthy_{true};
+  SenderStats* stats_ = nullptr;
   std::atomic<std::uint64_t> kill_seen_{0}, attempted_{0};
   std::string admission(const KalshiWriteJob& job, const Worker& self) const;
   KalshiWriteReply execute(kalshi::WireRequest request, const std::string& cid,

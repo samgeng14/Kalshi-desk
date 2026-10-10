@@ -78,14 +78,17 @@ Nothing is pushed. `ui/desk/js/contract.js` is the API contract deskd must serve
    to pub; gw's Manual owner must receive the same books and REST revisions before accepting
    orders. The strict /api/health schema stays unchanged; clock detail is in hdr.lat and
    /ops/status. Browser access was declined, so the real-page visual check is still open.
-2. **Stage 3, the Manual order path** (plan section 3). Done 2026-10-10: `Gateway::attach_manual`
-   runs admission, reservation, send-k1 replies and cancels on the gw thread; `/api/order`,
-   `/api/cancel`, `/api/cancel_all` post to gw (`test_manual_gw` against the fake over TLS).
-   Next concrete step: in `app/runtime` + `app/venue`, build the k1 and cancel `SparePool`s and
-   `KalshiSender`s (MANUAL on send-k1; the CANCEL role beside today's send-cx KILL path), a
-   lock-free book board from `on_book`, the health function (KX/KXP feeds, `pub.healthy()`,
-   sender health) and `attach_manual`; feed private fills to the ledger; a runtime test against
-   the fake; then header RO off and the demo proof. Then: wire `gw/order_ledger` into the gateway
+2. **Stage 3, the Manual order path** (plan section 3). Done 2026-10-10: gw runs admission,
+   reservation, send-k1 replies, cancels and private order/fill events (`Gateway::attach_manual`);
+   with a demo credential the runtime runs `KalshiSender`s on send-k1 (Manual) and send-cx
+   (cancels, and KILL as a real cancel-all), each on its own pool, and gw reads a book board.
+   `/api/order`, `/api/cancel`, `/api/cancel_all` post to gw; `/api/watch` reads the contract's
+   `on`. Orders stay refused RO until `"deskd": {"manual_orders": true}` is set in the config;
+   the header's cash is read-only until then. `/ops/status` shows `gw.manual_orders`,
+   `books_live`, `rest.fee_ready_live`, `clock.post_trusted`. Tested in `test_runtime_manual`
+   (the whole process against the fake over TLS: off by default, fill, rest and cancel, KILL).
+   Next: the demo proof on the Mac (set manual_orders, small sizes), then latency timelines,
+   per-shard token buckets, the journal, and positions from the execution ledger. Then: wire `gw/order_ledger` into the gateway
    alongside the execution/position ledger; authoritative series fees; PlaceIntent validation,
    fat-finger guard, worst-case reservation per shard, preserved `M...` cid, journal, `send-k1`;
    Take = IOC at the supplied slippage cap; Post = post_only + GTC + expiration_time +
