@@ -149,11 +149,11 @@ void Deskd::attach_manual() {
     };
     p.daily_stop = cfg_.daily_stop;
     p.groups = &groups_;
+    p.lanes = default_lanes();
+    for (auto& l : p.lanes) if (l.id == "M1") l.series = cfg_.lip_series;
   }
   if (cfg_.systematic_orders) {
-    // LIP-15 (lane M1): the 15-minute series it trades, quoted by the maker engine
-    const LaneSpec* m1 = nullptr;
-    for (const auto& l : default_lanes()) if (l.id == "M1") m1 = &l;
+    // LIP-15 (lane M1): the 15-minute series it trades (deskd.lip_series), quoted by the maker engine
     MakerEngine::Env env;
     env.view = [this] { return gw_->sys_view(); };
     env.snapshot = [this] { return rest_->snapshot(); };
@@ -185,7 +185,7 @@ void Deskd::attach_manual() {
       }
       if (changed) refresh_live();
     };
-    lip_ = std::make_unique<MakerEngine>("M1", m1 ? m1->series : std::vector<std::string>{"KXNATGAS15M"}, env);
+    lip_ = std::make_unique<MakerEngine>("M1", cfg_.lip_series, env);
   }
   p.send = [this](KalshiWriteJob j) { return q_man_.push(std::move(j)); };
   p.cancel = [this](KalshiWriteJob j) { return q_mcx_.push(std::move(j), Lane::PRIORITY); };

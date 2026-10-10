@@ -294,6 +294,10 @@ static void test_config() {
   CHECK(k.key_type == "ed25519");
   DeskdConfig l = load_deskd_config(write(R"({"deskd": {"lock_dir": "/tmp/locks"}})"));
   CHECK(l.lock_dir == "/tmp/locks");
+  // Systematic: off by default; LIP-15's series, natural gas unless set
+  CHECK(!e.systematic_orders && !e.manual_orders && e.lip_series == std::vector<std::string>{"KXNATGAS15M"});
+  DeskdConfig sys = load_deskd_config(write(R"({"deskd": {"systematic_orders": true, "lip_series": ["KXGOLD15M", "KXNATGAS15M"]}})"));
+  CHECK(sys.systematic_orders && sys.lip_series == (std::vector<std::string>{"KXGOLD15M", "KXNATGAS15M"}));
   auto throws = [&](const std::string& text, const std::string& want) {
     try {
       load_deskd_config(write(text));
@@ -303,6 +307,8 @@ static void test_config() {
     return false;
   };
   CHECK(throws(R"({"deskd": {"live": true}})", "command-line flag only"));
+  CHECK(throws(R"({"deskd": {"lip_series": ["kxgold15m"]}})", "not a series ticker"));
+  CHECK(throws(R"({"deskd": {"lip_series": "KXGOLD15M"}})", "wrong type"));
   CHECK(throws(R"({"key_type": "ecdsa"})", "\"key_type\" must be \"rsa\" or \"ed25519\""));
   CHECK(throws(R"({"deskd": {"heartbeat_window": 5000}})", "unknown key \"heartbeat_window\""));
   CHECK(throws(R"({"deskd": {"http_port": "8788"}})", "\"http_port\" has the wrong type"));

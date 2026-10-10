@@ -28,6 +28,7 @@
 
 #include "deskd/gw/manual_admission.h"
 #include "deskd/gw/order_ledger.h"
+#include "deskd/gw/sys_book.h"
 #include "deskd/net/kalshi_sender.h"
 
 namespace deskd {
@@ -60,6 +61,7 @@ struct ManualPath {
   std::function<void(const std::string&)> publish_lane;
   Money daily_stop = 0;
   GroupRegistry* groups = nullptr;
+  std::vector<LaneSpec> lanes;   // empty: default_lanes()
 };
 
 class ManualBook {

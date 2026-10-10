@@ -27,7 +27,7 @@ void Gateway::attach_manual(const ManualPath& path) {
   path_ = std::make_unique<ManualPath>(path);
   manual_ = std::make_unique<ManualBook>();
   if (path_->sys_send) {
-    sys_ = std::make_unique<SysBook>();
+    sys_ = std::make_unique<SysBook>(path_->lanes.empty() ? default_lanes() : path_->lanes);
     std::atomic_store(&groups_view_, std::make_shared<const std::pair<bool, std::string>>(false, "order groups not created yet"));
   }
 }

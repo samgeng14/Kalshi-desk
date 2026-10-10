@@ -102,6 +102,22 @@ Nothing is pushed. `ui/desk/js/contract.js` is the API contract deskd must serve
    ledger still needs a restart after a contradiction, and says so. The root cause on the Mac is
    not known yet: the next RO there names it. A failed REST poll now keeps the last good read
    (account up to 60 s, listing up to 5 minutes) instead of refusing clicks STALE.
+   **Strategy foundation (2026-10-10).** Reference feeds: Kalshi's `pyth_value` (ref-k thread)
+   and the 15-minute financial model fair on the ladder (`book.ref.fair/sd`, shown only when this
+   window's strike was reproduced by the feed; the replication count toward the 50-window gate is
+   in `/ops/status` "fair"); ESPN's game state and win probability on watched game markets
+   (ref-espn thread, a data-only connection that cannot reach a venue). Systematic: lanes M1
+   LIP-15 $55, M2 BAND 96-99 $25, S1 ARB $15, C1 COLLEGE TAKE $10, X1 ESPN EXP $5, all off; gw
+   admits S orders with the risk book (inventory 20/40 contracts per market, lane budget, 70%
+   ceiling, $30 daily stop -> HALTED), sends them on send-k2 in each lane's order group per shard;
+   Stop cancels them and triggers the groups, KILL's send-cx triggers them too, and they are
+   reset once stopped / at the re-arm. The LIP-15 maker engine (lane M1) quotes the open windows
+   of `deskd.lip_series` (default KXNATGAS15M) per plan section 5. To run it on demo: set
+   `"deskd": {"manual_orders": true, "systematic_orders": true}` (and `"lip_series"` to the
+   15-minute series demo lists), start deskd, turn lane M1 on in the SYSTEMATIC tab, press Start
+   once GROUPS passes. Not done yet: M2/S1/C1/X1 engines, the 4-hour soak and race tests, the
+   order_group_updates channel (REST acks confirm groups for now), LIP share estimates, hdr.sys
+   and hdr.stop from the lanes.
    Next: the demo proof on the Mac (set manual_orders, small sizes), then latency timelines,
    per-shard token buckets, the journal, and positions from the execution ledger. Then: wire `gw/order_ledger` into the gateway
    alongside the execution/position ledger; authoritative series fees; PlaceIntent validation,

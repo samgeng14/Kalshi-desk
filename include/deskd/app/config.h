@@ -7,6 +7,7 @@
 // or edited config cannot make a test run send to the production hosts.
 #include <cstdint>
 #include <string>
+#include <vector>
 
 #include "deskd/bus/units.h"
 
@@ -41,6 +42,9 @@ struct DeskdConfig {
   // lanes show, Start stays refused (GROUPS) and no group is created until the operator turns
   // it on. Independent of manual_orders.
   bool systematic_orders = false;
+  // The 15-minute series lane M1 (LIP-15) quotes; the plan starts with natural gas alone. A demo
+  // account may list other series, or none: then M1 has nothing to quote.
+  std::vector<std::string> lip_series = {"KXNATGAS15M"};
   // from the command line only
   bool live = false;
 };
