@@ -68,6 +68,10 @@ struct Options {
   // The public listing is the big read (a 1,000-market page measured 1.6 MB on demo). Smaller
   // pages with their own deadline finish on a slow link; account reads keep timeout_ms.
   int listing_page_size = 200, listing_timeout_ms = 15000;
+  // Kalshi rate-limits reads: requests leave at most every request_gap_ms, and a 429 (refused
+  // before processing, so a read is safe to repeat) waits backoff_429_ms, doubling, up to
+  // retries_429 times, or as long as the venue's Retry-After says, then repeats the same request.
+  int request_gap_ms = 100, retries_429 = 5, backoff_429_ms = 500;
 };
 
 class State {
@@ -110,7 +114,8 @@ class State {
   ClockCheck clock_;
   std::unique_ptr<net::Conn> conn_;  // REST owner only; read connections can be reused
   std::int64_t started_ms_ = 0, last_listing_mono_ = 0;
-  bool mve_filter_refused_ = false;   // the venue answered 400 to mve_filter=exclude: listed without it
+  bool mve_filter_refused_ = false;
+  std::int64_t last_request_mono_ = 0;   // the venue answered 400 to mve_filter=exclude: listed without it
   struct CachedSeries { kalshi::SeriesRow row; std::int64_t fetched_ms = 0, attempted_ms = 0; };
   std::map<std::string,CachedSeries> series_;
 };

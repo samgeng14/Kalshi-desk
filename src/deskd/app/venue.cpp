@@ -30,6 +30,7 @@ bool Deskd::init_venue(std::string* err) {
   md_->set_trade_callback([this](const MdTrade& t) { on_trade(t); });
   rest::Options ro;
   if (options_.rest_poll_ms > 0) ro.poll_ms = options_.rest_poll_ms;
+  if (options_.rest_gap_ms >= 0) ro.request_gap_ms = options_.rest_gap_ms;
   rest_ = std::make_unique<rest::State>(*factory_, *re, signer_.get(),
       [this](std::shared_ptr<const rest::Snapshot> s) { on_rest(std::move(s)); }, ro);
   private_ = std::make_unique<KalshiPrivate>(*we,*factory_,*signer_,feeds_.KXP,

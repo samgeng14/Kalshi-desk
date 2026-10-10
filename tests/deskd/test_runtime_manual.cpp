@@ -84,7 +84,7 @@ struct Run {
     RuntimeOptions o;
     const std::string base="https://127.0.0.1:"+std::to_string(venue.port());
     o.rest_url=base+"/trade-api/v2"; o.ws_url=base+"/trade-api/ws/v2"; o.factory=fx::trust_test_ca();
-    o.rest_poll_ms=700;   // reconciles (and clock samples at varied sub-second phases) come quickly
+    o.rest_poll_ms=700; o.rest_gap_ms=0;   // reconciles (and clock samples at varied sub-second phases) come quickly
     std::string err;
     auto lock=AccountLock::acquire(dir.path,"demo","deskd-test-runtime",false,&err);
     d=std::make_unique<Deskd>(c,std::move(lock),o);

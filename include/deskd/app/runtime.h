@@ -59,6 +59,7 @@ struct RuntimeOptions {
   std::string ws_url = "https://demo-api.kalshi.co/trade-api/ws/v2";
   net::FactoryOptions factory;
   int rest_poll_ms = 0;   // 0 = the REST owner's default; tests shorten it
+  int rest_gap_ms = -1;   // -1 = the REST owner's default request spacing
 };
 
 class Deskd {

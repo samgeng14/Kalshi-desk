@@ -111,7 +111,7 @@ void reconcile() {
   auto signer=key(); CHECK(signer!=nullptr);
   SendGuard guard(false,nullptr); net::ConnFactory factory(guard);
   const auto endpoint=net::Endpoint::parse("http://127.0.0.1:"+std::to_string(fake.port())+"/trade-api/v2",&why);
-  rest::Options opts; opts.page_size=2;
+  rest::Options opts; opts.page_size=2; opts.request_gap_ms=0; opts.backoff_429_ms=20;
   rest::State state(factory,*endpoint,signer.get(),{},opts);
   CHECK(state.refresh_once());
   auto s=state.snapshot();
@@ -164,6 +164,17 @@ void reconcile() {
     CHECK(fallback.refresh_once() && fallback.snapshot()->listing_ready && !fallback.snapshot()->markets.empty());
     CHECK(fallback.snapshot()->markets.size()==lister.snapshot()->markets.size());
     CHECK(fake.http_requests()>before);
+  }
+  {   // Kalshi's 429 is refused before processing: the same read waits and goes again
+    fakex::HttpFault limited; limited.method="GET"; limited.path="/markets"; limited.kind=fakex::HttpFault::Kind::RATE_LIMIT;
+    fake.add_fault(limited); fake.add_fault(limited);
+    rest::State patient(factory,*endpoint,signer.get(),{},opts);
+    CHECK(patient.refresh_once() && patient.snapshot()->listing_ready);
+    for(int i=0;i<=opts.retries_429;++i) fake.add_fault(limited);
+    rest::State gives_up(factory,*endpoint,signer.get(),{},opts);
+    CHECK(!gives_up.refresh_once());
+    CHECK(gives_up.snapshot()->error.find("HTTP 429")!=std::string::npos);
+    CHECK(gives_up.refresh_once());   // the faults are spent: the next poll loads it
   }
   opts.max_pages=1;
   rest::State capped(factory,*endpoint,signer.get(),{},opts);

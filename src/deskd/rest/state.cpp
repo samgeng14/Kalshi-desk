@@ -197,34 +197,62 @@ void State::publish(Snapshot next) {
   if (callback_) callback_(result);
 }
 
+namespace {
+// sleeps ms in short slices, beating, and gives up early when the worker stops
+bool rest_wait(Worker* worker, std::int64_t ms) {
+  const auto until = mono_ms() + ms;
+  while (mono_ms() < until) {
+    if (worker) { worker->beat(); if (worker->stopping()) return false; }
+    std::this_thread::sleep_for(std::chrono::milliseconds(std::min<std::int64_t>(50, std::max<std::int64_t>(1, until - mono_ms()))));
+  }
+  return true;
+}
+}  // namespace
+
 bool State::get(kalshi::WireRequest request, std::string* body, std::string* why, Worker* worker, int timeout_ms) {
   if (timeout_ms <= 0) timeout_ms = options_.timeout_ms;
   if (worker && worker->stopping()) { *why = "REST worker stopping"; return false; }
   if (request.auth && !signer_) { *why = "demo signing key not loaded"; return false; }
   if (starts(request.path, kalshi::kBasePath)) request.path.replace(0, std::string(kalshi::kBasePath).size(), endpoint_.base_path);
-  if (!conn_ || !conn_->usable()) {
-    conn_ = factory_.open(endpoint_, timeout_ms, why);
-    if (!conn_) return false;
+  for (int attempt = 0;; ++attempt) {
+    // at most one request every request_gap_ms from this owner (Kalshi's read rate limit)
+    if (last_request_mono_ && options_.request_gap_ms > 0 &&
+        !rest_wait(worker, last_request_mono_ + options_.request_gap_ms - mono_ms())) {
+      *why = "REST worker stopping"; return false;
+    }
+    if (!conn_ || !conn_->usable()) {
+      conn_ = factory_.open(endpoint_, timeout_ms, why);
+      if (!conn_) return false;
+    }
+    const auto auth = request.auth ? signer_->headers(now_ms(), request.method, request.path) : net::HeaderList{};
+    if (request.auth && auth.size() != 3) { *why = "request signing failed"; return false; }
+    const auto bytes = kalshi::request_bytes(request, endpoint_.host_header(), auth);
+    const auto sent = now_ms(), mono = mono_ms();
+    last_request_mono_ = mono;
+    const auto reply = net::exchange(*conn_, bytes, net::mono_us() + timeout_ms * 1000LL, false,
+                                   [worker] { if (worker) worker->beat(); });
+    const auto received = now_ms();
+    if (!reply.reusable) conn_.reset();
+    if (worker) worker->beat();
+    if (reply.fate != net::Exchange::Fate::REPLIED) { *why = request.path + ": " + reply.why; return false; }
+    // Cached replies' Date is the origin generation time, not a measurement of this round trip.
+    if (reply.res.header("age").empty() || reply.res.header("age") == "0")
+      clock_.observe(reply.res.header("date"), sent, received, mono_ms() - mono);
+    if (reply.res.status == 429 && attempt < options_.retries_429) {
+      std::int64_t wait = std::min<std::int64_t>(8000, static_cast<std::int64_t>(options_.backoff_429_ms) << attempt);
+      const auto after = reply.res.header("retry-after");
+      if (!after.empty() && after.size() < 4 && std::all_of(after.begin(), after.end(), ::isdigit))
+        wait = std::max<std::int64_t>(wait, std::min<std::int64_t>(10000, std::stoll(after) * 1000));
+      if (!rest_wait(worker, wait)) { *why = "REST worker stopping"; return false; }
+      continue;
+    }
+    if (reply.res.status != 200) {
+      *why = request.path + ": HTTP " + std::to_string(reply.res.status);
+      return false;  // no response bodies/headers in logs: they can contain account identifiers
+    }
+    *body = reply.res.body;
+    return true;
   }
-  const auto auth = request.auth ? signer_->headers(now_ms(), request.method, request.path) : net::HeaderList{};
-  if (request.auth && auth.size() != 3) { *why = "request signing failed"; return false; }
-  const auto bytes = kalshi::request_bytes(request, endpoint_.host_header(), auth);
-  const auto sent = now_ms(), mono = mono_ms();
-  const auto reply = net::exchange(*conn_, bytes, net::mono_us() + timeout_ms * 1000LL, false,
-                                 [worker] { if (worker) worker->beat(); });
-  const auto received = now_ms();
-  if (!reply.reusable) conn_.reset();
-  if (worker) worker->beat();
-  if (reply.fate != net::Exchange::Fate::REPLIED) { *why = request.path + ": " + reply.why; return false; }
-  // Cached replies' Date is the origin generation time, not a measurement of this round trip.
-  if (reply.res.header("age").empty() || reply.res.header("age") == "0")
-    clock_.observe(reply.res.header("date"), sent, received, mono_ms() - mono);
-  if (reply.res.status != 200) {
-    *why = request.path + ": HTTP " + std::to_string(reply.res.status);
-    return false;  // no response bodies/headers in logs: they can contain account identifiers
-  }
-  *body = reply.res.body;
-  return true;
 }
 
 bool State::account(Snapshot& next, std::string* why, Worker* worker) {
