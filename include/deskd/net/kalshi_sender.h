@@ -18,7 +18,7 @@ class KillSwitch;
 class KalshiSigner;
 class Worker;
 struct KalshiWriteJob {
-  enum class Kind { CREATE, CANCEL, GROUP } kind = Kind::CREATE;
+  enum class Kind { CREATE, CANCEL, GROUP, TRANSFER } kind = Kind::CREATE;
   kalshi::CreateOrder create;
   std::string cid, oid, ticker;
   int shard = -1, subaccount = -1;
@@ -26,6 +26,9 @@ struct KalshiWriteJob {
   // group_id; lane says whose group it is, for the reply.
   std::string group_action, group_id, lane;
   Qty group_limit = 0;
+  // TRANSFER (the Manual sender only): free cash from shard to transfer_to (shard is the source)
+  int transfer_to = -1;
+  Money amount = 0;
   // Required for CREATE. The gateway revokes this permit on a cancel, stale book or KILL.
   // Even a permit still true cannot outlive its deadline or cross a KILL generation.
   std::shared_ptr<std::atomic<bool>> permit;

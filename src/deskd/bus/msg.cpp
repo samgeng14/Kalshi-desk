@@ -28,6 +28,7 @@ Lane lane_of(const GwMsg& m) {
     Lane operator()(const PrivateMsg&) const { return Lane::PRIORITY; }
     Lane operator()(const LaneSet&) const { return Lane::PRIORITY; }
     Lane operator()(const ReleaseMarket&) const { return Lane::PRIORITY; }
+    Lane operator()(const TransferIntent&) const { return Lane::NORMAL; }
   };
   return std::visit(V{}, m);
 }

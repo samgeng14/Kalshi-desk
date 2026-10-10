@@ -226,6 +226,7 @@ void Deskd::attach_manual() {
     band_ = std::make_unique<MakerEngine>("M2", cfg_.band_series, band_env, band, band_quote);
   }
   p.send = [this](KalshiWriteJob j) { return q_man_.push(std::move(j)); };
+  p.refresh = [this] { rest_->request_refresh(); };
   p.cancel = [this](KalshiWriteJob j) { return q_mcx_.push(std::move(j), Lane::PRIORITY); };
   p.publish = [this](const std::string& row) {
     auto j = json::parse(row, nullptr, false);

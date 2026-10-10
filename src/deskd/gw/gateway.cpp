@@ -253,7 +253,9 @@ void Gateway::handle(GwMsg& m) {
     answer(p->reply, OrderReply{killed ? "KILLED" : "RO", killed ? "KILL lockout active" : "no venue path is enabled", ""});
     return;
   }
+  if (auto* t = std::get_if<TransferIntent>(&m)) return transfer(*t);
   if (auto* w = std::get_if<ManualWrite>(&m)) {
+    if (w->reply && w->reply->op == WireOp::TRANSFER) { transfer_reply(*w->reply); return; }
     if (w->reply && w->reply->op == WireOp::GROUP) group_reply(*w->reply);
     else if (w->reply) manual_reply(*w->reply);
     note_ledger();
@@ -598,6 +600,73 @@ std::vector<std::string> Gateway::cancel_foreign(const CancelIntent& c) {
     }
   }
   return out;
+}
+
+// The ticket's MOVE (contract POST /api/transfer): free cash from one shard to another on
+// send-k1. Never during KILL; never more than the source's free cash as gw sees it (cash less what
+// gw's working orders hold there). The page's answer waits for the venue's.
+void Gateway::transfer(TransferIntent& t) {
+  auto answer_t = [&](const char* code, const std::string& msg) {
+    if (t.reply) { try { t.reply->set_value(TransferReply{code, msg, ""}); } catch (const std::future_error&) {} }
+  };
+  // the contract's codes for it: BAD_REQUEST, NO_CASH, RATE, EXCHANGE (and INTERNAL)
+  if (!manual_) return answer_t("NO_CASH", "no Kalshi account in this deskd");
+  if (!path_->send) return answer_t("EXCHANGE", "Manual orders are off: no write path");
+  if (kill_.active()) return answer_t("EXCHANGE", "KILL lockout active: re-arm first");
+  // the Manual path's own gate (manual_orders, send-k1 healthy): a transfer is a Manual write
+  if (const auto h = path_->health ? path_->health() : ManualHealth{}; h.read_only || !h.manual_sender)
+    return answer_t("EXCHANGE", "the Manual path is read-only: " + (h.why.empty() ? std::string("Manual orders are off") : h.why));
+  if (t.from < 0 || t.to < 0 || t.from == t.to || t.amount <= 0) return answer_t("BAD_REQUEST", "a transfer names two shards and an amount");
+  sync_snapshot();
+  if (!snapshot_seen_ || !snapshot_seen_->account_ready) return answer_t("NO_CASH", "no account read yet");
+  if (!snapshot_seen_->balances.count(t.from) || !snapshot_seen_->balances.count(t.to))
+    return answer_t("BAD_REQUEST", "no shard S" + std::to_string(snapshot_seen_->balances.count(t.from) ? t.to : t.from));
+  const Money free = manual_->shard_free(t.from) / 100;
+  if (t.amount > free)
+    return answer_t("NO_CASH", "S" + std::to_string(t.from) + " has $" + money_str(std::max<Money>(0, free)) + " free");
+  KalshiWriteJob j;
+  j.kind = KalshiWriteJob::Kind::TRANSFER;
+  j.cid = "T" + std::to_string(++transfer_seq_);
+  j.shard = t.from;
+  j.transfer_to = t.to;
+  j.amount = t.amount;
+  j.kill_generation = kill_.generation();
+  const auto cid = j.cid;
+  if (!path_->send(std::move(j))) return answer_t("INTERNAL", "send-k1's queue is full");
+  DLOG_INFO("transfer %s: $%s from S%d to S%d", cid.c_str(), money_str(t.amount).c_str(), t.from, t.to);
+  transfers_[cid] = PendingTransfer{t.reply, t.from, t.to, t.amount};
+}
+
+void Gateway::transfer_reply(const KalshiWriteReply& r) {
+  const auto it = transfers_.find(r.cid);
+  if (it == transfers_.end()) return;
+  const auto t = it->second;
+  transfers_.erase(it);
+  using K = kalshi::WriteOutcome::Kind;
+  TransferReply out;
+  if (r.outcome.kind == K::ACK) {
+    // the shards as the last read has them, with the move applied; the next read confirms it
+    nlohmann::json shards = nlohmann::json::array();
+    if (snapshot_seen_)
+      for (const auto& [shard, cash] : snapshot_seen_->balances) {
+        const Money moved = shard == t.from ? -t.amount : shard == t.to ? t.amount : 0;
+        const Money free = std::max<Money>(0, manual_->shard_free(shard) / 100 + moved);
+        shards.push_back({{"id", "S" + std::to_string(shard)}, {"cash", money_str(std::max<Money>(0, cash + moved))},
+                          {"free", money_str(free)}});
+      }
+    out.shards = shards.dump();
+    DLOG_INFO("transfer %s done: $%s from S%d to S%d", r.cid.c_str(), money_str(t.amount).c_str(), t.from, t.to);
+  } else if (r.outcome.kind == K::REFUSED && r.outcome.cls == RejectClass::RETRYABLE) {
+    out.code = "RATE";
+    out.msg = "the venue is rate-limiting writes; try again";
+  } else {
+    out.code = "EXCHANGE";
+    out.msg = (r.outcome.kind == K::UNKNOWN ? "the venue did not confirm it (the next account read shows whether it moved): "
+                                              : "") + (r.outcome.why.empty() ? r.local_code : r.outcome.why).substr(0, 200);
+    DLOG_WARN("transfer %s: %s", r.cid.c_str(), out.msg.c_str());
+  }
+  if (path_->refresh) path_->refresh();
+  if (t.reply) { try { t.reply->set_value(std::move(out)); } catch (const std::future_error&) {} }
 }
 
 void Gateway::send_cancel(const std::string& cid) {

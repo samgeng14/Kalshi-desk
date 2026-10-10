@@ -361,6 +361,11 @@ static void test_builders() {
     CHECK(build_order_group_action("og-1", "trigger", 1, -1, &g, &why));
     CHECK(g.method == "PUT" && g.path == "/trade-api/v2/portfolio/order_groups/og-1/trigger" && g.query == "exchange_index=1");
     CHECK(!build_order_group_action("og-1", "delete", 1, -1, &g, &why) && !build_order_group_action("og 1", "reset", 1, -1, &g, &why));
+    CHECK(build_transfer(0, 2, 1000000, &g, &why));
+    CHECK(g.method == "POST" && g.path == "/trade-api/v2/portfolio/intra_exchange_instance_transfer" && g.write &&
+          g.op == WireOp::TRANSFER && json::parse(g.body) == json({{"source", "event_contract"}, {"destination", "event_contract"},
+          {"amount", 1000000}, {"source_exchange_shard", 0}, {"destination_exchange_shard", 2}}));
+    CHECK(!build_transfer(1, 1, 100, &g, &why) && !build_transfer(0, 1, 0, &g, &why) && !build_transfer(-1, 1, 100, &g, &why));
     CHECK(build_delete_order_group("og-1", 2, -1, &g, &why));
     CHECK(g.method == "DELETE" && g.path == "/trade-api/v2/portfolio/order_groups/og-1" && g.query == "exchange_index=2" &&
           g.body.empty() && g.write && g.op == WireOp::GROUP);

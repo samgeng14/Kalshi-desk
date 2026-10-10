@@ -135,6 +135,11 @@ bool build_create_order_group(Qty contracts_limit, int exchange_index, int subac
 // PUT /portfolio/order_groups/{id}/{trigger|reset}?exchange_index=N[&subaccount=S]
 bool build_order_group_action(const std::string& id, const std::string& action, int exchange_index, int subaccount,
                               WireRequest* out, std::string* why);
+// POST /portfolio/intra_exchange_instance_transfer: free cash from one shard to another (the
+// ticket's MOVE). The body is the old desk's, used live (src/client.cpp transfer_between_shards):
+// {source, destination: "event_contract", amount in 1/10,000 $, source_exchange_shard,
+// destination_exchange_shard}; the reply {transfer_id}.
+bool build_transfer(int from_shard, int to_shard, Money amount, WireRequest* out, std::string* why);
 // DELETE /portfolio/order_groups/{id}?exchange_index=N[&subaccount=S]: its orders cancelled, the group gone
 bool build_delete_order_group(const std::string& id, int exchange_index, int subaccount, WireRequest* out,
                               std::string* why);

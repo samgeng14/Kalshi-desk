@@ -705,6 +705,26 @@ bool build_order_group_action(const std::string& id, const std::string& action, 
   return true;
 }
 
+bool build_transfer(int from_shard, int to_shard, Money amount, WireRequest* out, std::string* why) {
+  if (from_shard < 0 || to_shard < 0 || from_shard == to_shard) {
+    if (why) *why = "a transfer names two different shards";
+    return false;
+  }
+  if (amount <= 0 || amount > 1000000LL * 10000) {
+    if (why) *why = "a transfer moves $0.0001 to $1,000,000";
+    return false;
+  }
+  WireRequest r;
+  r.method = "POST";
+  r.path = std::string(kBasePath) + "/portfolio/intra_exchange_instance_transfer";
+  r.body = json{{"source", "event_contract"}, {"destination", "event_contract"}, {"amount", amount},
+                {"source_exchange_shard", from_shard}, {"destination_exchange_shard", to_shard}}.dump();
+  r.write = true;
+  r.op = WireOp::TRANSFER;
+  *out = std::move(r);
+  return true;
+}
+
 bool build_delete_order_group(const std::string& id, int exchange_index, int subaccount, WireRequest* out,
                               std::string* why) {
   if (!id_ok(id)) {
@@ -1063,6 +1083,7 @@ WriteOutcome classify_write(WireOp op, const net::Exchange& x) {
       case WireOp::BATCH_CANCEL: parsed = st == 200 && parse_batch_cancel(x.res.body, &why).has_value(); break;
       case WireOp::CANCEL_ALL: parsed = st == 204 || st == 200; break;
       case WireOp::GROUP: parsed = true; break;
+      case WireOp::TRANSFER: parsed = true; break;
       case WireOp::OTHER: parsed = true; break;
     }
     if (parsed) {

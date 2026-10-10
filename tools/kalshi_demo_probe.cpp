@@ -786,6 +786,11 @@ struct DemoProbe {   // not Probe: bus/msg.h has a message of that name
       std::printf("  cannot open the socket: %s\n", why.c_str());
       return false;
     }
+    // the subscription acknowledged before the group exists, or its "created" can go unseen
+    for (const std::int64_t until = net::mono_us() + 3000000; s.ws.connected() && !s.has("order_group_updates") &&
+                                                              net::mono_us() < until;)
+      ws_next(s, 100);
+    if (!s.has("order_group_updates")) std::printf("  order_group_updates not acknowledged in 3 s; going on\n");
     std::vector<std::string> events;   // this group's, in order
     std::string group_id;
     // the socket's frames for up to ms, until this group's `want` event arrives

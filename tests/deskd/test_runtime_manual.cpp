@@ -685,9 +685,9 @@ void systematic_book() {
   // 4. TK settles NO: the long of 2 at 0.41 realizes -0.82, the day passes -$1.00: HALTED
   r.venue.f->with_engine([&](fakex::Engine& e,std::int64_t now) { e.settle_market(TK,false,now); });
   CHECK(r.until([&]{ return r.d->status()["run"]["state"]=="HALTED"; },15000));
-  CHECK(gw_pos(TK)==0 && gw_pos(V)==2000);
+  // the view strat reads follows within a tick of the HALT
+  CHECK(r.until([&]{ return gw_pos(TK)==0 && gw_pos(V)==2000 && r.d->gw().sys_view()->day<-1000000; }));
   const auto halted_day=r.d->gw().sys_view()->day;
-  CHECK(halted_day<-1000000);
   auto again=r.post("/api/start",json::object());
   CHECK(again && again->status!=200 && json::parse(again->body)["err"]["code"]=="HALTED");
   // 5. KILL and its re-arm leave it HALTED (until ET midnight)
@@ -782,7 +782,7 @@ void takeover() {
 // naming the shard, its cash and the market; Start is refused until it has cash.
 void shard_preflight() {
   const std::string S1="KXRUNTIME-26OCT10-S1";
-  Run r(false,[&](fakex::Engine& e,std::int64_t now) {
+  Run r(true,[&](fakex::Engine& e,std::int64_t now) {
     auto spec=fx::spec(S1,1); spec.close_ms=(now/1000+3600)*1000; e.add_market(spec,now);   // shard 1: $0
   },true);
   CHECK(r.ready());
@@ -799,8 +799,21 @@ void shard_preflight() {
       if(x["id"]=="SHARD" && x["ok"]==false && x["why"].get<std::string>().rfind("S1 ",0)==0) { row=x; return true; }
     return false; },15000));
   CHECK(row.value("why",std::string())=="S1 $0.0000 (M2 "+S1+")");
+  // the ticket's MOVE: $100 from S0 to S1 (refused past S0's free cash, and between unknown shards)
+  auto too_much=r.post("/api/transfer",{{"from","S0"},{"to","S1"},{"amt","5000.0000"}});
+  CHECK(too_much && too_much->status!=200 && json::parse(too_much->body)["err"]["code"]=="NO_CASH");
+  auto nowhere=r.post("/api/transfer",{{"from","S0"},{"to","S9"},{"amt","1.0000"}});
+  CHECK(nowhere && nowhere->status==400 && json::parse(nowhere->body)["err"]["code"]=="BAD_REQUEST");
+  auto mv=r.post("/api/transfer",{{"from","S0"},{"to","S1"},{"amt","100.0000"}});
+  CHECK(mv && mv->status==200);
+  if(mv && mv->status==200) {
+    const auto j=json::parse(mv->body);
+    bool s1=false;
+    for(const auto& x:j["shards"]) if(x["id"]=="S1" && x["cash"]=="100.0000" && x["free"]=="100.0000") s1=true;
+    CHECK(j["ok"]==true && s1);
+  } else if(mv) std::fprintf(stderr,"transfer: %s\n",mv->body.c_str());
+  CHECK(r.venue.f->with_engine([](fakex::Engine& e,std::int64_t) { return e.cash(0,1); })==100*fx::D);
   // with cash on shard 1 the row passes (Start then goes once every other row does)
-  r.venue.f->with_engine([](fakex::Engine& e,std::int64_t now) { e.set_cash(0,1,100*fx::D,now); });
   CHECK(r.until([&]{
     auto st=r.post("/api/start",json::object());
     if(!st) return false;

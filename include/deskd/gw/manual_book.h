@@ -67,6 +67,8 @@ struct ManualPath {
   std::string sys_state_file;
   // a market Manual took over, or released: its mkt row again (mkt.man)
   std::function<void(const std::string&)> publish_market;
+  // an account read soon (after a transfer, whose cash no private event reports)
+  std::function<void()> refresh;
   // an alert on the stream (level, src, msg): Systematic's refusals, so a lane that cannot trade
   // says why on the page, not only in /ops/status
   std::function<void(const std::string&, const std::string&, const std::string&)> alert;

@@ -152,6 +152,11 @@ class Gateway {
   // cancel that covers them cancels them by order id on send-cx; their cids as the page shows them
   std::vector<std::string> cancel_foreign(const CancelIntent& c);
   std::map<std::string, std::int64_t> foreign_cx_;   // page cid -> when its cancel was queued
+  struct PendingTransfer { std::shared_ptr<std::promise<TransferReply>> reply; int from = -1, to = -1; Money amount = 0; };
+  std::map<std::string, PendingTransfer> transfers_;   // "T<n>" -> the page waiting on it
+  std::uint64_t transfer_seq_ = 0;
+  void transfer(TransferIntent& t);
+  void transfer_reply(const KalshiWriteReply& r);
   void send_cancel(const std::string& cid);
   void publish_order(const std::string& cid);
   std::string order_json(const std::string& cid) const;

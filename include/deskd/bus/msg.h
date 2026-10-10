@@ -191,8 +191,19 @@ struct ReleaseMarket {
   std::shared_ptr<std::promise<bool>> reply;   // false: the market was not held
 };
 
+// POST /api/transfer (the ticket's MOVE): free cash between two Kalshi shards
+struct TransferReply {
+  std::string code, msg;   // "" = done
+  std::string shards;      // the shards after it, JSON text ([{id, cash, free}])
+};
+struct TransferIntent {
+  int from = -1, to = -1;
+  Money amount = 0;
+  std::shared_ptr<std::promise<TransferReply>> reply;
+};
+
 using GwMsg = std::variant<PlaceIntent, AmendIntent, CancelIntent, Start, Stop, SendResult, OrderEvent, Probe, ManualWrite,
-                           PrivateMsg, LaneSet, ReleaseMarket>;
+                           PrivateMsg, LaneSet, ReleaseMarket, TransferIntent>;
 
 // Stop goes in the control lane, which nothing else fills; cancels and private events go before
 // new orders (plan section 2). Start and amends wait in the normal lane with the orders, so a

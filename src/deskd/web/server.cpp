@@ -639,8 +639,27 @@ void WebServer::Impl::routes() {
     const json answer = d.watch(b);
     reply_json(res, answer.value("ok", false) ? 200 : err_http(answer.at("err").at("code")), answer);
   }));
-  svr.Post("/api/transfer", post("POST /api/transfer", [](const httplib::Request&, httplib::Response& res, const json&) {
-    reply_err(res, "NO_CASH", "no shard balances in this stage");
+  svr.Post("/api/transfer", post("POST /api/transfer", [this](const httplib::Request&, httplib::Response& res, const json& b) {
+    // the ticket's MOVE: gw checks the source's free cash, send-k1 writes it, the answer waits for the venue's
+    auto shard = [](const std::string& id) {
+      if (id.size() < 2 || id.size() > 3 || id[0] != 'S' || !std::all_of(id.begin() + 1, id.end(), ::isdigit)) return -1;
+      return std::stoi(id.substr(1));
+    };
+    TransferIntent t;
+    t.from = shard(b.at("from").get<std::string>());
+    t.to = shard(b.at("to").get<std::string>());
+    t.amount = parse_money(b.at("amt").get<std::string>()).value_or(0);
+    if (t.from < 0 || t.to < 0) return reply_err(res, "BAD_REQUEST", "from and to are Kalshi shards (S0, S1, ...)");
+    t.reply = std::make_shared<std::promise<TransferReply>>();
+    auto f = t.reply->get_future();
+    if (!d.gw->post(std::move(t))) return reply_err(res, "INTERNAL", "gw inbox full: transfer not queued");
+    OrderWaiter w(order_waiting);
+    if (!w.ok) return reply_err(res, "INTERNAL", "transfer queued; the header's shard cash shows the outcome");
+    if (f.wait_for(std::chrono::milliseconds(kOrderWaitMs)) != std::future_status::ready)
+      return reply_err(res, "EXCHANGE", "transfer queued; no answer within 3000 ms: the header's shard cash shows the outcome");
+    const TransferReply r = f.get();
+    if (!r.code.empty()) return reply_err(res, r.code, r.msg);
+    reply_json(res, 200, json{{"ok", true}, {"shards", json::parse(r.shards)}});
   }));
   // Any other POST: the token first, like every POST, then 404 (until 2026-10-06 an unknown
   // path answered 404 before the token was looked at)
