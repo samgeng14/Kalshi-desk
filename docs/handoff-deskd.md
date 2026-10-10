@@ -58,6 +58,18 @@ Nothing is pushed. `ui/desk/js/contract.js` is the API contract deskd must serve
   rows. Missing, stale, or unsupported metadata fails `rest::fee_ready()`; the display fallback
   must not be used for admission. Demo proof: 8/8 live markets fee-ready, both feeds healthy,
   five contract checks passed, zero orders sent. `/ops/status` reports metadata readiness.
+- Manual admission (2026-10-09, `gw/manual_admission`): pure checks for cid, gates, tick grid
+  per price range, two-tick band through the touch, POST expiry incl. until-close, reduce-only
+  clip, collateral and a worst-case taker-fee allowance.
+- 2026-10-10 (cloud session, Linux x86-64): the deskd suites build and pass on Linux (OpenSSL 3.0
+  fallback, glibc thread names, SIGPIPE test). Fractional sizes: `fractional_trading_enabled` is
+  parsed; whole-contract markets refuse non-whole counts (BAD_QTY) and clip reduce-only to whole
+  contracts. `gw/manual_book`: admission context from the REST revision + book + ledger, shard
+  free cash without double counting (see its header), conservative reducing room, foreign and
+  duplicate orders, reservation and send job in one gw turn, sender replies applied to the
+  ledger. `Snapshot::account_began_ms` added. Not yet wired into `Gateway` or `/api/order`.
+  `docs/deploy-oracle.md` and `tools/vm/{inspect,update}.sh`: VM plan, read-only inventory and
+  controlled updates (not yet run on the VM).
 - Oracle VM `deskd-recorder` for the recorder: `ssh -i ~/.ssh/oracle_deskd ubuntu@64.181.211.165` (Ubuntu 24.04 aarch64, 1 OCPU, 6 GB, 145 GB). Nothing installed yet.
 
 ## Next, in order
@@ -66,7 +78,12 @@ Nothing is pushed. `ui/desk/js/contract.js` is the API contract deskd must serve
    to pub; gw's Manual owner must receive the same books and REST revisions before accepting
    orders. The strict /api/health schema stays unchanged; clock detail is in hdr.lat and
    /ops/status. Browser access was declined, so the real-page visual check is still open.
-2. **Stage 3, the Manual order path** (plan section 3): wire `gw/order_ledger` into the gateway
+2. **Stage 3, the Manual order path** (plan section 3). Next concrete step: own a `ManualBook`
+   in `Gateway`; post REST snapshots and books to gw (new GwMsg variants, or gw reads the
+   immutable snapshot each turn); `/api/order` posts a PlaceIntent with a reply promise and
+   waits at most 50 ms; start `KalshiSender` MANUAL/CANCEL on send-k1/send-cx with their pools;
+   feed `KalshiWriteReply` and private events back to gw; keep header RO until the fake-exchange
+   end-to-end test passes. Then: wire `gw/order_ledger` into the gateway
    alongside the execution/position ledger; authoritative series fees; PlaceIntent validation,
    fat-finger guard, worst-case reservation per shard, preserved `M...` cid, journal, `send-k1`;
    Take = IOC at the supplied slippage cap; Post = post_only + GTC + expiration_time +
