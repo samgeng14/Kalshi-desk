@@ -562,10 +562,41 @@ void systematic_races() {
   CHECK(st["gw"]["ledger_healthy"]==true && st["senders"]["k2"]["healthy"]==true && !r.d->kill_switch().active());
   CHECK(gw_pos()==venue_pos());
 }
+// A group the venue triggers on its own (its contracts limit): order_group_updates tells gw, which
+// blocks the lane (GROUPS fails, its orders are refused) while Systematic runs, and resets the
+// group once it is stopped.
+void systematic_group_trigger() {
+  Run r(false,{},true);
+  CHECK(r.ready());
+  auto lane=r.post("/api/lane/M2",{{"on",true}});
+  CHECK(lane && lane->status==200);
+  std::string why;
+  CHECK(r.until([&]{ return r.d->gw().groups_ready(&why) && why.empty(); },20000));
+  httplib::Result start;
+  CHECK(r.until([&]{ start=r.post("/api/start",json::object()); return start && start->status==200; },10000));
+  const auto gid=r.venue.f->with_engine([](fakex::Engine& e,std::int64_t) {
+    std::string id; for(const auto& [k,g]:e.groups()) id=k; return id; });
+  CHECK(!gid.empty());
+  r.venue.f->with_engine([&](fakex::Engine& e,std::int64_t now) { CHECK(!e.group_trigger(gid,0,0,now)); });
+  CHECK(r.until([&]{ return !r.d->gw().groups_ready(&why); }));
+  CHECK(why.find("triggered")!=std::string::npos);
+  PlaceIntent p; p.cid="SM2-trig-1"; p.owner=Owner::SYS; p.lane="M2"; p.ticker=TK; p.side=Side::BUY; p.price=3900;
+  p.count=100; p.tif=Tif::POST; p.ttl_s=30; p.reply=std::make_shared<std::promise<OrderReply>>();
+  auto f=p.reply->get_future();
+  CHECK(r.d->gw().post(std::move(p)));
+  CHECK(f.wait_for(std::chrono::seconds(5))==std::future_status::ready);
+  const auto refused=f.get();
+  CHECK(refused.code=="RO" && refused.msg.find("not active")!=std::string::npos);
+  CHECK(r.d->status()["run"]["state"]=="RUN");   // never reset while running
+  auto stop=r.post("/api/stop",json::object());
+  CHECK(stop && stop->status==200);
+  CHECK(r.until([&]{ return r.d->gw().groups_ready(&why) && why.empty(); },15000));
+  CHECK(!r.venue.f->with_engine([&](fakex::Engine& e,std::int64_t) { return e.group(gid)->triggered; }));
+}
 }  // namespace
 
 int main() {
   std::signal(SIGPIPE,SIG_IGN);
-  off_by_default(); orders_cancel_kill(); stop_reasons(); financial_fair(); systematic(); systematic_maker(); systematic_band(); systematic_races();
+  off_by_default(); orders_cancel_kill(); stop_reasons(); financial_fair(); systematic(); systematic_maker(); systematic_band(); systematic_races(); systematic_group_trigger();
   return finish("deskd-runtime-manual");
 }

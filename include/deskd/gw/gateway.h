@@ -157,6 +157,7 @@ class Gateway {
   bool sys_dirty_ = true;
   void place_sys(PlaceIntent& p);
   void group_reply(const KalshiWriteReply& r);
+  void group_event(const std::string& id, const std::string& event);
   void group_job(const std::string& lane, int shard, const std::string& action);
   int cancel_sys(const std::function<bool(const std::string& lane)>& which, const char* why);
   void trigger_groups();

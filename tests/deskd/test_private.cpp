@@ -46,6 +46,10 @@ void parser() {
   body.erase("trade_id"); CHECK(!parse()); body["trade_id"]="trade-one";
   body.erase("book_side"); CHECK(!parse()); body["book_side"]="ask";
   body["post_position_fp"]="garbage"; CHECK(!parse());
+  // order_group_updates: the group and what happened to it
+  auto group=parse_private_event({{"type","order_group_updates"},{"sid",3},{"msg",{{"event_type","triggered"},{"order_group_id","og-1"},{"ts_ms",now}}}},now,&why);
+  CHECK(group && group->kind==PrivateEvent::Kind::GROUP && group->group_id=="og-1" && group->group_event=="triggered");
+  CHECK(!parse_private_event({{"type","order_group_updates"},{"msg",{{"event_type","reset"}}}},now,&why));
 }
 void socket() {
   fakex::FakeConfig config; config.rate_limits=false; config.ws_ping_ms=40;

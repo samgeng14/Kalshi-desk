@@ -335,6 +335,12 @@ void Gateway::manual_reply(const KalshiWriteReply& r) {
     return;   // a cancel that did not land leaves the order working until an order read or event says more
   }
   if (r.op != WireOp::CREATE || r.cid.empty()) return;   // cancel-all (KILL) is reconciled from the venue
+  if (sys_ && r.outcome.kind == K::REFUSED && r.outcome.cls == RejectClass::SOFT_GROUP)
+    if (const auto* o = manual_->ledger().find(r.cid); o && o->intent.owner == Owner::SYS) {
+      auto& g = sys_->group(o->intent.lane, o->shard);
+      if (g.state == SysBook::GroupState::ACTIVE) g.state = SysBook::GroupState::TRIGGERED;
+      lanes_dirty_.insert(o->intent.lane);
+    }
   const bool ok = manual_->apply(r);
   if (!ok) DLOG_ERR("reply for order %s contradicts the order book: reconcile before trading", r.cid.c_str());
   publish_order(r.cid);
@@ -372,6 +378,10 @@ void Gateway::manual_private(const PrivateEvent& e) {
   const bool healthy = ledger.healthy();
   const std::int64_t at = e.received_ms ? e.received_ms : now_ms();
   std::string cid;
+  if (e.kind == PrivateEvent::Kind::GROUP) {
+    if (sys_) group_event(e.group_id, e.group_event);
+    return;
+  }
   if (e.kind == PrivateEvent::Kind::ORDER) {
     if (!ledger.observed(e.order, at)) {
       if (healthy && !ledger.healthy())
@@ -669,6 +679,29 @@ void Gateway::group_reply(const KalshiWriteReply& r) {
     else { g->state = SysBook::GroupState::TRIGGERED; DLOG_WARN("order group %s not reset: %s", g->id.c_str(), r.outcome.why.c_str()); }
   }
   lanes_dirty_.insert(lane);
+}
+
+// order_group_updates: the venue's own word on a group. A trigger gw did not ask for is the
+// group's contracts limit at work (too many fills in 15 s): the lane is BLOCKED until a Stop or
+// HALT lets gw reset it, never reset while Systematic runs.
+void Gateway::group_event(const std::string& id, const std::string& event) {
+  for (auto& [key, g] : sys_->groups()) {
+    if (g.id != id) continue;
+    if (event == "triggered") {
+      if (g.state == SysBook::GroupState::ACTIVE)
+        DLOG_WARN("order group %s (%s, shard %d) triggered by the venue: %s blocked until Systematic stops",
+                  id.c_str(), key.first.c_str(), key.second, key.first.c_str());
+      if (g.state != SysBook::GroupState::RESETTING) g.state = SysBook::GroupState::TRIGGERED;
+    } else if (event == "reset") {
+      g.state = SysBook::GroupState::ACTIVE;
+    } else if (event == "deleted") {
+      if (path_->groups) path_->groups->remove(g.id);
+      g = SysBook::Group{};
+    }
+    lanes_dirty_.insert(key.first);
+    sys_dirty_ = true;
+    return;
+  }
 }
 
 void Gateway::trigger_groups() {
