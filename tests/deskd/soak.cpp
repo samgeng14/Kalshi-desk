@@ -5,6 +5,7 @@
 //   - the order ledger and send-k2 / send-cx healthy, KILL never tripped
 //   - at most one resting Systematic quote per market and side on the venue
 //   - gw's lane position equals the venue's position (allowing 5 s for the private feed)
+//   - gw refuses none of the maker's quotes
 // and at the end, Stop leaves nothing resting. ctest runs it for 60 s; for the real soak:
 //   DESKD_SOAK_SECONDS=14400 ./deskd-soak        (configure with -DDESKD_TSAN=ON for TSan)
 #include <httplib.h>
@@ -182,6 +183,9 @@ int main() {
               st["maker"]["refusals"].get<int>(),s.takes,fills,static_cast<long long>(s.max_resting),
               st["gw"]["sys_sent"].get<int>(),s.violations);
   CHECK(s.violations==0);
+  // gw never refused a quote: a refusal in a steady run is a gap somewhere (fee metadata going
+  // stale between polls was one, 2026-10-10)
+  CHECK(st["maker"]["refusals"]==0);
   CHECK(st["maker"]["places"].get<int>()>0 && fills>0);   // it quoted, and was traded against
   return finish("deskd-soak");
 }

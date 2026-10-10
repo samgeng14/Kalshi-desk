@@ -383,8 +383,10 @@ void State::metadata(Snapshot& next,Worker* worker) {
   std::vector<std::string> due;
   for(const auto& name:names) {
     const auto it=series_.find(name);
+    // Fetched again a minute before it goes stale: refetching only once stale left every order
+    // on the market refused RO until the next poll (12 s), every five minutes (soak, 2026-10-10).
     if(it==series_.end() || !it->second.fetched_ms || now_ms()<it->second.fetched_ms ||
-       now_ms()-it->second.fetched_ms>=kFeeFreshMs) due.push_back(name);
+       now_ms()-it->second.fetched_ms>=kFeeRefreshMs) due.push_back(name);
   }
   std::sort(due.begin(),due.end(),[&](const auto& a,const auto& b) {
     const auto ia=series_.find(a),ib=series_.find(b);

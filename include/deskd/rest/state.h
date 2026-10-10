@@ -132,6 +132,7 @@ class State {
 // until incentive metadata is integrated. Unknown fees retain the presentation fallback;
 // that fallback is NOT approval to trade: admission must require fee_ready().
 constexpr std::int64_t kFeeFreshMs = 300000;
+constexpr std::int64_t kFeeRefreshMs = kFeeFreshMs - 60000;   // fetched again before it is stale
 bool fee_ready(const kalshi::MarketRow& market, std::int64_t now_ms);
 std::string category(const kalshi::MarketRow& market);
 std::string outcome_date(const kalshi::MarketRow& market);
