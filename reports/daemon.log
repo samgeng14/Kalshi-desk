@@ -1,3 +1,53 @@
 2026-09-12T23:35:29Z  daemon up  live=False  rebalance every 168h  poll 300s
 2026-09-12T23:35:29Z  not due until 2026-09-19 23:07 UTC; nothing to do
 2026-09-12T23:35:29Z  to close the book: KALSHI_ARM=$KALSHI_ARM python3 scripts/portfolio_safety.py --flatten --live
+2026-09-12T23:36:12Z  daemon up  live=True  rebalance every 168h  poll 300s
+2026-09-12T23:36:13Z  book on start: KXBCHPERP -3, KXBTCPERP -1, KXETHPERP +3, KXNEARPERP +3   resting 0
+2026-09-12T23:49:05Z  daemon up  live=True  rebalance every 168h  poll 300s
+2026-09-12T23:49:06Z  book on start: (flat)   resting 0
+2026-09-13T04:28:36Z  wall clock jumped 18 minutes — treating as a sleep; clearing and re-planning
+2026-09-13T04:30:44Z  wall clock jumped 18 minutes — treating as a sleep; clearing and re-planning
+2026-09-13T12:54:25Z  wall clock jumped 20 minutes — treating as a sleep; clearing and re-planning
+2026-09-13T12:56:33Z  wall clock jumped 20 minutes — treating as a sleep; clearing and re-planning
+2026-09-13T14:47:39Z  wall clock jumped 20 minutes — treating as a sleep; clearing and re-planning
+2026-09-13T14:50:32Z  wall clock jumped 20 minutes — treating as a sleep; clearing and re-planning
+2026-09-13T14:50:32Z  cancelled 1 resting order(s) — woke after a 20 minute gap
+2026-09-13T17:16:18Z  wall clock jumped 34 minutes — treating as a sleep; clearing and re-planning
+2026-09-13T17:19:11Z  wall clock jumped 34 minutes — treating as a sleep; clearing and re-planning
+2026-09-14T02:46:27Z  wall clock jumped 22 minutes — treating as a sleep; clearing and re-planning
+2026-09-14T03:02:00Z  wall clock jumped 35 minutes — treating as a sleep; clearing and re-planning
+2026-09-14T03:20:06Z  wall clock jumped 34 minutes — treating as a sleep; clearing and re-planning
+2026-09-14T03:22:14Z  wall clock jumped 20 minutes — treating as a sleep; clearing and re-planning
+2026-09-14T13:39:22Z  wall clock jumped 72 minutes — treating as a sleep; clearing and re-planning
+2026-09-14T14:20:12Z  wall clock jumped 111 minutes — treating as a sleep; clearing and re-planning
+2026-09-14T14:25:20Z  wall clock jumped 46 minutes — treating as a sleep; clearing and re-planning
+2026-09-15T00:13:17Z  wall clock jumped 16 minutes — treating as a sleep; clearing and re-planning
+2026-09-15T04:19:24Z  wall clock jumped 91 minutes — treating as a sleep; clearing and re-planning
+2026-09-15T04:21:31Z  wall clock jumped 91 minutes — treating as a sleep; clearing and re-planning
+2026-09-15T05:00:15Z  wall clock jumped 31 minutes — treating as a sleep; clearing and re-planning
+2026-09-15T07:39:19Z  wall clock jumped 188 minutes — treating as a sleep; clearing and re-planning
+2026-09-15T11:51:36Z  wall clock jumped 411 minutes — treating as a sleep; clearing and re-planning
+2026-09-15T12:41:50Z  wall clock jumped 303 minutes — treating as a sleep; clearing and re-planning
+2026-09-15T12:41:55Z  could not cancel resting orders: GET /margin/orders?status=resting&limit=200 -> <urlopen error [Errno 8] nodename nor servname provided, or not known>
+2026-09-15T12:56:53Z  wall clock jumped 65 minutes — treating as a sleep; clearing and re-planning
+2026-09-15T12:59:05Z  wall clock jumped 17 minutes — treating as a sleep; clearing and re-planning
+2026-09-15T14:44:44Z  wall clock jumped 31 minutes — treating as a sleep; clearing and re-planning
+2026-09-15T14:47:32Z  wall clock jumped 31 minutes — treating as a sleep; clearing and re-planning
+2026-09-15T15:36:38Z  wall clock jumped 32 minutes — treating as a sleep; clearing and re-planning
+2026-09-15T15:42:43Z  wall clock jumped 35 minutes — treating as a sleep; clearing and re-planning
+2026-09-15T15:51:49Z  wall clock jumped 15 minutes — treating as a sleep; clearing and re-planning
+2026-09-15T18:10:55Z  wall clock jumped 148 minutes — treating as a sleep; clearing and re-planning
+2026-09-15T18:37:00Z  wall clock jumped 165 minutes — treating as a sleep; clearing and re-planning
+2026-09-15T19:07:44Z  wall clock jumped 57 minutes — treating as a sleep; clearing and re-planning
+2026-09-15T19:37:57Z  wall clock jumped 61 minutes — treating as a sleep; clearing and re-planning
+2026-09-15T20:12:12Z  wall clock jumped 64 minutes — treating as a sleep; clearing and re-planning
+2026-09-15T20:14:24Z  wall clock jumped 36 minutes — treating as a sleep; clearing and re-planning
+2026-09-16T22:57:30Z  wall clock jumped 16 minutes — treating as a sleep; clearing and re-planning
+2026-09-16T23:04:21Z  wall clock jumped 20 minutes — treating as a sleep; clearing and re-planning
+2026-09-17T00:01:51Z  wall clock jumped 20 minutes — treating as a sleep; clearing and re-planning
+2026-09-17T04:15:44Z  wall clock jumped 21 minutes — treating as a sleep; clearing and re-planning
+2026-09-17T04:34:21Z  wall clock jumped 37 minutes — treating as a sleep; clearing and re-planning
+2026-09-17T04:37:09Z  wall clock jumped 21 minutes — treating as a sleep; clearing and re-planning
+2026-09-17T08:38:30Z  wall clock jumped 21 minutes — treating as a sleep; clearing and re-planning
+2026-09-17T08:40:43Z  wall clock jumped 21 minutes — treating as a sleep; clearing and re-planning
+2026-09-17T16:24:28Z  shutting down (SIGTERM) — cancelling resting orders, LEAVING POSITIONS OPEN
