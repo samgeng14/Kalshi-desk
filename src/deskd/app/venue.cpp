@@ -27,6 +27,7 @@ bool Deskd::init_venue(std::string* err) {
   if (!factory_->ok(err)) return false;
   md_ = std::make_unique<KalshiMd>(*we, *factory_, *signer_, feeds_.KX,
                                   [this](const MdBook& b) { on_book(b); });
+  md_->set_trade_callback([this](const MdTrade& t) { on_trade(t); });
   rest::Options ro;
   if (options_.rest_poll_ms > 0) ro.poll_ms = options_.rest_poll_ms;
   rest_ = std::make_unique<rest::State>(*factory_, *re, signer_.get(),
@@ -100,6 +101,19 @@ HdrInputs Deskd::header() const {
   // Read-only until the operator turns Manual orders on (deskd.manual_orders) with a write path.
   h.cash_k=rest_cash_json(*s,!(cfg_.manual_orders && man_sender_));
   h.clk_off_ms = s->clock.offset_ms;
+  // Manual's day: realized today plus open positions at the mid; risk: the open worst case plus
+  // what working orders hold (cash less free).
+  Money unrl = 0, maxl = 0;
+  for (const auto& p : s->positions) {
+    const auto row = rest_position_json(p, mid(p.ticker));
+    unrl += parse_money(row.at("unrl").get<std::string>()).value_or(0);
+    maxl += parse_money(row.at("maxl").get<std::string>()).value_or(0);
+  }
+  const auto day = std::atomic_load(&day_);
+  h.day_man = (day ? day->real_total : 0) + unrl;
+  const auto total = parse_money(h.cash_k.value("total", std::string("0.0000"))).value_or(0);
+  const auto free = parse_money(h.cash_k.value("free", std::string("0.0000"))).value_or(0);
+  h.risk = maxl + std::max<Money>(0, total - free);
   return h;
 }
 
@@ -182,9 +196,87 @@ void Deskd::on_rest(std::shared_ptr<const rest::Snapshot>) {
     row["rev"] = std::max<std::uint64_t>(1,s->revision);
     pub_->post(PubData{"ord",std::move(row)});
   }
+  // Today's fills (new ones only; each is keyed by fid) and today's P&L per market.
+  auto day = std::make_shared<DayPnl>(day_pnl(*s, et_midnight_ms(now_ms()), [this](const std::string& tk) { return mid(tk); }));
+  if (day->unknown_basis)
+    DLOG_WARN("%zu of today's fills reduce a position whose cost before today is not recoverable: they count only their fee",
+              day->unknown_basis);
+  for (const auto& f : day->fills) {
+    const auto fid = f.at("fid").get<std::string>();
+    if (fills_sent_.insert(fid).second) pub_->post(PubData{"fill", f});
+  }
   std::vector<json> positions;
-  for (const auto& p : s->positions) positions.push_back(rest_position_json(p));
+  std::set<std::pair<std::string, int>> listed;
+  for (const auto& p : s->positions) {
+    const std::pair<std::string, int> key{p.ticker, p.exchange_index};
+    listed.insert(key);
+    const auto r = day->real.find(key), f = day->fees.find(key);
+    positions.push_back(rest_position_json(p, mid(p.ticker), r == day->real.end() ? 0 : r->second,
+                                           f == day->fees.end() ? 0 : f->second));
+  }
+  // A market traded flat today keeps its row, with today's realized P&L (contract pos).
+  for (const auto& [key, real] : day->real) {
+    if (listed.count(key)) continue;
+    kalshi::PositionRow flat;
+    flat.ticker = key.first;
+    flat.exchange_index = key.second;
+    positions.push_back(rest_position_json(flat, std::nullopt, real, day->fees.at(key)));
+  }
+  std::atomic_store(&day_, std::shared_ptr<const DayPnl>(std::move(day)));
   pub_->post(PubReplace{"pos",std::move(positions),"K"});
+}
+
+std::optional<Px> Deskd::mid(const std::string& ticker) const {
+  const auto books = std::atomic_load(&books_);
+  if (!books) return std::nullopt;
+  const auto it = books->find(ticker);
+  if (it == books->end() || it->second.stale || it->second.bids.empty() || it->second.asks.empty()) return std::nullopt;
+  return (it->second.bids.front().px + it->second.asks.front().px) / 2;
+}
+
+void Deskd::on_trade(const MdTrade& t) {
+  auto& tape = tape_[t.ticker];
+  if (!t.trade_id.empty()) {
+    if (!tape.seen.insert(t.trade_id).second) return;   // already shown
+    if (tape.seen.size() > 20000) tape.seen.clear();
+  }
+  tape.pending.push_back(t);
+  if (tape.pending.size() > 200) tape.pending.erase(tape.pending.begin());
+  if (!tape.last || t.ts_ms >= tape.last->ts_ms) tape.last = t;
+  if (t.ts_ms > tape.listing_ms) tape.since_listing += t.qty;
+  const auto book = md_last_.find(t.ticker);
+  if (book != md_last_.end() && !book->second.stale) publish_book(t.ticker);
+}
+
+void Deskd::publish_book(const std::string& ticker) {
+  const auto bk = md_last_.find(ticker);
+  if (bk == md_last_.end()) return;
+  const MdBook& b = bk->second;
+  auto& tape = tape_[ticker];
+  auto print = [](const MdTrade& t) {
+    return json{{"px", price_str(t.px)}, {"qty", qty_to_number(t.qty)}, {"side", t.taker_bought_yes ? "BUY" : "SELL"},
+                {"ts_ms", t.ts_ms}};
+  };
+  json bids = json::array(), asks = json::array(), trades = json::array();
+  for (const auto& level : b.bids) bids.push_back({price_str(level.px),qty_to_number(level.qty)});
+  for (const auto& level : b.asks) asks.push_back({price_str(level.px),qty_to_number(level.qty)});
+  for (const auto& t : tape.pending) trades.push_back(print(t));
+  tape.pending.clear();
+  // vol: Kalshi's 24-hour volume from the latest listing, plus prints seen since it was read
+  // (the contract's "today" is approximated by the venue's 24 h figure).
+  Qty vol = 0;
+  if (rest_) {
+    const auto s = rest_->snapshot();
+    if (tape.listing_ms != s->listing_ms) { tape.listing_ms = s->listing_ms; tape.since_listing = 0; }
+    const auto m = s->markets.find(ticker);
+    if (m != s->markets.end() && m->second.volume_24h) vol = *m->second.volume_24h;
+  }
+  vol += tape.since_listing;
+  pub_->post(PubData{"book",{{"v","K"},{"tk",ticker},{"depth","FULL"},
+      {"bids",bids},{"asks",asks},{"trades",trades},{"last",tape.last ? print(*tape.last) : json(nullptr)},
+      {"vol",qty_to_number(std::max<Qty>(0, vol))},
+      {"ref",{{"fair",nullptr},{"sd",nullptr},{"espn",nullptr},{"espn_ts_ms",nullptr},{"game",nullptr}}},
+      {"ex_ms",b.venue_ms.value_or(b.last_change_ms)}}});
 }
 
 void Deskd::on_book(const MdBook& b) {
@@ -195,15 +287,10 @@ void Deskd::on_book(const MdBook& b) {
     (*next)[b.ticker] = b;
     std::atomic_store(&books_, std::shared_ptr<const std::map<std::string, MdBook>>(std::move(next)));
   }
+  md_last_[b.ticker] = b;
   // STALE is a venue-wide heartbeat flag; never publish a gapped reconstruction as a price.
   if (b.stale) return;
-  json bids = json::array(), asks = json::array();
-  for (const auto& level : b.bids) bids.push_back({price_str(level.px),qty_to_number(level.qty)});
-  for (const auto& level : b.asks) asks.push_back({price_str(level.px),qty_to_number(level.qty)});
-  pub_->post(PubData{"book",{{"v","K"},{"tk",b.ticker},{"depth","FULL"},
-      {"bids",bids},{"asks",asks},{"trades",json::array()},{"last",nullptr},{"vol",0},
-      {"ref",{{"fair",nullptr},{"sd",nullptr},{"espn",nullptr},{"espn_ts_ms",nullptr},{"game",nullptr}}},
-      {"ex_ms",b.venue_ms.value_or(b.last_change_ms)}}});
+  publish_book(b.ticker);
 }
 
 json Deskd::watch(const json& request) {

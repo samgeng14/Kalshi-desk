@@ -259,6 +259,8 @@ bool State::account(Snapshot& next, std::string* why, Worker* worker) {
   orders.clear();
   for (auto& entry : unique_orders) orders.push_back(std::move(entry.second));
   std::vector<kalshi::FillRow> fills;
+  // Fills since the earlier of this start and today's ET midnight: the day's P&L is built from them.
+  q.min_ts = std::min(started_ms_ - 5000, et_midnight_ms(now_ms())) / 1000;
   if (!pages(&fills, [&](const std::string& cursor) { q.cursor = cursor; return kalshi::build_get_fills(q); },
              kalshi::parse_fills, fetch, options_.max_pages, why)) return false;
   std::map<std::string, kalshi::FillRow> unique_fills;
@@ -390,7 +392,21 @@ bool State::refresh(Worker* worker) {
   metadata(next,worker);
   next.ts_ms = now_ms();
   if (next.account_ready && commit_ && !commit_(fence)) {
-    next.account_ready = false;
+    // These pages may straddle a private event, so they never become the account. The last
+    // consistent read stays (ready if it was): gw counts every order of its own that a read
+    // cannot reflect at worst case, and a private feed that is down or unreconciled blocks
+    // orders by itself. Marking the account not ready here instead refused clicks for a poll
+    // after every fill or cancel during active trading.
+    const auto prev = snapshot();
+    next.exchange = prev->exchange;
+    next.balance = prev->balance;
+    next.balances = prev->balances;
+    next.positions = prev->positions;
+    next.orders = prev->orders;
+    next.fills = prev->fills;
+    next.account_ready = prev->account_ready;
+    next.account_ms = prev->account_ms;
+    next.account_began_ms = prev->account_began_ms;
     if (!next.error.empty()) next.error += "; ";
     next.error += "private feed changed during account read; reconciling again";
     if (fence) request_refresh(); // a disconnected socket requests a refresh after subscribing

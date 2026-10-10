@@ -204,8 +204,39 @@ void socket_integration() {
 }
 }  // namespace
 
+// The trade channel: prints in YES terms for subscribed markets only; a gap or a malformed print
+// is counted or skipped, never a reason to drop the books.
+void trades() {
+  std::vector<MdTrade> prints;
+  MdBooks b([](const MdBook&) {}, [&](const MdTrade& t) { prints.push_back(t); });
+  std::string why;
+  b.watch({"A", "B"}, 1);
+  CHECK(b.subscribed(1, {"A", "B"}, &why));
+  CHECK(b.subscribed_trades(2, {"A"}, &why));
+  CHECK(!b.subscribed_trades(2, {"A"}, &why));      // duplicate sid
+  CHECK(!b.subscribed_trades(3, {"Z"}, &why));      // not watched
+  CHECK(b.message(snapshot("A", 1, 1), 10, &why) && b.message(snapshot("B", 1, 2), 11, &why) && b.ready());
+  auto trade = [](const std::string& tk, std::int64_t seq, const char* px, const char* qty, const char* taker) {
+    return json{{"type", "trade"}, {"sid", 2}, {"seq", seq},
+                {"msg", {{"trade_id", "t" + std::to_string(seq)}, {"market_ticker", tk}, {"yes_price_dollars", px},
+                         {"count_fp", qty}, {"taker_side", taker}, {"ts", 1700000001}}}};
+  };
+  CHECK(b.message(trade("A", 1, "0.4200", "2.00", "yes"), 20, &why));
+  CHECK(prints.size() == 1 && prints[0].px == 4200 && prints[0].qty == 200 && prints[0].taker_bought_yes &&
+        prints[0].ts_ms == 1700000001000LL && prints[0].trade_id == "t1");
+  CHECK(b.message(trade("A", 2, "0.4100", "0.50", "no"), 21, &why));
+  CHECK(prints.size() == 2 && !prints[1].taker_bought_yes && prints[1].qty == 50);
+  CHECK(b.message(trade("A", 5, "0.4100", "1.00", "no"), 22, &why) && b.trade_gaps() == 1 && b.ready());   // gap: counted
+  CHECK(b.message(trade("B", 6, "0.4100", "1.00", "no"), 23, &why) && prints.size() == 3);    // not this sid's market
+  CHECK(b.message(trade("A", 7, "1.5", "1.00", "no"), 24, &why) && prints.size() == 3);      // malformed: skipped
+  CHECK(b.message({{"type", "ok"}, {"sid", 2}, {"seq", 8}}, 25, &why) && b.ready());          // other frames on the sid
+  json unnumbered = trade("A", 9, "0.4300", "1.00", "yes"); unnumbered.erase("seq");
+  CHECK(b.message(unnumbered, 26, &why) && prints.size() == 4 && prints[3].px == 4300);       // a print without seq
+  CHECK(b.message(delta("A", 1, 3, "yes", "0.4000", "-0.50"), 27, &why) && b.ready());        // books unaffected
+}
+
 int main() {
   ::signal(SIGPIPE, SIG_IGN);
-  framing(); reducer(); socket_integration();
+  framing(); reducer(); trades(); socket_integration();
   return finish("deskd-md");
 }

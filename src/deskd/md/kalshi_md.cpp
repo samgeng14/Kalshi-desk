@@ -7,6 +7,7 @@
 #include <climits>
 #include <deque>
 #include <limits>
+#include <set>
 #include <thread>
 
 #include <nlohmann/json.hpp>
@@ -84,6 +85,14 @@ bool MdBooks::subscribed(std::int64_t sid, const std::vector<std::string>& ticke
   for (const auto& ticker : tickers) books_.at(ticker).sid = sid;
   return true;
 }
+bool MdBooks::subscribed_trades(std::int64_t sid, const std::vector<std::string>& tickers, std::string* why) {
+  if (sid <= 0 || tickers.empty() || subs_.count(sid)) { if (why) *why = "invalid or duplicate trade subscription"; return false; }
+  for (const auto& ticker : tickers)
+    if (!books_.count(ticker)) { if (why) *why = "trade subscription contains an unwatched market"; return false; }
+  Sub sub; sub.tickers = std::set<std::string>(tickers.begin(), tickers.end()); sub.trades = true;
+  subs_.emplace(sid, std::move(sub));
+  return true;
+}
 bool MdBooks::fail(std::int64_t sid, const std::string& reason, std::int64_t now, std::string* why) {
   if (why) *why = reason;
   auto sub = subs_.find(sid);
@@ -102,6 +111,36 @@ bool MdBooks::message(const json& frame, std::int64_t received, std::string* why
   const auto type = frame["type"].get<std::string>();
   const auto sid = integer(frame, "sid");
   if (type == "error") return fail(sid.value_or(0), "venue rejected market-data subscription", received, why);
+  if (type == "trade") {
+    // Display data: a gap loses prints, nothing else. Count it, take the new position, go on.
+    const auto found = sid ? subs_.find(*sid) : subs_.end();
+    if (found == subs_.end() || !found->second.trades) return true;   // not a trade subscription of ours
+    auto& sub = found->second;
+    if (const auto seq = integer(frame, "seq")) {
+      if (sub.last_seq && *seq != sub.last_seq + 1) ++trade_gaps_;
+      sub.last_seq = std::max(sub.last_seq, *seq);
+    }
+    const auto it = frame.find("msg");
+    if (!trades_ || it == frame.end() || !it->is_object()) return true;
+    const auto& msg = *it;
+    const auto str = [&](const char* k) {
+      const auto f = msg.find(k);
+      return f != msg.end() && f->is_string() ? f->get<std::string>() : std::string();
+    };
+    MdTrade t;
+    t.ticker = str("market_ticker");
+    t.trade_id = str("trade_id");
+    const auto px = kalshi::parse_px(str("yes_price_dollars"));
+    const auto qty = kalshi::parse_count(str("count_fp"));
+    const auto side = str("taker_side");
+    if (!sub.tickers.count(t.ticker) || !px || !qty || *qty <= 0 || (side != "yes" && side != "no")) return true;
+    t.px = *px; t.qty = *qty; t.taker_bought_yes = side == "yes";
+    if (const auto ms = integer(msg, "ts_ms")) t.ts_ms = *ms;
+    else if (const auto sec = integer(msg, "ts")) t.ts_ms = *sec * 1000;
+    else t.ts_ms = received;
+    trades_(t);
+    return true;
+  }
   const bool is_book = type == "orderbook_snapshot" || type == "orderbook_delta";
   const bool numbered = frame.contains("seq") || is_book;
   if (!numbered) return true;
@@ -109,6 +148,7 @@ bool MdBooks::message(const json& frame, std::int64_t received, std::string* why
   if (!sid || !seq || *sid <= 0 || *seq <= 0 || !subs_.count(*sid))
     return fail(0, "missing or unknown market-data sequence", received, why);
   auto& sub = subs_.at(*sid);
+  if (sub.trades) return true;   // acknowledgments and other numbered frames on a trade sid
   if (sub.broken) return false;
   // The first subscribed frame may start at 2 (documented snapshot example). Thereafter every
   // numbered message, including acknowledgments, must be exactly next. Replays are unsafe too.
@@ -187,7 +227,7 @@ void KalshiMd::clear_watch() {
   if (!desired_.empty()) { desired_.clear(); ++version_; }
 }
 void KalshiMd::run(Worker& self) {
-  MdBooks books(callback_);
+  MdBooks books(callback_, trade_callback_);
   int backoff = options_.backoff_min_ms;
   while (!self.stopping()) {
     self.beat();
@@ -199,6 +239,7 @@ void KalshiMd::run(Worker& self) {
     const auto headers = signer_.headers(now_ms(), "GET", endpoint_.base_path);
     bool connected = !headers.empty() && ws.connect(factory_, endpoint_, headers, options_.connect_timeout_ms, &reason, [&] { self.beat(); });
     std::map<std::int64_t, std::vector<std::string>> pending;
+    std::set<std::int64_t> trade_commands;   // pending entries that subscribe the trade channel
     std::int64_t id = 0;
     if (connected) {
       for (std::size_t first = 0; first < watch.size(); first += options_.markets_per_subscription) {
@@ -207,6 +248,12 @@ void KalshiMd::run(Worker& self) {
         pending[++id] = batch;
         json command{{"id", id}, {"cmd", "subscribe"}, {"params", {{"channels", {"orderbook_delta"}}, {"market_tickers", batch}}}};
         if (!ws.send(net::WsOp::TEXT, command.dump(), 500, &reason, [&] { self.beat(); })) { connected = false; break; }
+        if (!trade_callback_) continue;
+        // Prints for the same markets on their own sid (display only; see subscribed_trades)
+        pending[++id] = batch;
+        trade_commands.insert(id);
+        json trades{{"id", id}, {"cmd", "subscribe"}, {"params", {{"channels", {"trade"}}, {"market_tickers", batch}}}};
+        if (!ws.send(net::WsOp::TEXT, trades.dump(), 500, &reason, [&] { self.beat(); })) { connected = false; break; }
       }
     }
     const auto started = mono_ms(); auto last_ping = started;
@@ -242,12 +289,30 @@ void KalshiMd::run(Worker& self) {
         }
       }
       if (!frame.contains("type") || !frame["type"].is_string()) { reason = "missing market-data message type"; break; }
+      if (frame["type"].get<std::string>() == "error") {
+        // A refused trade subscription costs the prints, never the books.
+        const auto command_id = integer(frame, "id");
+        if (command_id && trade_commands.count(*command_id)) {
+          DLOG_WARN("Kalshi refused the trade channel for %zu markets: books continue without prints",
+                    pending.count(*command_id) ? pending.at(*command_id).size() : std::size_t{0});
+          pending.erase(*command_id);
+          trade_commands.erase(*command_id);
+          continue;
+        }
+      }
       if (frame["type"].get<std::string>() == "subscribed") {
         const auto command_id = integer(frame, "id");
         if (!command_id || !pending.count(*command_id) || !frame.contains("msg") || !frame["msg"].is_object()) {
           reason = "unexpected subscription acknowledgment"; break;
         }
         const auto& msg = frame["msg"]; const auto sid = integer(msg, "sid");
+        if (trade_commands.count(*command_id)) {
+          if (!sid || !msg.contains("channel") || msg["channel"] != "trade" ||
+              !books.subscribed_trades(*sid, pending.at(*command_id), &reason)) break;
+          pending.erase(*command_id);
+          trade_commands.erase(*command_id);
+          continue;
+        }
         if (!sid || !msg.contains("channel") || !msg["channel"].is_string() || msg["channel"].get<std::string>() != "orderbook_delta" ||
             !books.subscribed(*sid, pending.at(*command_id), &reason)) break;
         pending.erase(*command_id);

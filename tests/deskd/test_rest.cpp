@@ -137,9 +137,19 @@ void reconcile() {
   CHECK(!state.refresh_once());
   CHECK(!state.snapshot()->account_ready && state.snapshot()->balances==s->balances);
   CHECK(state.refresh_once());
+  // A private event during the read: the pages are discarded, the last consistent read stays.
+  const auto consistent=state.snapshot();
   state.set_reconcile_guard([] { return std::uint64_t{7}; }, [](std::uint64_t) { return false; });
-  CHECK(!state.refresh_once() && !state.snapshot()->account_ready);
+  CHECK(state.refresh_once() && state.snapshot()->account_ready);
   CHECK(state.snapshot()->error.find("private feed changed") != std::string::npos);
+  CHECK(state.snapshot()->account_ms==consistent->account_ms &&
+        state.snapshot()->account_began_ms==consistent->account_began_ms &&
+        state.snapshot()->balances==consistent->balances);
+  {   // with no consistent read yet, the account is not ready
+    rest::State fresh(factory,*endpoint,signer.get(),{},opts);
+    fresh.set_reconcile_guard([] { return std::uint64_t{7}; }, [](std::uint64_t) { return false; });
+    CHECK(!fresh.refresh_once() && !fresh.snapshot()->account_ready);
+  }
   state.set_reconcile_guard([] { return std::uint64_t{8}; }, [](std::uint64_t fence) { return fence == 8; });
   CHECK(state.refresh_once());
   opts.max_pages=1;

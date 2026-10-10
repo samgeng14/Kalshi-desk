@@ -87,6 +87,12 @@ Nothing is pushed. `ui/desk/js/contract.js` is the API contract deskd must serve
    the header's cash is read-only until then. `/ops/status` shows `gw.manual_orders`,
    `books_live`, `rest.fee_ready_live`, `clock.post_trusted`. Tested in `test_runtime_manual`
    (the whole process against the fake over TLS: off by default, fill, rest and cancel, KILL).
+   The screen also gets real data the simulator only fakes (2026-10-10): the trade channel's
+   prints, last and volume on the ladders, today's fills (FILLS panel) with realized P&L by
+   average cost, positions marked at the live mid with today's real and fees (flat rows kept),
+   and the header's day.man and risk. Fair, ESPN, LIP and Systematic stay blank (no models or
+   lanes yet; never a placeholder). A private event during a REST read now keeps the last
+   consistent account instead of marking it not ready (clicks were refused after fills).
    Next: the demo proof on the Mac (set manual_orders, small sizes), then latency timelines,
    per-shard token buckets, the journal, and positions from the execution ledger. Then: wire `gw/order_ledger` into the gateway
    alongside the execution/position ledger; authoritative series fees; PlaceIntent validation,

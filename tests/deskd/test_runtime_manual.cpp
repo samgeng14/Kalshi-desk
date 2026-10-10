@@ -6,6 +6,7 @@
 #include <sys/stat.h>
 #include <csignal>
 #include <fstream>
+#include <thread>
 #include <nlohmann/json.hpp>
 #include "check.h"
 #include "deskd/app/lock.h"
@@ -20,6 +21,46 @@ namespace {
 const std::string TK="KXRUNTIME-26OCT10-A";   // shard 0, 1c grid, closes an hour after the test starts
 // RFC 8032 test vector, not an account credential (as in test_sender).
 const char* pem="-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIJ1hsZ3v/VpguoRK9JLsLMREScVpezJpGXA7rAMcrn9g\n-----END PRIVATE KEY-----\n";
+
+// The page's stream, on its own thread (as test_web's reader): the envelopes so far.
+struct Stream {
+  std::thread th;
+  std::mutex m;
+  std::string buf;
+  std::atomic<bool> stop{false};
+  Stream(int port, const std::string& sid) {
+    th = std::thread([this, port, sid] {
+      httplib::Client c("127.0.0.1", port);
+      c.set_read_timeout(15, 0);
+      c.Get("/api/stream?sid=" + sid, httplib::Headers{},
+            [](const httplib::Response&) { return true; },
+            [this](const char* data, std::size_t len) {
+              std::lock_guard<std::mutex> lk(m);
+              buf.append(data, len);
+              return !stop.load();
+            });
+    });
+  }
+  ~Stream() { stop = true; th.join(); }
+  std::vector<json> envelopes() {
+    std::string t;
+    { std::lock_guard<std::mutex> lk(m); t = buf; }
+    std::vector<json> out;
+    std::size_t at = 0;
+    while (true) {
+      const auto end = t.find("\n\n", at);
+      if (end == std::string::npos) break;
+      const std::string block = t.substr(at, end - at);
+      at = end + 2;
+      const auto d = block.find("data: ");
+      if (d == std::string::npos) continue;
+      const auto le = block.find('\n', d);
+      auto j = json::parse(block.substr(d + 6, le == std::string::npos ? std::string::npos : le - d - 6), nullptr, false);
+      if (!j.is_discarded()) out.push_back(j);
+    }
+    return out;
+  }
+};
 
 struct Run {
   fx::Venue venue;
@@ -98,14 +139,47 @@ void off_by_default() {
   CHECK(r.d->status()["gw"]["manual_orders"]==false);
 }
 
+// every event of a type in the stream so far, with its payload
+std::vector<json> of(Stream& st,const std::string& type) {
+  std::vector<json> out;
+  for(const auto& e:st.envelopes()) if(e.value("type","")==type) out.push_back(e);
+  return out;
+}
+
 void orders_cancel_kill() {
   Run r(true);
   CHECK(r.ready());
   CHECK(r.d->status()["gw"]["manual_orders"]==true);
+  Stream st(r.d->port(),"rt-stream-1");
+  CHECK(r.until([&]{ return !st.envelopes().empty(); }));
+  auto sub=r.post("/api/subscribe",{{"sid","rt-stream-1"},{"ladders",{{{"v","K"},{"tk",TK}}}},{"tops",json::array()}});
+  CHECK(sub && sub->status==200);
   // Take: IOC buy 2 at the 0.42 ask
   auto o=r.order("Mrt-take-1","BUY","0.4200",2,"IOC");
   if(o["status"]!=200) std::fprintf(stderr,"take: %s\n",o.dump().c_str());
   CHECK(o["status"]==200 && o["ord"]["st"]=="FILL" && o["ord"]["filled"]==2);
+  // The screen fills in from real data: the print on the ladder, the fill, the marked position.
+  auto has_print=[&]{
+    for(const auto& e:of(st,"book")) {
+      const auto& d=e["data"];
+      if(d["tk"]==TK && d["last"].is_object() && d["last"]["px"]=="0.4200" && d["last"]["side"]=="BUY" && d["vol"].get<double>()>=2) return true;
+    }
+    return false;
+  };
+  CHECK(r.until(has_print));
+  auto has_fill=[&]{
+    for(const auto& e:of(st,"fill")) if(e["data"]["cid"]=="Mrt-take-1" && e["data"]["qty"]==2 && e["data"]["liq"]=="T") return true;
+    return false;
+  };
+  CHECK(r.until(has_fill));
+  auto has_pos=[&]{
+    for(const auto& e:of(st,"pos")) {
+      const auto& rows=e["data"].is_array() ? e["data"] : json::array({e["data"]});
+      for(const auto& p:rows) if(p.value("tk","")==TK && p["pos"]==2 && p["mark"].is_string()) return true;
+    }
+    return false;
+  };
+  CHECK(r.until(has_pos));
   // Post: rest 1 at 0.41 for 60 s, then cancel it from the page's route
   o=r.order("Mrt-post-1","BUY","0.4100",1,"POST",60);
   if(o["status"]!=200) std::fprintf(stderr,"post: %s\n",o.dump().c_str());
@@ -116,6 +190,7 @@ void orders_cancel_kill() {
   CHECK(r.until([&]{ return r.resting()==0; }));
   // KILL: a resting order is cancelled by send-cx's cancel-all, and new orders are refused
   o=r.order("Mrt-post-2","BUY","0.4000",1,"POST",60);
+  if(o["status"]!=200) std::fprintf(stderr,"post-2: %s resting %zu\n",o.dump().c_str(),r.resting());
   CHECK(o["status"]==200 && o["ord"]["st"]=="WORK" && r.resting()==1);
   auto k=r.post("/api/kill",json::object());
   CHECK(k && k->status==200);
@@ -123,6 +198,24 @@ void orders_cancel_kill() {
   CHECK(r.d->cx_stats().kills.load()>=1);
   o=r.order("Mrt-take-2","BUY","0.4200",1,"IOC");
   CHECK(o["status"]==409 && o["err"]["code"]=="KILLED");
+  // Everything the page received, and its snapshot, checked by contract.js itself.
+  if(std::string(DESKD_NODE).empty()) { std::printf("node not found: contract.js check SKIPPED\n"); return; }
+  httplib::Client c("127.0.0.1",r.d->port());
+  auto snap=c.Get("/api/snapshot?sid=rt-stream-1");
+  CHECK(snap && snap->status==200);
+  json cap={{"snapshots",json::array()},{"events",st.envelopes()},{"responses",json::array()}};
+  if(snap && snap->status==200) {
+    const auto sj=json::parse(snap->body);
+    cap["snapshots"].push_back(sj);
+    bool fills=false, books=false;
+    for(const auto& f:sj["fills"]) if(f["cid"]=="Mrt-take-1") fills=true;
+    for(const auto& b:sj["books"]) if(b["tk"]==TK && b["last"].is_object()) books=true;
+    CHECK(fills && books);
+  }
+  const std::string file=r.dir.path+"/capture.json";
+  std::ofstream(file)<<cap.dump();
+  const std::string cmd=std::string("\"")+DESKD_NODE+"\" \""+DESKD_SOURCE_DIR+"/tests/deskd/contract_check.cjs\" \""+file+"\"";
+  CHECK(std::system(cmd.c_str())==0);
 }
 }  // namespace
 

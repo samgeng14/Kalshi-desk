@@ -110,6 +110,19 @@ std::string et_date(std::int64_t wall_ms) {
   return ymd(floor_div(utc_s + offset, 86400));
 }
 
+std::int64_t et_midnight_ms(std::int64_t wall_ms) {
+  // The ET day's start: local midnight is never inside a DST change (those happen at 02:00), so
+  // the offset in force at midnight is the one that maps the candidate back to the same date.
+  const std::int64_t utc_s = floor_div(wall_ms, 1000);
+  for (const std::int64_t offset : {-4 * 3600, -5 * 3600}) {
+    const std::int64_t midnight = floor_div(utc_s + offset, 86400) * 86400 - offset;
+    if (midnight <= utc_s && et_date(midnight * 1000) == et_date(wall_ms) &&
+        et_date((midnight - 1) * 1000) != et_date(wall_ms))
+      return midnight * 1000;
+  }
+  return floor_div(utc_s, 86400) * 86400 * 1000;   // unreachable for valid times
+}
+
 std::string et_date_after(const std::string& date) {
   int y = 0;
   unsigned m = 0, d = 0;
@@ -129,8 +142,8 @@ json hdr_json(const HdrInputs& in) {
       {"cash",
        {{"K", {{"total", zero}, {"free", zero}, {"ro", true}, {"shards", json::array()}}},
         {"P", {{"total", zero}, {"free", zero}, {"ro", true}}}}},
-      {"day", {{"total", zero}, {"sys", zero}, {"man", zero}, {"lip", zero}}},
-      {"risk", zero},
+      {"day", {{"total", money_str(in.day_man)}, {"sys", zero}, {"man", money_str(in.day_man)}, {"lip", zero}}},
+      {"risk", money_str(std::max<Money>(0, in.risk))},
       // left = limit + min(0, day.sys): the whole stop while nothing has traded
       {"stop", {{"left", money_str(in.daily_stop)}, {"limit", money_str(in.daily_stop)}, {"hit", false}}},
       {"sys", {{"K", venue_sys}, {"P", venue_sys}}},

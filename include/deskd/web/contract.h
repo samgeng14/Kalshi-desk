@@ -43,6 +43,7 @@ nlohmann::json subs_json(const Subs& s);
 // to 02:00 on the first Sunday of November), worked out here rather than through TZ and
 // localtime_r, which read process-wide state another thread may change.
 std::string et_date(std::int64_t wall_ms);
+std::int64_t et_midnight_ms(std::int64_t wall_ms);   // the start of wall_ms's ET day, epoch ms
 std::string et_date_after(const std::string& date);   // "2026-10-31" -> "2026-11-01"
 
 // hb.data: {epoch, sid, srv_ms, date, feeds}
@@ -59,6 +60,9 @@ struct HdrInputs {
   // Unknown account data stays read-only; known data is an exact cash.K contract object.
   nlohmann::json cash_k;
   std::optional<std::int64_t> kx_lag_ms, clk_off_ms, gw_ack_ms;
+  // Manual's day (realized today, net of fees, plus open positions at the mid) and the open
+  // worst case plus working reservations; zero when unknown. No Systematic or LIP yet.
+  Money day_man = 0, risk = 0;
 };
 nlohmann::json hdr_json(const HdrInputs& in);
 

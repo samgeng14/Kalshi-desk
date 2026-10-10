@@ -27,6 +27,7 @@
 #include <vector>
 
 #include "deskd/app/config.h"
+#include "deskd/app/projection.h"
 #include "deskd/app/lock.h"
 #include "deskd/app/ops.h"
 #include "deskd/app/worker.h"
@@ -112,6 +113,21 @@ class Deskd {
   std::unique_ptr<net::SparePool> pool_k1_, pool_cx_;
   std::unique_ptr<KalshiSender> man_sender_, cx_sender_;
   std::shared_ptr<const std::map<std::string, MdBook>> books_;   // std::atomic_load / std::atomic_store
+  // md thread only: each market's last book, and its prints since the last book message went out
+  struct Tape {
+    std::vector<MdTrade> pending;
+    std::optional<MdTrade> last;
+    Qty since_listing = 0;          // printed after the listing's volume_24h was read
+    std::int64_t listing_ms = 0;
+    std::set<std::string> seen;     // trade ids, against a replay after a resubscribe
+  };
+  std::map<std::string, MdBook> md_last_;
+  std::map<std::string, Tape> tape_;
+  std::shared_ptr<const DayPnl> day_;   // std::atomic_load / std::atomic_store; rest thread writes
+  std::set<std::string> fills_sent_;    // rest thread only
+  void on_trade(const MdTrade& t);
+  void publish_book(const std::string& ticker);
+  std::optional<Px> mid(const std::string& ticker) const;
   SenderStats k1_stats_, k2_stats_, k3_stats_, cx_stats_;
   StoreWorker store_;
   std::vector<std::unique_ptr<Worker>> workers_;   // in start order; web last
