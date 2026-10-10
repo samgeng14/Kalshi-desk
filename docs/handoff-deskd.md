@@ -93,6 +93,15 @@ Nothing is pushed. `ui/desk/js/contract.js` is the API contract deskd must serve
    and the header's day.man and risk. Fair, ESPN, LIP and Systematic stay blank (no models or
    lanes yet; never a placeholder). A private event during a REST read now keeps the last
    consistent account instead of marking it not ready (clicks were refused after fills).
+   **RO lock on demo (2026-10-10).** Every order after a KILL and re-arm was refused "RO an
+   execution owner is not ready". A sender that failed (a hard venue refusal, an unconfirmed
+   KILL cancel-all, a lost reply) stopped for good and nothing named it. Now: the refusal and
+   `/ops/status` (`senders.k1/cx.why`, `gw.ledger_why`) name the owner and the reason; a sender
+   comes back once a cancel-all sent after its failure is confirmed and KILL is re-armed; KILL's
+   cancel-all is sent again on a 429 (a cancel-all costs a whole batch's write tokens). The
+   ledger still needs a restart after a contradiction, and says so. The root cause on the Mac is
+   not known yet: the next RO there names it. A failed REST poll now keeps the last good read
+   (account up to 60 s, listing up to 5 minutes) instead of refusing clicks STALE.
    Next: the demo proof on the Mac (set manual_orders, small sizes), then latency timelines,
    per-shard token buckets, the journal, and positions from the execution ledger. Then: wire `gw/order_ledger` into the gateway
    alongside the execution/position ledger; authoritative series fees; PlaceIntent validation,
