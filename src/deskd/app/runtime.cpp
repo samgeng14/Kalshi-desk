@@ -16,6 +16,8 @@
 #include "deskd/ref/pyth.h"
 #include "deskd/strat/fair.h"
 #include "deskd/ref/espn.h"
+#include "deskd/strat/maker.h"
+#include "deskd/gw/sys_book.h"
 
 namespace deskd {
 
@@ -144,7 +146,10 @@ bool Deskd::start(std::string* err) {
     if (cx_sender_) cx_sender_->run(w); else run_cancel_sender(w, q_cx_, cx_stats_, kill_, alert);
   });
   by("strat")->start([this](Worker& w) {
-    run_strat(w, [this] { if (fair_ && rest_) fair_->step(*rest_->snapshot(), now_ms()); });
+    run_strat(w, [this] {
+      if (fair_ && rest_) fair_->step(*rest_->snapshot(), now_ms());
+      if (lip_) lip_->step(now_ms());
+    });
   });
   by("store")->start([this](Worker& w) { store_.run(w); });
   by("pub")->start([this](Worker& w) { pub_->run(w); });
@@ -236,6 +241,7 @@ json Deskd::status() const {
   result["pyth"] = pyth_ ? pyth_->status(now) : json(nullptr);
   result["fair"] = fair_ ? fair_->status() : json(nullptr);
   result["espn"] = espn_ ? espn_->status() : json(nullptr);
+  result["maker"] = lip_ ? lip_->status() : json(nullptr);
   result["senders"] = {{"k1", sender(man_sender_.get())}, {"cx", sender(cx_sender_.get())},
                        {"k2", sender(cfg_.systematic_orders ? sys_sender_.get() : nullptr)}};
   result["publisher_healthy"] = pub_->healthy();

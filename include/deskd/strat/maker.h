@@ -1,0 +1,117 @@
+#pragma once
+// The maker engine (plan section 5): one engine for every quoting lane, LIP-15 first.
+//
+//   fair    microprice, (bid x ask size + ask x bid size) / (bid size + ask size), or the mid
+//           when the spread is over 3 ticks; a validated anchor (the 15-minute model once its
+//           strike replication gate has passed) is averaged in 50/50, and quotes are pulled if
+//           the two differ by over 3c
+//   edge    e = 0.5c + the maker fee with an anchor, 1c without; inventory skew 0.1c a contract
+//   quotes  post-only both sides; the YES bid at the best bid or one tick better, never above
+//           fair - e - 0.1c x q, and the ask likewise; both sides in minutes 0-10 of the window,
+//           only the reducing side after; an IOC flatten from T-60 s while |q| > 10
+//   pulls   the book stale, the private feed down, the reference not fresh, the anchor too far
+//           from the microprice, and (owner) a fill of ours
+//
+// quote() is pure; MakerEngine owns a lane's working quotes through gw (strat thread only).
+#include <cstdint>
+#include <functional>
+#include <future>
+#include <map>
+#include <memory>
+#include <optional>
+#include <set>
+#include <string>
+#include <vector>
+
+#include <nlohmann/json.hpp>
+#include "deskd/bus/msg.h"
+#include "deskd/gw/gateway.h"
+#include "deskd/gw/kalshi_wire.h"
+#include "deskd/md/kalshi_md.h"
+
+namespace deskd {
+
+struct MakerParams {
+  Qty size = 1000;                     // per side: 10 contracts (plan: the markout leg, 10 a side)
+  Px edge_anchor = 50;                 // 0.5c, plus the maker fee
+  Px edge_alone = 100;                 // 1c with no anchor
+  Px skew_per_contract = 10;           // 0.1c
+  Px anchor_gap = 300;                 // 3c: anchor and microprice further apart pulls
+  int mid_over_ticks = 3;              // a spread wider than this uses the mid
+  int ttl_s = 60;                      // every order lives at most 60 s
+  std::int64_t two_sided_ms = 600000;  // minutes 0-10 of the window
+  std::int64_t flatten_ms = 60000;     // from T-60 s
+  Qty flatten_over = 1000;             // |q| over 10 contracts
+};
+
+struct MakerInput {
+  const MdBook* book = nullptr;
+  const std::vector<kalshi::PriceRange>* grid = nullptr;
+  std::optional<Px> anchor;            // the model fair, only once its gate has passed
+  Px maker_fee = 0;                    // per contract at this price, the venue's maker fee
+  Qty position = 0;                    // the lane's signed position here
+  std::int64_t now_ms = 0, open_ms = 0, close_ms = 0;
+  bool private_up = false, reference_fresh = true;
+};
+
+struct MakerQuote {
+  Side side = Side::BUY;
+  Px price = 0;
+  Qty size = 0;
+  bool ioc = false;                    // the T-60 s flatten
+};
+struct MakerDecision {
+  std::vector<MakerQuote> quotes;      // what should be working
+  std::string pull;                    // why nothing should be ("" when quoting)
+  std::optional<Px> fair;
+};
+MakerDecision maker_quote(const MakerInput& in, const MakerParams& p = {});
+
+// the grid's own prices: the step at p, and the nearest grid price at or below / at or above
+Px grid_step(Px p, const std::vector<kalshi::PriceRange>& grid);
+std::optional<Px> grid_floor(Px p, const std::vector<kalshi::PriceRange>& grid);
+std::optional<Px> grid_ceil(Px p, const std::vector<kalshi::PriceRange>& grid);
+// The venue's maker fee per contract at price p (quadratic_with_maker_fees: 0.0175 x mult x p(1-p),
+// rounded up to the 1/10,000 dollar); 0 on a series without maker fees.
+Px maker_fee(const kalshi::MarketRow& m, Px p);
+
+// One quoting lane's owner: keeps each market's working quotes equal to maker_quote()'s, by
+// cancel and re-post (no amends), through gw. Strat thread only.
+class MakerEngine {
+ public:
+  struct Env {
+    std::function<std::shared_ptr<const Gateway::SysView>()> view;
+    std::function<std::shared_ptr<const rest::Snapshot>()> snapshot;
+    std::function<std::optional<MdBook>(const std::string&)> book;
+    // the market's model anchor: gated once its strike replication gate has passed (plan
+    // section 5: 50 windows in a row); a gated anchor with no fresh fair pulls the quotes
+    struct Anchor { bool gated = false; std::optional<Px> fair; };
+    std::function<Anchor(const std::string&)> anchor;
+    std::function<bool()> private_up, reference_fresh;
+    std::function<bool(GwMsg)> post;                              // gw's inbox
+    std::function<void(std::set<std::string>)> want;              // markets whose books it needs
+  };
+  MakerEngine(std::string lane, std::vector<std::string> series, Env env, MakerParams params = {});
+  void step(std::int64_t now_ms);
+  nlohmann::json status() const;
+ private:
+  struct Side_ {
+    std::string cid;                   // the working (or pending) quote, "" = none
+    std::int64_t acted_ms = 0, backoff_until = 0;
+    OrderPromise reply;
+    std::future<OrderReply> answer;
+  };
+  std::string lane_;
+  std::vector<std::string> series_;
+  Env env_;
+  MakerParams p_;
+  std::map<std::string, std::map<int, Side_>> sides_;   // ticker -> 0 bid, 1 ask, 2 flatten
+  std::map<std::string, Qty> last_pos_;
+  std::map<std::string, std::int64_t> cool_until_;      // after a fill of ours
+  std::map<std::string, std::string> last_pull_;
+  std::uint64_t seq_ = 0;
+  std::int64_t places_ = 0, cancels_ = 0, refusals_ = 0;
+  std::string new_cid();
+};
+
+}  // namespace deskd

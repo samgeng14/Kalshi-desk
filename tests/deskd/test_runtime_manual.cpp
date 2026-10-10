@@ -113,8 +113,8 @@ struct Run {
     CHECK(json::parse(w->body)==json({{"ok",true},{"pin",true}}));
     return until([&]{
       const auto s=d->status();
-      return s["rest"]["ready"]==true && s["rest"]["fee_ready_live"]==1 && s["feeds"]["KX"]["up"]==true &&
-             s["feeds"]["KXP"]["up"]==true && s["feeds"]["KXP"]["gap"]==false && s["books_live"]==1 &&
+      return s["rest"]["ready"]==true && s["rest"]["fee_ready_live"]>=1 && s["feeds"]["KX"]["up"]==true &&
+             s["feeds"]["KXP"]["up"]==true && s["feeds"]["KXP"]["gap"]==false && s["books_live"]>=1 &&
              s["clock"]["post_trusted"]==true;
     },30000) || (std::fprintf(stderr,"not ready: rest %s feeds %s\n",d->status()["rest"].dump().c_str(),
                               d->status()["feeds"].dump().c_str()),false);
@@ -398,10 +398,61 @@ void systematic() {
   const std::string cmd=std::string("\"")+DESKD_NODE+"\" \""+DESKD_SOURCE_DIR+"/tests/deskd/contract_check.cjs\" \""+file+"\"";
   CHECK(std::system(cmd.c_str())==0);
 }
+// LIP-15 on the fake: lane M1 on, Start, and the maker quotes a 15-minute window one tick inside
+// both touches in M1's group; the street hits our bid, the lane is long 10, the maker pulls for a
+// second and quotes again skewed; Stop takes every quote down.
+void systematic_maker() {
+  const std::string W="KXNATGAS15M-26OCT101200-00";
+  Run r(false,[&](fakex::Engine& e,std::int64_t now) {
+    auto spec=fx::spec(W,0); spec.open_ms=now-60000; spec.close_ms=now+840000;
+    spec.strike_type="greater_or_equal"; spec.floor_strike=3.1;
+    e.add_market(spec,now);
+    e.street_add(W,false,4000,500,now);   // YES bid 0.40 x5
+    e.street_add(W,true,5400,500,now);    // NO bid 0.54 x5: YES ask 0.46 x5
+  },true);
+  CHECK(r.ready());
+  auto lane=r.post("/api/lane/M1",{{"on",true}});
+  CHECK(lane && lane->status==200);
+  std::string why;
+  CHECK(r.until([&]{ return r.d->gw().groups_ready(&why) && why.empty(); },20000));
+  httplib::Result start;
+  CHECK(r.until([&]{ start=r.post("/api/start",json::object()); return start && start->status==200; },10000));
+  struct Q { Px px; Qty left; fakex::Side side; std::string cid, group; };
+  auto quotes=[&]{
+    return r.venue.f->with_engine([&](fakex::Engine& e,std::int64_t) {
+      std::vector<Q> out;
+      for(const fakex::Order* o:e.user_orders())
+        if(o->status==fakex::OrdStatus::RESTING && o->client_order_id.rfind("SM1-",0)==0 && o->ticker==W)
+          out.push_back({o->price,o->remaining,o->side,o->client_order_id,o->order_group_id});
+      return out;
+    });
+  };
+  auto has=[&](fakex::Side side,Px px,Qty left) {
+    for(const auto& x:quotes()) if(x.side==side && x.px==px && x.left==left && !x.group.empty()) return true;
+    return false;
+  };
+  const bool quoted=r.until([&]{ return has(fakex::Side::BID,4100,1000) && has(fakex::Side::ASK,4500,1000); },15000);
+  if(!quoted) std::fprintf(stderr,"maker: %s\nquotes: %zu\n",r.d->status()["maker"].dump().c_str(),quotes().size());
+  CHECK(quoted);
+  // the street sells 10 into our bid
+  r.venue.f->with_engine([&](fakex::Engine& e,std::int64_t now) { CHECK(e.street_take(W,fakex::Side::ASK,4100,1000,now)==1000); });
+  CHECK(r.until([&]{ const auto v=r.d->gw().sys_view(); return v && v->positions.count("M1|"+W) && v->positions.at("M1|"+W)==1000; }));
+  // long 10: the bid stays at 0.41 (its cap is now 0.41), the ask too (its floor 0.43); both re-posted
+  CHECK(r.until([&]{ return has(fakex::Side::BID,4100,1000) && has(fakex::Side::ASK,4500,1000); },15000));
+  CHECK(r.d->status()["maker"]["places"].get<int>()>=3);
+  auto stop=r.post("/api/stop",json::object());
+  CHECK(stop && stop->status==200);
+  const bool down=r.until([&]{ return quotes().empty(); });
+  if(!down) {
+    for(const auto& q:quotes()) std::fprintf(stderr,"left resting: %s %lld x %lld group %s\n",q.cid.c_str(),(long long)q.px,(long long)q.left,q.group.c_str());
+    std::fprintf(stderr,"stop: %s\nstatus gw: %s\n",stop->body.c_str(),r.d->status()["gw"].dump().c_str());
+  }
+  CHECK(down);
+}
 }  // namespace
 
 int main() {
   std::signal(SIGPIPE,SIG_IGN);
-  off_by_default(); orders_cancel_kill(); stop_reasons(); financial_fair(); systematic();
+  off_by_default(); orders_cancel_kill(); stop_reasons(); financial_fair(); systematic(); systematic_maker();
   return finish("deskd-runtime-manual");
 }

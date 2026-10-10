@@ -66,6 +66,8 @@ class FinancialFair {
   FinancialFair(SymbolFn symbol, ViewFn view, std::int64_t watching_since_ms);
   void step(const rest::Snapshot& snapshot, std::int64_t now_ms);
   std::shared_ptr<const FairBoard> board() const;
+  // the plan's anchor gate: 50 windows in a row whose strike this feed reproduced
+  bool gated(const std::string& underlying) const;
   nlohmann::json status() const;
   // Is close the strike, to the contract's rounding? (one unit in the last stated place)
   static bool same_strike(double close, double strike, int decimals);

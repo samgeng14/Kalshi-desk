@@ -514,6 +514,8 @@ void Engine::execute(Market& m, Order& t, Order& mk, Qty q, Op& op) {
   mk.filled += q;
   mk.updated_ms = op.now;
   unrest(m, mk, q, op, t.street ? std::string() : t.client_order_id, t.street ? 0 : t.subaccount);
+  // a resting order filled to the last contract is executed, as the venue reports it
+  if (!mk.street && mk.remaining == 0 && mk.status == OrdStatus::RESTING) mk.status = OrdStatus::EXECUTED;
   if (!mk.street) settle(m, mk, q, yes_px, false, trade_id, op);
   if (!t.street) settle(m, t, q, yes_px, true, trade_id, op);
 

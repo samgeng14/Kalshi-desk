@@ -10,6 +10,8 @@
 #include "deskd/ref/pyth.h"
 #include "deskd/strat/fair.h"
 #include "deskd/ref/espn.h"
+#include "deskd/strat/maker.h"
+#include "deskd/gw/sys_book.h"
 
 namespace deskd {
 using json = nlohmann::json;
@@ -148,6 +150,43 @@ void Deskd::attach_manual() {
     p.daily_stop = cfg_.daily_stop;
     p.groups = &groups_;
   }
+  if (cfg_.systematic_orders) {
+    // LIP-15 (lane M1): the 15-minute series it trades, quoted by the maker engine
+    const LaneSpec* m1 = nullptr;
+    for (const auto& l : default_lanes()) if (l.id == "M1") m1 = &l;
+    MakerEngine::Env env;
+    env.view = [this] { return gw_->sys_view(); };
+    env.snapshot = [this] { return rest_->snapshot(); };
+    env.book = [this](const std::string& tk) -> std::optional<MdBook> {
+      const auto books = std::atomic_load(&books_);
+      if (!books) return std::nullopt;
+      const auto it = books->find(tk);
+      if (it == books->end()) return std::nullopt;
+      return it->second;
+    };
+    env.anchor = [this](const std::string& tk) {
+      MakerEngine::Env::Anchor a;
+      const Underlying* u = underlying_for(tk);
+      if (!u || !fair_ || !fair_->gated(u->key)) return a;
+      a.gated = true;
+      const auto board = fair_->board();
+      const auto f = board->find(tk);
+      if (f != board->end()) a.fair = f->second.fair;
+      return a;
+    };
+    env.private_up = [this] { const auto v = feeds_.KXP.view(); return v.up && !v.gap; };
+    env.post = [this](GwMsg m) { return gw_->post(std::move(m)); };
+    env.want = [this](std::set<std::string> markets) {
+      bool changed = false;
+      {
+        std::lock_guard<std::mutex> lk(live_mu_);
+        changed = markets != strat_want_;
+        if (changed) strat_want_ = std::move(markets);
+      }
+      if (changed) refresh_live();
+    };
+    lip_ = std::make_unique<MakerEngine>("M1", m1 ? m1->series : std::vector<std::string>{"KXNATGAS15M"}, env);
+  }
   p.send = [this](KalshiWriteJob j) { return q_man_.push(std::move(j)); };
   p.cancel = [this](KalshiWriteJob j) { return q_mcx_.push(std::move(j), Lane::PRIORITY); };
   p.publish = [this](const std::string& row) {
@@ -211,6 +250,7 @@ void Deskd::refresh_live() {
   {
     std::lock_guard<std::mutex> lk(live_mu_);
     selected = pins_;
+    selected.insert(strat_want_.begin(), strat_want_.end());
   }
   for (const auto& p : s->positions) if (p.position) selected.insert(p.ticker);
   for (const auto& o : s->orders)

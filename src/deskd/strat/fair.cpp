@@ -145,6 +145,12 @@ void FinancialFair::step(const rest::Snapshot& s, std::int64_t now) {
   board_ = std::move(board);
 }
 
+bool FinancialFair::gated(const std::string& underlying) const {
+  std::lock_guard<std::mutex> lk(m_);
+  const auto it = replication_.find(underlying);
+  return it != replication_.end() && it->second.consecutive >= 50;
+}
+
 json FinancialFair::status() const {
   std::lock_guard<std::mutex> lk(m_);
   json under = json::object();
