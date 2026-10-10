@@ -71,7 +71,14 @@ Deskd::Deskd(DeskdConfig cfg, std::unique_ptr<AccountLock> lock, RuntimeOptions 
   wd.cx_stats = &cx_stats_;
   wd.status = [this] { return status(); };
   wd.universe = [this](const json& q) {
-    return rest_ ? rest::universe(*rest_->snapshot(), q, now_ms()) : universe_json(q, now_ms());
+    if (!rest_) return universe_json(q, now_ms());
+    std::shared_ptr<const FairBoard> board = fair_ ? fair_->board() : nullptr;
+    return rest::universe(*rest_->snapshot(), q, now_ms(), [board](const std::string& tk) -> std::optional<Px> {
+      if (!board) return std::nullopt;
+      const auto it = board->find(tk);
+      if (it == board->end()) return std::nullopt;
+      return it->second.fair;
+    });
   };
   wd.watch = [this](const json& q) { return watch(q); };
   web_ = std::make_unique<WebServer>(std::move(wd));

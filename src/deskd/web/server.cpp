@@ -300,6 +300,7 @@ struct WebServer::Impl {
     p.reduce_only = b.contains("reduce_only") && b["reduce_only"].is_boolean() && b["reduce_only"].get<bool>();
     p.override_guard = b["override"].get<bool>();
     if (b.contains("t_click_ms") && !b["t_click_ms"].is_null()) p.t_click_ms = b["t_click_ms"].get<std::int64_t>();
+    if (b.contains("touch") && b["touch"].is_string()) p.touch = parse_price(b["touch"].get<std::string>());
     p.t_recv_ms = now_ms();
     p.reply = std::make_shared<std::promise<OrderReply>>();
     auto f = p.reply->get_future();

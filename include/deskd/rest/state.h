@@ -126,7 +126,9 @@ class State {
 };
 
 // Contract 1.5 projections. Missing exchange_index remains null; the gateway must refuse a
-// write without it. No model is invented: universe fair and edge are null. LIP remains false
+// write without it. No model is invented: universe fair and edge are null unless fair_of gives
+// a model's fair (strat/fair.h); then edge = the better take at the touch vs fair, after the
+// taker fee, per contract. LIP remains false
 // until incentive metadata is integrated. Unknown fees retain the presentation fallback;
 // that fallback is NOT approval to trade: admission must require fee_ready().
 constexpr std::int64_t kFeeFreshMs = 300000;
@@ -134,6 +136,11 @@ bool fee_ready(const kalshi::MarketRow& market, std::int64_t now_ms);
 std::string category(const kalshi::MarketRow& market);
 std::string outcome_date(const kalshi::MarketRow& market);
 nlohmann::json market_json(const kalshi::MarketRow& market, bool pin, bool live, std::int64_t now_ms);
-nlohmann::json universe(const Snapshot& state, const nlohmann::json& query, std::int64_t now_ms);
+using FairOf = std::function<std::optional<Px>(const std::string& ticker)>;
+nlohmann::json universe(const Snapshot& state, const nlohmann::json& query, std::int64_t now_ms,
+                        const FairOf& fair_of = {});
+// the better of buying at the ask and selling at the bid against fair, net of the taker fee at
+// that price (0.07 x mult x p(1-p)), per contract; nullopt without a touch
+std::optional<Money> take_edge(const kalshi::MarketRow& market, std::optional<Px> bid, std::optional<Px> ask, Px fair);
 
 }  // namespace deskd::rest

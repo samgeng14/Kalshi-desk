@@ -206,6 +206,9 @@ void MakerEngine::step(std::int64_t now) {
       pi.reduce_only = w->second.ioc;
       pi.override_guard = w->second.ioc;   // the flatten crosses at the touch by design
       pi.t_recv_ms = now;
+      if (book && !book->bids.empty() && !book->asks.empty())
+        pi.touch = pi.side == Side::BUY ? book->bids.front().px : book->asks.front().px;
+      pi.fair = d.fair;
       s.reply = std::make_shared<std::promise<OrderReply>>();
       s.answer = s.reply->get_future();
       pi.reply = s.reply;

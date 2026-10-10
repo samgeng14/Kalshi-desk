@@ -84,6 +84,17 @@ void discovery(json& capture) {
   CHECK(rest::universe(s,{{"day","T"},{"v","P"}},t)["total"]==0);
   const auto filtered=rest::universe(s,{{"day","T"},{"cat","WEATHER"},{"offset",4},{"limit",2}},t);
   CHECK(filtered["total"]==5 && filtered["rows"].size()==1);
+  {   // a model's fair: the row carries it and the better take's edge after the taker fee
+    kalshi::MarketRow fm; fm.fee_multiplier=1.0;
+    // buy at 0.48 against 0.50: 2c less 0.07 x 0.48 x 0.52 = 1.7472c, rounded up to 1.75c
+    CHECK(rest::take_edge(fm,Px{5100},Px{4800},5000)==std::optional<Money>(25));
+    CHECK(rest::take_edge(fm,Px{5300},Px{5600},5000)==std::optional<Money>(300-175));   // selling at 0.53
+    CHECK(!rest::take_edge(fm,std::nullopt,std::nullopt,5000));
+    auto with=rest::universe(s,{{"day","T"},{"cat","SPORTS"}},t,[&](const std::string& tk) -> std::optional<Px> {
+      return tk==m.ticker ? std::optional<Px>(5000) : std::nullopt; });
+    CHECK(with["rows"].size()==1 && with["rows"][0]["fair"]=="0.5000");
+    capture["responses"].push_back({{"key","GET /api/universe"},{"status",200},{"json",with}});
+  }
   for (const auto& p:s.markets)
     capture["events"].push_back({{"type","mkt"},{"seq",1},{"ts_ms",t},{"data",rest::market_json(p.second,false,true,t)}});
   kalshi::OrderRow o;

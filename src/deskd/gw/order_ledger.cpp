@@ -60,7 +60,9 @@ nlohmann::json OrderLedger::Order::json() const {
     {"exp_ms",intent.exp_ms ? J(intent.exp_ms) : J(nullptr)},{"st",state_name(state)},
     {"why",why},{"own",intent.owner == Owner::MAN ? "MAN" : intent.owner == Owner::SYS ? "SYS" : "EXT"},
     {"lane",intent.lane.empty() ? J(nullptr) : J(intent.lane)},{"piq",nullptr},
-    {"fee",money_str(fees / 100)},{"touch",nullptr},{"edge",nullptr},
+    {"fee",money_str(fees / 100)},{"touch",intent.touch ? J(price_str(*intent.touch)) : J(nullptr)},
+    // per contract against the model fair at send, + in our favour (Px and Money share 1/10,000 $)
+    {"edge",intent.fair ? J(money_str(intent.side == Side::BUY ? *intent.fair - intent.price : intent.price - *intent.fair)) : J(nullptr)},
     {"t",{{"click",intent.t_click_ms ? J(intent.t_click_ms) : J(nullptr)},
           {"recv",intent.t_recv_ms},{"sent",sent_ms ? J(sent_ms) : J(nullptr)},
           {"ack",ack_ms ? J(ack_ms) : J(nullptr)},{"done",done_ms ? J(done_ms) : J(nullptr)}}},{"rev",rev}};

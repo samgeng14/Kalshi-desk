@@ -115,6 +115,16 @@ static void unknown_table_and_proof() {
   CHECK(!post.resolve_absent("Mledger-1",h)); ++h.began_ms;
   CHECK(post.resolve_absent("Mledger-1",h)); CHECK(post.find("Mledger-1")->state==OrdState::EXP); record(post);
 }
+static void touch_and_edge() {
+  auto p=intent("Sedge-1"); p.owner=Owner::SYS; p.lane="M1"; p.side=Side::BUY;
+  p.touch=4100; p.fair=4350;
+  OrderLedger l; CHECK(l.insert(p,0,1));
+  const auto j=l.find("Sedge-1")->json();
+  CHECK(j["touch"]=="0.4100" && j["edge"]=="0.0150" && j["own"]=="SYS" && j["lane"]=="M1");   // bid 0.42 under fair 0.435
+  auto s=intent("Sedge-2"); s.side=Side::SELL; s.fair=4350;
+  CHECK(l.insert(s,0,1) && l.find("Sedge-2")->json()["edge"]=="-0.0150" && l.find("Sedge-2")->json()["touch"].is_null());
+  CHECK(!intent().touch && !intent().fair);
+}
 static void bad_evidence() {
   auto l=ledger(); auto f=execution();
   CHECK(l.fill(f,"",t+1)==OrderLedger::FillResult::UNMAPPED && l.healthy() && l.why_unhealthy().empty());
@@ -175,7 +185,7 @@ static void fractional_and_permutations() {
 }
 int main() {
   races(); cumulative_is_not_execution(); zero_cancel_needs_read(); unknown_table_and_proof();
-  bad_evidence(); fractional_and_permutations();
+  bad_evidence(); touch_and_edge(); fractional_and_permutations();
   TempDir dir;
   const std::string path=dir.file("order-ledger-contract.json");
   { std::ofstream out(path); out<<capture; }

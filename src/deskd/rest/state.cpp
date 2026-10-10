@@ -87,18 +87,21 @@ std::optional<std::int64_t> http_date_ms(const std::string& date) {
   return static_cast<std::int64_t>(::timegm(&tm)) * 1000;
 }
 
-json universe_row(const kalshi::MarketRow& m, const Snapshot& state) {
+json universe_row(const kalshi::MarketRow& m, const Snapshot& state, const FairOf& fair_of) {
   // Kalshi uses 0/1 for absent sides on some listings; a zero-sized side is absent as well.
   auto bid = m.yes_bid, ask = m.yes_ask;
   if (bid && (*bid <= 0 || (m.yes_bid_size && *m.yes_bid_size == 0))) bid.reset();
   if (ask && (*ask >= 10000 || (m.yes_ask_size && *m.yes_ask_size == 0))) ask.reset();
   const auto spread = bid && ask && *ask >= *bid ? std::optional<Px>(*ask - *bid) : std::nullopt;
+  const auto fair = fair_of ? fair_of(m.ticker) : std::nullopt;
+  const auto edge = fair ? take_edge(m, bid, ask, *fair) : std::nullopt;
   return {{"v", "K"}, {"tk", m.ticker}, {"ev", event(m)}, {"title", m.title.empty() ? m.ticker : m.title},
           {"short", label(m)}, {"cat", category(m)}, {"grp", group(m)}, {"gk", group(m)}, {"kind", kind(m)},
           {"date", outcome_date(m)}, {"close_ms", effective_close(m)}, {"bid", optional_px(bid)},
           {"ask", optional_px(ask)}, {"sprd", optional_px(spread)},
           {"vol", static_cast<double>(m.volume_24h.value_or(0)) / 100.0}, {"fee", fee(m)},
-          {"fair", nullptr}, {"edge", nullptr}, {"pin", state.pins.count(m.ticker) != 0},
+          {"fair", fair ? json(price_str(*fair)) : json(nullptr)},
+          {"edge", edge ? json(money_str(*edge)) : json(nullptr)}, {"pin", state.pins.count(m.ticker) != 0},
           {"live", state.live.count(m.ticker) != 0}};
 }
 }  // namespace
@@ -547,7 +550,19 @@ json market_json(const kalshi::MarketRow& market, bool pin, bool live, std::int6
           {"pin", pin}, {"gk", group(market)}, {"live", live}};
 }
 
-json universe(const Snapshot& state, const json& query, std::int64_t now) {
+std::optional<Money> take_edge(const kalshi::MarketRow& m, std::optional<Px> bid, std::optional<Px> ask, Px fair) {
+  const double mult = m.fee_multiplier.value_or(1.0);
+  auto fee = [mult](Px p) {   // per contract, in 1/10,000 dollar, rounded up
+    const double x = static_cast<double>(p) / kOneDollar;
+    return static_cast<Money>(std::ceil(0.07 * mult * x * (1 - x) * kOneDollar - 1e-9));
+  };
+  std::optional<Money> best;
+  if (ask) best = static_cast<Money>(fair - *ask) - fee(*ask);
+  if (bid) { const Money e = static_cast<Money>(*bid - fair) - fee(*bid); if (!best || e > *best) best = e; }
+  return best;
+}
+
+json universe(const Snapshot& state, const json& query, std::int64_t now, const FairOf& fair_of) {
   const auto errors = check_universe_query(query);
   if (!errors.empty()) return err_body("BAD_REQUEST", errors.front());
   const auto day = query.at("day").get<std::string>();
@@ -563,7 +578,7 @@ json universe(const Snapshot& state, const json& query, std::int64_t now) {
     if (!is_open(market) || (market.open_ms && *market.open_ms > now) || !market.close_ms || *market.close_ms <= now) continue;
     const auto outcome = outcome_date(market);
     if (outcome.empty() || (day == "T" ? outcome > today : outcome != date)) continue;
-    auto row = universe_row(market, state);
+    auto row = universe_row(market, state, fair_of);
     if (!text.empty() && upper(market.ticker + " " + market.title + " " + label(market) + " " + group(market)).find(text) == std::string::npos) continue;
     const auto c = category(market);
     cats[c] = cats[c].get<int>() + 1;

@@ -6,6 +6,7 @@
 #include <functional>
 #include <future>
 #include <memory>
+#include <optional>
 #include <string>
 #include <variant>
 #include <vector>
@@ -57,6 +58,8 @@ struct PlaceIntent {
   // than a cancel it already drained, so a click followed at once by Esc never rests.
   std::uint64_t cancel_epoch = 0;
   std::int64_t t_click_ms = 0;      // browser click time (performance.timeOrigin + timeStamp)
+  std::optional<Px> touch;          // the touch crossed or joined, at click or signal time (ord.touch)
+  std::optional<Px> fair;           // the model fair at send; ord.edge is the limit's edge against it
   std::int64_t t_recv_ms = 0;
   OrderPromise reply;               // MAN from the web: answered once the venue has (or never will)
 };
