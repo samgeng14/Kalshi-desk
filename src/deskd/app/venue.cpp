@@ -429,6 +429,30 @@ void Deskd::on_rest(std::shared_ptr<const rest::Snapshot>) {
   }
   std::atomic_store(&day_, std::shared_ptr<const DayPnl>(std::move(day)));
   pub_->post(PubReplace{"pos",std::move(positions),"K"});
+  // The risk book (contract risk): each event's positions with the P&L of its worst and best
+  // outcome, and cash per shard. A market alone pays $1 a contract or nothing against what the
+  // position cost; an event's markets are summed as if independent, a bound on both ends for a
+  // ladder of exclusive outcomes (never tighter than the truth).
+  std::map<std::string, std::pair<Micros, Micros>> outcomes;
+  std::map<std::string, json> members;
+  for (const auto& p : s->positions) {
+    if (!p.position) continue;
+    const auto it = s->markets.find(p.ticker);
+    const std::string og = it != s->markets.end() && !it->second.event_ticker.empty() ? it->second.event_ticker : p.ticker;
+    const Micros cost = std::max<Micros>(0, p.exposure);
+    auto& o = outcomes[og];
+    o.first -= cost;
+    o.second += kOneDollar * std::abs(p.position) - cost;
+    members[og].push_back({{"v", "K"}, {"tk", p.ticker}});
+  }
+  json groups = json::array();
+  for (const auto& [og, o] : outcomes)
+    groups.push_back({{"id", og}, {"name", og}, {"worst", money_str(o.first / 100)}, {"best", money_str(o.second / 100)},
+                      {"members", members[og]}});
+  json shards = json::array();
+  for (const auto& sh : rest_cash_json(*s, true).value("shards", json::array()))
+    shards.push_back({{"v", "K"}, {"id", sh["id"]}, {"cash", sh["cash"]}, {"free", sh["free"]}});
+  pub_->post(PubData{"risk", {{"groups", std::move(groups)}, {"shards", std::move(shards)}}});
 }
 
 std::optional<Px> Deskd::mid(const std::string& ticker) const {

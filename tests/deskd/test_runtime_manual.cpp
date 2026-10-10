@@ -734,6 +734,13 @@ void takeover() {
   CHECK(sys(4100,200).code.empty());
   r.venue.f->with_engine([&](fakex::Engine& e,std::int64_t now) { CHECK(e.street_take(TK,fakex::Side::ASK,4100,200,now)==200); });
   CHECK(r.until([&]{ return gw_pos()==200; }));
+  // the risk book: the position's event, losing its cost at worst ($0.82), with the shards' cash
+  CHECK(r.until([&]{
+    for(const auto& e:of(st,"risk"))
+      for(const auto& g:e["data"]["groups"])
+        if(g["members"].dump().find(TK)!=std::string::npos && g["worst"]=="-0.8200" && g["best"]=="1.1800" &&
+           !e["data"]["shards"].empty()) return true;
+    return false; },10000));
   const auto resting=sys(3900,100);
   CHECK(resting.code.empty());
   // a manual order on the market: the lane's bid goes (TAKEOVER), its 2 are handed over
@@ -762,6 +769,14 @@ void takeover() {
   CHECK(sys(3900,100).code.empty());
   auto stop=r.post("/api/stop",json::object());
   CHECK(stop && stop->status==200);
+  // everything the page got (mkt.man, risk, the TAKEOVER cancel), checked by contract.js itself
+  if(!std::string(DESKD_NODE).empty()) {
+    json cap={{"snapshots",json::array()},{"events",st.envelopes()},{"responses",json::array()}};
+    const std::string file=r.dir.path+"/capture-takeover.json";
+    std::ofstream(file)<<cap.dump();
+    const std::string cmd=std::string("\"")+DESKD_NODE+"\" \""+DESKD_SOURCE_DIR+"/tests/deskd/contract_check.cjs\" \""+file+"\"";
+    CHECK(std::system(cmd.c_str())==0);
+  }
 }
 // SHARD: a lane that is on whose market is listed on a shard without cash fails the preflight,
 // naming the shard, its cash and the market; Start is refused until it has cash.
