@@ -115,9 +115,16 @@ Nothing is pushed. `ui/desk/js/contract.js` is the API contract deskd must serve
    of `deskd.lip_series` (default KXNATGAS15M) per plan section 5. To run it on demo: set
    `"deskd": {"manual_orders": true, "systematic_orders": true}` (and `"lip_series"` to the
    15-minute series demo lists), start deskd, turn lane M1 on in the SYSTEMATIC tab, press Start
-   once GROUPS passes. Not done yet: M2/S1/C1/X1 engines, the 4-hour soak and race tests, the
-   order_group_updates channel (REST acks confirm groups for now), LIP share estimates, hdr.sys
-   and hdr.stop from the lanes.
+   once GROUPS passes. Later the same day: the header carries Systematic's day, stop, ceiling and
+   cost (IOC lanes CAPPED past a $5 daily fee budget); the market list carries the model fair and
+   the take edge after fees, and orders carry touch and edge; lane M2 BAND 96-99 joins 96-99c
+   favourites post-only (5 a market, $15 a city-day, paused at -$20; `deskd.band_series`, default
+   five weather cities; the plan's replay gate is the operator's call); `deskd-soak` runs LIP-15
+   against the fake with a wandering street and checks the invariants every second (60 s under
+   ctest; `DESKD_SOAK_SECONDS=14400` in a `-DDESKD_TSAN=ON` build for the plan's 4 hours). Not
+   done yet: S1 ARB (needs event exclusivity), C1 (needs the trained women's college basketball
+   model), X1, race tests, the order_group_updates channel (REST acks confirm groups for now), LIP
+   share estimates, markouts.
    Next: the demo proof on the Mac (set manual_orders, small sizes), then latency timelines,
    per-shard token buckets, the journal, and positions from the execution ledger. Then: wire `gw/order_ledger` into the gateway
    alongside the execution/position ledger; authoritative series fees; PlaceIntent validation,
