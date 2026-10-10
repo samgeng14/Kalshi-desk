@@ -444,7 +444,7 @@ foreach(t http pub_data order_ledger manual_admission manual_book)
   target_precompile_headers(deskd-test-${t} REUSE_FROM deskd_core)
   add_test(NAME deskd-${t} COMMAND deskd-test-${t})
 endforeach()
-foreach(t net wire md rest private sender)
+foreach(t net wire md rest private sender manual_gw)
   add_executable(deskd-test-${t} tests/deskd/test_${t}.cpp)
   target_link_libraries(deskd-test-${t} PRIVATE deskd_core fake_kalshi)
   target_precompile_headers(deskd-test-${t} REUSE_FROM deskd_core)
@@ -464,4 +464,4 @@ add_custom_target(deskd-all DEPENDS deskd deskctl deskd-test-bus deskd-test-ops 
                                     fake-kalshi deskd-test-fake-engine deskd-test-fake-wire
                                     deskd-test-http deskd-test-net deskd-test-wire deskd-test-md
                                     deskd-test-pub_data deskd-test-rest deskd-test-private deskd-test-order_ledger
-                                    deskd-test-sender deskd-test-manual_admission deskd-test-manual_book kalshi-demo-probe)
+                                    deskd-test-sender deskd-test-manual_admission deskd-test-manual_book deskd-test-manual_gw kalshi-demo-probe)

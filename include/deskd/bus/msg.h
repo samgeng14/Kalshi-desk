@@ -27,6 +27,15 @@ enum class RunState : std::uint8_t { RUN, STOP, KILLED, HALTED };
 const char* venue_code(Venue v);   // "K", "P"
 const char* run_code(RunState s);  // "RUN", "STOP", "KILLED", "HALTED"
 
+// gw's answer to one new order, for the web thread that posted it. ord is the order's contract
+// row as JSON text ("" when it never reached gw's book: a check refused it, or nothing was sent).
+struct OrderReply {
+  std::string code;   // "" = accepted by the venue (or ended CXL there: POST_CROSS, STP, USER)
+  std::string msg;
+  std::string ord;
+};
+using OrderPromise = std::shared_ptr<std::promise<OrderReply>>;
+
 // One new order. The cid carries its owner (M... for Manual, S<lane>-... for Systematic) so
 // ownership survives a crash; an unprefixed open order on the account is foreign.
 struct PlaceIntent {
@@ -49,6 +58,7 @@ struct PlaceIntent {
   std::uint64_t cancel_epoch = 0;
   std::int64_t t_click_ms = 0;      // browser click time (performance.timeOrigin + timeStamp)
   std::int64_t t_recv_ms = 0;
+  OrderPromise reply;               // MAN from the web: answered once the venue has (or never will)
 };
 
 // Expiry-only amend (plan section 3: no price amends in the first live weeks). gw builds the
@@ -59,6 +69,12 @@ struct AmendIntent {
   std::int64_t expiry_ms = 0;
 };
 
+struct CancelReply {
+  std::string code, msg;
+  std::vector<std::string> cids;   // orders asked to cancel (contract: n = cids.size())
+};
+using CancelPromise = std::shared_ptr<std::promise<CancelReply>>;
+
 struct CancelIntent {
   enum class Scope : std::uint8_t { CID, MARKET, LANE, ALL };
   enum class Own : std::uint8_t { MAN, SYS, ANY };
@@ -68,6 +84,10 @@ struct CancelIntent {
   std::string ticker;       // MARKET
   std::string lane;         // LANE
   Own own = Own::ANY;       // MARKET and ALL
+  bool has_side = false;    // MARKET: one ladder level (right-click on WRK) when side and/or px are set
+  Side side = Side::BUY;
+  Px px = 0;                // 0 = any price
+  CancelPromise reply;
 };
 
 struct RunView {
@@ -137,7 +157,13 @@ struct Probe {
   std::function<void()> fn;
 };
 
-using GwMsg = std::variant<PlaceIntent, AmendIntent, CancelIntent, Start, Stop, SendResult, OrderEvent, Probe>;
+// The Kalshi Manual or cancel sender's answer for one write (net/kalshi_sender.h), back to gw.
+struct KalshiWriteReply;
+struct ManualWrite {
+  std::shared_ptr<const KalshiWriteReply> reply;
+};
+
+using GwMsg = std::variant<PlaceIntent, AmendIntent, CancelIntent, Start, Stop, SendResult, OrderEvent, Probe, ManualWrite>;
 
 // Stop goes in the control lane, which nothing else fills; cancels and private events go before
 // new orders (plan section 2). Start and amends wait in the normal lane with the orders, so a

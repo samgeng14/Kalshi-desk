@@ -20,6 +20,7 @@
 // ledger order not yet reflected. A reduce_only right after a fill may therefore be refused
 // REDUCE until the next account read (each private event requests one).
 #include <atomic>
+#include <functional>
 #include <map>
 #include <memory>
 #include <optional>
@@ -37,6 +38,18 @@ struct ManualHealth {
   bool public_feed = false, private_feed = false, publisher = false;
   bool manual_sender = false, cancel_sender = false;
   std::uint64_t kill_generation = 0;
+};
+
+// What gw needs from the rest of deskd to run the Manual path. Every function is called on the
+// gw thread and must not block: snapshot and book read immutable published state, send and
+// cancel push to a bounded inbox (false = full), publish posts to pub.
+struct ManualPath {
+  std::function<std::shared_ptr<const rest::Snapshot>()> snapshot;
+  std::function<std::optional<MdBook>(const std::string&)> book;
+  std::function<ManualHealth()> health;          // gw sets killed and kill_generation itself
+  std::function<bool(KalshiWriteJob)> send;       // send-k1's inbox
+  std::function<bool(KalshiWriteJob)> cancel;     // the cancel sender's inbox
+  std::function<void(const std::string&)> publish;   // one ord row, JSON text
 };
 
 class ManualBook {

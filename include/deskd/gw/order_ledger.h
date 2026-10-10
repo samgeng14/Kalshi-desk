@@ -41,7 +41,7 @@ class OrderLedger {
   bool insert(PlaceIntent intent, int shard, kalshi::Micros reserve);
   bool sent(const std::string& cid, std::int64_t at);
   bool unknown(const std::string& cid);
-  // REJ with code as why; except POST_CROSS (the venue cancelled a crossing post-only) and USER
+  // REJ with code as why; except POST_CROSS (the venue cancelled a crossing post-only), STP and USER
   // (cancelled before it was sent), which the contract reports as CXL with that why.
   bool rejected(const std::string& cid, const std::string& code, std::int64_t at);
   bool acknowledged(const std::string& cid, const kalshi::CreateAck& ack, std::int64_t at);

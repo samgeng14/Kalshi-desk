@@ -383,7 +383,9 @@ static void test_guards_and_page(Desk& k) {
   const std::string ord = R"({"cid":"Mk3f9x2-17","v":"K","tk":"KXNATGAS15M-26OCT061930-30","side":"BUY","px":"0.6300",)"
                           R"("qty":10,"tif":"POST","ttl_s":15,"override":false,"touch":"0.6300","t_click_ms":1791307199950})";
   auto o = post(port, "/api/order", ord, token);
-  CHECK(o && o->status == 404 && err_code(o) == "UNKNOWN_MARKET");
+  // gw answers: the Manual path is not attached in this runtime yet, so read-only, nothing sent
+  CHECK(o && o->status == 409 && err_code(o) == "RO" && !json::parse(o->body).contains("ord"));
+  CHECK(k.d->gw().stats().place_refused >= 1);
   capture("POST /api/order", o);
   auto cx = post(port, "/api/cancel", R"({"cids":["Mk3f9x2-17"]})", token);
   CHECK(cx && cx->status == 200);

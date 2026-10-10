@@ -14,6 +14,8 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <map>
+#include <string>
 #include <memory>
 #include <vector>
 
@@ -24,6 +26,10 @@ namespace deskd {
 
 class KillSwitch;
 class Worker;
+class ManualBook;
+struct ManualPath;
+struct KalshiWriteReply;
+namespace rest { struct Snapshot; }
 
 class Gateway {
  public:
@@ -32,6 +38,13 @@ class Gateway {
   // registers its inbox's kick with kill.on_trip: construct it before any thread can trip kill,
   // and keep kill alive longer than it
   Gateway(KillSwitch& kill, PreflightFn preflight, std::size_t normal_cap = 4096, std::size_t priority_cap = 1024);
+  ~Gateway();
+
+  // Turns on the Manual order path (gw/manual_book.h). Call before run(); without it every new
+  // order is refused RO, as in week 0.
+  void attach_manual(const ManualPath& path);
+  // gw thread only (inside a Probe): the Manual book, or nullptr
+  ManualBook* manual_book() { return manual_.get(); }
 
   // queues m in its lane (lane_of); false when that lane is full: dropped, gap marked
   bool post(GwMsg m);
@@ -49,6 +62,8 @@ class Gateway {
     std::atomic<std::uint64_t> erased_by_stop{0};     // queued SYS orders and Starts a Stop deleted
     std::atomic<std::uint64_t> erased_by_kill{0};     // queued new orders and Starts a KILL deleted
     std::atomic<std::uint64_t> kills_seen{0};         // KILL generations gw has applied
+    std::atomic<std::uint64_t> manual_sent{0};        // Manual orders handed to send-k1
+    std::atomic<std::uint64_t> manual_cancels{0};     // Manual cancels handed to the cancel sender
   };
   const Stats& stats() const { return stats_; }
 
@@ -57,6 +72,12 @@ class Gateway {
   // applies a KILL or re-arm the switch shows and gw has not seen yet; true when it applied a KILL
   bool sync_kill();
   void publish();
+  void place_manual(PlaceIntent& p);
+  void manual_reply(const KalshiWriteReply& r);
+  std::vector<std::string> cancel_manual(const CancelIntent& c);
+  void send_cancel(const std::string& cid);
+  void publish_order(const std::string& cid);
+  std::string order_json(const std::string& cid) const;
 
   KillSwitch& kill_;
   PreflightFn preflight_;
@@ -65,6 +86,10 @@ class Gateway {
   RunView own_;                                   // gw thread only
   std::uint64_t kill_gen_seen_ = 0, kill_state_seen_ = 0;   // gw thread only
   std::shared_ptr<const RunView> view_;          // std::atomic_load / std::atomic_store
+  std::unique_ptr<ManualPath> path_;             // the rest: gw thread only
+  std::unique_ptr<ManualBook> manual_;
+  std::shared_ptr<const rest::Snapshot> snapshot_seen_;
+  std::map<std::string, OrderPromise> pending_;  // web threads waiting on a Manual order's write
 };
 
 }  // namespace deskd

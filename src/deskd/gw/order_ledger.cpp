@@ -90,7 +90,7 @@ bool OrderLedger::rejected(const std::string& cid, const std::string& code, std:
   auto& o = it->second;
   // Contradictory venue evidence requires reconciliation, never freeing this reservation.
   if (!o.oid.empty() || o.filled || o.executions || o.uncertain) return invalid();
-  const bool cancel = code == "POST_CROSS" || code == "USER";
+  const bool cancel = code == "POST_CROSS" || code == "USER" || code == "STP";
   if (o.terminal()) return o.refused && o.why == code;
   o.refused = true; o.state = cancel ? OrdState::CXL : OrdState::REJ; o.why = code; o.left = 0; o.done_ms = at; ++o.rev; return true;
 }

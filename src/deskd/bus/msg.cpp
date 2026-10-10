@@ -24,6 +24,7 @@ Lane lane_of(const GwMsg& m) {
     Lane operator()(const SendResult&) const { return Lane::PRIORITY; }
     Lane operator()(const OrderEvent&) const { return Lane::PRIORITY; }
     Lane operator()(const Probe&) const { return Lane::PRIORITY; }
+    Lane operator()(const ManualWrite&) const { return Lane::PRIORITY; }
   };
   return std::visit(V{}, m);
 }

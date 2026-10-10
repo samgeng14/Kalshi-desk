@@ -184,6 +184,7 @@ struct WebServer::Impl {
   std::atomic<std::uint64_t> requests{0};
   std::atomic<bool> stopping{false};
   std::atomic<int> waiting{0};   // request threads blocked on gw or pub right now
+  std::atomic<int> order_waiting{0};   // request threads blocked on a Manual order's venue reply
 
   using Handler = std::function<void(const httplib::Request&, httplib::Response&, const json&)>;
 
@@ -265,6 +266,83 @@ struct WebServer::Impl {
     reply_json(res, err_http(r.code), body);
   }
   static constexpr int kGwWaitMs = 50;
+
+  // A new order: gw admits it in microseconds, then the reply waits for the venue (send-k1's
+  // connect and reply budgets, 1 s + 1.5 s). At most kMaxOrderWaiting request threads wait on
+  // orders, apart from kMaxWaiting. Past the cap or the wait, the answer is a 5xx without ord,
+  // which the contract defines: the page keeps the order PEND and the stream carries its state.
+  static constexpr int kMaxOrderWaiting = 6;
+  static constexpr int kOrderWaitMs = 3000;
+  struct OrderWaiter {
+    std::atomic<int>& n;
+    bool ok;
+    explicit OrderWaiter(std::atomic<int>& c) : n(c), ok(c.fetch_add(1) < kMaxOrderWaiting) {}
+    ~OrderWaiter() { n.fetch_sub(1); }
+  };
+  void order_route(httplib::Response& res, const json& b) {
+    PlaceIntent p;
+    p.cid = b["cid"].get<std::string>();
+    p.owner = Owner::MAN;
+    if (b["v"] != "K") return reply_err(res, "UNKNOWN_MARKET", "P|" + b["tk"].get<std::string>() + ": Polymarket is not connected");
+    p.venue = Venue::K;
+    p.ticker = b["tk"].get<std::string>();
+    p.side = b["side"] == "BUY" ? Side::BUY : Side::SELL;
+    const auto px = parse_price(b["px"].get<std::string>());
+    const auto qty = qty_from_number(b["qty"].get<double>());
+    if (!px) return reply_err(res, "OFF_GRID", "price is not a contract price");
+    if (!qty || *qty <= 0) return reply_err(res, "BAD_QTY", "size must be positive with at most 2 decimals");
+    p.price = *px;
+    p.count = *qty;
+    const std::string tif = b["tif"].get<std::string>();
+    p.tif = tif == "POST" ? Tif::POST : tif == "FOK" ? Tif::FOK : Tif::IOC;
+    if (b.contains("ttl_s") && !b["ttl_s"].is_null()) p.ttl_s = b["ttl_s"].get<int>();
+    if (b.contains("exp_ms") && !b["exp_ms"].is_null()) p.exp_ms = b["exp_ms"].get<std::int64_t>();
+    p.reduce_only = b.contains("reduce_only") && b["reduce_only"].is_boolean() && b["reduce_only"].get<bool>();
+    p.override_guard = b["override"].get<bool>();
+    if (b.contains("t_click_ms") && !b["t_click_ms"].is_null()) p.t_click_ms = b["t_click_ms"].get<std::int64_t>();
+    p.t_recv_ms = now_ms();
+    p.reply = std::make_shared<std::promise<OrderReply>>();
+    auto f = p.reply->get_future();
+    OrderWaiter w(order_waiting);
+    if (!d.gw->post(std::move(p))) return reply_err(res, "RO", "gw inbox full: the order was not queued, nothing was sent");
+    if (!w.ok)
+      return reply_err(res, "INTERNAL", "order queued; " + std::to_string(kMaxOrderWaiting) +
+                                            " orders already wait on the venue: the stream carries its state");
+    if (f.wait_for(std::chrono::milliseconds(kOrderWaitMs)) != std::future_status::ready)
+      return reply_err(res, "INTERNAL", "order queued; no answer within " + std::to_string(kOrderWaitMs) +
+                                            " ms: the stream carries its state");
+    const OrderReply r = f.get();
+    json ord = r.ord.empty() ? json(nullptr) : json::parse(r.ord, nullptr, false);
+    if (ord.is_discarded()) return reply_err(res, "INTERNAL", "gw returned an unreadable order row");
+    if (r.code.empty()) {
+      if (ord.is_null()) return reply_err(res, "INTERNAL", "gw accepted the order without its row");
+      return reply_json(res, 200, json{{"ok", true}, {"ord", ord}});
+    }
+    json body = err_body(r.code, r.msg);
+    if (!ord.is_null()) body["ord"] = ord;
+    reply_json(res, err_http(r.code), body);
+  }
+
+  // Cancels: gw answers at once with the orders it asked to cancel (each then gets its ord).
+  void cancel_route(httplib::Response& res, std::vector<CancelIntent> intents) {
+    std::vector<std::future<CancelReply>> futures;
+    for (auto& c : intents) {
+      c.reply = std::make_shared<std::promise<CancelReply>>();
+      futures.push_back(c.reply->get_future());
+      if (!d.gw->post(std::move(c))) return reply_err(res, "EXCHANGE", "gw inbox full: cancel not queued; use KILL if it must go now");
+    }
+    Waiter w(waiting);
+    if (!w.ok) return reply_err(res, "EXCHANGE", "cancel queued; gw is busy: the stream shows each order's state");
+    json cids = json::array();
+    for (auto& f : futures) {
+      if (f.wait_for(std::chrono::milliseconds(500)) != std::future_status::ready)
+        return reply_err(res, "EXCHANGE", "cancel queued; gw has not answered: the stream shows each order's state");
+      const CancelReply r = f.get();
+      if (!r.code.empty()) return reply_err(res, r.code, r.msg);
+      for (const auto& cid : r.cids) cids.push_back(cid);
+    }
+    reply_json(res, 200, json{{"ok", true}, {"n", cids.size()}, {"cids", cids}});
+  }
 
   // Snapshot and subscribe: the contract's answer is the data itself, so these wait for pub (up
   // to 2 s), but under the same cap.
@@ -493,15 +571,38 @@ void WebServer::Impl::routes() {
   // Week 0 lists no markets and holds no orders, lanes or balances. These are the answers the
   // gateway would give an empty universe, so the page's buttons get contract replies, not 404s;
   // a body that breaks the contract never gets this far (post: BAD_REQUEST).
-  svr.Post("/api/order", post("POST /api/order", [](const httplib::Request&, httplib::Response& res, const json& b) {
-    reply_err(res, "UNKNOWN_MARKET", b["v"].get<std::string>() + "|" + b["tk"].get<std::string>() + ": no markets are listed in this stage");
+  // Manual orders go to gw, which refuses them RO until the Manual path is attached.
+  svr.Post("/api/order", post("POST /api/order", [this](const httplib::Request&, httplib::Response& res, const json& b) {
+    order_route(res, b);
   }));
-  svr.Post("/api/cancel", post("POST /api/cancel", [](const httplib::Request&, httplib::Response& res, const json& b) {
-    if (b.contains("cids")) return reply_json(res, 200, json{{"ok", true}, {"n", 0}, {"cids", json::array()}});   // unknown cids are skipped
-    reply_err(res, "NOT_FOUND", "no such market");
+  svr.Post("/api/cancel", post("POST /api/cancel", [this](const httplib::Request&, httplib::Response& res, const json& b) {
+    std::vector<CancelIntent> intents;
+    if (b.contains("cids")) {   // unknown or finished cids are skipped by gw
+      for (const auto& cid : b["cids"]) {
+        CancelIntent c; c.scope = CancelIntent::Scope::CID; c.cid = cid.get<std::string>();
+        intents.push_back(std::move(c));
+      }
+      if (intents.empty()) return reply_json(res, 200, json{{"ok", true}, {"n", 0}, {"cids", json::array()}});
+    } else {
+      CancelIntent c;
+      c.scope = CancelIntent::Scope::MARKET;
+      c.venue = b["v"] == "K" ? Venue::K : Venue::P;
+      c.ticker = b["tk"].get<std::string>();
+      const std::string own = b["own"].get<std::string>();
+      c.own = own == "MAN" ? CancelIntent::Own::MAN : own == "SYS" ? CancelIntent::Own::SYS : CancelIntent::Own::ANY;
+      if (b.contains("side") && !b["side"].is_null()) { c.has_side = true; c.side = b["side"] == "BUY" ? Side::BUY : Side::SELL; }
+      if (b.contains("px") && !b["px"].is_null()) c.px = parse_price(b["px"].get<std::string>()).value_or(0);
+      intents.push_back(std::move(c));
+    }
+    cancel_route(res, std::move(intents));
   }));
-  svr.Post("/api/cancel_all", post("POST /api/cancel_all", [](const httplib::Request&, httplib::Response& res, const json&) {
-    reply_json(res, 200, json{{"ok", true}, {"n", 0}, {"cids", json::array()}});
+  svr.Post("/api/cancel_all", post("POST /api/cancel_all", [this](const httplib::Request&, httplib::Response& res, const json& b) {
+    if (b.contains("v") && b["v"] == "P") return reply_json(res, 200, json{{"ok", true}, {"n", 0}, {"cids", json::array()}});
+    CancelIntent c;
+    c.scope = CancelIntent::Scope::ALL;
+    const std::string own = b["own"].get<std::string>();
+    c.own = own == "MAN" ? CancelIntent::Own::MAN : own == "SYS" ? CancelIntent::Own::SYS : CancelIntent::Own::ANY;
+    cancel_route(res, {c});
   }));
   svr.Post("/api/amend", post("POST /api/amend", [](const httplib::Request&, httplib::Response& res, const json&) {
     reply_err(res, "NOT_FOUND", "no such order");
