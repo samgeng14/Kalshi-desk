@@ -257,6 +257,8 @@ struct Market {
   Micros dollar_volume = 0;
   json last_ticker;             // the last ticker message's fields, to send only on change
   std::map<std::pair<bool, Px>, std::pair<Qty, std::int64_t>> debt;  // (no side?, px) -> (qty, since)
+  bool settled = false;         // settle_market: closed, determined and paid out
+  std::string result;           // "yes" or "no" once settled
 };
 
 struct EngineConfig {
@@ -295,6 +297,10 @@ class Engine {
   void pause(const std::string& ticker, std::int64_t now_ms);  // "" pauses every market
   void resume(const std::string& ticker, std::int64_t now_ms);
   void close(const std::string& ticker, std::int64_t now_ms);
+  // Closes the market (if open) and settles it: each position pays $1 a contract on the winning
+  // side into its shard's cash, realizes against its cost and goes to 0; the market lists as
+  // status "settled" with its result.
+  void settle_market(const std::string& ticker, bool yes, std::int64_t now_ms);
 
   // ---- time: expiries, closes, group windows and tape debts
   void tick(std::int64_t now_ms);

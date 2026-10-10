@@ -304,6 +304,7 @@ void FakeKalshi::pump_locked(std::int64_t now) {
       case TapeEvent::Kind::MARKET: {
         MarketSpec s = *e.spec;
         if (s.close_ms) s.close_ms = rebase(s.close_ms);
+        if (s.open_ms) s.open_ms = rebase(s.open_ms);
         engine_.add_market(std::move(s), at);
         break;
       }
@@ -335,6 +336,9 @@ void FakeKalshi::pump_locked(std::int64_t now) {
         break;
       case TapeEvent::Kind::CLOSE:
         engine_.close(e.ticker, at);
+        break;
+      case TapeEvent::Kind::PYTH:
+        pyth_locked(e.underlying, e.value, at);
         break;
     }
     ++tape_pos_;
@@ -370,6 +374,9 @@ void FakeKalshi::set_rate_limits(bool on, RateTier tier) {
 }
 void FakeKalshi::pyth(const std::string& underlying, double value_usd, std::int64_t source_ts_ms) {
   std::lock_guard<std::mutex> lk(mu_);
+  pyth_locked(underlying, value_usd, source_ts_ms);
+}
+void FakeKalshi::pyth_locked(const std::string& underlying, double value_usd, std::int64_t source_ts_ms) {
   Event e;
   e.channel = "pyth_value";
   e.type = "pyth_value";

@@ -323,6 +323,7 @@ class FakeKalshi {
   // still held goes behind them (Held); the returned targets cover what went out now.
   Targets publish_locked(const std::vector<Event>& events);
   Targets publish_now_locked(const std::vector<Event>& events);
+  void pyth_locked(const std::string& underlying, double value_usd, std::int64_t source_ts_ms);
   std::uint64_t hold_locked(std::vector<Event> events, bool ready);  // a new Held batch; its id
   void release_locked(std::uint64_t id);   // that batch is ready: publish what can go
   void sweep_locked(const std::shared_ptr<Session>& s);   // drops overflowed subscriptions

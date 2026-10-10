@@ -888,6 +888,17 @@ void test_scenarios() {
   CHECK(!parse_scenario("{\"t\":0,\"delta\":{\"ticker\":\"X\",\"side\":\"bid\",\"price\":\"0.40\",\"delta\":\"1\"}}\n", bad, &err));
   bad = Tape{};
   CHECK(!parse_scenario("not json\n", bad, &err));
+  // a 15-minute window listed before it opens, with its strike, and a pyth_value message
+  Tape w;
+  CHECK(parse_scenario(R"({"t":0,"market":{"ticker":"KXNATGAS15M-26OCT061215-15","open_in_ms":1000,"close_in_ms":901000,"strike_type":"greater_or_equal","floor_strike":3.105}}
+{"t":10,"pyth":{"underlying":"Commodities.Index.NATGAS/USD","value":3.11}}
+)", w, &err));
+  CHECK(w.events.size() == 2 && w.events[0].spec->open_ms == 1000 && w.events[0].spec->close_ms == 901000);
+  CHECK(w.events[0].spec->strike_type == "greater_or_equal" && w.events[0].spec->floor_strike == 3.105);
+  CHECK(w.events[1].kind == TapeEvent::Kind::PYTH && w.events[1].underlying == "Commodities.Index.NATGAS/USD" &&
+        w.events[1].value == 3.11 && w.kinds["pyth"] == 1);
+  bad = Tape{};
+  CHECK(!parse_scenario("{\"t\":0,\"pyth\":{\"underlying\":\"X\",\"value\":0}}\n", bad, &err));
 
   // played: the scenario's trade, its pause and its close
   FakeConfig cfg;

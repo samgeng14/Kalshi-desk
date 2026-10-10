@@ -568,7 +568,8 @@ json market_json(const Engine& e, const Market& m) {
   json ranges = json::array();
   for (const auto& r : m.spec.ticks)
     ranges.push_back(json{{"start", px_str(r.start)}, {"end", px_str(r.end)}, {"step", px_str(r.step)}});
-  const char* status = m.state == Market::State::OPEN ? "active" : m.state == Market::State::PAUSED ? "paused" : "closed";
+  const char* status = m.settled ? "settled" : m.state == Market::State::OPEN ? "active"
+                     : m.state == Market::State::PAUSED ? "paused" : "closed";
   json j{{"ticker", m.spec.ticker},
          {"event_ticker", m.spec.event_ticker},
          {"market_type", "binary"},
@@ -591,14 +592,17 @@ json market_json(const Engine& e, const Market& m) {
   if (!m.spec.strike_type.empty()) j["strike_type"] = m.spec.strike_type;
   if (m.spec.floor_strike) j["floor_strike"] = *m.spec.floor_strike;
   if (m.spec.cap_strike) j["cap_strike"] = *m.spec.cap_strike;
+  if (m.settled) j["result"] = m.result;
   return j;
 }
 
 // GET /markets (get-markets.md): limit 1-1000 (default 100), cursor, tickers (comma-separated),
 // event_ticker, series_ticker, status (unopened | open | paused | closed | settled); ordered by
 // ticker here, a cursor naming the last ticker sent. The venue's order is its own; deskd pages
-// to the empty cursor and never relies on one.
-RestReply list_markets(const Engine& e, const net::Request& r) {
+// to the empty cursor and never relies on one. unopened: a market whose open_time is still ahead
+// (status open lists it too: the engine trades a market from its listing, and deskd's tests
+// list a window shortly before it opens); settled: a market settle_market resolved.
+RestReply list_markets(const Engine& e, const net::Request& r, std::int64_t now) {
   bool b = false;
   const auto l = qint(r, "limit", &b);
   if (b || (l && (*l < 1 || *l > 1000))) return bad("limit must be an integer from 1 to 1000");
@@ -621,8 +625,9 @@ RestReply list_markets(const Engine& e, const net::Request& r) {
     if (!series.empty() && ticker.compare(0, series.size() + 1, series + "-") != 0) continue;
     if (status == "open" && m.state != Market::State::OPEN) continue;
     if (status == "paused" && m.state != Market::State::PAUSED) continue;
-    if (status == "closed" && m.state != Market::State::CLOSED) continue;
-    if (status == "unopened" || status == "settled") continue;   // the fake has neither
+    if (status == "closed" && (m.state != Market::State::CLOSED || m.settled)) continue;
+    if (status == "unopened" && !(m.state == Market::State::OPEN && m.spec.open_ms > now)) continue;
+    if (status == "settled" && !m.settled) continue;
     if (static_cast<int>(out.size()) == limit) {
       more = true;
       break;
@@ -750,7 +755,7 @@ RestReply rest_route(Engine& e, const net::Request& r, const std::string& path, 
     }
     return rest_error(404,"not_found","series not found");
   }
-  if (seg[0] == "markets" && r.method == "GET" && seg.size() == 1) return list_markets(e, r);
+  if (seg[0] == "markets" && r.method == "GET" && seg.size() == 1) return list_markets(e, r, now);
   if (seg[0] == "markets" && r.method == "GET" && seg.size() >= 2) {
     const Market* m = e.market(seg[1]);
     if (!m) return rest_error(404, "not_found", "market not found");

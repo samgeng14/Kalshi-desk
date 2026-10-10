@@ -209,6 +209,26 @@ void Engine::resume(const std::string& ticker, std::int64_t now_ms) {
     if ((ticker.empty() || t == ticker) && m.state == Market::State::PAUSED) m.state = Market::State::OPEN;
 }
 
+void Engine::settle_market(const std::string& ticker, bool yes, std::int64_t now_ms) {
+  Market* m = market(ticker);
+  if (!m || m->settled) return;
+  close(ticker, now_ms);
+  m->settled = true;
+  m->result = yes ? "yes" : "no";
+  for (auto& [key, p] : positions_) {
+    if (key.second != ticker || !p.pos) continue;
+    const bool wins = (p.pos > 0) == yes;
+    const Micros payout = wins ? notional(kDollar, std::abs(p.pos)) : 0;
+    cash_[{key.first, p.exchange_index}] += payout;
+    p.realized += payout - p.cost;
+    p.cost = 0;
+    p.pos_fees = 0;
+    p.pos = 0;
+    p.updated_ms = now_ms;
+  }
+  cash_updated_ms_ = now_ms;
+}
+
 void Engine::close(const std::string& ticker, std::int64_t now_ms) {
   Market* m = market(ticker);
   if (!m || m->state == Market::State::CLOSED) return;
