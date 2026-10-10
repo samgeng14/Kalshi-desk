@@ -22,8 +22,17 @@ KalshiSender::KalshiSender(Role role, BoundedQueue<KalshiWriteJob>& inbox, net::
 }
 std::string KalshiSender::admission(const KalshiWriteJob& j,const Worker& self) const {
   if(self.stopping()) return "STOP";
-  if(j.kind==KalshiWriteJob::Kind::CANCEL) return role_==Role::CANCEL && !j.cid.empty() ? "" : "BAD_REQUEST";
-  if(role_!=Role::MANUAL || j.cid.empty() || j.cid.front()!='M' || j.create.client_order_id!=j.cid)
+  if(j.kind==KalshiWriteJob::Kind::CANCEL)
+    return !j.cid.empty() && (role_==Role::CANCEL || (role_==Role::SYSTEMATIC && j.cid.front()=='S')) ? "" : "BAD_REQUEST";
+  if(j.kind==KalshiWriteJob::Kind::GROUP) {
+    if(role_!=Role::SYSTEMATIC || j.lane.empty()) return "BAD_REQUEST";
+    // a trigger always goes; a create or reset never during KILL, nor from a stopped sender
+    if(j.group_action=="trigger") return "";
+    if(kill_.active() || j.kill_generation!=kill_.generation()) return "KILLED";
+    return healthy() ? "" : "RO";
+  }
+  const char own=role_==Role::MANUAL ? 'M' : role_==Role::SYSTEMATIC ? 'S' : 0;
+  if(!own || j.cid.empty() || j.cid.front()!=own || j.create.client_order_id!=j.cid)
     return "BAD_REQUEST";
   if(kill_.active() || j.kill_generation!=kill_.generation()) return "KILLED";
   if(!healthy()) return "RO";
@@ -91,6 +100,10 @@ KalshiWriteReply KalshiSender::execute(kalshi::WireRequest request,const std::st
   if(r.outcome.kind==kalshi::WriteOutcome::Kind::ACK) {
     if(request.op==WireOp::CREATE) r.create=kalshi::parse_create_ack(r.exchange.res.body,&why);
     if(request.op==WireOp::CANCEL) r.cancel=kalshi::parse_cancel_ack(r.exchange.res.body,&why);
+    if(request.op==WireOp::GROUP && job && job->group_action=="create") {
+      if(auto id=kalshi::parse_create_order_group(r.exchange.res.body,&why)) r.group_id=*id;
+      else { r.outcome.kind=kalshi::WriteOutcome::Kind::UNKNOWN; r.outcome.why="order group created without a readable id"; }
+    }
   }
   if(r.outcome.kind==kalshi::WriteOutcome::Kind::REFUSED && r.outcome.cls==RejectClass::DUPLICATE) {
     // A duplicate is evidence an earlier request may have landed. Never free the reservation
@@ -134,6 +147,16 @@ void KalshiSender::take_kill(Worker& self) {
     fail_closed("KILL cancel-all unconfirmed ("+(reply.outcome.why.empty() ? reply.local_code : reply.outcome.why).substr(0,120)+
                 "); reconcile and press KILL again");
   deliver(std::move(reply));
+  // Then every order group: a triggered group refuses new orders until gw resets it at re-arm.
+  if(groups_) for(const auto& [id,shard]:groups_->all()) {
+    kalshi::WireRequest request; std::string why;
+    if(!kalshi::build_order_group_action(id,"trigger",shard,-1,&request,&why)) continue;
+    auto g=execute(std::move(request),"",self,nullptr);
+    g.group_action="trigger"; g.group_id=id; g.shard=shard;
+    if(g.outcome.kind!=kalshi::WriteOutcome::Kind::ACK && !(g.outcome.kind==kalshi::WriteOutcome::Kind::REFUSED && g.outcome.cls==RejectClass::GONE))
+      DLOG_WARN("KILL: order group %s on shard %d not triggered: %s",id.c_str(),shard,g.outcome.why.c_str());
+    deliver(std::move(g));
+  }
 }
 void KalshiSender::run(Worker& self) {
   while(!self.stopping()) {
@@ -143,21 +166,32 @@ void KalshiSender::run(Worker& self) {
     if(!job) continue;
     kalshi::WireRequest request; std::string why;
     const auto code=admission(*job,self);
-    const bool built=code.empty() && (job->kind==KalshiWriteJob::Kind::CREATE ?
-        kalshi::build_create(job->create,&request,&why) :
-        kalshi::build_cancel(job->oid,job->shard,job->ticker,job->subaccount,&request,&why));
+    using JK=KalshiWriteJob::Kind;
+    bool built=false;
+    if(code.empty()) {
+      if(job->kind==JK::CREATE) built=kalshi::build_create(job->create,&request,&why);
+      else if(job->kind==JK::CANCEL) built=kalshi::build_cancel(job->oid,job->shard,job->ticker,job->subaccount,&request,&why);
+      else if(job->group_action=="create") built=kalshi::build_create_order_group(job->group_limit,job->shard,job->subaccount,&request,&why);
+      else built=kalshi::build_order_group_action(job->group_id,job->group_action,job->shard,job->subaccount,&request,&why);
+    }
+    KalshiWriteReply r;
     if(!built) {
-      KalshiWriteReply r; r.cid=job->cid; r.entered_ms=now_ms();
-      r.op=job->kind==KalshiWriteJob::Kind::CREATE ? WireOp::CREATE : WireOp::CANCEL;
+      r.cid=job->cid; r.entered_ms=now_ms();
+      r.op=job->kind==JK::CREATE ? WireOp::CREATE : job->kind==JK::CANCEL ? WireOp::CANCEL : WireOp::GROUP;
       r.outcome.kind=kalshi::WriteOutcome::Kind::NOT_SENT;
       r.local_code=code.empty() ? "BAD_REQUEST" : code; r.outcome.why=why;
-      deliver(std::move(r));
-    } else deliver(execute(std::move(request),job->cid,self,&*job));
+    } else r=execute(std::move(request),job->cid,self,&*job);
+    if(job->kind==JK::GROUP) {
+      r.group_action=job->group_action; r.lane=job->lane; r.shard=job->shard;
+      if(r.group_id.empty()) r.group_id=job->group_id;
+    }
+    deliver(std::move(r));
   }
   // Queued jobs never disappear just because shutdown beat the worker to them.
   while(auto job=inbox_.try_pop()) {
     KalshiWriteReply r; r.cid=job->cid;
-    r.op=job->kind==KalshiWriteJob::Kind::CREATE ? WireOp::CREATE : WireOp::CANCEL;
+    r.op=job->kind==KalshiWriteJob::Kind::CREATE ? WireOp::CREATE : job->kind==KalshiWriteJob::Kind::CANCEL ? WireOp::CANCEL : WireOp::GROUP;
+    r.group_action=job->group_action; r.group_id=job->group_id; r.lane=job->lane; r.shard=job->shard;
     r.local_code="STOP"; r.outcome.kind=kalshi::WriteOutcome::Kind::NOT_SENT;
     deliver(std::move(r));
   }

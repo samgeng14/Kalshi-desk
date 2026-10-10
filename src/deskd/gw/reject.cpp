@@ -40,7 +40,7 @@ RejectClass classify_refusal(WireOp op, int status, const std::string& text) {
   auto has = [&](const char* s) { return b.find(s) != std::string::npos; };
   if (status == 429) return RejectClass::RETRYABLE;
   if (status == 401 || status == 403) return RejectClass::AUTH;
-  if ((op == WireOp::CANCEL || op == WireOp::BATCH_CANCEL) && status == 404) return RejectClass::GONE;
+  if ((op == WireOp::CANCEL || op == WireOp::BATCH_CANCEL || op == WireOp::GROUP) && status == 404) return RejectClass::GONE;
   if (status == 409 && (has("order_already_exists") || has("already exists") || has("duplicate")))
     return RejectClass::DUPLICATE;
   if (is_post_only_cross(b)) return RejectClass::SOFT_MARKET;

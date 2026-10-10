@@ -38,7 +38,7 @@ enum class RejectClass {
 
 const char* reject_class_name(RejectClass c);
 
-enum class WireOp { CREATE, CANCEL, BATCH_CANCEL, CANCEL_ALL, OTHER };
+enum class WireOp { CREATE, CANCEL, BATCH_CANCEL, CANCEL_ALL, GROUP, OTHER };
 
 // `text` is the venue's error code, message and details (any case). HTTP status first.
 RejectClass classify_refusal(WireOp op, int status, const std::string& text);

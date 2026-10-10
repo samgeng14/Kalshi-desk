@@ -653,6 +653,67 @@ WireRequest build_cancel_all(int subaccount) {
   return r;
 }
 
+bool build_create_order_group(Qty limit, int exchange_index, int subaccount, WireRequest* out, std::string* why) {
+  if (limit < kOneContract || limit % kOneContract || limit > 1000000 * kOneContract) {
+    if (why) *why = "contracts_limit is whole contracts, 1 to 1,000,000";
+    return false;
+  }
+  if (exchange_index < 0) {
+    if (why) *why = "a group names its shard (exchange_index)";
+    return false;
+  }
+  if (subaccount < -1 || subaccount > 63) {
+    if (why) *why = "subaccount must be 0-63";
+    return false;
+  }
+  json b{{"contracts_limit", limit / kOneContract}, {"contracts_limit_fp", count_wire(limit)},
+         {"exchange_index", exchange_index}};
+  if (subaccount >= 0) b["subaccount"] = subaccount;
+  WireRequest r;
+  r.method = "POST";
+  r.path = std::string(kBasePath) + "/portfolio/order_groups/create";
+  r.body = b.dump();
+  r.write = true;
+  r.op = WireOp::GROUP;
+  *out = std::move(r);
+  return true;
+}
+
+bool build_order_group_action(const std::string& id, const std::string& action, int exchange_index, int subaccount,
+                              WireRequest* out, std::string* why) {
+  if (!id_ok(id)) {
+    if (why) *why = "a bad order_group_id";
+    return false;
+  }
+  if (action != "trigger" && action != "reset") {
+    if (why) *why = "a group action is trigger or reset";
+    return false;
+  }
+  if (exchange_index < 0 || subaccount < -1 || subaccount > 63) {
+    if (why) *why = "a group action names its shard (and subaccount 0-63)";
+    return false;
+  }
+  WireRequest r;
+  r.method = "PUT";
+  r.path = std::string(kBasePath) + "/portfolio/order_groups/" + url_encode(id) + "/" + action;
+  add_q(r.query, "exchange_index", exchange_index, true);
+  add_q(r.query, "subaccount", subaccount, subaccount >= 0);
+  r.body = "{}";
+  r.write = true;
+  r.op = WireOp::GROUP;
+  *out = std::move(r);
+  return true;
+}
+
+std::optional<std::string> parse_create_order_group(const std::string& body, std::string* why) {
+  auto j = parse_object(body, why);
+  if (!j) return std::nullopt;
+  Rd r(*j, "order group");
+  const auto id = r.str("order_group_id");
+  if (r.ok() && !id_ok(id)) r.fail("order_group_id", "not an id");
+  return done(r, id, why);
+}
+
 WireRequest build_get_order(const std::string& order_id) { return get("/portfolio/orders/" + url_encode(order_id)); }
 WireRequest build_get_orders(const ListQuery& q) {
   std::string s;
@@ -980,6 +1041,7 @@ WriteOutcome classify_write(WireOp op, const net::Exchange& x) {
       case WireOp::CANCEL: parsed = st == 200 && parse_cancel_ack(x.res.body, &why).has_value(); break;
       case WireOp::BATCH_CANCEL: parsed = st == 200 && parse_batch_cancel(x.res.body, &why).has_value(); break;
       case WireOp::CANCEL_ALL: parsed = st == 204 || st == 200; break;
+      case WireOp::GROUP: parsed = true; break;
       case WireOp::OTHER: parsed = true; break;
     }
     if (parsed) {

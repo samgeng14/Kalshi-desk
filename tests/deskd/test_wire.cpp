@@ -350,6 +350,20 @@ static void test_builders() {
   CHECK(all.method == "DELETE" && all.path == "/trade-api/v2/portfolio/events/orders" && all.query.empty() &&
         all.op == WireOp::CANCEL_ALL && all.write);
   CHECK(build_cancel_all(0).query == "subaccount=0");
+  {   // order groups: whole contracts, a shard on every call
+    WireRequest g;
+    std::string why;
+    CHECK(build_create_order_group(5000, 2, -1, &g, &why));
+    CHECK(g.method == "POST" && g.path == "/trade-api/v2/portfolio/order_groups/create" && g.write && g.op == WireOp::GROUP);
+    CHECK(json::parse(g.body) == json({{"contracts_limit", 50}, {"contracts_limit_fp", "50.00"}, {"exchange_index", 2}}));
+    CHECK(!build_create_order_group(150, 0, -1, &g, &why) && !build_create_order_group(5000, -1, -1, &g, &why));
+    CHECK(build_order_group_action("og-1", "trigger", 1, -1, &g, &why));
+    CHECK(g.method == "PUT" && g.path == "/trade-api/v2/portfolio/order_groups/og-1/trigger" && g.query == "exchange_index=1");
+    CHECK(!build_order_group_action("og-1", "delete", 1, -1, &g, &why) && !build_order_group_action("og 1", "reset", 1, -1, &g, &why));
+    CHECK(parse_create_order_group(R"({"order_group_id":"og-9","exchange_index":0})", &why) == std::optional<std::string>("og-9"));
+    CHECK(!parse_create_order_group(R"({"exchange_index":0})", &why));
+    CHECK(classify_refusal(WireOp::GROUP, 404, "not_found") == RejectClass::GONE);
+  }
 
   // reads
   ListQuery q;

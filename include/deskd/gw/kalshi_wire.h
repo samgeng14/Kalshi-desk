@@ -127,6 +127,16 @@ bool build_batch_cancel(const std::vector<BatchCancelItem>& items, WireRequest* 
 // DELETE /portfolio/events/orders[?subaccount=S]: every resting order (204); KILL's backstop
 WireRequest build_cancel_all(int subaccount = -1);
 
+// Order groups (plan section 3: one per Systematic lane and shard; groups do not span shards).
+// POST /portfolio/order_groups/create {contracts_limit, contracts_limit_fp, exchange_index}: the
+// limit is whole contracts over the venue's rolling 15 s window of fills; going over it cancels
+// every order in the group and refuses new ones until a reset.
+bool build_create_order_group(Qty contracts_limit, int exchange_index, int subaccount, WireRequest* out, std::string* why);
+// PUT /portfolio/order_groups/{id}/{trigger|reset}?exchange_index=N[&subaccount=S]
+bool build_order_group_action(const std::string& id, const std::string& action, int exchange_index, int subaccount,
+                              WireRequest* out, std::string* why);
+std::optional<std::string> parse_create_order_group(const std::string& body, std::string* why);
+
 struct ListQuery {   // the read routes' shared filters; empty / -1 / 0 = left out
   std::string ticker;             // fills: comma-separated, up to 100
   std::string event_ticker;
