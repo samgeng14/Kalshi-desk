@@ -368,6 +368,14 @@ void FakeKalshi::set_rate_limits(bool on, RateTier tier) {
   write_ = Bucket{tier.write_per_s * tier.write_burst_s, tier.write_per_s, tier.write_per_s * tier.write_burst_s, now};
   write_shard_.clear();
 }
+void FakeKalshi::pyth(const std::string& underlying, double value_usd, std::int64_t source_ts_ms) {
+  std::lock_guard<std::mutex> lk(mu_);
+  Event e;
+  e.channel = "pyth_value";
+  e.type = "pyth_value";
+  e.msg = json{{"underlying_ticker", underlying}, {"value_usd", value_usd}, {"source_ts_ms", source_ts_ms}};
+  publish_now_locked({e});
+}
 void FakeKalshi::drop_ws_connections() {
   std::lock_guard<std::mutex> lk(mu_);
   for (auto& [id, s] : sessions_) {

@@ -299,6 +299,7 @@ add_library(deskd_core STATIC
   src/deskd/md/kalshi_md.cpp
   src/deskd/rest/state.cpp
   src/deskd/priv/kalshi_private.cpp
+  src/deskd/ref/pyth.cpp
   src/deskd/net/guard.cpp
   src/deskd/net/http.cpp
   src/deskd/net/ws.cpp
@@ -444,7 +445,7 @@ foreach(t http pub_data order_ledger manual_admission manual_book)
   target_precompile_headers(deskd-test-${t} REUSE_FROM deskd_core)
   add_test(NAME deskd-${t} COMMAND deskd-test-${t})
 endforeach()
-foreach(t net wire md rest private sender manual_gw runtime_manual)
+foreach(t net wire md rest private sender manual_gw runtime_manual pyth)
   add_executable(deskd-test-${t} tests/deskd/test_${t}.cpp)
   target_link_libraries(deskd-test-${t} PRIVATE deskd_core fake_kalshi)
   target_precompile_headers(deskd-test-${t} REUSE_FROM deskd_core)

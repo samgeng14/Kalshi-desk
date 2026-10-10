@@ -7,6 +7,7 @@
 #include "deskd/md/kalshi_md.h"
 #include "deskd/rest/state.h"
 #include "deskd/priv/kalshi_private.h"
+#include "deskd/ref/pyth.h"
 
 namespace deskd {
 using json = nlohmann::json;
@@ -40,6 +41,7 @@ bool Deskd::init_venue(std::string* err) {
         rest_->request_refresh();
         return gw_->post(PrivateMsg{std::make_shared<const PrivateEvent>(e)});
       },[this] { rest_->request_refresh(); });
+  pyth_ = std::make_unique<KalshiPyth>(*we, *factory_, *signer_, feeds_.PYTH);
   rest_->set_reconcile_guard([this] { return private_->fence(); },
                             [this](std::uint64_t fence) { return private_->reconcile(fence); });
   // The write path: send-k1 (Manual) and send-cx (cancels and KILL), each with its own pool.

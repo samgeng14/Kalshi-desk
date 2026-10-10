@@ -37,8 +37,9 @@ class FeedState {
 };
 
 // KX: Kalshi market data (md-k); KXP: Kalshi private, orders and fills (priv-k); PM: Polymarket.
+// PYTH: Kalshi's pyth_value reference (ref-k); not in the contract's hb.feeds, only /ops/status.
 struct Feeds {
-  FeedState KX, KXP, PM;
+  FeedState KX, KXP, PM, PYTH;
 };
 
 }  // namespace deskd

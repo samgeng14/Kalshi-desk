@@ -13,6 +13,7 @@
 #include "deskd/rest/state.h"
 #include "deskd/md/kalshi_md.h"
 #include "deskd/priv/kalshi_private.h"
+#include "deskd/ref/pyth.h"
 
 namespace deskd {
 
@@ -25,7 +26,7 @@ Deskd::Deskd(DeskdConfig cfg, std::unique_ptr<AccountLock> lock, RuntimeOptions 
   epoch_ = "e-" + std::to_string(started_ms_) + "-" + std::to_string(::getpid());
   token_ = random_token();
   if (lock_) kill_.persist_to(lock_->sibling(".killed"));
-  for (const char* n : {"md-k", "priv-k", "gw", "send-k1", "send-k2", "send-k3", "send-cx", "strat", "store", "pub",
+  for (const char* n : {"md-k", "priv-k", "ref-k", "gw", "send-k1", "send-k2", "send-k3", "send-cx", "strat", "store", "pub",
                         "rest", "ops", "web"})
     workers_.push_back(std::make_unique<Worker>(n));
 
@@ -115,6 +116,9 @@ bool Deskd::start(std::string* err) {
   });
   by("priv-k")->start([this](Worker& w) {
     if (private_) private_->run(w); else run_feed_placeholder(w, feeds_.KXP);
+  });
+  by("ref-k")->start([this](Worker& w) {
+    if (pyth_) pyth_->run(w); else run_feed_placeholder(w, feeds_.PYTH);
   });
   by("gw")->start([this](Worker& w) { gw_->run(w); });
   const AlertFn alert = [this](const std::string& lvl, const std::string& src, const std::string& msg) {
@@ -211,6 +215,7 @@ json Deskd::status() const {
     if (!s) return json(nullptr);
     return json{{"healthy", s->healthy()}, {"why", s->fail_reason()}, {"attempted", s->attempted()}};
   };
+  result["pyth"] = pyth_ ? pyth_->status(now) : json(nullptr);
   result["senders"] = {{"k1", sender(man_sender_.get())}, {"cx", sender(cx_sender_.get())}};
   result["publisher_healthy"] = pub_->healthy();
   if (rest_) {

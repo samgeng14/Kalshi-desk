@@ -2,6 +2,7 @@
 // deskd, composed: the owners of section 2's table, each on its own named thread.
 //
 //   md-k, priv-k     Kalshi market data and private feed (week 0: placeholders, feeds down)
+//   ref-k            Kalshi's pyth_value reference for the 15-minute financial markets
 //   gw               the gateway: run state, inbox lanes and deletions
 //   send-k1          Manual's sender; send-k2, send-k3 Systematic's (week 0: placeholders)
 //   send-cx          cancels and KILL, on its own path
@@ -49,6 +50,7 @@ namespace deskd {
 class KalshiSigner;
 class KalshiMd;
 class KalshiPrivate;
+class KalshiPyth;
 struct MdBook;
 namespace rest { class State; struct Snapshot; }
 
@@ -102,6 +104,7 @@ class Deskd {
   std::unique_ptr<rest::State> rest_;
   std::unique_ptr<KalshiMd> md_;
   std::unique_ptr<KalshiPrivate> private_;
+  std::unique_ptr<KalshiPyth> pyth_;
   std::string key_error_;
   mutable std::mutex live_mu_;
   std::set<std::string> pins_, live_;
