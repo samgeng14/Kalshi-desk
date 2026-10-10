@@ -51,7 +51,12 @@ std::int64_t effective_close(const kalshi::MarketRow& m) {
   return m.close_ms.value_or(0);
 }
 json optional_px(std::optional<Px> px) { return px ? json(kalshi::price_wire(*px)) : json(nullptr); }
-json fee() { return {{"type", "QUAD"}, {"mult", 1}}; }
+json fee(const kalshi::MarketRow& market) {
+  if(market.fee_multiplier && (market.fee_type=="quadratic" || market.fee_type=="quadratic_with_maker_fees"))
+    return {{"type",*market.fee_multiplier==0 ? "FREE" : market.fee_type=="quadratic" ? "QUAD" : "QUAD_MAKER"},
+            {"mult",*market.fee_multiplier}};
+  return {{"type","QUAD"},{"mult",1}}; // display fallback only; fee_ready() refuses admission
+}
 
 template<class Row, class Build, class Parse, class Get>
 bool pages(std::vector<Row>* rows, Build build, Parse parse, Get get, int max_pages, std::string* why) {
@@ -92,7 +97,7 @@ json universe_row(const kalshi::MarketRow& m, const Snapshot& state) {
           {"short", label(m)}, {"cat", category(m)}, {"grp", group(m)}, {"gk", group(m)}, {"kind", kind(m)},
           {"date", outcome_date(m)}, {"close_ms", effective_close(m)}, {"bid", optional_px(bid)},
           {"ask", optional_px(ask)}, {"sprd", optional_px(spread)},
-          {"vol", static_cast<double>(m.volume_24h.value_or(0)) / 100.0}, {"fee", fee()},
+          {"vol", static_cast<double>(m.volume_24h.value_or(0)) / 100.0}, {"fee", fee(m)},
           {"fair", nullptr}, {"edge", nullptr}, {"pin", state.pins.count(m.ticker) != 0},
           {"live", state.live.count(m.ticker) != 0}};
 }
@@ -316,6 +321,56 @@ bool State::listing(Snapshot& next, std::string* why, Worker* worker) {
   return true;
 }
 
+void State::metadata(Snapshot& next,Worker* worker) {
+  next.metadata_error.clear();
+  auto wanted=snapshot()->live;
+  for(const auto& p:next.positions) if(p.position) wanted.insert(p.ticker);
+  for(const auto& o:next.orders) if(o.status==kalshi::OrderStatus::RESTING) wanted.insert(o.ticker);
+  std::set<std::string> names;
+  for(const auto& tk:wanted) {
+    const auto it=next.markets.find(tk);
+    if(it!=next.markets.end()) names.insert(series(it->second));
+  }
+  std::vector<std::string> due;
+  for(const auto& name:names) {
+    const auto it=series_.find(name);
+    if(it==series_.end() || !it->second.fetched_ms || now_ms()<it->second.fetched_ms ||
+       now_ms()-it->second.fetched_ms>=kFeeFreshMs) due.push_back(name);
+  }
+  std::sort(due.begin(),due.end(),[&](const auto& a,const auto& b) {
+    const auto ia=series_.find(a),ib=series_.find(b);
+    const auto ta=ia==series_.end() ? 0 : ia->second.attempted_ms;
+    const auto tb=ib==series_.end() ? 0 : ib->second.attempted_ms;
+    return ta!=tb ? ta<tb : a<b;
+  });
+  // The unfiltered demo /series response is already >18 MB. Bound work to the live watchlist,
+  // use the single-series endpoint and cache it; never put discovery I/O on a click's path.
+  std::size_t tried=0;
+  for(const auto& name:due) {
+    if(tried++==16 || (worker && worker->stopping())) break;
+    auto& cached=series_[name]; cached.attempted_ms=now_ms();
+    std::string body,why;
+    if(!get(kalshi::build_get_series(name),&body,&why,worker)) {
+      next.metadata_error="series metadata unavailable for "+name; continue;
+    }
+    auto row=kalshi::parse_series(body,&why);
+    if(!row || row->ticker!=name) { next.metadata_error="invalid series metadata for "+name; continue; }
+    cached.row=std::move(*row); cached.fetched_ms=now_ms();
+  }
+  for(auto& item:next.markets) {
+    auto& m=item.second; const auto it=series_.find(series(m));
+    m.fee_type.clear(); m.fee_multiplier.reset(); m.fee_ms=0;
+    if(it==series_.end() || !it->second.fetched_ms) continue;
+    m.fee_type=it->second.row.fee_type; m.fee_multiplier=it->second.row.fee_multiplier;
+    m.fee_ms=it->second.fetched_ms;
+    if(m.category.empty()) m.category=it->second.row.category;
+  }
+}
+bool fee_ready(const kalshi::MarketRow& m,std::int64_t now) {
+  return m.fee_ms>0 && now>=m.fee_ms && now-m.fee_ms<kFeeFreshMs && m.fee_multiplier &&
+      std::isfinite(*m.fee_multiplier) && *m.fee_multiplier>=0 && *m.fee_multiplier<=1000 &&
+      (m.fee_type=="quadratic" || m.fee_type=="quadratic_with_maker_fees");
+}
 bool State::refresh_once() { return refresh(nullptr); }
 bool State::refresh(Worker* worker) {
   const auto fence = begin_ ? begin_() : 0;
@@ -330,6 +385,7 @@ bool State::refresh(Worker* worker) {
       next.error += "listing: " + why;
     }
   }
+  metadata(next,worker);
   next.ts_ms = now_ms();
   if (next.account_ready && commit_ && !commit_(fence)) {
     next.account_ready = false;
@@ -418,7 +474,7 @@ json market_json(const kalshi::MarketRow& market, bool pin, bool live, std::int6
           // When open_time is absent, an active listing proves it opened by the snapshot;
           // the fallback is presentation only. The gateway still has the optional raw field.
           {"open_ms", market.open_ms.value_or(std::min(now, close ? close : now))},
-          {"close_ms", close ? close : now}, {"status", status}, {"result", result}, {"grid", grid}, {"fee", fee()},
+          {"close_ms", close ? close : now}, {"status", status}, {"result", result}, {"grid", grid}, {"fee", fee(market)},
           {"shard", market.exchange_index ? json("S" + std::to_string(*market.exchange_index)) : json(nullptr)},
           {"lip", false}, {"start_ms", nullptr}, {"man", false}, {"cat", category(market)},
           {"date", outcome_date(market).empty() ? et_date(now) : outcome_date(market)},

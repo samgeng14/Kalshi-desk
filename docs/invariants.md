@@ -112,3 +112,18 @@ resting collateral. Reducing orders share existing inventory in price priority; 
 cannot both claim the same reducing contracts. Fractional collateral rounds upward, and
 missing/conflicting shard metadata keeps the view read-only. A fake-exchange resting $4 order
 now displays cash $500, free $496 on its shard, rather than cash $496, free $492.
+
+## Authoritative live-series fees — 2026-10-09
+
+- Fees come from [GET /series/{ticker}](https://docs.kalshi.com/api-reference/market/get-series),
+  independently of model edges. Missing/non-numeric/negative multipliers are rejected. Unknown
+  fee types stay explicit and fail `fee_ready`, rather than being treated as ordinary QUAD.
+- Only live, pinned or held series are fetched, at most 16 per refresh, cached for five minutes.
+  Stale metadata and backward clock steps fail readiness. Cached data enriches matching universe
+  rows too. The legacy display fallback remains presentation-only for unvisited/unknown series.
+- Metadata failure is visible separately in ops status and does not fabricate an account failure.
+  No discovery request or fee fetch occurs on an order's click path.
+
+Seven impacted integration suites passed (38.7 seconds). The actual demo probe with
+`--require-private --require-fees` passed all five contract checks, with 8/8 live markets having
+fresh supported fees, eight books, KX/KXP up without gaps, and zero exchange orders sent.

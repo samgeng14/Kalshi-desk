@@ -737,6 +737,14 @@ RestReply rest_route(Engine& e, const net::Request& r, const std::string& path, 
     }
     return rest_error(404, "not_found", "no such route");
   }
+  if(seg[0]=="series" && r.method=="GET" && seg.size()==2) {
+    for(const auto& item:e.markets()) if(item.first.substr(0,item.first.find('-'))==seg[1]) {
+      const auto& spec=item.second.spec;
+      return ok(200,json{{"series",{{"ticker",seg[1]},{"category",""},
+          {"fee_type",fee_type_name(spec.fee_type)},{"fee_multiplier",spec.fee_mult_milli/1000.0}}}});
+    }
+    return rest_error(404,"not_found","series not found");
+  }
   if (seg[0] == "markets" && r.method == "GET" && seg.size() == 1) return list_markets(e, r);
   if (seg[0] == "markets" && r.method == "GET" && seg.size() >= 2) {
     const Market* m = e.market(seg[1]);

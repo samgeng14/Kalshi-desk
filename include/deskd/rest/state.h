@@ -54,6 +54,7 @@ struct Snapshot {
   std::int64_t account_ms = 0, listing_ms = 0, ts_ms = 0;
   std::uint64_t revision = 0;
   std::string error;
+  std::string metadata_error;
 };
 
 struct Options {
@@ -87,6 +88,7 @@ class State {
   bool get(kalshi::WireRequest request, std::string* body, std::string* why, Worker* worker);
   bool account(Snapshot& next, std::string* why, Worker* worker);
   bool listing(Snapshot& next, std::string* why, Worker* worker);
+  void metadata(Snapshot& next, Worker* worker);
   void publish(Snapshot next);
   void controls(bool pins, std::set<std::string> values);
   net::ConnFactory& factory_;
@@ -103,11 +105,16 @@ class State {
   ClockCheck clock_;
   std::unique_ptr<net::Conn> conn_;  // REST owner only; read connections can be reused
   std::int64_t started_ms_ = 0, last_listing_mono_ = 0;
+  struct CachedSeries { kalshi::SeriesRow row; std::int64_t fetched_ms = 0, attempted_ms = 0; };
+  std::map<std::string,CachedSeries> series_;
 };
 
 // Contract 1.5 projections. Missing exchange_index remains null; the gateway must refuse a
 // write without it. No model is invented: universe fair and edge are null. LIP remains false
-// until incentive metadata is integrated. The fee display is conservatively QUAD x1.
+// until incentive metadata is integrated. Unknown fees retain the presentation fallback;
+// that fallback is NOT approval to trade: admission must require fee_ready().
+constexpr std::int64_t kFeeFreshMs = 300000;
+bool fee_ready(const kalshi::MarketRow& market, std::int64_t now_ms);
 std::string category(const kalshi::MarketRow& market);
 std::string outcome_date(const kalshi::MarketRow& market);
 nlohmann::json market_json(const kalshi::MarketRow& market, bool pin, bool live, std::int64_t now_ms);

@@ -53,6 +53,11 @@ Nothing is pushed. `ui/desk/js/contract.js` is the API contract deskd must serve
 - Cash projection fix (2026-10-09): the header no longer subtracts collateral twice from
   Kalshi's available balance. It adds modeled resting collateral to reconstruct cash, shares
   reducing room across orders in price priority, and retains exact fractional quantities.
+- Venue fee metadata (2026-10-09): live/pinned/held series use the public single-series endpoint
+  and a five-minute cache. The fee model/multiplier now enrich live markets and matching universe
+  rows. Missing, stale, or unsupported metadata fails `rest::fee_ready()`; the display fallback
+  must not be used for admission. Demo proof: 8/8 live markets fee-ready, both feeds healthy,
+  five contract checks passed, zero orders sent. `/ops/status` reports metadata readiness.
 - Oracle VM `deskd-recorder` for the recorder: `ssh -i ~/.ssh/oracle_deskd ubuntu@64.181.211.165` (Ubuntu 24.04 aarch64, 1 OCPU, 6 GB, 145 GB). Nothing installed yet.
 
 ## Next, in order
@@ -86,9 +91,10 @@ Nothing is pushed. `ui/desk/js/contract.js` is the API contract deskd must serve
   reconciliation into stage 3; do not advertise KXP up merely because REST succeeded.
 - `rest_position_json` is a startup cost projection. REST realized/fees are lifetime totals;
   the Manual execution ledger must supply daily P&L and own order revisions once enabled.
-- Series category fallback is conservative prefix classification when market metadata omits
-  category. Fee fallback is QUAD x1; LIP/model values are not invented. Integrate authoritative
-  series fees before relying on this presentation fallback for cash admission.
+- Series metadata fills categories and fees for live/pinned/held markets; unvisited series keep
+  prefix/category and QUAD x1 display fallbacks. Admission must require `rest::fee_ready(m,now)`
+  before computing fees. The metadata worker uses at most 16 targeted requests per refresh:
+  the unfiltered demo /series response measured 18.9 MB, above the normal HTTP body limit.
 - Publisher inbox overflow latches its header read-only and requires a restart. The gateway
   must include `pub.healthy()` in its entry prerequisites when Manual writes are wired.
 - `OrderLedger` belongs exclusively to gw. Admission supplies a resolved expiry and conservative
@@ -106,6 +112,8 @@ Read-only demo verification after launch (use the port deskd prints):
 python3 tools/deskd_read_probe.py --base http://127.0.0.1:PORT --out build-deskd/demo-read-capture.json
 # Stage 3 private-feed readiness as well:
 python3 tools/deskd_read_probe.py --base http://127.0.0.1:PORT --require-private --out build-deskd/demo-private-read-capture.json
+# Live-series fee readiness too:
+python3 tools/deskd_read_probe.py --base http://127.0.0.1:PORT --require-private --require-fees --out build-deskd/demo-fees-read-capture.json
 ```
 
 This changes only the probe's local book subscription and validates captured responses with

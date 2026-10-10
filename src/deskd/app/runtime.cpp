@@ -199,7 +199,15 @@ json Deskd::status() const {
   if (rest_) {
     const auto s = rest_->snapshot();
     result["rest"] = {{"ready",s->ready},{"account_ms",s->account_ms},{"listing_ms",s->listing_ms},
-                       {"markets",s->markets.size()},{"revision",s->revision},{"error",s->error}};
+                       {"markets",s->markets.size()},{"revision",s->revision},{"error",s->error},
+                       {"metadata_error",s->metadata_error}};
+    result["rest"]["live"]=s->live.size();
+    std::size_t fee_ready=0;
+    for(const auto& tk:s->live) {
+      const auto it=s->markets.find(tk);
+      if(it!=s->markets.end() && rest::fee_ready(it->second,now)) ++fee_ready;
+    }
+    result["rest"]["fee_ready_live"]=fee_ready;
     result["clock"] = {{"offset_ms",s->clock.offset_ms ? json(*s->clock.offset_ms) : json(nullptr)},
                         {"uncertainty_ms",s->clock.uncertainty_ms ? json(*s->clock.uncertainty_ms) : json(nullptr)},
                         {"measured_ms",s->clock.measured_ms},{"post_trusted",s->clock.post_trusted}};

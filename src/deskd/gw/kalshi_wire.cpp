@@ -1,6 +1,7 @@
 #include "deskd/gw/kalshi_wire.h"
 
 #include <cctype>
+#include <cmath>
 #include <cstdio>
 #include <nlohmann/json.hpp>
 
@@ -657,6 +658,7 @@ WireRequest build_get_balance(int exchange_index, int subaccount) {
   return get("/portfolio/balance", s);
 }
 WireRequest build_get_market(const std::string& ticker) { return get("/markets/" + url_encode(ticker), "", false); }
+WireRequest build_get_series(const std::string& ticker) { return get("/series/" + url_encode(ticker), "", false); }
 WireRequest build_get_markets(const MarketsQuery& q) {
   std::string s;
   add_q(s, "limit", q.limit, q.limit > 0);
@@ -828,6 +830,23 @@ std::optional<Balance> parse_balance(const std::string& body, std::string* why) 
   return done(r, b, why);
 }
 
+std::optional<SeriesRow> parse_series(const std::string& body, std::string* why) {
+  auto j=parse_object(body,why);
+  if(!j || !j->contains("series")) { if(why) *why="series: missing object"; return {}; }
+  Rd r(j->at("series"),"series"); SeriesRow row;
+  row.ticker=r.str("ticker"); row.category=r.str_or_empty("category"); row.fee_type=r.str("fee_type");
+  const auto* m=r.at("fee_multiplier");
+  if(!m || !m->is_number()) r.fail("fee_multiplier","missing or not numeric");
+  else {
+    row.fee_multiplier=m->get<double>();
+    if(!std::isfinite(row.fee_multiplier) || row.fee_multiplier<0 || row.fee_multiplier>1000)
+      r.fail("fee_multiplier","outside supported numeric range");
+  }
+  if(row.ticker.empty()) r.fail("ticker","empty");
+  if(row.fee_type.empty()) r.fail("fee_type","empty");
+  // Unknown fee models remain explicit. The gateway must not trade them by assuming QUAD.
+  return done(r,std::move(row),why);
+}
 std::optional<MarketRow> parse_market(const std::string& body, std::string* why) {
   auto j = parse_object(body, why);
   if (!j) return std::nullopt;

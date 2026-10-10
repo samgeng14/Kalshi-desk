@@ -146,6 +146,7 @@ WireRequest build_get_fills(const ListQuery& q);
 WireRequest build_get_positions(const ListQuery& q);
 WireRequest build_get_balance(int exchange_index = -1, int subaccount = -1);
 WireRequest build_get_market(const std::string& ticker);
+WireRequest build_get_series(const std::string& ticker);
 struct MarketsQuery {
   int limit = 0;                  // 1..1000
   std::string cursor, event_ticker, series_ticker, status, tickers;
@@ -241,6 +242,14 @@ struct MarketRow {
   std::optional<Qty> yes_bid_size, yes_ask_size, volume, volume_24h, open_interest;
   std::optional<std::int64_t> open_ms, close_ms, expected_expiration_ms, expiration_ms;
   std::vector<PriceRange> price_ranges;
+  // Enriched only by the public series endpoint, never a guessed market-prefix fee.
+  std::string fee_type;
+  std::optional<double> fee_multiplier;
+  std::int64_t fee_ms = 0;
+};
+struct SeriesRow {
+  std::string ticker, category, fee_type;
+  double fee_multiplier = 0;
 };
 struct Orderbook {
   std::vector<std::pair<Px, Qty>> yes, no;   // as sent: ascending, the best last
@@ -272,6 +281,7 @@ std::optional<Page<FillRow>> parse_fills(const std::string& body, std::string* w
 std::optional<Page<PositionRow>> parse_positions(const std::string& body, std::string* why);
 std::optional<Balance> parse_balance(const std::string& body, std::string* why);
 std::optional<MarketRow> parse_market(const std::string& body, std::string* why);   // {"market":{...}}
+std::optional<SeriesRow> parse_series(const std::string& body, std::string* why);   // {"series":{...}}
 std::optional<Page<MarketRow>> parse_markets(const std::string& body, std::string* why);
 std::optional<Orderbook> parse_orderbook(const std::string& body, std::string* why);
 std::optional<ExchangeStatus> parse_exchange_status(const std::string& body, std::string* why);

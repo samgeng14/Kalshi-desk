@@ -38,6 +38,24 @@ void clock_checks() {
   c.observe("bad date",t+2100,t+2110,10);
   CHECK(!c.estimate(t+2110).post_trusted);
 }
+void series_fees() {
+  std::string why;
+  json j={{"series",{{"ticker","TEST"},{"category","Sports"},{"fee_type","quadratic_with_maker_fees"},
+                     {"fee_multiplier",1.5}}}};
+  auto parsed=kalshi::parse_series(j.dump(),&why);
+  CHECK(parsed && parsed->fee_multiplier==1.5 && parsed->category=="Sports");
+  CHECK(!kalshi::build_get_series("TEST").auth && kalshi::build_get_series("TEST").path=="/trade-api/v2/series/TEST");
+  j["series"]["fee_multiplier"]="1.5"; CHECK(!kalshi::parse_series(j.dump(),&why));
+  j["series"]["fee_multiplier"]=-1; CHECK(!kalshi::parse_series(j.dump(),&why));
+  j["series"]["fee_multiplier"]=nullptr; CHECK(!kalshi::parse_series(j.dump(),&why));
+  j["series"]["fee_multiplier"]=0; CHECK(kalshi::parse_series(j.dump(),&why));
+  kalshi::MarketRow m; m.fee_type="quadratic"; m.fee_multiplier=0; m.fee_ms=now_ms();
+  CHECK(rest::fee_ready(m,m.fee_ms));
+  CHECK(rest::market_json(m,false,false,m.fee_ms)["fee"]["type"]=="FREE");
+  CHECK(!rest::fee_ready(m,m.fee_ms+rest::kFeeFreshMs));
+  CHECK(!rest::fee_ready(m,m.fee_ms-1));
+  m.fee_type="future_unknown_model"; CHECK(!rest::fee_ready(m,m.fee_ms));
+}
 void discovery(json& capture) {
   const auto t = *kalshi::parse_time_ms("2026-10-07T18:00:00Z");
   rest::Snapshot s;
@@ -83,6 +101,7 @@ void reconcile() {
   fake.with_engine([](fakex::Engine& e,std::int64_t now) {
     for (int i=0;i<5;++i) {
       fakex::MarketSpec m; m.ticker="TEST-"+std::to_string(i); m.exchange_index=i%2;
+      m.fee_type=fakex::FeeType::QUADRATIC_WITH_MAKER_FEES; m.fee_mult_milli=1500;
       m.close_ms=now+3600000; e.add_market(m,now);
     }
     e.set_cash(0,0,500*fakex::kMicrosPerDollar,now);
@@ -101,6 +120,18 @@ void reconcile() {
   CHECK(s->balances.count(1) && s->balances.at(1)==75*10000);
   state.set_pins({"TEST-1"}); CHECK(state.snapshot()->pins.count("TEST-1"));
   CHECK(state.snapshot()->live.count("TEST-1"));
+  fakex::HttpFault metadata_fault; metadata_fault.method="GET"; metadata_fault.path="/series/TEST";
+  metadata_fault.kind=fakex::HttpFault::Kind::DROP_BEFORE_REPLY; fake.add_fault(metadata_fault);
+  CHECK(state.refresh_once()); // missing fee metadata is per-market, not a fabricated cash/account failure
+  CHECK(!state.snapshot()->metadata_error.empty());
+  CHECK(!rest::fee_ready(state.snapshot()->markets.at("TEST-1"),now_ms()));
+  CHECK(state.refresh_once());
+  CHECK(rest::fee_ready(state.snapshot()->markets.at("TEST-1"),now_ms()));
+  CHECK(state.snapshot()->metadata_error.empty());
+  const auto meta=rest::market_json(state.snapshot()->markets.at("TEST-1"),true,true,now_ms());
+  CHECK(meta["fee"]["type"]=="QUAD_MAKER" && meta["fee"]["mult"]==1.5);
+  fake.clear_wire_log(); CHECK(state.refresh_once());
+  for(const auto& entry:fake.wire_log()) CHECK(entry.find("/series/")==std::string::npos); // fresh cache
   fakex::HttpFault fault; fault.method="GET"; fault.path="/portfolio/balance";
   fault.kind=fakex::HttpFault::Kind::DROP_BEFORE_REPLY; fake.add_fault(fault);
   CHECK(!state.refresh_once());
@@ -156,7 +187,7 @@ void cash_projection(json& capture) {
 }
 int main() {
   ::signal(SIGPIPE,SIG_IGN);
-  clock_checks(); json capture={{"events",json::array()},{"responses",json::array()}};
+  clock_checks(); series_fees(); json capture={{"events",json::array()},{"responses",json::array()}};
   discovery(capture); reconcile(); cash_projection(capture);
   TempDir dir; std::ofstream out(dir.file("capture.json")); out<<capture.dump(); out.close();
   const std::string command="node '"+std::string(DESKD_SOURCE_DIR)+"/tests/deskd/contract_check.cjs' '"+dir.file("capture.json")+"'";
