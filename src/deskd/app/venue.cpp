@@ -150,7 +150,10 @@ void Deskd::attach_manual() {
     p.daily_stop = cfg_.daily_stop;
     p.groups = &groups_;
     p.lanes = default_lanes();
-    for (auto& l : p.lanes) if (l.id == "M1") l.series = cfg_.lip_series;
+    for (auto& l : p.lanes) {
+      if (l.id == "M1") l.series = cfg_.lip_series;
+      if (l.id == "M2") l.series = cfg_.band_series;
+    }
   }
   if (cfg_.systematic_orders) {
     // LIP-15 (lane M1): the 15-minute series it trades (deskd.lip_series), quoted by the maker engine
@@ -176,16 +179,29 @@ void Deskd::attach_manual() {
     };
     env.private_up = [this] { const auto v = feeds_.KXP.view(); return v.up && !v.gap; };
     env.post = [this](GwMsg m) { return gw_->post(std::move(m)); };
-    env.want = [this](std::set<std::string> markets) {
-      bool changed = false;
-      {
-        std::lock_guard<std::mutex> lk(live_mu_);
-        changed = markets != strat_want_;
-        if (changed) strat_want_ = std::move(markets);
-      }
-      if (changed) refresh_live();
+    auto want = [this](const std::string& lane) {
+      return [this, lane](std::set<std::string> markets) {
+        bool changed = false;
+        {
+          std::lock_guard<std::mutex> lk(live_mu_);
+          changed = markets != strat_want_[lane];
+          if (changed) strat_want_[lane] = std::move(markets);
+        }
+        if (changed) refresh_live();
+      };
     };
+    env.want = want("M1");
     lip_ = std::make_unique<MakerEngine>("M1", cfg_.lip_series, env);
+    // BAND 96-99 (lane M2): the weather highs first (deskd.band_series); no anchor; 5 a market,
+    // $15 an event (a city's day), and it stops quoting once its day is down $20 (plan section 5)
+    MakerParams band;
+    band.size = 500;
+    band.event_cap = 15 * 1000000LL;
+    band.lane_pause = 20 * 1000000LL;
+    auto band_env = env;
+    band_env.anchor = {};
+    band_env.want = want("M2");
+    band_ = std::make_unique<MakerEngine>("M2", cfg_.band_series, band_env, band, band_quote);
   }
   p.send = [this](KalshiWriteJob j) { return q_man_.push(std::move(j)); };
   p.cancel = [this](KalshiWriteJob j) { return q_mcx_.push(std::move(j), Lane::PRIORITY); };
@@ -261,7 +277,7 @@ void Deskd::refresh_live() {
   {
     std::lock_guard<std::mutex> lk(live_mu_);
     selected = pins_;
-    selected.insert(strat_want_.begin(), strat_want_.end());
+    for (const auto& [lane, markets] : strat_want_) selected.insert(markets.begin(), markets.end());
   }
   for (const auto& p : s->positions) if (p.position) selected.insert(p.ticker);
   for (const auto& o : s->orders)

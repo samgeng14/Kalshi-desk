@@ -84,6 +84,7 @@ class Gateway {
     // its day (real net of fees + unrl at the mids), its fees today, its used worst case, the 70%
     // ceiling and the effective ceiling min(ceiling, used + free)
     std::int64_t day = 0, fees = 0, used = 0, ceiling = 0, eff = 0;
+    std::map<std::string, std::int64_t> lane_day;     // each lane's day, micro-dollars
     std::int64_t ts_ms = 0;
   };
   // The daily cost budget of the IOC-style lanes (contract hdr.cost.budget): past it they are CAPPED.

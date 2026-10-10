@@ -83,6 +83,7 @@ struct Run {
     c.env="demo"; c.key_id="runtime-test"; c.pem_path=key; c.key_type="ed25519";
     c.manual_orders=manual_orders;
     c.systematic_orders=systematic;
+    c.band_series={"KXRUNTIME","KXHIGHNY"};   // M2 trades the test's own market too
     RuntimeOptions o;
     const std::string base="https://127.0.0.1:"+std::to_string(venue.port());
     o.rest_url=base+"/trade-api/v2"; o.ws_url=base+"/trade-api/ws/v2"; o.factory=fx::trust_test_ca();
@@ -453,10 +454,42 @@ void systematic_maker() {
   }
   CHECK(down);
 }
+// BAND 96-99 on the fake: lane M2 on and Start; on a market whose YES bid is 0.97 it joins that
+// bid with 5, in M2's group; on one whose YES ask is 0.02 (NO the favourite) it joins the ask.
+void systematic_band() {
+  const std::string Y="KXHIGHNY-26OCT10-B70", N="KXHIGHNY-26OCT10-B80";
+  Run r(false,[&](fakex::Engine& e,std::int64_t now) {
+    for(const auto& tk:{Y,N}) { auto spec=fx::spec(tk,0); spec.open_ms=now-3600000; spec.close_ms=now+7200000; e.add_market(spec,now); }
+    e.street_add(Y,false,9700,2000,now); e.street_add(Y,true,100,300,now);    // YES 0.97 bid / 0.99 ask
+    e.street_add(N,false,100,500,now);   e.street_add(N,true,9800,800,now);   // YES 0.01 bid / 0.02 ask
+  },true);
+  CHECK(r.ready());
+  auto lane=r.post("/api/lane/M2",{{"on",true}});
+  CHECK(lane && lane->status==200);
+  std::string why;
+  CHECK(r.until([&]{ return r.d->gw().groups_ready(&why) && why.empty(); },20000));
+  httplib::Result start;
+  CHECK(r.until([&]{ start=r.post("/api/start",json::object()); return start && start->status==200; },10000));
+  auto quoted=[&](const std::string& tk,fakex::Side side,Px px) {
+    return r.venue.f->with_engine([&](fakex::Engine& e,std::int64_t) {
+      for(const fakex::Order* o:e.user_orders())
+        if(o->status==fakex::OrdStatus::RESTING && o->client_order_id.rfind("SM2-",0)==0 && o->ticker==tk &&
+           o->side==side && o->price==px && o->remaining==500 && !o->order_group_id.empty()) return true;
+      return false;
+    });
+  };
+  const bool both=r.until([&]{ return quoted(Y,fakex::Side::BID,9700) && quoted(N,fakex::Side::ASK,200); },15000);
+  if(!both) std::fprintf(stderr,"band: %s\n",r.d->status()["band"].dump().c_str());
+  CHECK(both);
+  CHECK(r.d->status()["band"]["last"][Y]=="quoting");
+  auto stop=r.post("/api/stop",json::object());
+  CHECK(stop && stop->status==200);
+  CHECK(r.until([&]{ return !quoted(Y,fakex::Side::BID,9700) && !quoted(N,fakex::Side::ASK,200); }));
+}
 }  // namespace
 
 int main() {
   std::signal(SIGPIPE,SIG_IGN);
-  off_by_default(); orders_cancel_kill(); stop_reasons(); financial_fair(); systematic(); systematic_maker();
+  off_by_default(); orders_cancel_kill(); stop_reasons(); financial_fair(); systematic(); systematic_maker(); systematic_band();
   return finish("deskd-runtime-manual");
 }

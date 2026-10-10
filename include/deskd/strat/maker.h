@@ -42,6 +42,10 @@ struct MakerParams {
   std::int64_t two_sided_ms = 600000;  // minutes 0-10 of the window
   std::int64_t flatten_ms = 60000;     // from T-60 s
   Qty flatten_over = 1000;             // |q| over 10 contracts
+  // owner limits (any engine): the worst case one event may hold (working + positions at $1 a
+  // contract), and the lane's day below which it stops quoting; 0 = none
+  std::int64_t event_cap = 0;          // micro-dollars
+  std::int64_t lane_pause = 0;         // micro-dollars, a loss
 };
 
 struct MakerInput {
@@ -67,6 +71,12 @@ struct MakerDecision {
 };
 MakerDecision maker_quote(const MakerInput& in, const MakerParams& p = {});
 
+// M2 BAND 96-99 (plan section 5): post-only on a near-certain favourite, at the back of its
+// queue: a YES bid joining a best bid of 0.96-0.99, or (NO the favourite) a YES ask joining a
+// best ask of 0.01-0.04; p.size a market, and no more once that much is held on that side. The
+// position is held to settlement. Pulled on a stale book or the private feed down.
+MakerDecision band_quote(const MakerInput& in, const MakerParams& p);
+
 // the grid's own prices: the step at p, and the nearest grid price at or below / at or above
 Px grid_step(Px p, const std::vector<kalshi::PriceRange>& grid);
 std::optional<Px> grid_floor(Px p, const std::vector<kalshi::PriceRange>& grid);
@@ -91,7 +101,9 @@ class MakerEngine {
     std::function<bool(GwMsg)> post;                              // gw's inbox
     std::function<void(std::set<std::string>)> want;              // markets whose books it needs
   };
-  MakerEngine(std::string lane, std::vector<std::string> series, Env env, MakerParams params = {});
+  using Decide = std::function<MakerDecision(const MakerInput&, const MakerParams&)>;
+  MakerEngine(std::string lane, std::vector<std::string> series, Env env, MakerParams params = {},
+              Decide decide = {});
   void step(std::int64_t now_ms);
   nlohmann::json status() const;
  private:
@@ -105,6 +117,7 @@ class MakerEngine {
   std::vector<std::string> series_;
   Env env_;
   MakerParams p_;
+  Decide decide_;
   std::map<std::string, std::map<int, Side_>> sides_;   // ticker -> 0 bid, 1 ask, 2 flatten
   std::map<std::string, Qty> last_pos_;
   std::map<std::string, std::int64_t> cool_until_;      // after a fill of ours
@@ -112,6 +125,7 @@ class MakerEngine {
   std::uint64_t seq_ = 0;
   std::int64_t places_ = 0, cancels_ = 0, refusals_ = 0;
   std::string new_cid();
+  std::int64_t event_worst(const Gateway::SysView& v, const rest::Snapshot& s, const std::string& event) const;
 };
 
 }  // namespace deskd

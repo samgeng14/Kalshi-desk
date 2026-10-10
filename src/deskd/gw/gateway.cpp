@@ -768,6 +768,8 @@ void Gateway::sys_tick(std::int64_t now) {
       if (const auto* d = sys_->day(l.id))
         for (const auto& [tk, inv] : d->inv) if (inv.pos) v->positions[l.id + "|" + tk] = inv.pos;
     v->day = sys_->day_total(mk);
+    for (const auto& l : sys_->lanes())
+      if (const auto* dl = sys_->day(l.id)) v->lane_day[l.id] = dl->real - dl->fees + sys_->unrealized(l.id, mk);
     v->fees = sys_fees();
     sys_money(&v->used, &v->ceiling, &v->eff);
     v->ts_ms = now;

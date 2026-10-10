@@ -116,7 +116,8 @@ class Deskd {
   std::unique_ptr<FinancialFair> fair_;
   std::unique_ptr<EspnFeed> espn_;
   std::unique_ptr<MakerEngine> lip_;   // lane M1's quoter, on the strat thread
-  std::set<std::string> strat_want_;   // under live_mu_: the markets the lanes quote
+  std::unique_ptr<MakerEngine> band_;  // lane M2's
+  std::map<std::string, std::set<std::string>> strat_want_;   // under live_mu_: by lane, the markets it quotes
   std::string key_error_;
   mutable std::mutex live_mu_;
   std::set<std::string> pins_, live_;

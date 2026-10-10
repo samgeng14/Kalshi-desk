@@ -66,7 +66,7 @@ DeskdConfig load_deskd_config(const std::string& path) {
   static const std::set<std::string> known = {"data_dir",    "lock_dir",    "ui_dir",
                                               "http_port",   "web_threads", "keepalive_s",
                                               "max_streams", "heartbeat_window_ms", "daily_stop_dollars",
-                                              "manual_orders", "systematic_orders", "lip_series"};
+                                              "manual_orders", "systematic_orders", "lip_series", "band_series"};
   for (auto kv = d.begin(); kv != d.end(); ++kv) {
     if (kv.key() == "live")
       throw std::runtime_error(where + ": \"live\" is a command-line flag only (--live), never a file setting");
@@ -83,11 +83,14 @@ DeskdConfig load_deskd_config(const std::string& path) {
   take(d, "manual_orders", c.manual_orders, where);
   take(d, "systematic_orders", c.systematic_orders, where);
   take(d, "lip_series", c.lip_series, where);
-  for (const auto& s : c.lip_series) {
-    const bool ok = !s.empty() && s.size() <= 40 &&
-        std::all_of(s.begin(), s.end(), [](unsigned char ch) { return std::isupper(ch) || std::isdigit(ch); });
-    if (!ok) throw std::runtime_error(where + ": lip_series has \"" + s + "\", not a series ticker");
-  }
+  take(d, "band_series", c.band_series, where);
+  for (const auto* list : {&c.lip_series, &c.band_series})
+    for (const auto& s : *list) {
+      const bool ok = !s.empty() && s.size() <= 40 &&
+          std::all_of(s.begin(), s.end(), [](unsigned char ch) { return std::isupper(ch) || std::isdigit(ch); });
+      if (!ok) throw std::runtime_error(where + ": " + (list == &c.lip_series ? "lip_series" : "band_series") +
+                                        " has \"" + s + "\", not a series ticker");
+    }
   double stop = -1;
   take(d, "daily_stop_dollars", stop, where);
   if (stop >= 0) c.daily_stop = static_cast<Money>(std::llround(stop * 10000.0));

@@ -99,8 +99,52 @@ MakerDecision maker_quote(const MakerInput& in, const MakerParams& p) {
   return d;
 }
 
-MakerEngine::MakerEngine(std::string lane, std::vector<std::string> series, Env env, MakerParams params)
-    : lane_(std::move(lane)), series_(std::move(series)), env_(std::move(env)), p_(params) {}
+MakerDecision band_quote(const MakerInput& in, const MakerParams& p) {
+  MakerDecision d;
+  auto pull = [&](const char* why) { d.quotes.clear(); d.pull = why; return d; };
+  if (!in.book || in.book->stale) return pull("book stale");
+  if (!in.private_up) return pull("private feed down");
+  if (in.close_ms <= in.now_ms) return pull("closed");
+  const auto& bids = in.book->bids;
+  const auto& asks = in.book->asks;
+  const Px bb = bids.empty() ? 0 : bids.front().px, ba = asks.empty() ? kOneDollar : asks.front().px;
+  if (!bids.empty() && !asks.empty() && bb >= ba) return pull("crossed book");
+  if (bb >= 9600 && bb <= 9900) {
+    if (in.position >= p.size) return pull("holding the favourite");
+    d.fair = bb;
+    d.quotes.push_back({Side::BUY, bb, std::min(p.size, (p.size - std::max<Qty>(0, in.position)) / kOneContract * kOneContract), false});
+  } else if (!asks.empty() && ba >= 100 && ba <= 400) {
+    if (-in.position >= p.size) return pull("holding the favourite");
+    d.fair = ba;
+    d.quotes.push_back({Side::SELL, ba, std::min(p.size, (p.size - std::max<Qty>(0, -in.position)) / kOneContract * kOneContract), false});
+  } else {
+    return pull("no favourite at 96-99c");
+  }
+  if (d.quotes.back().size <= 0) return pull("holding the favourite");
+  return d;
+}
+
+MakerEngine::MakerEngine(std::string lane, std::vector<std::string> series, Env env, MakerParams params, Decide decide)
+    : lane_(std::move(lane)), series_(std::move(series)), env_(std::move(env)), p_(params),
+      decide_(decide ? std::move(decide) : Decide(maker_quote)) {}
+
+// what the lane holds and works in one event, at worst: a position at $1 a contract, a working
+// bid at its price, a working ask at 1 - its price (micro-dollars)
+std::int64_t MakerEngine::event_worst(const Gateway::SysView& v, const rest::Snapshot& s, const std::string& event) const {
+  std::int64_t w = 0;
+  auto in_event = [&](const std::string& tk) {
+    const auto it = s.markets.find(tk);
+    return it != s.markets.end() && it->second.event_ticker == event;
+  };
+  for (const auto& [cid, o] : v.orders)
+    if (o.lane == lane_ && !o.terminal && in_event(o.ticker))
+      w += (o.side == Side::BUY ? o.price : kOneDollar - o.price) * o.left;
+  for (const auto& [key, pos] : v.positions) {
+    const auto bar = key.find('|');
+    if (key.compare(0, bar, lane_) == 0 && in_event(key.substr(bar + 1))) w += kOneDollar * std::abs(pos);
+  }
+  return w;
+}
 
 std::string MakerEngine::new_cid() {
   // S<lane>-<ms in base 36>-<seq>: at most 40 characters, [A-Za-z0-9-]
@@ -148,8 +192,11 @@ void MakerEngine::step(std::int64_t now) {
     MakerDecision d;
     const auto m = snap->markets.find(tk);
     std::optional<MdBook> book = env_.book ? env_.book(tk) : std::nullopt;
+    const auto day = view->lane_day.find(lane_);
     if (!running) d.pull = "not running";
     else if (m == snap->markets.end()) d.pull = "not listed";
+    else if (p_.lane_pause > 0 && day != view->lane_day.end() && day->second <= -p_.lane_pause) d.pull = "lane paused: its day is past the loss limit";
+    else if (p_.event_cap > 0 && event_worst(*view, *snap, m->second.event_ticker) >= p_.event_cap) d.pull = "event cap";
     else if (now < cool_until_[tk]) d.pull = "our fill";
     else {
       MakerInput in;
@@ -166,7 +213,7 @@ void MakerEngine::step(std::int64_t now) {
         in.reference_fresh = a.fair.has_value();
         if (a.fair) in.maker_fee = maker_fee(m->second, *a.fair);
       }
-      d = maker_quote(in, p_);
+      d = decide_(in, p_);
     }
     last_pull_[tk] = d.pull.empty() ? "quoting" : d.pull;
     // slot 0 bid, 1 ask, 2 the flatten

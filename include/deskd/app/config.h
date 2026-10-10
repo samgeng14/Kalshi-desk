@@ -45,6 +45,8 @@ struct DeskdConfig {
   // The 15-minute series lane M1 (LIP-15) quotes; the plan starts with natural gas alone. A demo
   // account may list other series, or none: then M1 has nothing to quote.
   std::vector<std::string> lip_series = {"KXNATGAS15M"};
+  // The series lane M2 (BAND 96-99) quotes: the plan's five weather cities first.
+  std::vector<std::string> band_series = {"KXHIGHNY", "KXHIGHCHI", "KXHIGHMIA", "KXHIGHAUS", "KXHIGHLAX"};
   // from the command line only
   bool live = false;
 };

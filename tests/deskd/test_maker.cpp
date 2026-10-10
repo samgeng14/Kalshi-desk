@@ -92,9 +92,31 @@ void anchor_and_pulls() {
   CHECK(maker_quote(input(one)).pull == "one-sided book");
   CHECK(maker_quote(input(book(4000, 500, 4600, 500), CLOSE)).pull == "closed");
 }
+void band() {
+  MakerParams p; p.size = 500;
+  // YES the favourite at 0.97: join its bid, 5 contracts
+  auto b = book(9700, 2000, 9900, 300);
+  auto d = band_quote(input(b), p);
+  CHECK(d.quotes.size() == 1 && d.quotes[0].side == Side::BUY && d.quotes[0].price == 9700 && d.quotes[0].size == 500);
+  // holding 3: two more; holding 5: none
+  d = band_quote(input(b, OPEN + 60000, 300), p);
+  CHECK(d.quotes.size() == 1 && d.quotes[0].size == 200);
+  CHECK(band_quote(input(b, OPEN + 60000, 500), p).pull == "holding the favourite");
+  // NO the favourite (YES ask 0.02): join the ask, selling YES
+  b = book(100, 500, 200, 800);
+  d = band_quote(input(b), p);
+  CHECK(d.quotes.size() == 1 && d.quotes[0].side == Side::SELL && d.quotes[0].price == 200 && d.quotes[0].size == 500);
+  // nothing near certain: no quote; 0.95 is outside the band, as is 0.995 on a deci grid
+  CHECK(band_quote(input(book(4000, 500, 4600, 500)), p).pull == "no favourite at 96-99c");
+  CHECK(band_quote(input(book(9500, 500, 9700, 500)), p).pull == "no favourite at 96-99c");
+  CHECK(band_quote(input(book(9950, 500, 9990, 500)), p).pull == "no favourite at 96-99c");
+  auto in = input(book(9700, 500, 9900, 500));
+  in.private_up = false;
+  CHECK(band_quote(in, p).pull == "private feed down");
+}
 }  // namespace
 
 int main() {
-  grid(); quotes(); anchor_and_pulls();
+  grid(); quotes(); anchor_and_pulls(); band();
   return finish("deskd-maker");
 }

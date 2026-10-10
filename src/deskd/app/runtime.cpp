@@ -156,6 +156,7 @@ bool Deskd::start(std::string* err) {
     run_strat(w, [this] {
       if (fair_ && rest_) fair_->step(*rest_->snapshot(), now_ms());
       if (lip_) lip_->step(now_ms());
+      if (band_) band_->step(now_ms());
     });
   });
   by("store")->start([this](Worker& w) { store_.run(w); });
@@ -249,6 +250,7 @@ json Deskd::status() const {
   result["fair"] = fair_ ? fair_->status() : json(nullptr);
   result["espn"] = espn_ ? espn_->status() : json(nullptr);
   result["maker"] = lip_ ? lip_->status() : json(nullptr);
+  result["band"] = band_ ? band_->status() : json(nullptr);
   result["senders"] = {{"k1", sender(man_sender_.get())}, {"cx", sender(cx_sender_.get())},
                        {"k2", sender(cfg_.systematic_orders ? sys_sender_.get() : nullptr)}};
   result["publisher_healthy"] = pub_->healthy();
