@@ -54,6 +54,7 @@ class KalshiPyth;
 class FinancialFair;
 class EspnFeed;
 class MakerEngine;
+class Markouts;
 struct MdBook;
 namespace rest { class State; struct Snapshot; }
 
@@ -117,6 +118,7 @@ class Deskd {
   std::unique_ptr<EspnFeed> espn_;
   std::unique_ptr<MakerEngine> lip_;   // lane M1's quoter, on the strat thread
   std::unique_ptr<MakerEngine> band_;  // lane M2's
+  std::unique_ptr<Markouts> markouts_;   // every fill's 1/10/60 s markout
   std::map<std::string, std::set<std::string>> strat_want_;   // under live_mu_: by lane, the markets it quotes
   std::string key_error_;
   mutable std::mutex live_mu_;

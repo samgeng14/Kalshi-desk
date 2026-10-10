@@ -412,6 +412,8 @@ void systematic_maker() {
     e.street_add(W,true,5400,500,now);    // NO bid 0.54 x5: YES ask 0.46 x5
   },true);
   CHECK(r.ready());
+  Stream st(r.d->port(),"rt-maker-1");
+  CHECK(r.until([&]{ return !st.envelopes().empty(); }));
   auto lane=r.post("/api/lane/M1",{{"on",true}});
   CHECK(lane && lane->status==200);
   std::string why;
@@ -445,6 +447,21 @@ void systematic_maker() {
   // long 10: the bid stays at 0.41 (its cap is now 0.41), the ask too (its floor 0.43); both re-posted
   CHECK(r.until([&]{ return has(fakex::Side::BID,4100,1000) && has(fakex::Side::ASK,4500,1000); },15000));
   CHECK(r.d->status()["maker"]["places"].get<int>()>=3);
+  // the fill on the stream is lane M1's, and its 1 s markout follows (the mid is still 0.43)
+  std::string fid;
+  CHECK(r.until([&]{
+    for(const auto& e:of(st,"fill")) if(e["data"]["lane"]=="M1" && e["data"]["side"]=="BUY") { fid=e["data"]["fid"]; return true; }
+    return false; }));
+  CHECK(r.until([&]{
+    for(const auto& e:of(st,"mo")) if(e["data"]["fid"]==fid && e["data"]["h"]=="1s") return true;
+    return false; },10000));
+  if(!std::string(DESKD_NODE).empty()) {
+    json cap={{"snapshots",json::array()},{"events",st.envelopes()},{"responses",json::array()}};
+    const std::string file=r.dir.path+"/capture-maker.json";
+    std::ofstream(file)<<cap.dump();
+    const std::string cmd=std::string("\"")+DESKD_NODE+"\" \""+DESKD_SOURCE_DIR+"/tests/deskd/contract_check.cjs\" \""+file+"\"";
+    CHECK(std::system(cmd.c_str())==0);
+  }
   auto stop=r.post("/api/stop",json::object());
   CHECK(stop && stop->status==200);
   const bool down=r.until([&]{ return quotes().empty(); });

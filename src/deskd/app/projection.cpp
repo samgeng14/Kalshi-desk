@@ -151,7 +151,9 @@ DayPnl day_pnl(const rest::Snapshot& state, std::int64_t day_start_ms, const Mid
           {"oid", f->order_id.empty() ? json(nullptr) : json(f->order_id)}, {"v", "K"}, {"tk", f->ticker},
           {"side", f->side == kalshi::BookSide::BID ? "BUY" : "SELL"}, {"px", price_str(f->yes_price)},
           {"qty", qty_to_number(f->count)}, {"liq", f->taker ? "T" : "M"}, {"fee", money_str(fee)},
-          {"ts_ms", f->ts_ms}, {"own", own}, {"lane", nullptr}, {"mid", m ? json(price_str(*m)) : json(nullptr)},
+          {"ts_ms", f->ts_ms}, {"own", own},
+          {"lane", own == "SYS" && cid.find('-') != std::string::npos && cid.find('-') > 1 ? json(cid.substr(1, cid.find('-') - 1)) : json(nullptr)},
+          {"mid", m ? json(price_str(*m)) : json(nullptr)},
           {"fair", nullptr}, {"real", money_str(real)}});
     }
     out.real[key] = real_sum;

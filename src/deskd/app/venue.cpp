@@ -11,6 +11,7 @@
 #include "deskd/strat/fair.h"
 #include "deskd/ref/espn.h"
 #include "deskd/strat/maker.h"
+#include "deskd/strat/markouts.h"
 #include "deskd/gw/sys_book.h"
 
 namespace deskd {
@@ -51,6 +52,7 @@ bool Deskd::init_venue(std::string* err) {
       [this](const std::string& symbol, std::int64_t since, std::int64_t now) { return pyth_->view(symbol, since, now); },
       options_.fair_watch_since_ms ? options_.fair_watch_since_ms : now_ms());
   md_->set_idle_callback([this] { republish_refs(); });
+  markouts_ = std::make_unique<Markouts>();
   if (!options_.espn_url.empty()) {
     std::string why;
     if (auto ep = net::Endpoint::parse(options_.espn_url, &why)) {
@@ -345,7 +347,15 @@ void Deskd::on_rest(std::shared_ptr<const rest::Snapshot>) {
               day->unknown_basis);
   for (const auto& f : day->fills) {
     const auto fid = f.at("fid").get<std::string>();
-    if (fills_sent_.insert(fid).second) pub_->post(PubData{"fill", f});
+    if (!fills_sent_.insert(fid).second) continue;
+    pub_->post(PubData{"fill", f});
+    if (markouts_) {
+      const auto px = parse_price(f.at("px").get<std::string>());
+      const auto qty = qty_from_number(f.at("qty").get<double>());
+      if (px && qty)
+        markouts_->fill(fid, f.at("lane").is_string() ? f.at("lane").get<std::string>() : "", f.at("tk").get<std::string>(),
+                        f.at("side") == "BUY" ? Side::BUY : Side::SELL, *px, *qty, f.at("ts_ms").get<std::int64_t>());
+    }
   }
   std::vector<json> positions;
   std::set<std::pair<std::string, int>> listed;
@@ -466,6 +476,10 @@ void Deskd::on_book(const MdBook& b) {
     std::atomic_store(&books_, std::shared_ptr<const std::map<std::string, MdBook>>(std::move(next)));
   }
   md_last_[b.ticker] = b;
+  if (markouts_) {
+    const bool two = !b.stale && !b.bids.empty() && !b.asks.empty();
+    markouts_->mid(b.ticker, now_ms(), two ? (b.bids.front().px + b.asks.front().px) / 2 : Px{-1});
+  }
   // STALE is a venue-wide heartbeat flag; never publish a gapped reconstruction as a price.
   if (b.stale) return;
   publish_book(b.ticker);
