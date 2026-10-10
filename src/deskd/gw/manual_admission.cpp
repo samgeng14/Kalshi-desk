@@ -54,6 +54,9 @@ ManualAdmission admit_manual(const PlaceIntent& input,const ManualContext& c) {
     return refuse("UNKNOWN_MARKET","no Kalshi market for this intent");
   const auto& m=*c.market;
   if(input.count<=0 || input.count>kMaxQty) return refuse("BAD_QTY","quantity outside supported range");
+  // Qty is in 1/100 contract. A market without fractional_trading_enabled takes whole contracts.
+  const bool whole_only=!m.fractional.value_or(false);
+  if(whole_only && input.count%100) return refuse("BAD_QTY","this market trades whole contracts only");
   if(input.price<=0 || input.price>=kOneDollar) return refuse("OFF_GRID","price must be inside (0,1)");
   if((input.tif!=Tif::POST && (input.ttl_s || input.exp_ms)) ||
      (input.reduce_only && input.tif!=Tif::IOC))
@@ -108,8 +111,10 @@ ManualAdmission admit_manual(const PlaceIntent& input,const ManualContext& c) {
   const Qty reducing=input.side==Side::BUY ? std::max<Qty>(0,-c.position) : std::max<Qty>(0,c.position);
   const Qty room=std::max<Qty>(0,reducing-c.reducing_committed);
   if(input.reduce_only) {
-    if(!room) return refuse("REDUCE","no uncommitted position on the reducing side");
-    a.intent.count=std::min(input.count,room);
+    // A fractional position on a whole-contract market can only be reduced in whole contracts.
+    const Qty clip=whole_only ? room/100*100 : room;
+    if(!clip) return refuse("REDUCE","no uncommitted position on the reducing side");
+    a.intent.count=std::min(input.count,clip);
   }
   // Conservative incremental collateral: pending orders already own their reducing room.
   // Do not release their reservations speculatively because a new order has a better price.

@@ -584,6 +584,7 @@ json market_json(const Engine& e, const Market& m) {
          {"volume_fp", qty_str(m.volume)},
          {"open_interest_fp", qty_str(m.open_interest)},
          {"price_level_structure", m.spec.price_level_structure},
+         {"fractional_trading_enabled", m.spec.fractional},
          {"price_ranges", ranges}};
   if (m.spec.close_ms > 0) j["close_time"] = rfc3339(m.spec.close_ms);
   return j;

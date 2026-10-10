@@ -283,6 +283,7 @@ MarketRow read_market(Rd& r) {
   m.open_ms = r.otime("open_time");
   m.expected_expiration_ms = r.otime("expected_expiration_time");
   m.expiration_ms = r.otime("expiration_time");
+  m.fractional = r.obool("fractional_trading_enabled");
   if (const json* pr = r.at("price_ranges")) {
     if (!pr->is_array()) {
       r.fail("price_ranges", "not an array");

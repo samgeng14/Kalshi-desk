@@ -501,6 +501,10 @@ static void test_parsers() {
   CHECK(m && m->exchange_index == 2 && m->yes_bid == 4500 && m->yes_ask == 4700 && m->yes_bid_size == 3000 &&
         m->close_ms == 1791301500000 && m->price_ranges.size() == 3 && m->price_ranges[0].step == 10 &&
         m->price_ranges[1].step == 100);
+  CHECK(m && !m->fractional);   // absent: whole contracts only
+  auto mf = parse_market(R"({"market":{"ticker":"T","status":"active","fractional_trading_enabled":true}})", &why);
+  CHECK(mf && mf->fractional && *mf->fractional);
+  CHECK(!parse_market(R"({"market":{"ticker":"T","status":"active","fractional_trading_enabled":"yes"}})", &why));
   auto ms = parse_markets("{\"markets\":[" + market + "],\"cursor\":\"c2\"}", &why);
   CHECK(ms && ms->rows.size() == 1 && ms->cursor == "c2");
   auto ob = parse_orderbook(R"({"orderbook_fp":{"yes_dollars":[["0.3900","10.00"],["0.4000","5.00"]],
@@ -799,6 +803,7 @@ static void round_trip(const std::string& key_type) {
   CHECK(b2 && b2->available == 1000 * 10000);
   auto mkt = parse_market(rt.send(build_get_market(fx::G)).res.body, &why);
   CHECK(mkt && mkt->exchange_index == 2 && mkt->price_ranges.size() == 3 && mkt->price_level_structure == "tapered_deci_cent");
+  CHECK(mkt && mkt->fractional && !*mkt->fractional);   // the fake lists the flag, false by default
   MarketsQuery mq;
   mq.limit = 1;
   auto mp = parse_markets(rt.send(build_get_markets(mq)).res.body, &why);

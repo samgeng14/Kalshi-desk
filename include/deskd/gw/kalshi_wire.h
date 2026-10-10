@@ -242,6 +242,9 @@ struct MarketRow {
   std::optional<Qty> yes_bid_size, yes_ask_size, volume, volume_24h, open_interest;
   std::optional<std::int64_t> open_ms, close_ms, expected_expiration_ms, expiration_ms;
   std::vector<PriceRange> price_ranges;
+  // fractional_trading_enabled; absent means whole contracts only (Kalshi enables fractional
+  // order sizes market by market; docs.kalshi.com/getting_started/fixed_point_migration).
+  std::optional<bool> fractional;
   // Enriched only by the public series endpoint, never a guessed market-prefix fee.
   std::string fee_type;
   std::optional<double> fee_multiplier;

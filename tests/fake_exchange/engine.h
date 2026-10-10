@@ -120,6 +120,7 @@ struct MarketSpec {
   FeeType fee_type = FeeType::QUADRATIC;
   int fee_mult_milli = 1000;
   std::int64_t close_ms = 0;    // 0: never closes on its own
+  bool fractional = false;      // fractional_trading_enabled (listed only; the engine does not refuse)
 };
 
 enum class Side { BID, ASK };  // the order's book side, YES terms
