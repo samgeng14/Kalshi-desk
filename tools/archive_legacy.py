@@ -288,15 +288,42 @@ def read_env(path):
 
 def cmd_upload(a):
     import boto3
+    from boto3.s3.transfer import TransferConfig
     from botocore.config import Config
-    from botocore.exceptions import ClientError
+    from botocore.exceptions import BotoCoreError, ClientError
+    if a.part_mb < 5 or a.concurrency < 1:
+        sys.exit("--part-mb must be at least 5 and --concurrency at least 1")
     out = os.path.expanduser(a.out)
     with open(os.path.join(out, "manifest.json")) as f:
         manifest = json.load(f)
     env = read_env(a.env)
+    # boto3 >= 1.36 adds streamed CRC checksums to every upload by default; R2 and other S3-compatible
+    # stores can drop those requests mid-body. Integrity is checked here instead: size after each
+    # upload, and the sha256 from convert is stored as object metadata.
     s3 = boto3.client("s3", endpoint_url=env["R2_ENDPOINT"], aws_access_key_id=env["R2_ACCESS_KEY_ID"],
                       aws_secret_access_key=env["R2_SECRET_ACCESS_KEY"], region_name="auto",
-                      config=Config(retries={"max_attempts": 5, "mode": "standard"}))
+                      config=Config(retries={"max_attempts": 5, "mode": "standard"},
+                                    request_checksum_calculation="when_required",
+                                    response_checksum_validation="when_required",
+                                    connect_timeout=20, read_timeout=120))
+    part = a.part_mb * 1024 * 1024
+    transfer = TransferConfig(multipart_threshold=part, multipart_chunksize=part, max_concurrency=a.concurrency)
+
+    def put(path, key, extra, size):
+        for attempt in range(1, 6):
+            try:
+                s3.upload_file(path, bucket, key, ExtraArgs=extra, Config=transfer)
+                h = s3.head_object(Bucket=bucket, Key=key)
+                if h["ContentLength"] == size:
+                    return
+                why = f"R2 holds {h['ContentLength']} bytes, expected {size}"
+            except (BotoCoreError, ClientError, OSError) as e:
+                why = f"{type(e).__name__}: {str(e)[:200]}"
+            if attempt == 5:
+                sys.exit(f"{key}: upload failed 5 times ({why}). Re-run upload: finished files are skipped. "
+                         "If it keeps failing, try --concurrency 1 --part-mb 16.")
+            log(f"  {key}: attempt {attempt} failed ({why}); retrying in {2 ** attempt} s")
+            time.sleep(2 ** attempt)
     bucket, prefix = env["R2_BUCKET"], a.prefix.strip("/") + "/"
     try:
         s3.head_bucket(Bucket=bucket)
@@ -320,15 +347,12 @@ def cmd_upload(a):
             except ClientError as e:
                 if e.response.get("Error", {}).get("Code") not in ("404", "NoSuchKey", "NotFound"):
                     raise
-            s3.upload_file(p, bucket, key, ExtraArgs={"Metadata": {"sha256": x["sha256"], "rows": str(x["rows"])},
-                                                      "ContentType": "application/vnd.apache.parquet"})
-            h = s3.head_object(Bucket=bucket, Key=key)
-            if h["ContentLength"] != x["bytes"]:
-                sys.exit(f"{key}: R2 holds {h['ContentLength']} bytes, expected {x['bytes']}; stopped")
+            put(p, key, {"Metadata": {"sha256": x["sha256"], "rows": str(x["rows"])},
+                         "ContentType": "application/vnd.apache.parquet"}, x["bytes"])
             sent += 1
             log(f"  {key} ({x['bytes'] / 1e6:.1f} MB)")
-    s3.upload_file(os.path.join(out, "manifest.json"), bucket, prefix + "manifest.json",
-                   ExtraArgs={"ContentType": "application/json"})
+    mp = os.path.join(out, "manifest.json")
+    put(mp, prefix + "manifest.json", {"ContentType": "application/json"}, os.path.getsize(mp))
     log(f"done: {sent} uploaded, {skipped} already there; manifest at s3://{bucket}/{prefix}manifest.json")
 
 
@@ -348,6 +372,8 @@ def main():
     u.add_argument("--env", default="~/.r2/kalshi-desk-archive.env")
     u.add_argument("--prefix", default="archive/legacy/prod")
     u.add_argument("--recheck", action="store_true", help="re-hash every file before upload")
+    u.add_argument("--concurrency", type=int, default=4, help="parallel parts per large file (default 4)")
+    u.add_argument("--part-mb", type=int, default=64, help="multipart part size in MB, at least 5 (default 64)")
     a = ap.parse_args()
     {"plan": cmd_plan, "convert": cmd_convert, "upload": cmd_upload}[a.cmd](a)
 
