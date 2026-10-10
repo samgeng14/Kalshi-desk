@@ -56,6 +56,20 @@ static void races() {
   CHECK(l.find("Mledger-1")->state==OrdState::CXL && l.find("Mledger-1")->filled==500); record(l);
   CHECK(!l.insert(intent(),0,4200000));
 }
+// gw's reason for a cancel (STOP, HALT, LANE_OFF, TAKEOVER) is the order's why whichever lands
+// first: the private feed's canceled update or the cancel's own reply (a TAKEOVER showed USER)
+static void cancel_reason_either_way() {
+  auto l=ledger();
+  CHECK(l.acknowledged("Mledger-1",ack(),t+2));
+  CHECK(l.request_cancel("Mledger-1","TAKEOVER"));
+  CHECK(l.observed(row(0,0,kalshi::OrderStatus::CANCELED,t+4),t+4));
+  CHECK(l.find("Mledger-1")->state==OrdState::CXL && l.find("Mledger-1")->why=="TAKEOVER"); record(l);
+  CHECK(l.cancelled("Mledger-1",{"oid-1","Mledger-1",1000,t+5},"TAKEOVER",t+5));
+  CHECK(l.find("Mledger-1")->why=="TAKEOVER");
+  auto m=ledger();
+  CHECK(m.acknowledged("Mledger-1",ack(),t+2) && m.request_cancel("Mledger-1"));   // the page's x: USER
+  CHECK(m.observed(row(0,0,kalshi::OrderStatus::CANCELED,t+4),t+4) && m.find("Mledger-1")->why=="USER");
+}
 static void cumulative_is_not_execution() {
   auto l=ledger(Tif::IOC);
   CHECK(l.acknowledged("Mledger-1",ack(250,0),t+2));
@@ -184,7 +198,7 @@ static void fractional_and_permutations() {
   } while(std::next_permutation(ops.begin(),ops.end()));
 }
 int main() {
-  races(); cumulative_is_not_execution(); zero_cancel_needs_read(); unknown_table_and_proof();
+  races(); cancel_reason_either_way(); cumulative_is_not_execution(); zero_cancel_needs_read(); unknown_table_and_proof();
   bad_evidence(); touch_and_edge(); fractional_and_permutations();
   TempDir dir;
   const std::string path=dir.file("order-ledger-contract.json");

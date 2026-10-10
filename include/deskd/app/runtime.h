@@ -167,6 +167,9 @@ class Deskd {
   void on_rest(std::shared_ptr<const rest::Snapshot> state);
   void on_book(const MdBook& book);
   nlohmann::json watch(const nlohmann::json& request);
+  // a market's mkt row: rest::market_json with man (Manual took it over) from gw
+  nlohmann::json mkt_row(const kalshi::MarketRow& m, bool pin, bool live) const;
+  void publish_market(const std::string& ticker);
   HdrInputs header() const;
   std::vector<PreflightRow> venue_preflight() const;
 };

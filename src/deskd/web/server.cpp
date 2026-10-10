@@ -621,8 +621,18 @@ void WebServer::Impl::routes() {
     if (!r.code.empty()) return reply_err(res, r.code, r.msg);
     reply_json(res, 200, json{{"ok", true}, {"lane", json::parse(r.lane)}});
   }));
-  svr.Post("/api/release", post("POST /api/release", [](const httplib::Request&, httplib::Response& res, const json&) {
-    reply_err(res, "UNKNOWN_MARKET", "no markets are listed in this stage");
+  svr.Post("/api/release", post("POST /api/release", [this](const httplib::Request&, httplib::Response& res, const json& b) {
+    const std::string tk = b.at("tk").get<std::string>();
+    if (b.at("v") != "K") return reply_err(res, "UNKNOWN_MARKET", tk + " is not held by Manual");
+    auto p = std::make_shared<std::promise<bool>>();
+    if (!d.gw->post(ReleaseMarket{tk, p})) return reply_err(res, "INTERNAL", "gw inbox full: release not queued");
+    auto f = p->get_future();
+    Waiter w(waiting);
+    if (!w.ok) return reply_err(res, "INTERNAL", "release queued; the stream's mkt row shows the outcome");
+    if (f.wait_for(std::chrono::milliseconds(kGwWaitMs)) != std::future_status::ready)
+      return reply_err(res, "INTERNAL", "release queued; gw has not answered within 50 ms: the stream's mkt row shows the outcome");
+    if (!f.get()) return reply_err(res, "UNKNOWN_MARKET", tk + " is not held by Manual");
+    reply_json(res, 200, json{{"ok", true}});
   }));
   svr.Post("/api/watch", post("POST /api/watch", [this](const httplib::Request&, httplib::Response& res, const json& b) {
     if (!d.watch) return reply_err(res, "UNKNOWN_MARKET", "no markets are listed in this stage");

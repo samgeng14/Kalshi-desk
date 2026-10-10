@@ -86,6 +86,7 @@ class Gateway {
     // ceiling and the effective ceiling min(ceiling, used + free)
     std::int64_t day = 0, fees = 0, used = 0, ceiling = 0, eff = 0;
     std::map<std::string, std::int64_t> lane_day;     // each lane's day, micro-dollars
+    std::set<std::string> held;                       // markets Manual took over: no lane quotes them
     std::int64_t ts_ms = 0;
   };
   // The daily cost budget of the IOC-style lanes (contract hdr.cost.budget): past it they are CAPPED.
@@ -96,6 +97,11 @@ class Gateway {
   std::int64_t sys_saved_ms() const { return sys_saved_ms_; }
   // Any thread: the markets Systematic holds positions in (REST reads them until they settle)
   std::shared_ptr<const std::set<std::string>> sys_held() const { return std::atomic_load(&sys_held_); }
+  // Any thread: the markets Manual took over (contract mkt.man): a manual order where Systematic
+  // quotes or holds, or that a lane which is on trades, cancels Systematic's orders there (why
+  // TAKEOVER), hands the lanes' inventory to Manual at the mid, and keeps the lanes out until
+  // POST /api/release (plan section 4)
+  std::shared_ptr<const std::set<std::string>> manual_held() const { return std::atomic_load(&man_view_); }
 
   // Any thread: the order path's latency (stage 4: click-to-ack p90 under 100 ms), over the last
   // 200 creates the venue acknowledged: click (the page's clock) to ack, deskd's receipt to ack,
@@ -186,6 +192,12 @@ class Gateway {
   std::int64_t reconciled_ms_ = 0;            // the account read last reconciled
   std::string sys_restore_error_;            // a saved book that could not be read blocks Systematic
   void sys_reconcile(const rest::Snapshot& s);
+  std::set<std::string> man_held_;                                   // gw thread
+  std::shared_ptr<const std::set<std::string>> man_view_;           // std::atomic_load / std::atomic_store
+  std::map<std::string, std::int64_t> alerted_;                      // "lane|code" -> when last alerted
+  void takeover(const std::string& ticker);
+  void publish_held();
+  int cancel_sys_if(const std::function<bool(const std::string& lane, const std::string& ticker)>& which, const char* why);
   void save_sys();
   void place_sys(PlaceIntent& p);
   void group_reply(const KalshiWriteReply& r);

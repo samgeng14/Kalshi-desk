@@ -243,6 +243,7 @@ void MakerEngine::step(std::int64_t now) {
     else if (now < cool_until_[tk]) hold = cool_why_[tk];
     if (!running) d.pull = "not running";
     else if (m == snap->markets.end()) d.pull = "not listed";
+    else if (view->held.count(tk)) d.pull = "held by Manual";   // until POST /api/release
     else {
       MakerInput in;
       in.book = book ? &*book : nullptr;

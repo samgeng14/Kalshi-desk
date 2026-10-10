@@ -62,8 +62,14 @@ struct ManualPath {
   Money daily_stop = 0;
   GroupRegistry* groups = nullptr;
   std::vector<LaneSpec> lanes;   // empty: default_lanes()
-  // Systematic's book across a restart (its day, positions, trade ids and HALT); "" keeps none
+  // Systematic's book across a restart (its day, positions, trade ids, HALT and the markets
+  // Manual holds); "" keeps none
   std::string sys_state_file;
+  // a market Manual took over, or released: its mkt row again (mkt.man)
+  std::function<void(const std::string&)> publish_market;
+  // an alert on the stream (level, src, msg): Systematic's refusals, so a lane that cannot trade
+  // says why on the page, not only in /ops/status
+  std::function<void(const std::string&, const std::string&, const std::string&)> alert;
 };
 
 class ManualBook {

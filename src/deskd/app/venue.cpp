@@ -147,6 +147,8 @@ void Deskd::attach_manual() {
                 (kill_.active() ? "; re-arm KILL once its cancel-all is confirmed" : "; press KILL, then re-arm once its cancel-all is confirmed");
       return h;
     };
+    p.publish_market = [this](const std::string& tk) { publish_market(tk); };
+    p.alert = [this](const std::string& lvl, const std::string& src, const std::string& msg) { pub_->alert(lvl, src, msg); };
     p.publish_lane = [this](const std::string& row) {
       auto j = json::parse(row, nullptr, false);
       if (!j.is_discarded()) pub_->post(PubData{"lane", std::move(j)});
@@ -337,7 +339,7 @@ void Deskd::refresh_live() {
   }
   for (const auto& tk : removed) {
     const auto it = s->markets.find(tk);
-    if (it != s->markets.end()) pub_->post(PubData{"mkt",rest::market_json(it->second,false,false,now_ms())});
+    if (it != s->markets.end()) pub_->post(PubData{"mkt",mkt_row(it->second,false,false)});
   }
   rest_->set_live(selected);
   if (selected.empty()) md_->clear_watch();
@@ -352,7 +354,7 @@ void Deskd::on_rest(std::shared_ptr<const rest::Snapshot>) {
   for (const auto& tk : s->live) {
     const auto it = s->markets.find(tk);
     if (it != s->markets.end())
-      pub_->post(PubData{"mkt",rest::market_json(it->second,s->pins.count(tk),true,now_ms())});
+      pub_->post(PubData{"mkt",mkt_row(it->second,s->pins.count(tk),true)});
   }
   if (!s->account_ready) return;
   const auto owned = gw_->manual_cids();   // gw publishes its own orders' rows
@@ -507,6 +509,20 @@ void Deskd::on_book(const MdBook& b) {
   publish_book(b.ticker);
 }
 
+json Deskd::mkt_row(const kalshi::MarketRow& m, bool pin, bool live) const {
+  auto row = rest::market_json(m, pin, live, now_ms());
+  const auto held = gw_->manual_held();
+  row["man"] = held && held->count(m.ticker) > 0;
+  return row;
+}
+
+void Deskd::publish_market(const std::string& tk) {
+  if (!rest_) return;
+  const auto s = rest_->snapshot();
+  const auto it = s->markets.find(tk);
+  if (it != s->markets.end()) pub_->post(PubData{"mkt", mkt_row(it->second, s->pins.count(tk), s->live.count(tk))});
+}
+
 json Deskd::watch(const json& request) {
   const auto tk = request.at("tk").get<std::string>();
   if (!rest_ || request.at("v") != "K") return err_body("UNKNOWN_MARKET",tk);
@@ -526,7 +542,7 @@ json Deskd::watch(const json& request) {
   rest_->set_pins(std::move(pins));
   refresh_live();
   const auto current = rest_->snapshot();
-  const auto m = rest::market_json(it->second,pin,current->live.count(tk),now_ms());
+  const auto m = mkt_row(it->second,pin,current->live.count(tk));
   pub_->post(PubData{"mkt",m});   // the market's row follows on the stream
   return {{"ok",true},{"pin",pin}};
 }

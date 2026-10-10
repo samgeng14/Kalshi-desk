@@ -15,6 +15,7 @@ class OrderLedger {
     PlaceIntent intent;
     int shard = -1;
     std::string oid, why;
+    std::string cancel_why = "USER";   // why a cancel was asked (gw's STOP, HALT, LANE_OFF, TAKEOVER)
     OrdState state = OrdState::PEND;
     Qty filled = 0, executions = 0, left = 0;
     kalshi::Micros execution_cost = 0, fees = 0, original_reserve = 0;
@@ -49,7 +50,9 @@ class OrderLedger {
   // APPLIED is the ONLY outcome that permits the caller to book this execution in positions.
   // An orphan waits for mapping/reconciliation. Conflicting duplicate executions fail closed.
   FillResult fill(const kalshi::FillRow& row, const std::string& cid, std::int64_t at);
-  bool request_cancel(const std::string& cid);
+  // why: the order's why if the cancel ends it, whichever of the cancel's reply and the private
+  // feed's update arrives first
+  bool request_cancel(const std::string& cid, const std::string& why = "USER");
   bool cancelled(const std::string& cid, const kalshi::CancelAck& ack,
                  const std::string& reason, std::int64_t at);
   // A complete history read begun after the deadline is required to prove absence. Mere

@@ -704,10 +704,69 @@ void systematic_book() {
   again=r.post("/api/start",json::object());
   CHECK(again && again->status!=200 && json::parse(again->body)["err"]["code"]=="HALTED");
 }
+// Manual takes over a market a lane quotes (plan section 4, contract mkt.man): the lane's
+// order there is cancelled (why TAKEOVER), its position handed to Manual at the mid, the market
+// held (mkt.man) and refused to the lanes until POST /api/release.
+void takeover() {
+  Run r(true,{},true);
+  CHECK(r.ready());
+  Stream st(r.d->port(),"rt-take-1");
+  CHECK(r.until([&]{ return !st.envelopes().empty(); }));
+  auto lane=r.post("/api/lane/M2",{{"on",true}});
+  CHECK(lane && lane->status==200);
+  std::string why;
+  CHECK(r.until([&]{ return r.d->gw().groups_ready(&why) && why.empty(); },20000));
+  httplib::Result start;
+  CHECK(r.until([&]{ start=r.post("/api/start",json::object()); return start && start->status==200; },10000));
+  int n=0;
+  auto sys=[&](Px px,Qty count) {
+    PlaceIntent p; p.cid="SM2-take-"+std::to_string(++n); p.owner=Owner::SYS; p.lane="M2"; p.ticker=TK; p.side=Side::BUY;
+    p.price=px; p.count=count; p.tif=Tif::POST; p.ttl_s=30; p.reply=std::make_shared<std::promise<OrderReply>>();
+    auto f=p.reply->get_future();
+    CHECK(r.d->gw().post(std::move(p)));
+    return f.wait_for(std::chrono::seconds(5))==std::future_status::ready ? f.get() : OrderReply{"TIMEOUT","",""};
+  };
+  auto gw_pos=[&]{
+    const auto v=r.d->gw().sys_view();
+    return v && v->positions.count("M2|"+TK) ? v->positions.at("M2|"+TK) : Qty{0};
+  };
+  // the lane holds 2 (its bid at 0.41 taken) and rests another bid at 0.39
+  CHECK(sys(4100,200).code.empty());
+  r.venue.f->with_engine([&](fakex::Engine& e,std::int64_t now) { CHECK(e.street_take(TK,fakex::Side::ASK,4100,200,now)==200); });
+  CHECK(r.until([&]{ return gw_pos()==200; }));
+  const auto resting=sys(3900,100);
+  CHECK(resting.code.empty());
+  // a manual order on the market: the lane's bid goes (TAKEOVER), its 2 are handed over
+  const auto m=r.order("Mtake-1","BUY","0.3800",1.0,"POST",60);
+  CHECK(m["status"]==200);
+  CHECK(r.until([&]{ return r.resting()==1; }));   // only the manual order rests
+  CHECK(r.until([&]{
+    for(const auto& e:of(st,"ord")) if(e["data"]["cid"]=="SM2-take-2" && e["data"]["st"]=="CXL" && e["data"]["why"]=="TAKEOVER") return true;
+    return false; }));
+  CHECK(r.until([&]{ return gw_pos()==0; }));
+  CHECK(r.until([&]{
+    for(const auto& e:of(st,"mkt")) if(e["data"]["tk"]==TK && e["data"]["man"]==true) return true;
+    return false; }));
+  const auto held=r.d->gw().manual_held();
+  CHECK(held && held->count(TK));
+  // the lanes stay out until it is released
+  const auto refused=sys(3900,100);
+  CHECK(refused.code=="BAD_STATE" && refused.msg.find("held by Manual")!=std::string::npos);
+  auto rel=r.post("/api/release",{{"v","K"},{"tk",TK}});
+  CHECK(rel && rel->status==200 && json::parse(rel->body)==json({{"ok",true}}));
+  CHECK(r.until([&]{
+    for(const auto& e:of(st,"mkt")) if(e["data"]["tk"]==TK && e["data"]["man"]==false) return true;
+    return false; }));
+  auto again=r.post("/api/release",{{"v","K"},{"tk",TK}});
+  CHECK(again && again->status!=200 && json::parse(again->body)["err"]["code"]=="UNKNOWN_MARKET");
+  CHECK(sys(3900,100).code.empty());
+  auto stop=r.post("/api/stop",json::object());
+  CHECK(stop && stop->status==200);
+}
 }  // namespace
 
 int main() {
   std::signal(SIGPIPE,SIG_IGN);
-  off_by_default(); orders_cancel_kill(); stop_reasons(); financial_fair(); systematic(); systematic_maker(); systematic_band(); systematic_races(); systematic_group_trigger(); systematic_book();
+  off_by_default(); orders_cancel_kill(); stop_reasons(); financial_fair(); systematic(); systematic_maker(); systematic_band(); systematic_races(); systematic_group_trigger(); systematic_book(); takeover();
   return finish("deskd-runtime-manual");
 }

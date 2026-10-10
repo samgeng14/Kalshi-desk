@@ -185,8 +185,14 @@ struct LaneSet {
   LanePromise reply;
 };
 
+// POST /api/release: the operator hands a market Manual took over back to Systematic
+struct ReleaseMarket {
+  std::string ticker;
+  std::shared_ptr<std::promise<bool>> reply;   // false: the market was not held
+};
+
 using GwMsg = std::variant<PlaceIntent, AmendIntent, CancelIntent, Start, Stop, SendResult, OrderEvent, Probe, ManualWrite,
-                           PrivateMsg, LaneSet>;
+                           PrivateMsg, LaneSet, ReleaseMarket>;
 
 // Stop goes in the control lane, which nothing else fills; cancels and private events go before
 // new orders (plan section 2). Start and amends wait in the normal lane with the orders, so a

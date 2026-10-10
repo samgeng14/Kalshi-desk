@@ -45,6 +45,9 @@ void Gateway::attach_manual(const ManualPath& path) {
       if (!j.is_discarded() && sys_->restore(j, day0, &h, &why)) {
         sys_day_ms_ = day0;
         sys_saved_ms_ = j.value("saved_ms", std::int64_t{0});
+        if (j.contains("man_held") && j["man_held"].is_array())
+          for (const auto& t : j["man_held"]) if (t.is_string()) man_held_.insert(t.get<std::string>());
+        publish_held();
         if (h.on) {
           own_ = RunView{RunState::HALTED, h.ms, 0, h.why};
           publish();
@@ -72,7 +75,9 @@ void Gateway::save_sys() {
   const std::string tmp = path_->sys_state_file + ".tmp";
   {
     std::ofstream out(tmp, std::ios::trunc);
-    out << sys_->to_json(h, now).dump();
+    auto j = sys_->to_json(h, now);
+    j["man_held"] = man_held_;
+    out << j.dump();
     out.flush();
     if (!out) {
       DLOG_ERR("cannot write %s: Systematic's book is not saved", tmp.c_str());
@@ -353,6 +358,18 @@ void Gateway::handle(GwMsg& m) {
     if (pr->fn) pr->fn();
     return;
   }
+  if (auto* rel = std::get_if<ReleaseMarket>(&m)) {
+    const bool held = man_held_.erase(rel->ticker) > 0;
+    if (held) {
+      DLOG_INFO("%s released to Systematic", rel->ticker.c_str());
+      publish_held();
+      sys_save_due_ = true;
+      sys_dirty_ = true;
+      if (path_ && path_->publish_market) path_->publish_market(rel->ticker);
+    }
+    if (rel->reply) { try { rel->reply->set_value(held); } catch (const std::future_error&) {} }
+    return;
+  }
   // AmendIntent, SendResult, OrderEvent: not used by the Manual path yet (amends are not
   // offered; private events reach gw through the REST reconcile until the ledger takes them).
 }
@@ -394,6 +411,7 @@ void Gateway::place_manual(PlaceIntent& p) {
     owned->insert(cid);
     std::atomic_store(&owned_, std::shared_ptr<const std::set<std::string>>(std::move(owned)));
   }
+  if (sys_) takeover(p.ticker);
   publish_order(cid);   // PEND, with its reservation
   if (!path_->send || !path_->send(std::move(*placed.job))) {
     KalshiWriteReply r;
@@ -670,6 +688,16 @@ void Gateway::place_sys(PlaceIntent& p) {
   auto refuse = [&](const char* code, const std::string& msg) {
     stats_.sys_refused.fetch_add(1);
     DLOG_INFO("Systematic %s refused: %s (%s)", p.cid.c_str(), code, msg.c_str());
+    // on the page too (a lane that cannot trade says why), once a minute per lane and code; not
+    // the passing ones (between Stop and the maker seeing it, the first read after a start)
+    const std::string c = code;
+    if (path_->alert && c != "BAD_STATE" && c != "STALE") {
+      auto& last = alerted_[p.lane + "|" + c];
+      if (now_ms() - last >= 60000) {
+        last = now_ms();
+        path_->alert("WARN", p.lane, "refused " + c + ": " + msg);
+      }
+    }
     answer(p.reply, OrderReply{code, msg, ""});
   };
   if (kill_.active()) return refuse("KILLED", "KILL lockout active");
@@ -682,6 +710,7 @@ void Gateway::place_sys(PlaceIntent& p) {
   sync_snapshot();
   if (!snapshot_seen_) return refuse("STALE", "no account read yet");
   if (!sys_rebuilt_) return refuse("STALE", "Systematic's day is rebuilt from the venue's fills first");
+  if (man_held_.count(p.ticker)) return refuse("BAD_STATE", p.ticker + " is held by Manual until released");
   const auto m = snapshot_seen_->markets.find(p.ticker);
   if (m == snapshot_seen_->markets.end() || !m->second.exchange_index) return refuse("UNKNOWN_MARKET", "no Kalshi market " + p.ticker);
   if (!lane->series.empty() &&
@@ -770,18 +799,63 @@ void Gateway::place_sys(PlaceIntent& p) {
 }
 
 int Gateway::cancel_sys(const std::function<bool(const std::string& lane)>& which, const char* why) {
+  return cancel_sys_if([&which](const std::string& lane, const std::string&) { return which(lane); }, why);
+}
+
+int Gateway::cancel_sys_if(const std::function<bool(const std::string& lane, const std::string& ticker)>& which,
+                           const char* why) {
   std::vector<std::string> cids;
   for (const auto& [cid, o] : manual_->ledger().orders())
-    if (o.intent.owner == Owner::SYS && !o.terminal() && which(o.intent.lane)) cids.push_back(cid);
+    if (o.intent.owner == Owner::SYS && !o.terminal() && which(o.intent.lane, o.intent.ticker)) cids.push_back(cid);
   for (const auto& cid : cids) {
     cancel_why_[cid] = why;
     manual_->revoke(cid);   // a write not yet on the wire never leaves
-    manual_->ledger().request_cancel(cid);
+    manual_->ledger().request_cancel(cid, why);
     const auto* o = manual_->ledger().find(cid);
     if (o && !o->oid.empty() && !cancel_sent_.count(cid)) send_cancel(cid);
     publish_order(cid);
   }
   return static_cast<int>(cids.size());
+}
+
+// A manual order admitted on a market Systematic quotes or holds, or that a lane which is on
+// trades (its series): the market is Manual's until released (plan section 4: Kalshi nets one
+// position per market). Systematic's orders there are cancelled (TAKEOVER) and each lane's
+// position is handed to Manual at the mid (the last mid seen; never priced: as worthless), with a
+// logged line; Manual owns any flatten.
+void Gateway::takeover(const std::string& tk) {
+  if (man_held_.count(tk)) return;
+  bool here = false;
+  for (const auto& [cid, o] : manual_->ledger().orders())
+    if (o.intent.owner == Owner::SYS && !o.terminal() && o.intent.ticker == tk) here = true;
+  const auto held = sys_->held();
+  for (const auto& [lane, t] : held) if (t == tk) here = true;
+  for (const auto& l : sys_->lanes())
+    if (sys_->on(l.id))
+      for (const auto& s : l.series)
+        if (tk.size() > s.size() && tk.compare(0, s.size(), s) == 0 && tk[s.size()] == '-') here = true;
+  if (!here) return;
+  man_held_.insert(tk);
+  const int n = cancel_sys_if([&tk](const std::string&, const std::string& t) { return t == tk; }, "TAKEOVER");
+  for (const auto& [lane, t] : held) {
+    if (t != tk) continue;
+    const Qty pos = sys_->position(lane, tk);
+    const auto m = mark(tk);
+    const Px at = m ? *m : (pos > 0 ? 0 : kOneDollar);
+    const Micros pnl = sys_->settle(lane, tk, at, now_ms());
+    DLOG_WARN("Manual took over %s: lane %s's %s contracts handed to Manual at %s (%s realized)", tk.c_str(), lane.c_str(),
+              qty_text(pos).c_str(), price_str(at).c_str(), money_str(pnl / 100).c_str());
+    lanes_dirty_.insert(lane);
+  }
+  DLOG_WARN("Manual took over %s: %d Systematic order(s) cancelled; lanes stay out until it is released", tk.c_str(), n);
+  publish_held();
+  sys_dirty_ = true;
+  sys_save_due_ = true;
+  if (path_->publish_market) path_->publish_market(tk);
+}
+
+void Gateway::publish_held() {
+  std::atomic_store(&man_view_, std::make_shared<const std::set<std::string>>(man_held_));
 }
 
 void Gateway::group_job(const std::string& lane, int shard, const std::string& action) {
@@ -965,6 +1039,7 @@ void Gateway::sys_tick(std::int64_t now) {
     for (const auto& l : sys_->lanes())
       if (const auto* dl = sys_->day(l.id)) v->lane_day[l.id] = dl->real - dl->fees + sys_->unrealized(l.id, mk);
     v->fees = sys_fees();
+    v->held = man_held_;
     sys_money(&v->used, &v->ceiling, &v->eff);
     v->ts_ms = now;
     std::atomic_store(&sys_view_, std::shared_ptr<const SysView>(std::move(v)));

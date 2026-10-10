@@ -171,7 +171,7 @@ bool OrderLedger::observed(const kalshi::OrderRow& row, std::int64_t at) {
     else if (row.status == kalshi::OrderStatus::RESTING) o.state = o.cancel_unverified ? OrdState::PEND : o.filled ? OrdState::PART : OrdState::WORK;
     else o.state = o.intent.exp_ms && updated >= o.intent.exp_ms ? OrdState::EXP : OrdState::CXL;
     o.why = o.state == OrdState::EXP ? "EXPIRY" : o.state == OrdState::CXL ?
-        (o.cancel_requested ? "USER" : o.intent.tif == Tif::IOC ? "IOC_REST" : o.intent.tif == Tif::FOK ? "FOK" : "") : "";
+        (o.cancel_requested ? o.cancel_why : o.intent.tif == Tif::IOC ? "IOC_REST" : o.intent.tif == Tif::FOK ? "FOK" : "") : "";
     if (o.terminal()) o.done_ms = at;
   }
   if (o.filled == o.intent.count) {
@@ -219,9 +219,9 @@ OrderLedger::FillResult OrderLedger::fill(const kalshi::FillRow& row, const std:
   else if (!o.terminal()) { o.state=o.cancel_unverified ? OrdState::PEND : OrdState::PART; o.why.clear(); }
   missing(o,at); ++o.rev; return FillResult::APPLIED;
 }
-bool OrderLedger::request_cancel(const std::string& cid) {
+bool OrderLedger::request_cancel(const std::string& cid, const std::string& why) {
   auto it=orders_.find(cid); if(it==orders_.end() || it->second.terminal()) return false;
-  if(!it->second.cancel_requested) { it->second.cancel_requested=true; ++it->second.rev; }
+  if(!it->second.cancel_requested) { it->second.cancel_requested=true; it->second.cancel_why=why; ++it->second.rev; }
   return true;
 }
 bool OrderLedger::cancelled(const std::string& cid, const kalshi::CancelAck& ack,
