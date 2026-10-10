@@ -290,8 +290,11 @@ void KalshiMd::run(Worker& self) {
       }
       if (!frame.contains("type") || !frame["type"].is_string()) { reason = "missing market-data message type"; break; }
       if (frame["type"].get<std::string>() == "error") {
-        // A refused trade subscription costs the prints, never the books.
-        const auto command_id = integer(frame, "id");
+        // A refused trade subscription costs the prints, never the books. An error naming no
+        // command while trade subscriptions are pending is taken as theirs too: a refused book
+        // subscription still ends at the snapshot timeout and reconnects.
+        auto command_id = integer(frame, "id");
+        if (!command_id && !trade_commands.empty()) command_id = *trade_commands.begin();
         if (command_id && trade_commands.count(*command_id)) {
           DLOG_WARN("Kalshi refused the trade channel for %zu markets: books continue without prints",
                     pending.count(*command_id) ? pending.at(*command_id).size() : std::size_t{0});
@@ -320,6 +323,16 @@ void KalshiMd::run(Worker& self) {
       if (books.ready() && pending.empty()) backoff = options_.backoff_min_ms;
     }
     ws.close(); feed_.set(false, !watch.empty());
+    if (!changed && !self.stopping()) {
+      // why the books went stale, once per distinct reason a minute (a reconnect loop stays readable)
+      static std::string last_reason;
+      static std::int64_t last_log = 0;
+      const std::string r = reason.empty() ? "market-data disconnected" : reason;
+      if (r != last_reason || mono_ms() - last_log > 60000) {
+        DLOG_WARN("market data: %s (%zu markets); reconnecting in %d ms", r.c_str(), watch.size(), backoff);
+        last_reason = r; last_log = mono_ms();
+      }
+    }
     books.disconnected(reason.empty() ? "market-data disconnected" : reason, now_ms());
     if (changed || self.stopping()) continue;
     const auto until = mono_ms() + backoff;
