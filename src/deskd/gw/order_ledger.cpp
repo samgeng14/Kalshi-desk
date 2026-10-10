@@ -90,13 +90,14 @@ bool OrderLedger::rejected(const std::string& cid, const std::string& code, std:
   auto& o = it->second;
   // Contradictory venue evidence requires reconciliation, never freeing this reservation.
   if (!o.oid.empty() || o.filled || o.executions || o.uncertain) return invalid();
-  if (o.terminal()) return o.state == OrdState::REJ;
-  o.state = OrdState::REJ; o.why = code; o.left = 0; o.done_ms = at; ++o.rev; return true;
+  const bool cancel = code == "POST_CROSS" || code == "USER";
+  if (o.terminal()) return o.refused && o.why == code;
+  o.refused = true; o.state = cancel ? OrdState::CXL : OrdState::REJ; o.why = code; o.left = 0; o.done_ms = at; ++o.rev; return true;
 }
 bool OrderLedger::acknowledged(const std::string& cid, const kalshi::CreateAck& ack, std::int64_t at) {
   auto it = orders_.find(cid); if (it == orders_.end()) return false;
   auto& o = it->second;
-  if (o.state == OrdState::REJ) return invalid();
+  if (o.refused) return invalid();
   if ((!ack.client_order_id.empty() && ack.client_order_id != cid) || ack.fill_count < 0 ||
       ack.remaining < 0 || ack.fill_count > o.intent.count || ack.remaining > o.intent.count - ack.fill_count)
     return invalid();
@@ -128,7 +129,7 @@ bool OrderLedger::observed(const kalshi::OrderRow& row, std::int64_t at) {
     it = orders_.find(id->second);
   }
   auto& o = it->second;
-  if (o.state == OrdState::REJ) return invalid();
+  if (o.refused) return invalid();
   if ((!row.client_order_id.empty() && row.client_order_id != o.intent.cid) || row.ticker != o.intent.ticker ||
       row.side != (o.intent.side == Side::BUY ? kalshi::BookSide::BID : kalshi::BookSide::ASK) ||
       (row.exchange_index && *row.exchange_index != o.shard) || row.initial != o.intent.count ||
@@ -174,7 +175,7 @@ OrderLedger::FillResult OrderLedger::fill(const kalshi::FillRow& row, const std:
   auto& o = it->second;
   if ((!cid.empty() && cid != o.intent.cid) || row.ticker != o.intent.ticker || row.exchange_index != o.shard ||
       row.side != (o.intent.side == Side::BUY ? kalshi::BookSide::BID : kalshi::BookSide::ASK) ||
-      row.count > o.intent.count - o.executions || o.state == OrdState::REJ ||
+      row.count > o.intent.count - o.executions || o.refused ||
       (row.fee > 0 && o.fees > std::numeric_limits<kalshi::Micros>::max()-row.fee) ||
       (row.fee < 0 && o.fees < std::numeric_limits<kalshi::Micros>::min()-row.fee)) return bad();
   if (!bind(o,row.order_id)) return FillResult::INVALID;
@@ -195,7 +196,7 @@ bool OrderLedger::cancelled(const std::string& cid, const kalshi::CancelAck& ack
                              const std::string& reason, std::int64_t at) {
   auto it=orders_.find(cid); if(it==orders_.end()) return false;
   auto& o=it->second;
-  if(o.state==OrdState::REJ) return invalid();
+  if(o.refused) return invalid();
   if ((!ack.client_order_id.empty() && ack.client_order_id!=cid) || ack.reduced_by<0 || ack.reduced_by>o.intent.count)
     return invalid();
   if(!bind(o,ack.order_id)) return false;

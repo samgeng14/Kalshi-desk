@@ -19,6 +19,7 @@ class OrderLedger {
     Qty filled = 0, executions = 0, left = 0;
     kalshi::Micros execution_cost = 0, fees = 0, original_reserve = 0;
     bool uncertain = false, cancel_requested = false, cancel_unverified = false;
+    bool refused = false;   // ended by rejected(): never reached the venue, so no venue evidence may follow
     std::int64_t sent_ms = 0, ack_ms = 0, done_ms = 0, update_ms = 0;
     std::uint64_t rev = 1;
     bool terminal() const;
@@ -40,6 +41,8 @@ class OrderLedger {
   bool insert(PlaceIntent intent, int shard, kalshi::Micros reserve);
   bool sent(const std::string& cid, std::int64_t at);
   bool unknown(const std::string& cid);
+  // REJ with code as why; except POST_CROSS (the venue cancelled a crossing post-only) and USER
+  // (cancelled before it was sent), which the contract reports as CXL with that why.
   bool rejected(const std::string& cid, const std::string& code, std::int64_t at);
   bool acknowledged(const std::string& cid, const kalshi::CreateAck& ack, std::int64_t at);
   bool observed(const kalshi::OrderRow& row, std::int64_t at);
@@ -57,6 +60,7 @@ class OrderLedger {
   kalshi::Micros reserved(int shard) const;
   std::vector<std::string> fills_due(std::int64_t now) const;
   bool healthy() const { return healthy_; }
+  const std::map<std::string, Order>& orders() const { return orders_; }
  private:
   bool bind(Order& order, const std::string& oid);
   bool invalid();

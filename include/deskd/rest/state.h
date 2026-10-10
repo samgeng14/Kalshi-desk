@@ -51,7 +51,9 @@ struct Snapshot {
   ClockEstimate clock;
   std::set<std::string> pins, live;
   bool ready = false, account_ready = false, listing_ready = false;
-  std::int64_t account_ms = 0, listing_ms = 0, ts_ms = 0;
+  // account_began_ms: when the last complete account read began. Anything deskd saw finish
+  // before it is in these balances and positions; anything later may not be.
+  std::int64_t account_began_ms = 0, account_ms = 0, listing_ms = 0, ts_ms = 0;
   std::uint64_t revision = 0;
   std::string error;
   std::string metadata_error;

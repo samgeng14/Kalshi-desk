@@ -377,7 +377,9 @@ bool State::refresh(Worker* worker) {
   Snapshot next = *snapshot();
   next.error.clear();
   std::string why;
+  const std::int64_t account_began = now_ms();
   if (!account(next, &why, worker)) { next.account_ready = false; next.error = "account: " + why; }
+  else next.account_began_ms = account_began;
   if (!next.listing_ready || mono_ms() - last_listing_mono_ >= options_.listing_poll_ms) {
     if (!listing(next, &why, worker)) {
       next.listing_ready = false;
