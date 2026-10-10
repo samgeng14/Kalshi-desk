@@ -66,7 +66,7 @@ struct Run {
   fx::Venue venue;
   TempDir dir;
   std::unique_ptr<Deskd> d;
-  explicit Run(bool manual_orders,std::function<void(fakex::Engine&,std::int64_t)> more={}) {
+  explicit Run(bool manual_orders,std::function<void(fakex::Engine&,std::int64_t)> more={},bool systematic=false) {
     CHECK(venue.ok);
     venue.f->with_engine([&](fakex::Engine& e,std::int64_t now) {
       auto spec=fx::spec(TK,0); spec.close_ms=(now/1000+3600)*1000;
@@ -82,6 +82,7 @@ struct Run {
     c.data_dir=dir.path; c.ui_dir=std::string(DESKD_SOURCE_DIR)+"/ui/desk"; c.http_port=0;
     c.env="demo"; c.key_id="runtime-test"; c.pem_path=key; c.key_type="ed25519";
     c.manual_orders=manual_orders;
+    c.systematic_orders=systematic;
     RuntimeOptions o;
     const std::string base="https://127.0.0.1:"+std::to_string(venue.port());
     o.rest_url=base+"/trade-api/v2"; o.ws_url=base+"/trade-api/ws/v2"; o.factory=fx::trust_test_ca();
@@ -300,10 +301,107 @@ void financial_fair() {
   CHECK(fs["markets"][W]["fair"].is_string() && fs["markets"][BAD]["fair"].is_null());
   CHECK(r.d->status()["pyth"]["underlyings"][NG]["messages"].get<int>()>=3600);
 }
+// Systematic on the fake: an order group per lane and shard, a lane switched on, Start, an S order
+// in its lane's group, gw's refusals (lane off, wrong owner, inventory, not running), Stop
+// cancelling it and triggering the groups (reset again once stopped), and KILL's sender
+// triggering them (reset at the re-arm).
+void systematic() {
+  Run r(false,{},true);
+  CHECK(r.ready());
+  CHECK(r.d->status()["gw"]["systematic_orders"]==true && r.d->status()["senders"]["k2"]["healthy"]==true);
+  Stream st(r.d->port(),"rt-sys-1");
+  CHECK(r.until([&]{ return !st.envelopes().empty(); }));
+  json responses=json::array();
+  auto keep=[&](const char* key,const httplib::Result& res) {
+    if(res) responses.push_back({{"key",key},{"status",res->status},{"json",json::parse(res->body,nullptr,false)}});
+  };
+  auto lane=r.post("/api/lane/M2",{{"on",true}});
+  keep("POST /api/lane/{id}",lane);
+  CHECK(lane && lane->status==200);
+  if(lane && lane->status==200) {
+    const auto row=json::parse(lane->body)["lane"];
+    CHECK(row["id"]=="M2" && row["on"]==true && row["state"]=="OFF" && row["why"]=="STOP" && row["budget"]=="25.0000");
+  }
+  auto none=r.post("/api/lane/Z9",{{"on",true}});
+  CHECK(none && none->status==404);
+  keep("POST /api/lane/{id}",none);
+  std::string why;
+  const bool ready=r.until([&]{ return r.d->gw().groups_ready(&why) && why.empty(); },20000);   // M2's groups active
+  if(!ready) std::fprintf(stderr,"groups: %s\n",why.c_str());
+  CHECK(ready);
+  // Start, as an operator would: again while a preflight row (the fake's 1 s Date: CLK) flickers
+  httplib::Result start;
+  CHECK(r.until([&]{ start=r.post("/api/start",json::object()); return start && start->status==200; },10000));
+  if(start && start->status!=200) std::fprintf(stderr,"start: %s\n",start->body.c_str());
+  CHECK(start && start->status==200 && json::parse(start->body)["run"]["state"]=="RUN");
+  keep("POST /api/start",start);
+  auto sys=[&](const std::string& cid,Px px,Qty count,const std::string& ln="M2") {
+    PlaceIntent p; p.cid=cid; p.owner=Owner::SYS; p.lane=ln; p.ticker=TK; p.side=Side::BUY; p.price=px; p.count=count;
+    p.tif=Tif::POST; p.ttl_s=30; p.reply=std::make_shared<std::promise<OrderReply>>();
+    auto f=p.reply->get_future();
+    CHECK(r.d->gw().post(std::move(p)));
+    if(f.wait_for(std::chrono::seconds(5))!=std::future_status::ready) return OrderReply{"TIMEOUT","",""};
+    return f.get();
+  };
+  auto a=sys("SM2-rt-1",3900,200);
+  if(!a.code.empty()) std::fprintf(stderr,"sys order: %s %s\n",a.code.c_str(),a.msg.c_str());
+  CHECK(a.code.empty());
+  if(a.code.empty()) {
+    const auto ord=json::parse(a.ord);
+    CHECK(ord["st"]=="WORK" && ord["own"]=="SYS" && ord["lane"]=="M2");
+  }
+  const bool grouped=r.venue.f->with_engine([](fakex::Engine& e,std::int64_t) {
+    for(const fakex::Order* o:e.user_orders())
+      if(o->client_order_id=="SM2-rt-1") return !o->order_group_id.empty() && e.group(o->order_group_id)!=nullptr;
+    return false;
+  });
+  CHECK(grouped);
+  CHECK(sys("SM1-rt-1",3900,100,"M1").code=="BAD_STATE");     // M1 is off
+  CHECK(sys("Mrt-sys-1",3900,100).code=="BAD_REQUEST");        // not a Systematic cid
+  CHECK(sys("SM2-rt-2",3900,1900).code=="SYS_CEILING");        // 2 working + 19 > 20 contracts
+  auto stop=r.post("/api/stop",json::object());
+  CHECK(stop && stop->status==200 && json::parse(stop->body)["n"]==1);
+  keep("POST /api/stop",stop);
+  CHECK(r.until([&]{ return r.resting()==0; }));
+  CHECK(sys("SM2-rt-3",3900,100).code=="BAD_STATE");           // not running
+  auto triggered=[&]{
+    return r.venue.f->with_engine([](fakex::Engine& e,std::int64_t) {
+      int n=0; for(const auto& [id,g]:e.groups()) if(g.triggered) ++n; return n; });
+  };
+  // Stop triggered the groups; once stopped gw resets them, ready for the next Start
+  CHECK(r.until([&]{ return triggered()==0 && r.d->gw().groups_ready(&why); },20000));
+  // KILL: send-cx's cancel-all, then every group triggered; the re-arm resets them
+  auto k=r.post("/api/kill",json::object());
+  CHECK(k && k->status==200);
+  CHECK(r.until([&]{ return triggered()>0; }));
+  CHECK(r.until([&]{ return !r.d->gw().groups_ready(&why); }));   // gw saw send-cx's triggers
+  CHECK(r.until([&]{ return r.d->kill_switch().confirmed_gen()==r.d->kill_switch().generation(); }));
+  CHECK(r.d->kill_switch().rearm(now_ms(),mono_ms()+61000).empty());
+  CHECK(r.until([&]{ return triggered()==0 && r.d->gw().groups_ready(&why); },20000));
+  CHECK(r.d->status()["gw"]["sys_sent"]==1);
+  // the lane rows, orders and replies the page got, checked by contract.js itself
+  bool lane_on_stream=false;
+  for(const auto& e:of(st,"lane")) if(e["data"]["id"]=="M2" && e["data"]["on"]==true) lane_on_stream=true;
+  CHECK(lane_on_stream);
+  if(std::string(DESKD_NODE).empty()) { std::printf("node not found: contract.js check SKIPPED\n"); return; }
+  httplib::Client c("127.0.0.1",r.d->port());
+  auto snap=c.Get("/api/snapshot?sid=rt-sys-1");
+  CHECK(snap && snap->status==200);
+  json cap={{"snapshots",json::array()},{"events",st.envelopes()},{"responses",responses}};
+  if(snap && snap->status==200) {
+    const auto sj=json::parse(snap->body);
+    cap["snapshots"].push_back(sj);
+    CHECK(sj["lanes"].size()==5);
+  }
+  const std::string file=r.dir.path+"/capture-sys.json";
+  std::ofstream(file)<<cap.dump();
+  const std::string cmd=std::string("\"")+DESKD_NODE+"\" \""+DESKD_SOURCE_DIR+"/tests/deskd/contract_check.cjs\" \""+file+"\"";
+  CHECK(std::system(cmd.c_str())==0);
+}
 }  // namespace
 
 int main() {
   std::signal(SIGPIPE,SIG_IGN);
-  off_by_default(); orders_cancel_kill(); stop_reasons(); financial_fair();
+  off_by_default(); orders_cancel_kill(); stop_reasons(); financial_fair(); systematic();
   return finish("deskd-runtime-manual");
 }

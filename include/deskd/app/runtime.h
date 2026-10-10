@@ -122,9 +122,10 @@ class Deskd {
   BoundedQueue<SendJob> q_k1_{256, 64}, q_k2_{1024, 64}, q_k3_{1024, 64}, q_cx_{256, 256};
   // With a venue credential: send-k1 and send-cx run KalshiSenders on these, each on its own
   // pool of pre-opened connections; send-cx's KILL is then a real cancel-all.
-  BoundedQueue<KalshiWriteJob> q_man_{256, 64}, q_mcx_{256, 256};
-  std::unique_ptr<net::SparePool> pool_k1_, pool_cx_;
-  std::unique_ptr<KalshiSender> man_sender_, cx_sender_;
+  BoundedQueue<KalshiWriteJob> q_man_{256, 64}, q_mcx_{256, 256}, q_sys_{512, 128};
+  std::unique_ptr<net::SparePool> pool_k1_, pool_cx_, pool_k2_;
+  std::unique_ptr<KalshiSender> man_sender_, cx_sender_, sys_sender_;
+  GroupRegistry groups_;   // every Systematic order group, for KILL's sender
   std::shared_ptr<const std::map<std::string, MdBook>> books_;   // std::atomic_load / std::atomic_store
   // md thread only: each market's last book, and its prints since the last book message went out
   struct Tape {
@@ -139,6 +140,7 @@ class Deskd {
   std::map<std::string, std::string> ref_sent_;   // md thread: each book's ref as last published
   nlohmann::json ref_json(const std::string& ticker) const;
   void republish_refs();
+  PreflightRow groups_row() const;
   std::shared_ptr<const DayPnl> day_;   // std::atomic_load / std::atomic_store; rest thread writes
   std::set<std::string> fills_sent_;    // rest thread only
   void on_trade(const MdTrade& t);

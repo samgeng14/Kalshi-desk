@@ -18,6 +18,7 @@
 #include <set>
 #include <string>
 #include <memory>
+#include <optional>
 #include <vector>
 
 #include "deskd/bus/msg.h"
@@ -28,6 +29,7 @@ namespace deskd {
 class KillSwitch;
 class Worker;
 class ManualBook;
+class SysBook;
 struct ManualPath;
 struct KalshiWriteReply;
 struct PrivateEvent;
@@ -56,6 +58,32 @@ class Gateway {
     return why ? *why : std::string();
   }
 
+  // Any thread: the GROUPS preflight row (every lane that is on has an active order group on every
+  // shard), as gw last saw it.
+  bool groups_ready(std::string* why) const {
+    const auto g = std::atomic_load(&groups_view_);
+    if (why) *why = g ? g->second : "Systematic is not attached";
+    return g && g->first;
+  }
+  // Any thread: what strat needs from gw's book, republished as it changes (at most every 100 ms).
+  struct SysOrder {
+    std::string cid, lane, ticker;
+    Side side = Side::BUY;
+    Px price = 0;
+    Qty count = 0, left = 0, filled = 0;
+    OrdState state = OrdState::PEND;
+    bool terminal = false, cancel_requested = false;
+    std::int64_t done_ms = 0;
+  };
+  struct SysView {
+    RunState run = RunState::STOP;
+    std::set<std::string> lanes_on;
+    std::map<std::string, SysOrder> orders;           // working ones, and those ended in the last 2 minutes
+    std::map<std::string, Qty> positions;             // "lane|ticker" -> the lane's signed position
+    std::int64_t ts_ms = 0;
+  };
+  std::shared_ptr<const SysView> sys_view() const { return std::atomic_load(&sys_view_); }
+
   // queues m in its lane (lane_of); false when that lane is full: dropped, gap marked
   bool post(GwMsg m);
   BoundedQueue<GwMsg>& inbox() { return inbox_; }
@@ -75,6 +103,10 @@ class Gateway {
     std::atomic<std::uint64_t> manual_sent{0};        // Manual orders handed to send-k1
     std::atomic<std::uint64_t> manual_cancels{0};     // Manual cancels handed to the cancel sender
     std::atomic<std::uint64_t> private_applied{0};    // private order updates and fills applied to Manual orders
+    std::atomic<std::uint64_t> sys_sent{0};           // Systematic orders handed to send-k2
+    std::atomic<std::uint64_t> sys_refused{0};        // Systematic intents refused by gw
+    std::atomic<std::uint64_t> sys_cancels{0};        // Systematic cancels handed to send-k2
+    std::atomic<std::uint64_t> group_jobs{0};         // order-group creates, triggers and resets
   };
   const Stats& stats() const { return stats_; }
 
@@ -103,9 +135,31 @@ class Gateway {
   std::shared_ptr<const rest::Snapshot> snapshot_seen_;
   std::map<std::string, OrderPromise> pending_;  // web threads waiting on a Manual order's write
   std::set<std::string> cancel_sent_;            // cids whose cancel went to the cancel sender
+  std::map<std::string, std::string> cancel_why_;   // a cancel gw itself asked for: STOP, LANE_OFF, HALT
   std::shared_ptr<const std::set<std::string>> owned_;   // std::atomic_load / std::atomic_store
   std::shared_ptr<const std::string> ledger_why_;        // std::atomic_load / std::atomic_store
   void note_ledger();
+
+  // ---- Systematic (gw/sys_book.h); gw thread only
+  std::unique_ptr<SysBook> sys_;
+  std::shared_ptr<const std::pair<bool, std::string>> groups_view_;   // std::atomic_load / std::atomic_store
+  std::shared_ptr<const SysView> sys_view_;                          // std::atomic_load / std::atomic_store
+  std::map<std::string, std::int64_t> lane_published_;   // lane id -> when its row last went out
+  std::set<std::string> lanes_dirty_;
+  std::int64_t sys_view_ms_ = 0, groups_paced_ms_ = 0;
+  bool sys_dirty_ = true;
+  void place_sys(PlaceIntent& p);
+  void group_reply(const KalshiWriteReply& r);
+  void group_job(const std::string& lane, int shard, const std::string& action);
+  int cancel_sys(const std::function<bool(const std::string& lane)>& which, const char* why);
+  void trigger_groups();
+  void reset_groups();
+  void sys_tick(std::int64_t now);
+  void halt(const std::string& why);
+  std::set<int> shards() const;
+  std::optional<Px> mark(const std::string& ticker) const;
+  std::string lane_row(const std::string& id) const;
+  void sync_snapshot();
 };
 
 }  // namespace deskd

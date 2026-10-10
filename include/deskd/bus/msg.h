@@ -169,8 +169,21 @@ struct PrivateMsg {
   std::shared_ptr<const PrivateEvent> event;
 };
 
+// POST /api/lane/{id}: a Systematic lane on or off. Off cancels that lane's working orders.
+struct LaneReply {
+  std::string code, msg;   // "" = ok
+  std::string lane;        // the lane's row, JSON text
+  int n = 0;               // orders asked to cancel
+};
+using LanePromise = std::shared_ptr<std::promise<LaneReply>>;
+struct LaneSet {
+  std::string id;
+  bool on = false;
+  LanePromise reply;
+};
+
 using GwMsg = std::variant<PlaceIntent, AmendIntent, CancelIntent, Start, Stop, SendResult, OrderEvent, Probe, ManualWrite,
-                           PrivateMsg>;
+                           PrivateMsg, LaneSet>;
 
 // Stop goes in the control lane, which nothing else fills; cancels and private events go before
 // new orders (plan section 2). Start and amends wait in the normal lane with the orders, so a

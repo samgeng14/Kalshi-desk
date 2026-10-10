@@ -51,6 +51,15 @@ struct ManualPath {
   std::function<bool(KalshiWriteJob)> send;       // send-k1's inbox
   std::function<bool(KalshiWriteJob)> cancel;     // the cancel sender's inbox
   std::function<void(const std::string&)> publish;   // one ord row, JSON text
+  // Systematic (gw/sys_book.h), on when sys_send is set: send-k2's inbox for S creates and
+  // order-group jobs and its priority lane for S cancels (Systematic never uses send-k1 or
+  // send-cx); its health (manual_sender = send-k2); its lane rows; the daily loss stop; the
+  // registry KILL's sender triggers.
+  std::function<bool(KalshiWriteJob)> sys_send, sys_cancel;
+  std::function<ManualHealth()> sys_health;
+  std::function<void(const std::string&)> publish_lane;
+  Money daily_stop = 0;
+  GroupRegistry* groups = nullptr;
 };
 
 class ManualBook {

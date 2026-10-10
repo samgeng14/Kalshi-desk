@@ -607,8 +607,18 @@ void WebServer::Impl::routes() {
   svr.Post("/api/amend", post("POST /api/amend", [](const httplib::Request&, httplib::Response& res, const json&) {
     reply_err(res, "NOT_FOUND", "no such order");
   }));
-  svr.Post(R"(/api/lane/([A-Za-z0-9_-]+))", post("POST /api/lane/{id}", [](const httplib::Request& req, httplib::Response& res, const json&) {
-    reply_err(res, "NOT_FOUND", "no lane " + std::string(req.matches[1]));
+  svr.Post(R"(/api/lane/([A-Za-z0-9_-]+))", post("POST /api/lane/{id}", [this](const httplib::Request& req, httplib::Response& res, const json& b) {
+    auto p = std::make_shared<std::promise<LaneReply>>();
+    const bool posted = d.gw->post(LaneSet{std::string(req.matches[1]), b.at("on").get<bool>(), p});
+    if (!posted) return reply_err(res, "INTERNAL", "gw inbox full: lane switch not queued");
+    auto f = p->get_future();
+    Waiter w(waiting);
+    if (!w.ok) return reply_err(res, "INTERNAL", "lane switch queued; the stream's lane row shows the outcome");
+    if (f.wait_for(std::chrono::milliseconds(kGwWaitMs)) != std::future_status::ready)
+      return reply_err(res, "INTERNAL", "lane switch queued; gw has not answered within 50 ms: the stream's lane row shows the outcome");
+    const LaneReply r = f.get();
+    if (!r.code.empty()) return reply_err(res, r.code, r.msg);
+    reply_json(res, 200, json{{"ok", true}, {"lane", json::parse(r.lane)}});
   }));
   svr.Post("/api/release", post("POST /api/release", [](const httplib::Request&, httplib::Response& res, const json&) {
     reply_err(res, "UNKNOWN_MARKET", "no markets are listed in this stage");

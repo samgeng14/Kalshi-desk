@@ -37,6 +37,10 @@ struct DeskdConfig {
   // Manual orders to the (demo) venue. Off by default: gw still admits and answers, but every
   // order is refused RO and the header stays read-only until the operator turns it on.
   bool manual_orders = false;
+  // Systematic orders to the (demo) venue (send-k2, order groups, lanes). Off by default: the
+  // lanes show, Start stays refused (GROUPS) and no group is created until the operator turns
+  // it on. Independent of manual_orders.
+  bool systematic_orders = false;
   // from the command line only
   bool live = false;
 };

@@ -8,8 +8,10 @@
 namespace deskd {
 namespace {
 constexpr Qty kMaxQty = 1000000000; // same arithmetic bound as OrderLedger, not a budget
-bool cid_ok(const std::string& cid) {
-  if(cid.size()<6 || cid.size()>40 || cid.front()!='M') return false;
+// Manual cids start with M, Systematic's with S (contract: ownership survives a crash).
+bool cid_ok(const std::string& cid, Owner owner) {
+  const char own=owner==Owner::MAN ? 'M' : owner==Owner::SYS ? 'S' : 0;
+  if(!own || cid.size()<6 || cid.size()>40 || cid.front()!=own) return false;
   return std::all_of(cid.begin(),cid.end(),[](unsigned char ch) {
     return std::isalnum(ch) || ch=='-' || ch=='_';
   });
@@ -45,10 +47,10 @@ ManualAdmission admit_manual(const PlaceIntent& input,const ManualContext& c) {
   ManualAdmission a; a.intent=input;
   auto refuse=[&](const char* code,const std::string& text) { a.code=code; a.message=text; return a; };
   if(c.now_ms<=0 || c.now_ms>std::numeric_limits<std::int64_t>::max()-1800000 ||
-     !cid_ok(input.cid) || input.owner!=Owner::MAN || !input.lane.empty() ||
+     !cid_ok(input.cid,input.owner) || (input.owner==Owner::MAN)!=input.lane.empty() ||
      (input.side!=Side::BUY && input.side!=Side::SELL) ||
      (input.tif!=Tif::IOC && input.tif!=Tif::FOK && input.tif!=Tif::POST))
-    return refuse("BAD_REQUEST","invalid Manual intent");
+    return refuse("BAD_REQUEST","invalid intent");
   if(c.duplicate_cid) return refuse("DUP_CID","client order id already registered");
   if(input.venue!=Venue::K || !c.market || c.market->ticker!=input.ticker)
     return refuse("UNKNOWN_MARKET","no Kalshi market for this intent");
@@ -96,13 +98,17 @@ ManualAdmission admit_manual(const PlaceIntent& input,const ManualContext& c) {
     const bool relative=input.ttl_s!=0, absolute=input.exp_ms!=0;
     if(relative==absolute) return refuse("BAD_REQUEST","POST needs exactly one expiry");
     if(relative) {
-      if(input.ttl_s!=5 && input.ttl_s!=15 && input.ttl_s!=60 && input.ttl_s!=300 && input.ttl_s!=1800)
-        return refuse("BAD_REQUEST","unsupported Manual TTL");
+      // Systematic orders live at most 60 s (plan section 3), Manual's on the ticket's choices
+      if(input.owner==Owner::SYS ? input.ttl_s<5 || input.ttl_s>60 :
+         input.ttl_s!=5 && input.ttl_s!=15 && input.ttl_s!=60 && input.ttl_s!=300 && input.ttl_s!=1800)
+        return refuse("BAD_REQUEST","unsupported TTL");
       a.intent.exp_ms=(c.now_ms/1000+input.ttl_s)*1000;
     } else if(input.exp_ms%1000 || input.exp_ms<c.now_ms+5000) {
       return refuse("BAD_REQUEST","absolute expiry must be whole seconds and at least five seconds ahead");
     }
     if(a.intent.exp_ms>*m.close_ms) return refuse("BAD_REQUEST","expiry is later than the market close");
+    if(input.owner==Owner::SYS && a.intent.exp_ms>c.now_ms+61000)
+      return refuse("BAD_REQUEST","a Systematic order lives at most 60 s");
     a.intent.ttl_s=0;
   }
   if(c.position < -kMaxQty || c.position>kMaxQty || c.reducing_committed<0 ||

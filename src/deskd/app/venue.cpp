@@ -77,6 +77,8 @@ bool Deskd::init_venue(std::string* err) {
   pool_k1_ = std::make_unique<net::SparePool>(*factory_, pc);
   pc.name = "cx";
   pool_cx_ = std::make_unique<net::SparePool>(*factory_, pc);
+  pc.name = "k2";
+  pool_k2_ = std::make_unique<net::SparePool>(*factory_, pc);
   auto reply = [this](KalshiWriteReply r) {
     return gw_->post(ManualWrite{std::make_shared<const KalshiWriteReply>(std::move(r))});
   };
@@ -84,6 +86,9 @@ bool Deskd::init_venue(std::string* err) {
   man_sender_ = std::make_unique<KalshiSender>(KalshiSender::Role::MANUAL, q_man_, *pool_k1_, *signer_, kill_, reply, alert);
   cx_sender_ = std::make_unique<KalshiSender>(KalshiSender::Role::CANCEL, q_mcx_, *pool_cx_, *signer_, kill_, reply, alert);
   cx_sender_->set_stats(&cx_stats_);
+  cx_sender_->set_groups(&groups_);
+  // send-k2: Systematic's creates, cancels and order groups (never send-k1 or send-cx)
+  sys_sender_ = std::make_unique<KalshiSender>(KalshiSender::Role::SYSTEMATIC, q_sys_, *pool_k2_, *signer_, kill_, reply, alert);
   attach_manual();
   return true;
 }
@@ -119,6 +124,30 @@ void Deskd::attach_manual() {
     else if (!h.cancel_sender) h.why = stopped("send-cx", *cx_sender_);
     return h;
   };
+  if (cfg_.systematic_orders) {
+    p.sys_send = [this](KalshiWriteJob j) { return q_sys_.push(std::move(j)); };
+    p.sys_cancel = [this](KalshiWriteJob j) { return q_sys_.push(std::move(j), Lane::PRIORITY); };
+    p.sys_health = [this] {
+      ManualHealth h;
+      h.read_only = false;
+      const auto kx = feeds_.KX.view(), kxp = feeds_.KXP.view();
+      h.public_feed = kx.up && !kx.gap;
+      h.private_feed = kxp.up && !kxp.gap;
+      h.publisher = pub_->healthy();
+      h.manual_sender = h.cancel_sender = sys_sender_->healthy();
+      if (!h.publisher) h.why = "the page publisher dropped updates; restart deskd";
+      else if (!h.manual_sender)
+        h.why = "send-k2 stopped: " + sys_sender_->fail_reason() +
+                (kill_.active() ? "; re-arm KILL once its cancel-all is confirmed" : "; press KILL, then re-arm once its cancel-all is confirmed");
+      return h;
+    };
+    p.publish_lane = [this](const std::string& row) {
+      auto j = json::parse(row, nullptr, false);
+      if (!j.is_discarded()) pub_->post(PubData{"lane", std::move(j)});
+    };
+    p.daily_stop = cfg_.daily_stop;
+    p.groups = &groups_;
+  }
   p.send = [this](KalshiWriteJob j) { return q_man_.push(std::move(j)); };
   p.cancel = [this](KalshiWriteJob j) { return q_mcx_.push(std::move(j), Lane::PRIORITY); };
   p.publish = [this](const std::string& row) {
@@ -165,7 +194,14 @@ std::vector<PreflightRow> Deskd::venue_preflight() const {
           {"CASH",fresh && s->balance.available > 0,fresh ? "" : "account reconcile pending"},
           {"SHARD",fresh && !s->balances.empty(),fresh ? "" : "shard balances stale"},
           {"CLK",clock,clock ? "" : "venue clock uncertainty exceeds 500 ms"},
-          {"GROUPS",false,"Systematic groups are not enabled in this stage"}};
+          groups_row()};
+}
+
+PreflightRow Deskd::groups_row() const {
+  if (!cfg_.systematic_orders) return {"GROUPS", false, "Systematic orders are off (deskd.systematic_orders in config/desk.json)"};
+  std::string why;
+  const bool ok = gw_->groups_ready(&why);
+  return {"GROUPS", ok, why};
 }
 
 void Deskd::refresh_live() {

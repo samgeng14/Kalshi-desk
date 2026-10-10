@@ -64,7 +64,7 @@ DeskdConfig load_deskd_config(const std::string& path) {
   static const std::set<std::string> known = {"data_dir",    "lock_dir",    "ui_dir",
                                               "http_port",   "web_threads", "keepalive_s",
                                               "max_streams", "heartbeat_window_ms", "daily_stop_dollars",
-                                              "manual_orders"};
+                                              "manual_orders", "systematic_orders"};
   for (auto kv = d.begin(); kv != d.end(); ++kv) {
     if (kv.key() == "live")
       throw std::runtime_error(where + ": \"live\" is a command-line flag only (--live), never a file setting");
@@ -79,6 +79,7 @@ DeskdConfig load_deskd_config(const std::string& path) {
   take(d, "max_streams", c.max_streams, where);
   take(d, "heartbeat_window_ms", c.heartbeat_window_ms, where);
   take(d, "manual_orders", c.manual_orders, where);
+  take(d, "systematic_orders", c.systematic_orders, where);
   double stop = -1;
   take(d, "daily_stop_dollars", stop, where);
   if (stop >= 0) c.daily_stop = static_cast<Money>(std::llround(stop * 10000.0));

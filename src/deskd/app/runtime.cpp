@@ -132,10 +132,13 @@ bool Deskd::start(std::string* err) {
     pub_->alert(lvl, src, msg);
   };
   if (pool_k1_) { pool_k1_->start(); pool_cx_->start(); }
+  if (pool_k2_ && cfg_.systematic_orders) pool_k2_->start();
   by("send-k1")->start([this, alert](Worker& w) {
     if (man_sender_) man_sender_->run(w); else run_sender(w, q_k1_, k1_stats_, alert);
   });
-  by("send-k2")->start([this, alert](Worker& w) { run_sender(w, q_k2_, k2_stats_, alert); });
+  by("send-k2")->start([this, alert](Worker& w) {
+    if (sys_sender_ && cfg_.systematic_orders) sys_sender_->run(w); else run_sender(w, q_k2_, k2_stats_, alert);
+  });
   by("send-k3")->start([this, alert](Worker& w) { run_sender(w, q_k3_, k3_stats_, alert); });
   by("send-cx")->start([this, alert](Worker& w) {
     if (cx_sender_) cx_sender_->run(w); else run_cancel_sender(w, q_cx_, cx_stats_, kill_, alert);
@@ -168,6 +171,7 @@ void Deskd::stop() {
   for (auto& w : workers_) w->request_stop();
   for (auto& w : workers_) w->join();
   if (pool_k1_) { pool_k1_->stop(); pool_cx_->stop(); }
+  if (pool_k2_ && cfg_.systematic_orders) pool_k2_->stop();
   DLOG_INFO("stopped");
   flush_logger(500);
 }
@@ -207,6 +211,11 @@ json Deskd::status() const {
                 {"manual_cancels", gs.manual_cancels.load()},
                 {"private_applied", gs.private_applied.load()},
                 {"manual_orders", cfg_.manual_orders && man_sender_ != nullptr},
+                {"sys_sent", gs.sys_sent.load()},
+                {"sys_refused", gs.sys_refused.load()},
+                {"sys_cancels", gs.sys_cancels.load()},
+                {"group_jobs", gs.group_jobs.load()},
+                {"systematic_orders", cfg_.systematic_orders && sys_sender_ != nullptr},
                 {"ledger_healthy", gw_->ledger_why().empty()},
                 {"ledger_why", gw_->ledger_why()},
                 {"kills_seen", gs.kills_seen.load()}}},
@@ -227,7 +236,8 @@ json Deskd::status() const {
   result["pyth"] = pyth_ ? pyth_->status(now) : json(nullptr);
   result["fair"] = fair_ ? fair_->status() : json(nullptr);
   result["espn"] = espn_ ? espn_->status() : json(nullptr);
-  result["senders"] = {{"k1", sender(man_sender_.get())}, {"cx", sender(cx_sender_.get())}};
+  result["senders"] = {{"k1", sender(man_sender_.get())}, {"cx", sender(cx_sender_.get())},
+                       {"k2", sender(cfg_.systematic_orders ? sys_sender_.get() : nullptr)}};
   result["publisher_healthy"] = pub_->healthy();
   if (rest_) {
     const auto s = rest_->snapshot();
