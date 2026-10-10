@@ -152,6 +152,19 @@ void reconcile() {
   }
   state.set_reconcile_guard([] { return std::uint64_t{8}; }, [](std::uint64_t fence) { return fence == 8; });
   CHECK(state.refresh_once());
+  {   // the listing leaves out multivariate combos; a venue that refuses the filter gets the plain listing
+    kalshi::MarketsQuery mq; mq.limit=200; mq.status="open"; mq.mve_filter="exclude";
+    CHECK(kalshi::build_get_markets(mq).query.find("mve_filter=exclude")!=std::string::npos);
+    rest::State lister(factory,*endpoint,signer.get(),{},opts);
+    CHECK(lister.refresh_once() && lister.snapshot()->listing_ready);
+    fakex::HttpFault refuse; refuse.method="GET"; refuse.path="/markets";
+    refuse.kind=fakex::HttpFault::Kind::STATUS_AFTER_ACCEPT; refuse.status=400; fake.add_fault(refuse);
+    const auto before=fake.http_requests();
+    rest::State fallback(factory,*endpoint,signer.get(),{},opts);
+    CHECK(fallback.refresh_once() && fallback.snapshot()->listing_ready && !fallback.snapshot()->markets.empty());
+    CHECK(fallback.snapshot()->markets.size()==lister.snapshot()->markets.size());
+    CHECK(fake.http_requests()>before);
+  }
   opts.max_pages=1;
   rest::State capped(factory,*endpoint,signer.get(),{},opts);
   CHECK(!capped.refresh_once());

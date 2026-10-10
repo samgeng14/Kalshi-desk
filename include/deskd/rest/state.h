@@ -65,6 +65,9 @@ struct Options {
   // Public listing horizon. UI still admits only outcome dates T/T1; a longer close horizon
   // includes games whose published trading close is after their expected outcome date.
   int listing_horizon_days = 4;
+  // The public listing is the big read (a 1,000-market page measured 1.6 MB on demo). Smaller
+  // pages with their own deadline finish on a slow link; account reads keep timeout_ms.
+  int listing_page_size = 200, listing_timeout_ms = 15000;
 };
 
 class State {
@@ -87,7 +90,7 @@ class State {
 
  private:
   bool refresh(Worker* worker);
-  bool get(kalshi::WireRequest request, std::string* body, std::string* why, Worker* worker);
+  bool get(kalshi::WireRequest request, std::string* body, std::string* why, Worker* worker, int timeout_ms = 0);
   bool account(Snapshot& next, std::string* why, Worker* worker);
   bool listing(Snapshot& next, std::string* why, Worker* worker);
   void metadata(Snapshot& next, Worker* worker);
@@ -107,6 +110,7 @@ class State {
   ClockCheck clock_;
   std::unique_ptr<net::Conn> conn_;  // REST owner only; read connections can be reused
   std::int64_t started_ms_ = 0, last_listing_mono_ = 0;
+  bool mve_filter_refused_ = false;   // the venue answered 400 to mve_filter=exclude: listed without it
   struct CachedSeries { kalshi::SeriesRow row; std::int64_t fetched_ms = 0, attempted_ms = 0; };
   std::map<std::string,CachedSeries> series_;
 };

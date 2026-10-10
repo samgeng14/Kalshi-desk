@@ -197,19 +197,20 @@ void State::publish(Snapshot next) {
   if (callback_) callback_(result);
 }
 
-bool State::get(kalshi::WireRequest request, std::string* body, std::string* why, Worker* worker) {
+bool State::get(kalshi::WireRequest request, std::string* body, std::string* why, Worker* worker, int timeout_ms) {
+  if (timeout_ms <= 0) timeout_ms = options_.timeout_ms;
   if (worker && worker->stopping()) { *why = "REST worker stopping"; return false; }
   if (request.auth && !signer_) { *why = "demo signing key not loaded"; return false; }
   if (starts(request.path, kalshi::kBasePath)) request.path.replace(0, std::string(kalshi::kBasePath).size(), endpoint_.base_path);
   if (!conn_ || !conn_->usable()) {
-    conn_ = factory_.open(endpoint_, options_.timeout_ms, why);
+    conn_ = factory_.open(endpoint_, timeout_ms, why);
     if (!conn_) return false;
   }
   const auto auth = request.auth ? signer_->headers(now_ms(), request.method, request.path) : net::HeaderList{};
   if (request.auth && auth.size() != 3) { *why = "request signing failed"; return false; }
   const auto bytes = kalshi::request_bytes(request, endpoint_.host_header(), auth);
   const auto sent = now_ms(), mono = mono_ms();
-  const auto reply = net::exchange(*conn_, bytes, net::mono_us() + options_.timeout_ms * 1000LL, false,
+  const auto reply = net::exchange(*conn_, bytes, net::mono_us() + timeout_ms * 1000LL, false,
                                  [worker] { if (worker) worker->beat(); });
   const auto received = now_ms();
   if (!reply.reusable) conn_.reset();
@@ -291,16 +292,31 @@ bool State::account(Snapshot& next, std::string* why, Worker* worker) {
 }
 
 bool State::listing(Snapshot& next, std::string* why, Worker* worker) {
+  const int deadline = std::max(options_.timeout_ms, options_.listing_timeout_ms);
   auto fetch = [&](kalshi::WireRequest request, std::string* body, std::string* error) {
-    return get(std::move(request), body, error, worker);
+    return get(std::move(request), body, error, worker, deadline);
   };
   kalshi::MarketsQuery q;
-  q.limit = options_.page_size;
+  q.limit = std::max(1, std::min(options_.page_size, options_.listing_page_size));
   q.status = "open";
   q.max_close_ts = (now_ms() + std::max(2, options_.listing_horizon_days) * kDay) / 1000;
+  // Multivariate combo markets (KXMVE...) are most of an open listing and not traded here; a
+  // position or order in one is still fetched by ticker below.
+  q.mve_filter = mve_filter_refused_ ? "" : "exclude";
   std::vector<kalshi::MarketRow> markets;
-  if (!pages(&markets, [&](const std::string& cursor) { q.cursor = cursor; return kalshi::build_get_markets(q); },
-             kalshi::parse_markets, fetch, options_.max_pages, why)) return false;
+  auto list = [&] {
+    markets.clear();
+    return pages(&markets, [&](const std::string& cursor) { q.cursor = cursor; return kalshi::build_get_markets(q); },
+                 kalshi::parse_markets, fetch, options_.max_pages, why);
+  };
+  if (!list()) {
+    if (mve_filter_refused_ || why->find(": HTTP 400") == std::string::npos) return false;
+    mve_filter_refused_ = true;   // the venue refused the combination: list everything instead
+    DLOG_WARN("Kalshi refused mve_filter=exclude on the market listing; listing without it");
+    q.mve_filter.clear();
+    q.cursor.clear();
+    if (!list()) return false;
+  }
   std::map<std::string, kalshi::MarketRow> rows;
   for (auto& market : markets) rows[market.ticker] = std::move(market);
   // A position/order can outlive the public OPEN listing. Fetch its actual status rather than
