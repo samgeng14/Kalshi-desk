@@ -80,8 +80,14 @@ class Gateway {
     std::set<std::string> lanes_on;
     std::map<std::string, SysOrder> orders;           // working ones, and those ended in the last 2 minutes
     std::map<std::string, Qty> positions;             // "lane|ticker" -> the lane's signed position
+    // the header's Systematic numbers (contract hdr.day.sys, hdr.sys.K, hdr.cost), micro-dollars:
+    // its day (real net of fees + unrl at the mids), its fees today, its used worst case, the 70%
+    // ceiling and the effective ceiling min(ceiling, used + free)
+    std::int64_t day = 0, fees = 0, used = 0, ceiling = 0, eff = 0;
     std::int64_t ts_ms = 0;
   };
+  // The daily cost budget of the IOC-style lanes (contract hdr.cost.budget): past it they are CAPPED.
+  static constexpr Money kCostBudget = 5 * 10000;
   std::shared_ptr<const SysView> sys_view() const { return std::atomic_load(&sys_view_); }
 
   // queues m in its lane (lane_of); false when that lane is full: dropped, gap marked
@@ -159,6 +165,9 @@ class Gateway {
   std::set<int> shards() const;
   std::optional<Px> mark(const std::string& ticker) const;
   std::string lane_row(const std::string& id) const;
+  // Systematic's used worst case (open positions + working reservations) and its ceilings
+  void sys_money(std::int64_t* used, std::int64_t* ceiling, std::int64_t* eff) const;   // micro-dollars
+  std::int64_t sys_fees() const;
   void sync_snapshot();
 };
 

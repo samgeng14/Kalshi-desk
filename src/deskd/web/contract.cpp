@@ -152,6 +152,16 @@ json hdr_json(const HdrInputs& in) {
       {"preflight", preflight_json(in.preflight)},
       {"lat", {{"kx_lag_ms", nullptr}, {"pm_lag_ms", nullptr}, {"gw_ack_ms", nullptr}, {"clk_off_ms", nullptr}}}};
   if (in.cash_k.is_object()) result["cash"]["K"] = in.cash_k;
+  if (in.sys) {
+    // day_man arrives as the account's whole day; Systematic's part is gw's lanes
+    const Money sys = in.sys->day;
+    result["day"] = {{"total", money_str(in.day_man)}, {"sys", money_str(sys)}, {"man", money_str(in.day_man - sys)},
+                     {"lip", zero}};
+    const Money left = in.daily_stop + std::min<Money>(0, sys);
+    result["stop"] = {{"left", money_str(left)}, {"limit", money_str(in.daily_stop)}, {"hit", left <= 0}};
+    result["sys"]["K"] = {{"used", money_str(in.sys->used)}, {"ceiling", money_str(in.sys->ceiling)}, {"eff", money_str(in.sys->eff)}};
+    result["cost"] = {{"used", money_str(in.sys->fees)}, {"budget", money_str(in.sys->budget)}};
+  }
   if (in.kx_lag_ms) result["lat"]["kx_lag_ms"] = *in.kx_lag_ms;
   if (in.clk_off_ms) result["lat"]["clk_off_ms"] = *in.clk_off_ms;
   if (in.gw_ack_ms) result["lat"]["gw_ack_ms"] = *in.gw_ack_ms;

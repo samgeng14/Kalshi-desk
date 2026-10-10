@@ -437,6 +437,10 @@ void systematic_maker() {
   // the street sells 10 into our bid
   r.venue.f->with_engine([&](fakex::Engine& e,std::int64_t now) { CHECK(e.street_take(W,fakex::Side::ASK,4100,1000,now)==1000); });
   CHECK(r.until([&]{ const auto v=r.d->gw().sys_view(); return v && v->positions.count("M1|"+W) && v->positions.at("M1|"+W)==1000; }));
+  {   // the header's Systematic numbers: long 10 at 0.41 holds $4.10 at worst, under a 70% ceiling
+    const auto v=r.d->gw().sys_view();
+    CHECK(v->used>=4100000 && v->ceiling>0 && v->eff>=v->used);
+  }
   // long 10: the bid stays at 0.41 (its cap is now 0.41), the ask too (its floor 0.43); both re-posted
   CHECK(r.until([&]{ return has(fakex::Side::BID,4100,1000) && has(fakex::Side::ASK,4500,1000); },15000));
   CHECK(r.d->status()["maker"]["places"].get<int>()>=3);

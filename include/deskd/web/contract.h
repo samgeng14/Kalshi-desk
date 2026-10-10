@@ -63,6 +63,12 @@ struct HdrInputs {
   // Manual's day (realized today, net of fees, plus open positions at the mid) and the open
   // worst case plus working reservations; zero when unknown. No Systematic or LIP yet.
   Money day_man = 0, risk = 0;
+  // Systematic's part (gw's lanes), when Systematic is attached: its day (in day_man's total, so
+  // day.man = the account's day - day.sys), its fees today and cost budget, and hdr.sys.K.
+  struct Sys {
+    Money day = 0, fees = 0, budget = 0, used = 0, ceiling = 0, eff = 0;
+  };
+  std::optional<Sys> sys;
 };
 nlohmann::json hdr_json(const HdrInputs& in);
 

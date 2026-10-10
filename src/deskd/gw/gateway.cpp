@@ -468,23 +468,38 @@ std::optional<Px> Gateway::mark(const std::string& ticker) const {
   return (b->bids.front().px + b->asks.front().px) / 2;
 }
 
+void Gateway::sys_money(Micros* used, Micros* ceiling, Micros* eff) const {
+  Micros u = 0;
+  for (const auto& [cid, o] : manual_->ledger().orders()) if (o.intent.owner == Owner::SYS) u += o.reservation();
+  for (const auto& x : sys_->lanes()) u += sys_->open_worst(x.id);
+  // contract hdr.sys: ceiling = 0.70 x (cash + open positions' value), eff = min(ceiling, used + free)
+  Micros c = 0, e = 0;
+  if (snapshot_seen_) {
+    const Micros equity = (snapshot_seen_->balance.available + snapshot_seen_->balance.portfolio_value.value_or(0)) * 100;
+    c = equity * 7 / 10;
+    e = std::min<Micros>(c, u + manual_->venue_free());
+  }
+  if (used) *used = u;
+  if (ceiling) *ceiling = c;
+  if (eff) *eff = e;
+}
+
+Micros Gateway::sys_fees() const {
+  Micros f = 0;
+  for (const auto& l : sys_->lanes()) if (const auto* d = sys_->day(l.id)) f += d->fees;
+  return f;
+}
+
 std::string Gateway::lane_row(const std::string& id) const {
   const auto* l = sys_->lane(id);
   if (!l) return "";
-  Micros reserved = 0, used_all = 0;
+  Micros reserved = 0, used_all = 0, eff = 0;
   int working = 0;
-  for (const auto& [cid, o] : manual_->ledger().orders()) {
-    if (o.intent.owner != Owner::SYS) continue;
-    if (!o.terminal() && o.intent.lane == id) { reserved += o.reservation(); ++working; }
-    used_all += o.reservation();
-  }
-  for (const auto& x : sys_->lanes()) used_all += sys_->open_worst(x.id);
-  // the effective Systematic ceiling (contract hdr.sys): min(70% of equity, used + free)
-  Micros eff = 0;
-  if (snapshot_seen_) {
-    const Micros equity = (snapshot_seen_->balance.available + snapshot_seen_->balance.portfolio_value.value_or(0)) * 100;
-    eff = std::min<Micros>(equity * 7 / 10, used_all + manual_->venue_free());
-  }
+  for (const auto& [cid, o] : manual_->ledger().orders())
+    if (o.intent.owner == Owner::SYS && !o.terminal() && o.intent.lane == id) { reserved += o.reservation(); ++working; }
+  sys_money(&used_all, nullptr, &eff);
+  // an IOC-style lane past the day's cost budget takes nothing more (contract: CAPPED)
+  if (l->style == "IOC" && sys_fees() >= kCostBudget * 100) eff = used_all;
   std::string blocked;
   if (sys_->on(id) && own_.state == RunState::RUN)
     for (const int shard : shards()) {
@@ -524,6 +539,8 @@ void Gateway::place_sys(PlaceIntent& p) {
   // the same side, may not grow past the lane's limit.
   Qty pos = 0, pending = 0;
   for (const auto& l : sys_->lanes()) pos += sys_->position(l.id, p.ticker);
+  if (lane->style == "IOC" && sys_fees() >= kCostBudget * 100)
+    return refuse("SYS_CEILING", "the IOC lanes' daily cost budget " + money_str(kCostBudget) + " is spent");
   Micros reserved_lane = 0, used_all = 0;
   for (const auto& [cid, o] : manual_->ledger().orders()) {
     if (o.intent.owner != Owner::SYS) continue;
@@ -750,6 +767,9 @@ void Gateway::sys_tick(std::int64_t now) {
     for (const auto& l : sys_->lanes())
       if (const auto* d = sys_->day(l.id))
         for (const auto& [tk, inv] : d->inv) if (inv.pos) v->positions[l.id + "|" + tk] = inv.pos;
+    v->day = sys_->day_total(mk);
+    v->fees = sys_fees();
+    sys_money(&v->used, &v->ceiling, &v->eff);
     v->ts_ms = now;
     std::atomic_store(&sys_view_, std::shared_ptr<const SysView>(std::move(v)));
     sys_dirty_ = false;

@@ -221,6 +221,17 @@ HdrInputs Deskd::header() const {
   const auto total = parse_money(h.cash_k.value("total", std::string("0.0000"))).value_or(0);
   const auto free = parse_money(h.cash_k.value("free", std::string("0.0000"))).value_or(0);
   h.risk = maxl + std::max<Money>(0, total - free);
+  if (cfg_.systematic_orders)
+    if (const auto v = gw_->sys_view()) {
+      HdrInputs::Sys sys;
+      sys.day = v->day / 100;
+      sys.fees = v->fees / 100;
+      sys.budget = Gateway::kCostBudget;
+      sys.used = v->used / 100;
+      sys.ceiling = v->ceiling / 100;
+      sys.eff = v->eff / 100;
+      h.sys = sys;
+    }
   return h;
 }
 

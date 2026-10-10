@@ -228,6 +228,18 @@ void cash_projection(json& capture) {
   CHECK(cash["total"]=="99.0000" && cash["free"]=="97.0000");
   HdrInputs hdr; hdr.cash_k=cash;
   capture["events"].push_back({{"type","hdr"},{"seq",1},{"ts_ms",now_ms()},{"data",hdr_json(hdr)}});
+  {   // Systematic's part: day.man is the account's day less day.sys; the stop counts sys only
+    HdrInputs h=hdr; h.daily_stop=300000; h.day_man=-50000;
+    h.sys=HdrInputs::Sys{-120000,7000,50000,45000,690000,600000};
+    const auto j=hdr_json(h);
+    CHECK(j["day"]["total"]=="-5.0000" && j["day"]["sys"]=="-12.0000" && j["day"]["man"]=="7.0000");
+    CHECK(j["stop"]["left"]=="18.0000" && j["stop"]["limit"]=="30.0000" && j["stop"]["hit"]==false);
+    CHECK(j["sys"]["K"]==json({{"used","4.5000"},{"ceiling","69.0000"},{"eff","60.0000"}}));
+    CHECK(j["cost"]==json({{"used","0.7000"},{"budget","5.0000"}}));
+    h.sys->day=-310000;
+    CHECK(hdr_json(h)["stop"]["hit"]==true && hdr_json(h)["stop"]["left"]=="-1.0000");
+    capture["events"].push_back({{"type","hdr"},{"seq",2},{"ts_ms",now_ms()},{"data",hdr_json(h)}});
+  }
   // Equivalent BUY orders against NO inventory allocate the reducing room highest first.
   s.positions[0].position=-500; s.orders[0].side=s.orders[1].side=kalshi::BookSide::BID;
   cash=rest_cash_json(s,false); CHECK(cash["shards"][0]["cash"]=="94.7500");
