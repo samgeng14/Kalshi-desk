@@ -273,6 +273,13 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang" AND NOT CMAKE_CXX_COMPILE_OPTIONS
   endif()
 endif()
 
+# The plan's soak runs under ThreadSanitizer (plan section 8): configure a separate build with
+# -DDESKD_TSAN=ON; every target, the fake exchange included, is instrumented.
+option(DESKD_TSAN "build deskd and its tests under ThreadSanitizer" OFF)
+if(DESKD_TSAN)
+  add_compile_options(-fsanitize=thread -g -O1)
+  add_link_options(-fsanitize=thread)
+endif()
 add_library(deskd_flags INTERFACE)
 target_include_directories(deskd_flags INTERFACE include ${CMAKE_BINARY_DIR}/generated)
 target_include_directories(deskd_flags SYSTEM INTERFACE third_party)
@@ -456,6 +463,13 @@ foreach(t net wire md rest private sender manual_gw runtime_manual pyth)
   target_precompile_headers(deskd-test-${t} REUSE_FROM deskd_core)
   add_test(NAME deskd-${t} COMMAND deskd-test-${t})
 endforeach()
+# The Systematic soak (tests/deskd/soak.cpp): 60 s under ctest; DESKD_SOAK_SECONDS=14400 for the
+# plan's 4 hours, in a build configured with -DDESKD_TSAN=ON.
+add_executable(deskd-soak tests/deskd/soak.cpp)
+target_link_libraries(deskd-soak PRIVATE deskd_core fake_kalshi)
+target_precompile_headers(deskd-soak REUSE_FROM deskd_core)
+add_test(NAME deskd-soak COMMAND deskd-soak)
+set_tests_properties(deskd-soak PROPERTIES TIMEOUT 300)
 
 # tools/kalshi_demo_probe: signed reads (and, asked for, one tiny post-only order and its cancel)
 # against Kalshi's DEMO exchange through deskd's own net/ and signer, with latency figures. Not a
