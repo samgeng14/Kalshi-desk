@@ -763,10 +763,40 @@ void takeover() {
   auto stop=r.post("/api/stop",json::object());
   CHECK(stop && stop->status==200);
 }
+// SHARD: a lane that is on whose market is listed on a shard without cash fails the preflight,
+// naming the shard, its cash and the market; Start is refused until it has cash.
+void shard_preflight() {
+  const std::string S1="KXRUNTIME-26OCT10-S1";
+  Run r(false,[&](fakex::Engine& e,std::int64_t now) {
+    auto spec=fx::spec(S1,1); spec.close_ms=(now/1000+3600)*1000; e.add_market(spec,now);   // shard 1: $0
+  },true);
+  CHECK(r.ready());
+  auto lane=r.post("/api/lane/M2",{{"on",true}});
+  CHECK(lane && lane->status==200);
+  json row;
+  CHECK(r.until([&]{
+    auto st=r.post("/api/start",json::object());
+    if(!st || st->status==200) return false;
+    const auto j=json::parse(st->body);
+    // the rows of a Start just after launch can predate the first reads ("stale"): the one that
+    // counts names the shard
+    for(const auto& x:j.value("preflight",json::array()))
+      if(x["id"]=="SHARD" && x["ok"]==false && x["why"].get<std::string>().rfind("S1 ",0)==0) { row=x; return true; }
+    return false; },15000));
+  CHECK(row.value("why",std::string())=="S1 $0.0000 (M2 "+S1+")");
+  // with cash on shard 1 the row passes (Start then goes once every other row does)
+  r.venue.f->with_engine([](fakex::Engine& e,std::int64_t now) { e.set_cash(0,1,100*fx::D,now); });
+  CHECK(r.until([&]{
+    auto st=r.post("/api/start",json::object());
+    if(!st) return false;
+    if(st->status==200) return true;
+    for(const auto& x:json::parse(st->body).value("preflight",json::array())) if(x["id"]=="SHARD") return x["ok"]==true;
+    return false; },20000));
+}
 }  // namespace
 
 int main() {
   std::signal(SIGPIPE,SIG_IGN);
-  off_by_default(); orders_cancel_kill(); stop_reasons(); financial_fair(); systematic(); systematic_maker(); systematic_band(); systematic_races(); systematic_group_trigger(); systematic_book(); takeover();
+  off_by_default(); orders_cancel_kill(); stop_reasons(); financial_fair(); systematic(); systematic_maker(); systematic_band(); systematic_races(); systematic_group_trigger(); systematic_book(); takeover(); shard_preflight();
   return finish("deskd-runtime-manual");
 }

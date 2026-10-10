@@ -169,6 +169,7 @@ class Deskd {
   nlohmann::json watch(const nlohmann::json& request);
   // a market's mkt row: rest::market_json with man (Manual took it over) from gw
   nlohmann::json mkt_row(const kalshi::MarketRow& m, bool pin, bool live) const;
+  PreflightRow shard_row(const rest::Snapshot& s, bool fresh) const;
   void publish_market(const std::string& ticker);
   HdrInputs header() const;
   std::vector<PreflightRow> venue_preflight() const;

@@ -283,9 +283,38 @@ std::vector<PreflightRow> Deskd::venue_preflight() const {
   const bool clock = s->clock.post_trusted && now_ms() - s->clock.measured_ms < 30000;
   return {{"KEY",signer_ != nullptr,signer_ ? "" : "no demo key"},
           {"CASH",fresh && s->balance.available > 0,fresh ? "" : "account reconcile pending"},
-          {"SHARD",fresh && !s->balances.empty(),fresh ? "" : "shard balances stale"},
+          shard_row(*s,fresh),
           {"CLK",clock,clock ? "" : "venue clock uncertainty exceeds 500 ms"},
           groups_row()};
+}
+
+// SHARD (contract: every shard Systematic uses has cash): each lane that is on, over the open
+// markets of its series, needs a quote's worth of free cash on the shard each one is listed on.
+// Orders never move cash between shards, and a lane on a $0 shard was refused SHARD_CASH quote
+// after quote with nothing on the page but Sent 0 (conformance review, 2026-10-10).
+PreflightRow Deskd::shard_row(const rest::Snapshot& s, bool fresh) const {
+  if (!fresh) return {"SHARD", false, "shard balances stale"};
+  if (s.balances.empty()) return {"SHARD", false, "no shard balances"};
+  const auto v = cfg_.systematic_orders ? gw_->sys_view() : nullptr;
+  if (!v) return {"SHARD", true, ""};
+  constexpr Money kQuote = 5 * 10000;   // a 10-lot at 0.50, or the band's 5 at 0.97
+  const std::map<std::string, std::vector<std::string>> series = {{"M1", cfg_.lip_series}, {"M2", cfg_.band_series}};
+  const auto now = now_ms();
+  for (const auto& lane : v->lanes_on) {
+    const auto it = series.find(lane);
+    if (it == series.end()) continue;
+    for (const auto& [tk, m] : s.markets) {
+      const bool mine = std::any_of(it->second.begin(), it->second.end(), [&](const std::string& x) {
+        return tk.size() > x.size() && tk.compare(0, x.size(), x) == 0 && tk[x.size()] == '-';
+      });
+      if (!mine || !m.exchange_index || (m.status != "active" && m.status != "open") || !m.close_ms || *m.close_ms <= now) continue;
+      const auto b = s.balances.find(*m.exchange_index);
+      const Money cash = b == s.balances.end() ? 0 : b->second;
+      if (cash < kQuote)
+        return {"SHARD", false, "S" + std::to_string(*m.exchange_index) + " $" + money_str(cash) + " (" + lane + " " + tk + ")"};
+    }
+  }
+  return {"SHARD", true, ""};
 }
 
 PreflightRow Deskd::groups_row() const {
