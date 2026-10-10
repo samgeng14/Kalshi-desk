@@ -260,8 +260,10 @@ void KalshiMd::run(Worker& self) {
     std::int64_t ping_sent = 0; std::string ping_payload;
     std::deque<int> lags; int lag = -1;
     bool changed = false;
+    std::int64_t last_idle = 0;
     while (connected && !self.stopping()) {
       self.beat();
+      if (idle_ && mono_ms() - last_idle >= 250) { last_idle = mono_ms(); idle_(); }
       { std::lock_guard<std::mutex> lock(mutex_); changed = version_ != version; }
       if (changed) { reason = "watch list changed"; break; }
       const auto mono = mono_ms();

@@ -3,6 +3,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <nlohmann/json.hpp>
 
 namespace deskd::kalshi {
@@ -284,6 +285,22 @@ MarketRow read_market(Rd& r) {
   m.expected_expiration_ms = r.otime("expected_expiration_time");
   m.expiration_ms = r.otime("expiration_time");
   m.fractional = r.obool("fractional_trading_enabled");
+  m.strike_type = r.str_or_empty("strike_type");
+  auto strike = [&r](const char* key) -> std::optional<double> {
+    const json* v = r.at(key);
+    if (!v) return std::nullopt;
+    double d = 0;
+    if (v->is_number()) d = v->get<double>();
+    else if (v->is_string()) {
+      const auto& s = v->get_ref<const std::string&>();
+      char* end = nullptr;
+      d = std::strtod(s.c_str(), &end);
+      if (s.empty() || end != s.c_str() + s.size()) return std::nullopt;
+    } else return std::nullopt;
+    return std::isfinite(d) ? std::optional<double>(d) : std::nullopt;
+  };
+  m.floor_strike = strike("floor_strike");
+  m.cap_strike = strike("cap_strike");
   if (const json* pr = r.at("price_ranges")) {
     if (!pr->is_array()) {
       r.fail("price_ranges", "not an array");

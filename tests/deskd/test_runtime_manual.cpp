@@ -66,13 +66,14 @@ struct Run {
   fx::Venue venue;
   TempDir dir;
   std::unique_ptr<Deskd> d;
-  explicit Run(bool manual_orders) {
+  explicit Run(bool manual_orders,std::function<void(fakex::Engine&,std::int64_t)> more={}) {
     CHECK(venue.ok);
-    venue.f->with_engine([](fakex::Engine& e,std::int64_t now) {
+    venue.f->with_engine([&](fakex::Engine& e,std::int64_t now) {
       auto spec=fx::spec(TK,0); spec.close_ms=(now/1000+3600)*1000;
       e.add_market(spec,now);
       e.street_add(TK,false,4000,500,now);   // YES bid 0.40 x5
       e.street_add(TK,true,5800,300,now);    // NO bid 0.58 x3: YES ask 0.42 x3
+      if(more) more(e,now);
     });
     const std::string key=dir.path+"/test-key.pem";
     { std::ofstream f(key); f<<pem; }
@@ -85,6 +86,7 @@ struct Run {
     const std::string base="https://127.0.0.1:"+std::to_string(venue.port());
     o.rest_url=base+"/trade-api/v2"; o.ws_url=base+"/trade-api/ws/v2"; o.factory=fx::trust_test_ca();
     o.rest_poll_ms=700; o.rest_gap_ms=0;   // reconciles (and clock samples at varied sub-second phases) come quickly
+    o.fair_watch_since_ms=now_ms()-600000;   // a window opening now is one the fair can check
     std::string err;
     auto lock=AccountLock::acquire(dir.path,"demo","deskd-test-runtime",false,&err);
     d=std::make_unique<Deskd>(c,std::move(lock),o);
@@ -250,10 +252,58 @@ void stop_reasons() {
   CHECK(msg.rfind("order ledger stopped: Mrt-hard-1: ",0)==0 && msg.find("restart deskd")!=std::string::npos);
   CHECK(!r.venue.has_cid("Mrt-after-1"));
 }
+// The 15-minute financial fair end to end: an hour of pyth_value history, a natural-gas window
+// whose strike is the candle close the feed saw at its open, and the ladder carries the model's
+// fair; a window whose strike the feed did not reproduce gets none.
+void financial_fair() {
+  const std::string NG="Commodities.Index.NATGAS/USD";
+  const std::string W="KXNATGAS15M-26OCT101200-00", BAD="KXNATGAS15M-26OCT101215-15";
+  const auto open=now_ms()+6000;   // after deskd is up and its feed has the history
+  double s=3.0; std::uint64_t x=1234567;
+  std::vector<std::pair<std::int64_t,double>> ticks;
+  for(int i=3600;i>=1;--i) {   // a walk, one value a second, ending a second before the open
+    x=x*6364136223846793005ULL+1442695040888963407ULL;
+    s*=1+((static_cast<double>(x>>11)/9007199254740992.0)-0.5)*0.0006;
+    ticks.emplace_back(open-i*1000LL,std::round(s*1e5)/1e5);
+  }
+  const double strike=ticks.back().second;
+  Run r(false,[&](fakex::Engine& e,std::int64_t now) {
+    auto spec=fx::spec(W,0); spec.close_ms=open+900000; spec.open_ms=open;
+    spec.strike_type="greater_or_equal"; spec.floor_strike=strike;
+    e.add_market(spec,now);
+    auto bad=spec; bad.ticker=BAD; bad.floor_strike=strike+0.001; e.add_market(bad,now);
+    e.street_add(W,false,4000,500,now); e.street_add(W,true,5500,500,now);
+  });
+  CHECK(r.until([&]{ return r.d->status()["pyth"]["up"]==true; },10000));
+  for(const auto& [t,v]:ticks) r.venue.f->pyth(NG,v,t);
+  CHECK(r.until([&]{ return r.d->status()["rest"]["ready"]==true; },15000));
+  CHECK(r.until([&]{ return now_ms()>open+500; },10000));
+  Stream st(r.d->port(),"rt-fair-1");
+  CHECK(r.until([&]{ return !st.envelopes().empty(); }));
+  auto w=r.post("/api/watch",{{"v","K"},{"tk",W},{"on",true}});
+  if(!w || w->status!=200) std::fprintf(stderr,"watch: %s\n",w?w->body.c_str():"no reply");
+  CHECK(w && w->status==200);
+  auto sub=r.post("/api/subscribe",{{"sid","rt-fair-1"},{"ladders",{{{"v","K"},{"tk",W}}}},{"tops",json::array()}});
+  CHECK(sub && sub->status==200);
+  std::atomic<bool> stop{false};
+  std::thread live([&]{ while(!stop) { r.venue.f->pyth(NG,strike,now_ms()); std::this_thread::sleep_for(std::chrono::milliseconds(300)); } });
+  auto fair_on_ladder=[&]{
+    for(const auto& e:of(st,"book")) if(e["data"]["tk"]==W && e["data"]["ref"]["fair"].is_string()) return true;
+    return false;
+  };
+  const bool shown=r.until(fair_on_ladder,20000);
+  stop=true; live.join();
+  const auto fs=r.d->status()["fair"];
+  if(!shown) std::fprintf(stderr,"fair: %s\npyth: %s\n",fs.dump().c_str(),r.d->status()["pyth"].dump().c_str());
+  CHECK(shown);
+  CHECK(fs["replication"]["natgas"]["checked"]==2 && fs["replication"]["natgas"]["matched"]==1);
+  CHECK(fs["markets"][W]["fair"].is_string() && fs["markets"][BAD]["fair"].is_null());
+  CHECK(r.d->status()["pyth"]["underlyings"][NG]["messages"].get<int>()>=3600);
+}
 }  // namespace
 
 int main() {
   std::signal(SIGPIPE,SIG_IGN);
-  off_by_default(); orders_cancel_kill(); stop_reasons();
+  off_by_default(); orders_cancel_kill(); stop_reasons(); financial_fair();
   return finish("deskd-runtime-manual");
 }

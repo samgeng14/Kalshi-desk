@@ -14,6 +14,7 @@
 #include "deskd/md/kalshi_md.h"
 #include "deskd/priv/kalshi_private.h"
 #include "deskd/ref/pyth.h"
+#include "deskd/strat/fair.h"
 
 namespace deskd {
 
@@ -133,7 +134,9 @@ bool Deskd::start(std::string* err) {
   by("send-cx")->start([this, alert](Worker& w) {
     if (cx_sender_) cx_sender_->run(w); else run_cancel_sender(w, q_cx_, cx_stats_, kill_, alert);
   });
-  by("strat")->start([](Worker& w) { run_strat(w); });
+  by("strat")->start([this](Worker& w) {
+    run_strat(w, [this] { if (fair_ && rest_) fair_->step(*rest_->snapshot(), now_ms()); });
+  });
   by("store")->start([this](Worker& w) { store_.run(w); });
   by("pub")->start([this](Worker& w) { pub_->run(w); });
   by("ops")->start([this](Worker& w) { ops_->run(w); });
@@ -216,6 +219,7 @@ json Deskd::status() const {
     return json{{"healthy", s->healthy()}, {"why", s->fail_reason()}, {"attempted", s->attempted()}};
   };
   result["pyth"] = pyth_ ? pyth_->status(now) : json(nullptr);
+  result["fair"] = fair_ ? fair_->status() : json(nullptr);
   result["senders"] = {{"k1", sender(man_sender_.get())}, {"cx", sender(cx_sender_.get())}};
   result["publisher_healthy"] = pub_->healthy();
   if (rest_) {

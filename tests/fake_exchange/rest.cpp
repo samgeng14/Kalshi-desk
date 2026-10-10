@@ -587,6 +587,10 @@ json market_json(const Engine& e, const Market& m) {
          {"fractional_trading_enabled", m.spec.fractional},
          {"price_ranges", ranges}};
   if (m.spec.close_ms > 0) j["close_time"] = rfc3339(m.spec.close_ms);
+  if (m.spec.open_ms > 0) j["open_time"] = rfc3339(m.spec.open_ms);
+  if (!m.spec.strike_type.empty()) j["strike_type"] = m.spec.strike_type;
+  if (m.spec.floor_strike) j["floor_strike"] = *m.spec.floor_strike;
+  if (m.spec.cap_strike) j["cap_strike"] = *m.spec.cap_strike;
   return j;
 }
 

@@ -121,6 +121,11 @@ struct MarketSpec {
   int fee_mult_milli = 1000;
   std::int64_t close_ms = 0;    // 0: never closes on its own
   bool fractional = false;      // fractional_trading_enabled (listed only; the engine does not refuse)
+  std::int64_t open_ms = 0;     // open_time; 0: left out
+  // strike_type, floor_strike, cap_strike as listed ("" / nullopt: left out); the engine never
+  // settles on them
+  std::string strike_type;
+  std::optional<double> floor_strike, cap_strike;
 };
 
 enum class Side { BID, ASK };  // the order's book side, YES terms

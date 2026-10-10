@@ -51,6 +51,7 @@ class KalshiSigner;
 class KalshiMd;
 class KalshiPrivate;
 class KalshiPyth;
+class FinancialFair;
 struct MdBook;
 namespace rest { class State; struct Snapshot; }
 
@@ -62,6 +63,9 @@ struct RuntimeOptions {
   net::FactoryOptions factory;
   int rest_poll_ms = 0;   // 0 = the REST owner's default; tests shorten it
   int rest_gap_ms = -1;   // -1 = the REST owner's default request spacing
+  // When the financial fair began watching (strat/fair.h checks only windows that opened a
+  // minute after it); 0 = deskd's start. Tests set it earlier.
+  std::int64_t fair_watch_since_ms = 0;
 };
 
 class Deskd {
@@ -105,6 +109,7 @@ class Deskd {
   std::unique_ptr<KalshiMd> md_;
   std::unique_ptr<KalshiPrivate> private_;
   std::unique_ptr<KalshiPyth> pyth_;
+  std::unique_ptr<FinancialFair> fair_;
   std::string key_error_;
   mutable std::mutex live_mu_;
   std::set<std::string> pins_, live_;
@@ -127,6 +132,8 @@ class Deskd {
   };
   std::map<std::string, MdBook> md_last_;
   std::map<std::string, Tape> tape_;
+  std::map<std::string, std::pair<Px, Px>> ref_sent_;   // md thread: the fair and sd last published
+  void republish_refs();
   std::shared_ptr<const DayPnl> day_;   // std::atomic_load / std::atomic_store; rest thread writes
   std::set<std::string> fills_sent_;    // rest thread only
   void on_trade(const MdTrade& t);

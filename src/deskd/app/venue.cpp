@@ -8,6 +8,7 @@
 #include "deskd/rest/state.h"
 #include "deskd/priv/kalshi_private.h"
 #include "deskd/ref/pyth.h"
+#include "deskd/strat/fair.h"
 
 namespace deskd {
 using json = nlohmann::json;
@@ -42,6 +43,11 @@ bool Deskd::init_venue(std::string* err) {
         return gw_->post(PrivateMsg{std::make_shared<const PrivateEvent>(e)});
       },[this] { rest_->request_refresh(); });
   pyth_ = std::make_unique<KalshiPyth>(*we, *factory_, *signer_, feeds_.PYTH);
+  fair_ = std::make_unique<FinancialFair>(
+      [this](const std::vector<std::string>& patterns) { return pyth_->symbol_for(patterns); },
+      [this](const std::string& symbol, std::int64_t since, std::int64_t now) { return pyth_->view(symbol, since, now); },
+      options_.fair_watch_since_ms ? options_.fair_watch_since_ms : now_ms());
+  md_->set_idle_callback([this] { republish_refs(); });
   rest_->set_reconcile_guard([this] { return private_->fence(); },
                             [this](std::uint64_t fence) { return private_->reconcile(fence); });
   // The write path: send-k1 (Manual) and send-cx (cancels and KILL), each with its own pool.
@@ -285,11 +291,37 @@ void Deskd::publish_book(const std::string& ticker) {
     if (m != s->markets.end() && m->second.volume_24h) vol = *m->second.volume_24h;
   }
   vol += tape.since_listing;
+  // The model's fair and its sd, where a model stands behind one (strat/fair.h); never a placeholder.
+  json ref = {{"fair",nullptr},{"sd",nullptr},{"espn",nullptr},{"espn_ts_ms",nullptr},{"game",nullptr}};
+  std::pair<Px, Px> sent{-1, -1};
+  if (fair_) {
+    const auto board = fair_->board();
+    const auto f = board->find(ticker);
+    if (f != board->end()) {
+      ref["fair"] = price_str(f->second.fair);
+      ref["sd"] = price_str(f->second.sd);
+      sent = {f->second.fair, f->second.sd};
+    }
+  }
+  ref_sent_[ticker] = sent;
   pub_->post(PubData{"book",{{"v","K"},{"tk",ticker},{"depth","FULL"},
       {"bids",bids},{"asks",asks},{"trades",trades},{"last",tape.last ? print(*tape.last) : json(nullptr)},
       {"vol",qty_to_number(std::max<Qty>(0, vol))},
-      {"ref",{{"fair",nullptr},{"sd",nullptr},{"espn",nullptr},{"espn_ts_ms",nullptr},{"game",nullptr}}},
+      {"ref",ref},
       {"ex_ms",b.venue_ms.value_or(b.last_change_ms)}}});
+}
+
+// md thread: a book whose model fair moved since it was last published goes out again.
+void Deskd::republish_refs() {
+  if (!fair_) return;
+  const auto board = fair_->board();
+  for (const auto& [ticker, b] : md_last_) {
+    if (b.stale) continue;
+    const auto f = board->find(ticker);
+    const std::pair<Px, Px> now = f == board->end() ? std::make_pair(Px{-1}, Px{-1}) : std::make_pair(f->second.fair, f->second.sd);
+    const auto sent = ref_sent_.find(ticker);
+    if (sent == ref_sent_.end() || sent->second != now) publish_book(ticker);
+  }
 }
 
 void Deskd::on_book(const MdBook& b) {

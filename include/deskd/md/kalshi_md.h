@@ -94,6 +94,9 @@ class KalshiMd {
   void clear_watch();
   // Prints for the watched markets (trade channel); call before run(). Called on md's thread.
   void set_trade_callback(MdBooks::TradeCallback fn) { trade_callback_ = std::move(fn); }
+  // Called on md's thread about every 250 ms while connected (republishing what other owners
+  // changed, e.g. a market's model fair); call before run(). Must not block.
+  void set_idle_callback(std::function<void()> fn) { idle_ = std::move(fn); }
   void run(Worker& self);
  private:
   net::Endpoint endpoint_;
@@ -102,6 +105,7 @@ class KalshiMd {
   FeedState& feed_;
   Callback callback_;
   MdBooks::TradeCallback trade_callback_;
+  std::function<void()> idle_;
   Options options_;
   std::mutex mutex_;  // desired list only; never held over I/O or callbacks
   std::vector<std::string> desired_;

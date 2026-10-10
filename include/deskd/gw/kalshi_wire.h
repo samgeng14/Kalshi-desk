@@ -245,6 +245,10 @@ struct MarketRow {
   // fractional_trading_enabled; absent means whole contracts only (Kalshi enables fractional
   // order sizes market by market; docs.kalshi.com/getting_started/fixed_point_migration).
   std::optional<bool> fractional;
+  // What the contract pays on (greater, greater_or_equal, less, less_or_equal, between, ...),
+  // for a terminal-price model; a strike that is absent or not a number is left out, never 0.
+  std::string strike_type;
+  std::optional<double> floor_strike, cap_strike;
   // Enriched only by the public series endpoint, never a guessed market-prefix fee.
   std::string fee_type;
   std::optional<double> fee_multiplier;
