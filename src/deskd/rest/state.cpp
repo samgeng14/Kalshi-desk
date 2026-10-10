@@ -424,11 +424,15 @@ bool State::refresh(Worker* worker) {
   next.error.clear();
   std::string why;
   const std::int64_t account_began = now_ms();
-  if (!account(next, &why, worker)) { next.account_ready = false; next.error = "account: " + why; }
-  else next.account_began_ms = account_began;
+  // account() and listing() change next only once every page is in: a failure leaves the last read.
+  auto young = [](std::int64_t at, int keep_ms) { return at > 0 && now_ms() >= at && now_ms() - at <= keep_ms; };
+  if (!account(next, &why, worker)) {
+    next.account_ready = next.account_ready && young(next.account_ms, options_.account_keep_ms);
+    next.error = "account: " + why;
+  } else next.account_began_ms = account_began;
   if (!next.listing_ready || mono_ms() - last_listing_mono_ >= options_.listing_poll_ms) {
     if (!listing(next, &why, worker)) {
-      next.listing_ready = false;
+      next.listing_ready = next.listing_ready && young(next.listing_ms, options_.listing_keep_ms);
       if (!next.error.empty()) next.error += "; ";
       next.error += "listing: " + why;
     }

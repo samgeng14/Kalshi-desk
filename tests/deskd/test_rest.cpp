@@ -3,6 +3,7 @@
 #include <openssl/pem.h>
 #include <signal.h>
 #include <fstream>
+#include <thread>
 #include "check.h"
 #include "deskd/app/log.h"
 #include "deskd/app/projection.h"
@@ -132,11 +133,31 @@ void reconcile() {
   CHECK(meta["fee"]["type"]=="QUAD_MAKER" && meta["fee"]["mult"]==1.5);
   fake.clear_wire_log(); CHECK(state.refresh_once());
   for(const auto& entry:fake.wire_log()) CHECK(entry.find("/series/")==std::string::npos); // fresh cache
+  // A failed account read keeps the last good one while it is young, and says so.
   fakex::HttpFault fault; fault.method="GET"; fault.path="/portfolio/balance";
   fault.kind=fakex::HttpFault::Kind::DROP_BEFORE_REPLY; fake.add_fault(fault);
-  CHECK(!state.refresh_once());
-  CHECK(!state.snapshot()->account_ready && state.snapshot()->balances==s->balances);
+  const auto good=state.snapshot();
   CHECK(state.refresh_once());
+  CHECK(state.snapshot()->account_ready && state.snapshot()->balances==s->balances);
+  CHECK(state.snapshot()->account_ms==good->account_ms && state.snapshot()->account_began_ms==good->account_began_ms);
+  CHECK(state.snapshot()->error.rfind("account: ",0)==0);
+  CHECK(state.refresh_once() && state.snapshot()->error.empty() && state.snapshot()->account_ms>good->account_ms);
+  {   // an older one is not kept; nor is a listing
+    auto strict=opts; strict.account_keep_ms=-1; strict.listing_keep_ms=-1; strict.listing_poll_ms=100;
+    rest::State old(factory,*endpoint,signer.get(),{},strict);
+    CHECK(old.refresh_once());
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    fake.add_fault(fault);
+    CHECK(!old.refresh_once() && !old.snapshot()->account_ready && old.snapshot()->listing_ready);
+    fakex::HttpFault listing_fault; listing_fault.method="GET"; listing_fault.path="/markets";
+    listing_fault.kind=fakex::HttpFault::Kind::DROP_BEFORE_REPLY; fake.add_fault(listing_fault);
+    std::this_thread::sleep_for(std::chrono::milliseconds(110));   // listing_poll_ms is at least 100
+    const bool listed=old.refresh_once();
+    if(listed || !old.snapshot()->account_ready || old.snapshot()->listing_ready) std::fprintf(stderr,"listing fault: %d %d %d %s\n",listed,(int)old.snapshot()->account_ready,(int)old.snapshot()->listing_ready,old.snapshot()->error.c_str());
+    CHECK(!listed && old.snapshot()->account_ready && !old.snapshot()->listing_ready);
+    CHECK(!old.snapshot()->markets.empty());   // the rows stay for the screen; admission waits on ready
+    CHECK(old.refresh_once());
+  }
   // A private event during the read: the pages are discarded, the last consistent read stays.
   const auto consistent=state.snapshot();
   state.set_reconcile_guard([] { return std::uint64_t{7}; }, [](std::uint64_t) { return false; });

@@ -72,6 +72,11 @@ struct Options {
   // before processing, so a read is safe to repeat) waits backoff_429_ms, doubling, up to
   // retries_429 times, or as long as the venue's Retry-After says, then repeats the same request.
   int request_gap_ms = 100, retries_429 = 5, backoff_429_ms = 500;
+  // A failed poll keeps the last good read while it is younger than these (with an error saying
+  // so): one timeout on a slow link no longer refuses every click STALE until the next poll. gw
+  // treats the read's age itself (an account read over 60 s old is STALE) and counts every order
+  // of its own the read cannot reflect at worst case.
+  int account_keep_ms = 60000, listing_keep_ms = 300000;
 };
 
 class State {
