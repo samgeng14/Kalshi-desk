@@ -486,10 +486,69 @@ void systematic_band() {
   CHECK(stop && stop->status==200);
   CHECK(r.until([&]{ return !quoted(Y,fakex::Side::BID,9700) && !quoted(N,fakex::Side::ASK,200); }));
 }
+// Systematic's races on the fake (plan section 8): a quote hit before its 201 arrives, a fill
+// during a Systematic cancel, and Stop overtaking a create still on the wire. After each, gw's
+// lane position equals the venue's, the ledger stays healthy and nothing of Systematic rests.
+void systematic_races() {
+  Run r(false,{},true);
+  CHECK(r.ready());
+  auto lane=r.post("/api/lane/M2",{{"on",true}});
+  CHECK(lane && lane->status==200);
+  std::string why;
+  CHECK(r.until([&]{ return r.d->gw().groups_ready(&why) && why.empty(); },20000));
+  httplib::Result start;
+  CHECK(r.until([&]{ start=r.post("/api/start",json::object()); return start && start->status==200; },10000));
+  auto sys=[&](const std::string& cid,Px px,Qty count) {
+    PlaceIntent p; p.cid=cid; p.owner=Owner::SYS; p.lane="M2"; p.ticker=TK; p.side=Side::BUY; p.price=px; p.count=count;
+    p.tif=Tif::POST; p.ttl_s=30; p.reply=std::make_shared<std::promise<OrderReply>>();
+    auto f=p.reply->get_future();
+    CHECK(r.d->gw().post(std::move(p)));
+    return f;
+  };
+  auto venue_pos=[&]{
+    return r.venue.f->with_engine([](fakex::Engine& e,std::int64_t) {
+      for(const auto& [key,p]:e.positions()) if(key.first==0 && key.second==TK) return p.pos;
+      return Qty{0};
+    });
+  };
+  auto gw_pos=[&]{
+    const auto v=r.d->gw().sys_view();
+    return v && v->positions.count("M2|"+TK) ? v->positions.at("M2|"+TK) : Qty{0};
+  };
+  auto sys_resting=[&]{
+    return r.venue.f->with_engine([](fakex::Engine& e,std::int64_t) {
+      int n=0; for(const fakex::Order* o:e.user_orders()) if(o->status==fakex::OrdStatus::RESTING && o->client_order_id.rfind("SM2-",0)==0) ++n; return n; });
+  };
+  // 1. the street takes 1 of our resting bid before its 201 reaches us
+  fakex::HttpFault hit; hit.kind=fakex::HttpFault::Kind::HIT_AFTER_REST; hit.qty=100;
+  r.venue.f->add_fault(hit);
+  auto a=sys("SM2-race-1",4100,200);
+  CHECK(a.wait_for(std::chrono::seconds(5))==std::future_status::ready && a.get().code.empty());
+  CHECK(r.until([&]{ return gw_pos()==100 && venue_pos()==100; }));
+  // 2. a fill during our cancel: the street takes the other 1 first, the reply reduces by nothing left
+  fakex::HttpFault during; during.kind=fakex::HttpFault::Kind::FILL_DURING_CANCEL; during.method="DELETE";
+  during.path="/portfolio/events/orders"; during.qty=100;
+  r.venue.f->add_fault(during);
+  CancelIntent cx; cx.scope=CancelIntent::Scope::CID; cx.cid="SM2-race-1";
+  CHECK(r.d->gw().post(cx));
+  CHECK(r.until([&]{ return gw_pos()==200 && venue_pos()==200 && sys_resting()==0; }));
+  // 3. Stop overtakes a create the venue is still answering: the order is cancelled once its id is known
+  fakex::HttpFault slow; slow.kind=fakex::HttpFault::Kind::STALL_AFTER; slow.stall_ms=800;
+  r.venue.f->add_fault(slow);
+  auto c=sys("SM2-race-3",4000,100);
+  CHECK(r.until([&]{ return r.venue.has_cid("SM2-race-3"); }));
+  auto stop=r.post("/api/stop",json::object());
+  CHECK(stop && stop->status==200);
+  CHECK(c.wait_for(std::chrono::seconds(5))==std::future_status::ready);
+  CHECK(r.until([&]{ return sys_resting()==0; }));
+  const auto st=r.d->status();
+  CHECK(st["gw"]["ledger_healthy"]==true && st["senders"]["k2"]["healthy"]==true && !r.d->kill_switch().active());
+  CHECK(gw_pos()==venue_pos());
+}
 }  // namespace
 
 int main() {
   std::signal(SIGPIPE,SIG_IGN);
-  off_by_default(); orders_cancel_kill(); stop_reasons(); financial_fair(); systematic(); systematic_maker(); systematic_band();
+  off_by_default(); orders_cancel_kill(); stop_reasons(); financial_fair(); systematic(); systematic_maker(); systematic_band(); systematic_races();
   return finish("deskd-runtime-manual");
 }
