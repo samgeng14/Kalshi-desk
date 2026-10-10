@@ -15,6 +15,7 @@
 #include "deskd/priv/kalshi_private.h"
 #include "deskd/ref/pyth.h"
 #include "deskd/strat/fair.h"
+#include "deskd/ref/espn.h"
 
 namespace deskd {
 
@@ -27,7 +28,7 @@ Deskd::Deskd(DeskdConfig cfg, std::unique_ptr<AccountLock> lock, RuntimeOptions 
   epoch_ = "e-" + std::to_string(started_ms_) + "-" + std::to_string(::getpid());
   token_ = random_token();
   if (lock_) kill_.persist_to(lock_->sibling(".killed"));
-  for (const char* n : {"md-k", "priv-k", "ref-k", "gw", "send-k1", "send-k2", "send-k3", "send-cx", "strat", "store", "pub",
+  for (const char* n : {"md-k", "priv-k", "ref-k", "ref-espn", "gw", "send-k1", "send-k2", "send-k3", "send-cx", "strat", "store", "pub",
                         "rest", "ops", "web"})
     workers_.push_back(std::make_unique<Worker>(n));
 
@@ -120,6 +121,11 @@ bool Deskd::start(std::string* err) {
   });
   by("ref-k")->start([this](Worker& w) {
     if (pyth_) pyth_->run(w); else run_feed_placeholder(w, feeds_.PYTH);
+  });
+  by("ref-espn")->start([this](Worker& w) {
+    if (espn_) espn_->run(w); else while (!w.stopping()) {
+      w.beat(); std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
   });
   by("gw")->start([this](Worker& w) { gw_->run(w); });
   const AlertFn alert = [this](const std::string& lvl, const std::string& src, const std::string& msg) {
@@ -220,6 +226,7 @@ json Deskd::status() const {
   };
   result["pyth"] = pyth_ ? pyth_->status(now) : json(nullptr);
   result["fair"] = fair_ ? fair_->status() : json(nullptr);
+  result["espn"] = espn_ ? espn_->status() : json(nullptr);
   result["senders"] = {{"k1", sender(man_sender_.get())}, {"cx", sender(cx_sender_.get())}};
   result["publisher_healthy"] = pub_->healthy();
   if (rest_) {

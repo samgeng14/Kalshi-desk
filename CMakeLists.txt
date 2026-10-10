@@ -300,6 +300,7 @@ add_library(deskd_core STATIC
   src/deskd/rest/state.cpp
   src/deskd/priv/kalshi_private.cpp
   src/deskd/ref/pyth.cpp
+  src/deskd/ref/espn.cpp
   src/deskd/net/guard.cpp
   src/deskd/net/http.cpp
   src/deskd/net/ws.cpp
@@ -441,7 +442,7 @@ add_dependencies(deskd-test-fake-wire fake-kalshi)  # it starts the binary once
 #   wire   the signer (RSA-PSS and Ed25519, verified by the fake), the builders and parsers against
 #          the documented shapes and the fake over TLS, what each write reply means, and the demo
 #          probe binary run against the fake
-foreach(t http pub_data order_ledger manual_admission manual_book fair)
+foreach(t http pub_data order_ledger manual_admission manual_book fair espn)
   add_executable(deskd-test-${t} tests/deskd/test_${t}.cpp)
   target_link_libraries(deskd-test-${t} PRIVATE deskd_core)
   target_precompile_headers(deskd-test-${t} REUSE_FROM deskd_core)

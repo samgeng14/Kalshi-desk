@@ -9,6 +9,7 @@
 #include "deskd/priv/kalshi_private.h"
 #include "deskd/ref/pyth.h"
 #include "deskd/strat/fair.h"
+#include "deskd/ref/espn.h"
 
 namespace deskd {
 using json = nlohmann::json;
@@ -48,6 +49,25 @@ bool Deskd::init_venue(std::string* err) {
       [this](const std::string& symbol, std::int64_t since, std::int64_t now) { return pyth_->view(symbol, since, now); },
       options_.fair_watch_since_ms ? options_.fair_watch_since_ms : now_ms());
   md_->set_idle_callback([this] { republish_refs(); });
+  if (!options_.espn_url.empty()) {
+    std::string why;
+    if (auto ep = net::Endpoint::parse(options_.espn_url, &why)) {
+      // the watched game markets, with the other team's market of each game
+      espn_ = std::make_unique<EspnFeed>(*ep, [this] {
+        std::vector<kalshi::MarketRow> out;
+        const auto s = rest_->snapshot();
+        std::set<std::string> events;
+        for (const auto& tk : s->live) {
+          const auto it = s->markets.find(tk);
+          if (it != s->markets.end() && espn_league_for(tk)) events.insert(it->second.event_ticker);
+        }
+        for (const auto& [tk, m] : s->markets) if (events.count(m.event_ticker)) out.push_back(m);
+        return out;
+      });
+    } else {
+      DLOG_WARN("ESPN off: %s", why.c_str());
+    }
+  }
   rest_->set_reconcile_guard([this] { return private_->fence(); },
                             [this](std::uint64_t fence) { return private_->reconcile(fence); });
   // The write path: send-k1 (Manual) and send-cx (cancels and KILL), each with its own pool.
@@ -291,19 +311,8 @@ void Deskd::publish_book(const std::string& ticker) {
     if (m != s->markets.end() && m->second.volume_24h) vol = *m->second.volume_24h;
   }
   vol += tape.since_listing;
-  // The model's fair and its sd, where a model stands behind one (strat/fair.h); never a placeholder.
-  json ref = {{"fair",nullptr},{"sd",nullptr},{"espn",nullptr},{"espn_ts_ms",nullptr},{"game",nullptr}};
-  std::pair<Px, Px> sent{-1, -1};
-  if (fair_) {
-    const auto board = fair_->board();
-    const auto f = board->find(ticker);
-    if (f != board->end()) {
-      ref["fair"] = price_str(f->second.fair);
-      ref["sd"] = price_str(f->second.sd);
-      sent = {f->second.fair, f->second.sd};
-    }
-  }
-  ref_sent_[ticker] = sent;
+  const json ref = ref_json(ticker);
+  ref_sent_[ticker] = ref.dump();
   pub_->post(PubData{"book",{{"v","K"},{"tk",ticker},{"depth","FULL"},
       {"bids",bids},{"asks",asks},{"trades",trades},{"last",tape.last ? print(*tape.last) : json(nullptr)},
       {"vol",qty_to_number(std::max<Qty>(0, vol))},
@@ -311,16 +320,37 @@ void Deskd::publish_book(const std::string& ticker) {
       {"ex_ms",b.venue_ms.value_or(b.last_change_ms)}}});
 }
 
-// md thread: a book whose model fair moved since it was last published goes out again.
+// A book's reference values: the model's fair and sd where a model stands behind one
+// (strat/fair.h), ESPN's game state and win probability on game markets (ref/espn.h). Never a
+// placeholder: what no source gives is null.
+json Deskd::ref_json(const std::string& ticker) const {
+  json ref = {{"fair",nullptr},{"sd",nullptr},{"espn",nullptr},{"espn_ts_ms",nullptr},{"game",nullptr}};
+  if (fair_) {
+    const auto board = fair_->board();
+    const auto f = board->find(ticker);
+    if (f != board->end()) {
+      ref["fair"] = price_str(f->second.fair);
+      ref["sd"] = price_str(f->second.sd);
+    }
+  }
+  if (espn_) {
+    const auto board = espn_->board();
+    const auto e = board->find(ticker);
+    if (e != board->end()) {
+      ref["game"] = {{"per",e->second.per},{"clock",e->second.clock},{"score",e->second.score},{"src","ESPN"}};
+      if (e->second.espn) ref["espn"] = price_str(*e->second.espn);
+      if (e->second.espn && e->second.espn_ts_ms) ref["espn_ts_ms"] = e->second.espn_ts_ms;
+    }
+  }
+  return ref;
+}
+
+// md thread: a book whose reference values moved since it was last published goes out again.
 void Deskd::republish_refs() {
-  if (!fair_) return;
-  const auto board = fair_->board();
   for (const auto& [ticker, b] : md_last_) {
     if (b.stale) continue;
-    const auto f = board->find(ticker);
-    const std::pair<Px, Px> now = f == board->end() ? std::make_pair(Px{-1}, Px{-1}) : std::make_pair(f->second.fair, f->second.sd);
     const auto sent = ref_sent_.find(ticker);
-    if (sent == ref_sent_.end() || sent->second != now) publish_book(ticker);
+    if (sent == ref_sent_.end() || sent->second != ref_json(ticker).dump()) publish_book(ticker);
   }
 }
 
