@@ -1118,8 +1118,10 @@ void FakeKalshi::serve(int fd) {
       } else {
         data += rep.body;
       }
-      net::write_all(fd, data);
+      // logged before the write: a client that has its reply (and a test that then clears the
+      // log) never sees the entry arrive late (test_rest's fresh-cache check, 2026-10-10)
       log_wire(label);
+      net::write_all(fd, data);
     }
     if (held) {
       std::lock_guard<std::mutex> lk(mu_);

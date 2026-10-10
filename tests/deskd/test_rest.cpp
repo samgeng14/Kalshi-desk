@@ -152,6 +152,7 @@ void reconcile() {
   CHECK(state.snapshot()->account_ready && state.snapshot()->balances==s->balances);
   CHECK(state.snapshot()->account_ms==good->account_ms && state.snapshot()->account_began_ms==good->account_began_ms);
   CHECK(state.snapshot()->error.rfind("account: ",0)==0);
+  std::this_thread::sleep_for(std::chrono::milliseconds(2));   // a whole refresh can take under 1 ms
   CHECK(state.refresh_once() && state.snapshot()->error.empty() && state.snapshot()->account_ms>good->account_ms);
   {   // an older one is not kept; nor is a listing
     auto strict=opts; strict.account_keep_ms=-1; strict.listing_keep_ms=-1; strict.listing_poll_ms=100;
