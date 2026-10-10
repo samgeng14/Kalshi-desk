@@ -705,6 +705,27 @@ bool build_order_group_action(const std::string& id, const std::string& action, 
   return true;
 }
 
+bool build_delete_order_group(const std::string& id, int exchange_index, int subaccount, WireRequest* out,
+                              std::string* why) {
+  if (!id_ok(id)) {
+    if (why) *why = "a bad order_group_id";
+    return false;
+  }
+  if (exchange_index < 0 || subaccount < -1 || subaccount > 63) {
+    if (why) *why = "a group's delete names its shard (and subaccount 0-63)";
+    return false;
+  }
+  WireRequest r;
+  r.method = "DELETE";
+  r.path = std::string(kBasePath) + "/portfolio/order_groups/" + url_encode(id);
+  add_q(r.query, "exchange_index", exchange_index, true);
+  add_q(r.query, "subaccount", subaccount, subaccount >= 0);
+  r.write = true;
+  r.op = WireOp::GROUP;
+  *out = std::move(r);
+  return true;
+}
+
 std::optional<std::string> parse_create_order_group(const std::string& body, std::string* why) {
   auto j = parse_object(body, why);
   if (!j) return std::nullopt;

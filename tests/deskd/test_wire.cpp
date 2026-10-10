@@ -23,6 +23,7 @@
 #include <signal.h>
 #include <sys/wait.h>
 
+#include <atomic>
 #include <cstdio>
 #include <fstream>
 #include <nlohmann/json.hpp>
@@ -360,6 +361,10 @@ static void test_builders() {
     CHECK(build_order_group_action("og-1", "trigger", 1, -1, &g, &why));
     CHECK(g.method == "PUT" && g.path == "/trade-api/v2/portfolio/order_groups/og-1/trigger" && g.query == "exchange_index=1");
     CHECK(!build_order_group_action("og-1", "delete", 1, -1, &g, &why) && !build_order_group_action("og 1", "reset", 1, -1, &g, &why));
+    CHECK(build_delete_order_group("og-1", 2, -1, &g, &why));
+    CHECK(g.method == "DELETE" && g.path == "/trade-api/v2/portfolio/order_groups/og-1" && g.query == "exchange_index=2" &&
+          g.body.empty() && g.write && g.op == WireOp::GROUP);
+    CHECK(!build_delete_order_group("og/1", 0, -1, &g, &why) && !build_delete_order_group("og-1", -1, -1, &g, &why));
     CHECK(parse_create_order_group(R"({"order_group_id":"og-9","exchange_index":0})", &why) == std::optional<std::string>("og-9"));
     CHECK(!parse_create_order_group(R"({"exchange_index":0})", &why));
     CHECK(classify_refusal(WireOp::GROUP, 404, "not_found") == RejectClass::GONE);
@@ -942,6 +947,44 @@ static void test_probe_binary() {
   for (const char* n : {"exchange_status", "balance", "markets", "create", "order", "cancel", "order_canceled"})
     CHECK(std::filesystem::exists(d.file(std::string("kalshi_demo_") + n + ".json")));
   std::printf("probe against the fake: exit %d, %zu bytes of output\n", rc, out.size());
+
+  // --group-check and --feeds-check: the group's life around one bid (created, the bid in it,
+  // triggered: the bid cancelled and a second refused, reset, deleted, each on the socket too),
+  // then the lanes' series and two seconds of pyth_value while the fake relays natural gas
+  std::atomic<bool> relaying{true};
+  std::thread relay([&] {
+    for (int i = 0; relaying; ++i) {
+      v.f->pyth("Commodities.Index.NATGAS/USD", 3.1 + 0.001 * i, now_ms() - 400);
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+  });
+  const std::string more = run(demo_key, "--base " + v.ep().url() + " --handshakes 1 --group-check --order-ticker " + fx::T +
+                                             " --feeds-check --feeds-seconds 2 --lip-series KXNATGAS15M --band-series KXTEST,KXNONE",
+                               &rc);
+  relaying = false;
+  relay.join();
+  CHECK(rc == 0);
+  if (rc != 0) std::fprintf(stderr, "probe output:\n%s\n", more.c_str());
+  auto in = [&](const std::string& s) { return more.find(s) != std::string::npos; };
+  CHECK(in("create group (POST)") && in(", contracts_limit 1 (" + fx::T));
+  CHECK(in("resting, order_group_id as sent"));
+  CHECK(in("the bid after the trigger: canceled"));
+  CHECK(in("outcome REFUSED soft_group (HTTP 400)") && !in("gw expects soft_group"));
+  CHECK(in("order_group_updates for it: created, triggered, reset, deleted (subscribed yes)"));
+  CHECK(in("this check's orders resting: 0"));
+  CHECK(in("M1  KXNATGAS15M        1 open, 0 with a YES bid, 0 with a strike; next " + fx::G));
+  CHECK(in("M2  KXTEST             1 open") && in("M2  KXNONE           none open") && in("M2  1 of 2 series with open markets\n"));
+  CHECK(in("subscribed: pyth_value yes, order_group_updates yes"));
+  CHECK(in("pyth_value: 1 underlyings,") && in("Commodities.Index.NATGAS/USD"));
+  CHECK(in("KXNATGAS15M      Commodities.Index.NATGAS/USD") && in("KXGOLD15M        not seen"));
+  CHECK(in("\nok\n"));
+  CHECK(!in("BEGIN") && !in("KALSHI-ACCESS") && !in("probe-key") && !in("?"));
+  // the group is gone, and neither bid rests
+  CHECK(v.f->with_engine([](fakex::Engine& e, std::int64_t) {
+    int resting = 0;
+    for (const auto* o : e.user_orders()) resting += o->status == fakex::OrdStatus::RESTING;
+    return e.groups().empty() && resting == 0;
+  }));
 
   // a production base: the guard refuses it before any socket, exit 2, no handshake section
   const std::string prod = run(demo_key, "--base https://api.elections.kalshi.com/trade-api/v2 --handshakes 1", &rc);

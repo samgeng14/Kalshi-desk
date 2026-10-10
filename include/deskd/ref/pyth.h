@@ -71,6 +71,10 @@ class PythValues {
   std::int64_t malformed_ = 0;
 };
 
+// The first symbol in `values` that contains any pattern (case-insensitive), exact names first;
+// "" when none has arrived. KalshiPyth::symbol_for and the demo probe's feeds check share it.
+std::string pyth_symbol_for(const PythValues& values, const std::vector<std::string>& patterns);
+
 // The value of one underlying at one moment, for a model.
 struct RefView {
   std::string symbol;

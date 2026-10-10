@@ -87,16 +87,20 @@ KalshiPyth::KalshiPyth(net::Endpoint ep, net::ConnFactory& factory, const Kalshi
     : endpoint_(std::move(ep)), factory_(factory), signer_(signer), feed_(feed), options_(options),
       values_(options.values) {}
 
-std::string KalshiPyth::symbol_for(const std::vector<std::string>& patterns) const {
-  std::lock_guard<std::mutex> lk(m_);
+std::string pyth_symbol_for(const PythValues& values, const std::vector<std::string>& patterns) {
   for (const auto& p : patterns)
-    if (values_.series().count(p)) return p;
+    if (values.series().count(p)) return p;
   for (const auto& p : patterns) {
     const auto want = lower(p);
-    for (const auto& [symbol, s] : values_.series())
+    for (const auto& [symbol, s] : values.series())
       if (lower(symbol).find(want) != std::string::npos) return symbol;
   }
   return "";
+}
+
+std::string KalshiPyth::symbol_for(const std::vector<std::string>& patterns) const {
+  std::lock_guard<std::mutex> lk(m_);
+  return pyth_symbol_for(values_, patterns);
 }
 
 std::optional<RefView> KalshiPyth::view(const std::string& symbol, std::int64_t since_ms, std::int64_t now) const {

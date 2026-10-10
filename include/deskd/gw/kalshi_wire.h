@@ -135,6 +135,9 @@ bool build_create_order_group(Qty contracts_limit, int exchange_index, int subac
 // PUT /portfolio/order_groups/{id}/{trigger|reset}?exchange_index=N[&subaccount=S]
 bool build_order_group_action(const std::string& id, const std::string& action, int exchange_index, int subaccount,
                               WireRequest* out, std::string* why);
+// DELETE /portfolio/order_groups/{id}?exchange_index=N[&subaccount=S]: its orders cancelled, the group gone
+bool build_delete_order_group(const std::string& id, int exchange_index, int subaccount, WireRequest* out,
+                              std::string* why);
 std::optional<std::string> parse_create_order_group(const std::string& body, std::string* why);
 
 struct ListQuery {   // the read routes' shared filters; empty / -1 / 0 = left out
