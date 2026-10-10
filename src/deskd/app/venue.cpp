@@ -49,24 +49,8 @@ HdrInputs Deskd::header() const {
   h.kx_lag_ms = feeds_.KX.view().lag_ms;
   if (!rest_) return h;
   const auto s = rest_->snapshot();
-  std::map<int, Money> reserved;
-  Money total_reserved = 0;
-  bool unknown_shard = false;
-  for (const auto& o : s->orders) if (o.status == kalshi::OrderStatus::RESTING) {
-    const auto p = o.side == kalshi::BookSide::BID ? o.yes_price : kOneDollar-o.yes_price;
-    const Money cost = (p * o.remaining + 99) / 100;
-    total_reserved += cost;
-    if (o.exchange_index) reserved[*o.exchange_index] += cost; else unknown_shard = true;
-  }
-  json shards = json::array();
-  for (const auto& b : s->balances)
-    shards.push_back({{"id","S" + std::to_string(b.first)},
-                      {"cash",money_str(b.second)},
-                      {"free",money_str(unknown_shard ? 0 : std::max<Money>(0,b.second-reserved[b.first]))}});
-  h.cash_k = {{"total",money_str(s->balance.available)},
-              {"free",money_str(std::max<Money>(0,s->balance.available-total_reserved))},
-              // Venue data is connected, but the Manual write/ledger path is not enabled yet.
-              {"ro",true},{"shards",shards}};
+  // Venue data is connected, but the Manual write/ledger path is not enabled yet.
+  h.cash_k=rest_cash_json(*s,true);
   h.clk_off_ms = s->clock.offset_ms;
   return h;
 }

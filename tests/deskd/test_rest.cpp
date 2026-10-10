@@ -9,6 +9,7 @@
 #include "deskd/build_paths.h"
 #include "deskd/net/guard.h"
 #include "deskd/rest/state.h"
+#include "deskd/web/contract.h"
 #include "fake_kalshi.h"
 
 using namespace deskd;
@@ -114,12 +115,49 @@ void reconcile() {
   rest::State capped(factory,*endpoint,signer.get(),{},opts);
   CHECK(!capped.refresh_once());
   CHECK(!capped.snapshot()->listing_ready && capped.snapshot()->markets.empty());
+
+  // The exchange already deducts collateral from its available balance. The UI must not
+  // deduct it again. Exercise the real REST parser/projection against an actual resting order.
+  fake.with_engine([](fakex::Engine& e,std::int64_t now) {
+    fakex::NewOrder o; o.ticker="TEST-0"; o.client_order_id="Mcash-1";
+    o.price=4000; o.count=1000; o.exchange_index=0; o.tif=fakex::Tif::GTC; o.post_only=true;
+    o.expiration_s=now/1000+60;
+    CHECK(!e.create(o,now).err);
+  });
+  CHECK(state.refresh_once());
+  auto cash=rest_cash_json(*state.snapshot(),false);
+  CHECK(cash["shards"][0]["free"]=="496.0000" && cash["shards"][0]["cash"]=="500.0000");
+  CHECK(cash["total"]=="575.0000" && cash["free"]=="571.0000");
+}
+void cash_projection(json& capture) {
+  rest::Snapshot s; s.balances={{0,920000},{2,50000}};
+  kalshi::PositionRow p; p.ticker="TEST-A"; p.exchange_index=0; p.position=500;
+  s.positions.push_back(p);
+  kalshi::OrderRow a; a.order_id="high"; a.ticker=p.ticker; a.exchange_index=0;
+  a.initial=500; a.remaining=500; a.side=kalshi::BookSide::ASK; a.yes_price=6000;
+  auto b=a; b.order_id="low"; b.yes_price=5500;
+  s.orders={a,b}; // low SELL gets the five reducing contracts; high SELL reserves $2
+  auto cash=rest_cash_json(s,false);
+  CHECK(cash["shards"][0]["cash"]=="94.0000" && cash["shards"][0]["free"]=="92.0000");
+  CHECK(cash["total"]=="99.0000" && cash["free"]=="97.0000");
+  HdrInputs hdr; hdr.cash_k=cash;
+  capture["events"].push_back({{"type","hdr"},{"seq",1},{"ts_ms",now_ms()},{"data",hdr_json(hdr)}});
+  // Equivalent BUY orders against NO inventory allocate the reducing room highest first.
+  s.positions[0].position=-500; s.orders[0].side=s.orders[1].side=kalshi::BookSide::BID;
+  cash=rest_cash_json(s,false); CHECK(cash["shards"][0]["cash"]=="94.7500");
+  // Fractional collateral is rounded upward at the UI boundary, never down to whole lots.
+  s.positions.clear(); s.orders.resize(1); s.orders[0].remaining=1; s.orders[0].yes_price=5555;
+  cash=rest_cash_json(s,false); CHECK(cash["shards"][0]["cash"]=="92.0056");
+  s.orders[0].exchange_index.reset();
+  CHECK(rest_cash_json(s,false)["ro"]==true);
+  s.markets["TEST-A"].exchange_index=0; // actual market metadata can identify a missing order shard
+  CHECK(rest_cash_json(s,false)["ro"]==false);
 }
 }
 int main() {
   ::signal(SIGPIPE,SIG_IGN);
   clock_checks(); json capture={{"events",json::array()},{"responses",json::array()}};
-  discovery(capture); reconcile();
+  discovery(capture); reconcile(); cash_projection(capture);
   TempDir dir; std::ofstream out(dir.file("capture.json")); out<<capture.dump(); out.close();
   const std::string command="node '"+std::string(DESKD_SOURCE_DIR)+"/tests/deskd/contract_check.cjs' '"+dir.file("capture.json")+"'";
   CHECK(std::system(command.c_str())==0);

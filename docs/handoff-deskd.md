@@ -50,6 +50,9 @@ Nothing is pushed. `ui/desk/js/contract.js` is the API contract deskd must serve
   timings, and cancel-all independent of gateway and queue capacity. Fake TLS proofs cover
   accepted-but-lost replies, no retries, duplicate cids, soft refusals, result-queue loss, a
   frozen gateway, and KILL overtaking an in-flight Manual write. Runtime wiring remains open.
+- Cash projection fix (2026-10-09): the header no longer subtracts collateral twice from
+  Kalshi's available balance. It adds modeled resting collateral to reconstruct cash, shares
+  reducing room across orders in price priority, and retains exact fractional quantities.
 - Oracle VM `deskd-recorder` for the recorder: `ssh -i ~/.ssh/oracle_deskd ubuntu@64.181.211.165` (Ubuntu 24.04 aarch64, 1 OCPU, 6 GB, 145 GB). Nothing installed yet.
 
 ## Next, in order

@@ -102,3 +102,13 @@ again. The final targeted rerun covers the new partial and complete late-ack cas
   create response. All four sender/order-ledger/wire/net suites passed (15.4 seconds).
 
 These workers are not yet installed in runtime; no demo or production write was made by them.
+
+## Available cash projection — 2026-10-09
+
+Kalshi's [balance endpoint](https://docs.kalshi.com/api-reference/portfolio/get-balance)
+returns available balance. The prior header subtracted resting collateral from that number a
+second time. The header now preserves it as free cash and reconstructs cash by adding modeled
+resting collateral. Reducing orders share existing inventory in price priority; two orders
+cannot both claim the same reducing contracts. Fractional collateral rounds upward, and
+missing/conflicting shard metadata keeps the view read-only. A fake-exchange resting $4 order
+now displays cash $500, free $496 on its shard, rather than cash $496, free $492.
