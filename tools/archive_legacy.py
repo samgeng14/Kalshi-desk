@@ -4,6 +4,7 @@
     python3 tools/archive_legacy.py plan    --db data/prod.sqlite
     python3 tools/archive_legacy.py convert --db data/prod.sqlite --out ~/kalshi-archive/prod
     python3 tools/archive_legacy.py upload  --out ~/kalshi-archive/prod --env ~/.r2/kalshi-desk-archive.env
+    python3 tools/archive_legacy.py verify  --out ~/kalshi-archive/prod --deep
 
 Needs: python3 -m pip install pyarrow boto3   (in a venv; no DuckDB extension download).
 
@@ -356,6 +357,48 @@ def cmd_upload(a):
     log(f"done: {sent} uploaded, {skipped} already there; manifest at s3://{bucket}/{prefix}manifest.json")
 
 
+def cmd_verify(a):
+    """Compare R2 with manifest.json: every file present with its size (and with --deep, the
+    sha256 recorded at upload). Read-only on both sides."""
+    import boto3
+    from botocore.config import Config
+    out = os.path.expanduser(a.out)
+    with open(os.path.join(out, "manifest.json")) as f:
+        manifest = json.load(f)
+    env = read_env(a.env)
+    s3 = boto3.client("s3", endpoint_url=env["R2_ENDPOINT"], aws_access_key_id=env["R2_ACCESS_KEY_ID"],
+                      aws_secret_access_key=env["R2_SECRET_ACCESS_KEY"], region_name="auto",
+                      config=Config(retries={"max_attempts": 5, "mode": "standard"},
+                                    request_checksum_calculation="when_required",
+                                    response_checksum_validation="when_required"))
+    bucket, prefix = env["R2_BUCKET"], a.prefix.strip("/") + "/"
+    remote = {}
+    for page in s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix):
+        for o in page.get("Contents", []):
+            remote[o["Key"][len(prefix):]] = o["Size"]
+    files = [x for tb in manifest["tables"].values() for x in tb["files"]]
+    missing = [x["path"] for x in files if x["path"] not in remote]
+    wrong = [x["path"] for x in files if x["path"] in remote and remote[x["path"]] != x["bytes"]]
+    bad_hash = []
+    if a.deep:
+        for x in files:
+            if x["path"] in remote and x["path"] not in wrong:
+                meta = s3.head_object(Bucket=bucket, Key=prefix + x["path"]).get("Metadata", {})
+                if meta.get("sha256") != x["sha256"]:
+                    bad_hash.append(x["path"])
+    rows = sum(x["rows"] for x in files)
+    size = sum(x["bytes"] for x in files)
+    log(f"manifest: {len(manifest['tables'])} tables, {len(files)} files, {rows:,} rows, {size / 1e9:.2f} GB")
+    log(f"R2 s3://{bucket}/{prefix}: {len(remote)} objects; manifest.json {'present' if 'manifest.json' in remote else 'MISSING'}")
+    for name, items in (("missing on R2", missing), ("wrong size on R2", wrong), ("sha256 differs", bad_hash)):
+        if items:
+            log(f"{len(items)} {name}: " + ", ".join(items[:10]) + (" ..." if len(items) > 10 else ""))
+    ok = not missing and not wrong and not bad_hash and "manifest.json" in remote
+    log("VERIFIED: every file is on R2 with its size" + (" and sha256" if a.deep else "") if ok
+        else "NOT complete: run upload again (finished files are skipped), then verify")
+    sys.exit(0 if ok else 1)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -374,8 +417,13 @@ def main():
     u.add_argument("--recheck", action="store_true", help="re-hash every file before upload")
     u.add_argument("--concurrency", type=int, default=4, help="parallel parts per large file (default 4)")
     u.add_argument("--part-mb", type=int, default=64, help="multipart part size in MB, at least 5 (default 64)")
+    v = sub.add_parser("verify", help="check R2 against manifest.json (read-only)")
+    v.add_argument("--out", required=True)
+    v.add_argument("--env", default="~/.r2/kalshi-desk-archive.env")
+    v.add_argument("--prefix", default="archive/legacy/prod")
+    v.add_argument("--deep", action="store_true", help="also compare each object's sha256 metadata")
     a = ap.parse_args()
-    {"plan": cmd_plan, "convert": cmd_convert, "upload": cmd_upload}[a.cmd](a)
+    {"plan": cmd_plan, "convert": cmd_convert, "upload": cmd_upload, "verify": cmd_verify}[a.cmd](a)
 
 
 if __name__ == "__main__":
