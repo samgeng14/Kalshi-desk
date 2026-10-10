@@ -9,9 +9,9 @@ const std::vector<LaneSpec>& default_lanes() {
   static const std::vector<LaneSpec> L = {
       {"M1", "LIP-15", "REST", 55 * 10000, 4000, 5000, {"KXNATGAS15M"}, std::nullopt},
       {"M2", "BAND 96-99", "REST", 25 * 10000, 2000, 5000, {}, std::nullopt},
-      {"S1", "ARB", "IOC", 15 * 10000, 2000, 5000, {}, Money{200}},
-      {"C1", "COLLEGE TAKE", "IOC", 10 * 10000, 2000, 5000, {}, Money{300}},
-      {"X1", "ESPN EXP", "IOC", 5 * 10000, 200, 1000, {}, Money{300}},
+      {"S1", "ARB", "IOC", 15 * 10000, 2000, 5000, {}, Money{200}, false},
+      {"C1", "COLLEGE TAKE", "IOC", 10 * 10000, 2000, 5000, {}, Money{300}, false},
+      {"X1", "ESPN EXP", "IOC", 5 * 10000, 200, 1000, {}, Money{300}, false},
   };
   return L;
 }

@@ -354,6 +354,10 @@ void systematic() {
   auto none=r.post("/api/lane/Z9",{{"on",true}});
   CHECK(none && none->status==404);
   keep("POST /api/lane/{id}",none);
+  // a lane no engine trades yet does not switch on (its groups would only hold up GROUPS)
+  auto idle=r.post("/api/lane/S1",{{"on",true}});
+  CHECK(idle && idle->status==400 && json::parse(idle->body)["err"]["code"]=="BAD_REQUEST");
+  keep("POST /api/lane/{id}",idle);
   std::string why;
   const bool ready=r.until([&]{ return r.d->gw().groups_ready(&why) && why.empty(); },20000);   // M2's groups active
   if(!ready) std::fprintf(stderr,"groups: %s\n",why.c_str());

@@ -266,6 +266,9 @@ void Gateway::handle(GwMsg& m) {
     if (!sys_ || !sys_->lane(l->id)) {
       r.code = "NOT_FOUND";
       r.msg = "no lane " + l->id;
+    } else if (l->on && !sys_->lane(l->id)->engine) {
+      r.code = "BAD_REQUEST";
+      r.msg = "lane " + l->id + " has no engine yet: nothing would trade it";
     } else {
       sys_->set_on(l->id, l->on);
       // off cancels that lane's working orders (contract: why LANE_OFF)

@@ -50,6 +50,9 @@ struct LaneSpec {
   Qty group_limit = 5000;               // contracts over the venue's 15 s window
   std::vector<std::string> series;      // the markets it trades ("" = any)
   std::optional<Money> thr;             // IOC lanes: the net edge per contract it needs
+  // false: no engine trades it yet (S1 needs event exclusivity, C1 its model, X1 its backtest), so
+  // it cannot be switched on (on, it would only hold order groups that GROUPS waits for)
+  bool engine = true;
 };
 const std::vector<LaneSpec>& default_lanes();
 
