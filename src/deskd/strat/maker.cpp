@@ -196,6 +196,8 @@ void MakerEngine::step(std::int64_t now) {
     if (!running) d.pull = "not running";
     else if (m == snap->markets.end()) d.pull = "not listed";
     else if (p_.lane_pause > 0 && day != view->lane_day.end() && day->second <= -p_.lane_pause) d.pull = "lane paused: its day is past the loss limit";
+    else if (p_.mo_after > 0 && env_.markout && env_.markout().first >= p_.mo_after && env_.markout().second < -p_.mo_floor)
+      d.pull = "lane paused: its 60 s markout is below the floor";
     else if (p_.event_cap > 0 && event_worst(*view, *snap, m->second.event_ticker) >= p_.event_cap) d.pull = "event cap";
     else if (now < cool_until_[tk]) d.pull = "our fill";
     else {

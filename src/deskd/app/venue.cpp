@@ -193,16 +193,23 @@ void Deskd::attach_manual() {
       };
     };
     env.want = want("M1");
-    lip_ = std::make_unique<MakerEngine>("M1", cfg_.lip_series, env);
+    env.markout = [this] { const auto m = markouts_->lane_mean("M1", "60s"); return std::make_pair(m.fills, m.mean); };
+    MakerParams lip;
+    lip.mo_after = 200;   // plan section 5: "Rule after 200 fills" retires LIP-15 below -1.5c
+    lip.mo_floor = 150;
+    lip_ = std::make_unique<MakerEngine>("M1", cfg_.lip_series, env, lip);
     // BAND 96-99 (lane M2): the weather highs first (deskd.band_series); no anchor; 5 a market,
     // $15 an event (a city's day), and it stops quoting once its day is down $20 (plan section 5)
     MakerParams band;
     band.size = 500;
     band.event_cap = 15 * 1000000LL;
     band.lane_pause = 20 * 1000000LL;
+    band.mo_after = 100;  // "pause below -1c after 100 fills"
+    band.mo_floor = 100;
     auto band_env = env;
     band_env.anchor = {};
     band_env.want = want("M2");
+    band_env.markout = [this] { const auto m = markouts_->lane_mean("M2", "60s"); return std::make_pair(m.fills, m.mean); };
     band_ = std::make_unique<MakerEngine>("M2", cfg_.band_series, band_env, band, band_quote);
   }
   p.send = [this](KalshiWriteJob j) { return q_man_.push(std::move(j)); };

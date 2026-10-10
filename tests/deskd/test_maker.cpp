@@ -1,6 +1,7 @@
 // The maker engine's decision (strat/maker.h): plan section 5's quote rules, worked by hand.
 #include "check.h"
 #include "deskd/strat/maker.h"
+#include "deskd/rest/state.h"
 using namespace deskd;
 namespace {
 const std::vector<kalshi::PriceRange> CENT = {{0, 10000, 100}};
@@ -114,9 +115,67 @@ void band() {
   in.private_up = false;
   CHECK(band_quote(in, p).pull == "private feed down");
 }
+// The owner's limits, with gw, the REST read and the books stubbed: what it posts, or why not.
+void engine_limits() {
+  const std::string tk = "KXHIGHNY-26OCT10-B70";
+  auto view = std::make_shared<Gateway::SysView>();
+  view->run = RunState::RUN;
+  view->lanes_on = {"M2"};
+  auto snap = std::make_shared<rest::Snapshot>();
+  kalshi::MarketRow m; m.ticker = tk; m.event_ticker = "KXHIGHNY-26OCT10"; m.status = "active";
+  m.open_ms = OPEN; m.close_ms = OPEN + 86400000; m.price_ranges = CENT;
+  snap->markets[tk] = m;
+  std::vector<GwMsg> posted;
+  std::pair<std::int64_t, Money> mo{0, 0};
+  MakerEngine::Env env;
+  env.view = [&] { return std::shared_ptr<const Gateway::SysView>(view); };
+  env.snapshot = [&] { return std::shared_ptr<const rest::Snapshot>(snap); };
+  env.book = [&](const std::string&) { return std::optional<MdBook>(book(9700, 2000, 9900, 300)); };
+  env.private_up = [] { return true; };
+  env.post = [&](GwMsg g) { posted.push_back(std::move(g)); return true; };
+  env.markout = [&] { return mo; };
+  MakerParams p; p.size = 500; p.event_cap = 15000000; p.lane_pause = 20000000; p.mo_after = 100; p.mo_floor = 100;
+  MakerEngine e("M2", {"KXHIGHNY"}, env, p, band_quote);
+  e.step(OPEN + 1000);
+  CHECK(posted.size() == 1);
+  if (posted.size() == 1) {
+    const auto* pi = std::get_if<PlaceIntent>(&posted[0]);
+    CHECK(pi && pi->owner == Owner::SYS && pi->lane == "M2" && pi->tif == Tif::POST && pi->ttl_s == 60 &&
+          pi->price == 9700 && pi->count == 500 && pi->cid.rfind("SM2-", 0) == 0 && pi->touch == Px{9700});
+  }
+  // the markout floor: 100 fills at -1.5c stops it; a fresh engine sees why
+  mo = {100, -150};
+  MakerEngine paused("M2", {"KXHIGHNY"}, env, p, band_quote);
+  posted.clear();
+  paused.step(OPEN + 1000);
+  CHECK(posted.empty() && paused.status()["last"][tk] == "lane paused: its 60 s markout is below the floor");
+  mo = {99, -150};   // not enough fills yet to judge
+  MakerEngine young("M2", {"KXHIGHNY"}, env, p, band_quote);
+  young.step(OPEN + 1000);
+  CHECK(posted.size() == 1);
+  // the lane's day past -$20
+  mo = {0, 0};
+  view->lane_day["M2"] = -20000000;
+  MakerEngine down("M2", {"KXHIGHNY"}, env, p, band_quote);
+  posted.clear();
+  down.step(OPEN + 1000);
+  CHECK(posted.empty() && down.status()["last"][tk] == "lane paused: its day is past the loss limit");
+  // the event cap: 15 contracts held in the event at $1 a contract is $15
+  view->lane_day.clear();
+  view->positions["M2|" + tk] = 1500;
+  MakerEngine capped("M2", {"KXHIGHNY"}, env, p, band_quote);
+  capped.step(OPEN + 1000);
+  CHECK(posted.empty() && capped.status()["last"][tk] == "event cap");
+  // not running: nothing
+  view->positions.clear();
+  view->run = RunState::STOP;
+  MakerEngine stopped("M2", {"KXHIGHNY"}, env, p, band_quote);
+  stopped.step(OPEN + 1000);
+  CHECK(posted.empty() && stopped.status()["last"][tk] == "not running");
+}
 }  // namespace
 
 int main() {
-  grid(); quotes(); anchor_and_pulls(); band();
+  grid(); quotes(); anchor_and_pulls(); band(); engine_limits();
   return finish("deskd-maker");
 }

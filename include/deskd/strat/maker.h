@@ -46,6 +46,10 @@ struct MakerParams {
   // contract), and the lane's day below which it stops quoting; 0 = none
   std::int64_t event_cap = 0;          // micro-dollars
   std::int64_t lane_pause = 0;         // micro-dollars, a loss
+  // the plan's markout rule: once mo_after of the lane's fills are marked at 60 s, a mean below
+  // -mo_floor per contract stops it (BAND: 100 fills, 1c; LIP-15: 200 fills, 1.5c); 0 = none
+  std::int64_t mo_after = 0;
+  Money mo_floor = 0;
 };
 
 struct MakerInput {
@@ -100,6 +104,8 @@ class MakerEngine {
     std::function<bool()> private_up, reference_fresh;
     std::function<bool(GwMsg)> post;                              // gw's inbox
     std::function<void(std::set<std::string>)> want;              // markets whose books it needs
+    // the lane's 60 s markouts so far: fills marked and the mean per contract
+    std::function<std::pair<std::int64_t, Money>()> markout;
   };
   using Decide = std::function<MakerDecision(const MakerInput&, const MakerParams&)>;
   MakerEngine(std::string lane, std::vector<std::string> series, Env env, MakerParams params = {},

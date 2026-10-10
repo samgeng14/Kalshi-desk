@@ -34,6 +34,9 @@ class Markouts {
   std::vector<nlohmann::json> step(std::int64_t now_ms);
   // per lane and horizon: fills marked and the contract-weighted mean markout
   nlohmann::json status() const;
+  // one lane's markouts at a horizon ("1s", "10s", "60s"): fills marked and the mean, per contract
+  struct LaneMean { std::int64_t fills = 0; Money mean = 0; };
+  LaneMean lane_mean(const std::string& lane, const std::string& horizon) const;
   std::optional<Px> mid_at(const std::string& ticker, std::int64_t at_ms) const;
 
  private:

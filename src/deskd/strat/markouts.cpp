@@ -68,6 +68,15 @@ std::vector<json> Markouts::step(std::int64_t now) {
   return out;
 }
 
+Markouts::LaneMean Markouts::lane_mean(const std::string& lane, const std::string& horizon) const {
+  std::lock_guard<std::mutex> lk(m_);
+  const auto l = means_.find(lane);
+  if (l == means_.end()) return {};
+  const auto h = l->second.find(horizon);
+  if (h == l->second.end() || !h->second.contracts) return {};
+  return {h->second.n, h->second.sum / h->second.contracts};
+}
+
 json Markouts::status() const {
   std::lock_guard<std::mutex> lk(m_);
   json lanes = json::object();
