@@ -130,7 +130,18 @@ Nothing is pushed. `ui/desk/js/contract.js` is the API contract deskd must serve
    Stop over an in-flight create). `order_group_updates` (its own subscribe command) tells gw of
    a venue-triggered group: the lane is BLOCKED until a Stop lets gw reset it. Not done yet: S1
    ARB (needs event exclusivity), C1 (needs the trained women's college basketball model), X1, LIP
-   share estimates, the 4-hour TSan soak itself (run it on the Mac).
+   share estimates, the 4-hour TSan soak itself (run it on the Mac). An 8-minute soak after the
+   fee fix: 745 quotes, 80 fills, 0 refusals, 0 violations.
+   **Before turning lanes on, on the Mac (demo only):**
+   `build-deskd/kalshi-demo-probe --handshakes 2 --feeds-check --group-check`. `--feeds-check`
+   (reads only) lists the open markets of M1's and M2's series on demo (change them with
+   `--lip-series` / `--band-series`, then `deskd.lip_series` / `band_series` to match), reads
+   `pyth_value` for 15 s and says which 15-minute series' reference symbol demo relays, and checks
+   the `order_group_updates` subscription. `--group-check` places one post-only $0.01 bid (15 s
+   expiry) in a 1-contract group, triggers it (the bid must be cancelled, a second bid refused as
+   soft_group), resets and deletes it, and wants `triggered` on the socket. Each prints NOT OK
+   with the reason; a series with no open markets on demo or no `pyth_value` there means that
+   lane has nothing to do on demo, not that deskd is broken.
    Next: the demo proof on the Mac (set manual_orders, small sizes), then latency timelines,
    per-shard token buckets, the journal, and positions from the execution ledger. Then: wire `gw/order_ledger` into the gateway
    alongside the execution/position ledger; authoritative series fees; PlaceIntent validation,
