@@ -254,6 +254,14 @@ json Deskd::status() const {
   result["maker"] = lip_ ? lip_->status() : json(nullptr);
   result["band"] = band_ ? band_->status() : json(nullptr);
   result["markouts"] = markouts_ ? markouts_->status() : json(nullptr);
+  if (const auto l = gw_->latency()) {
+    auto ms = [](const std::optional<int>& v) { return v ? json(*v) : json(nullptr); };
+    result["latency"] = {{"n", l->n}, {"click_ack_p50", ms(l->click_ack_p50)}, {"click_ack_p90", ms(l->click_ack_p90)},
+                         {"recv_ack_p50", ms(l->recv_ack_p50)}, {"recv_ack_p90", ms(l->recv_ack_p90)},
+                         {"wire_p50", ms(l->wire_p50)}, {"wire_p90", ms(l->wire_p90)}};
+  } else {
+    result["latency"] = {{"n", 0}};
+  }
   result["senders"] = {{"k1", sender(man_sender_.get())}, {"cx", sender(cx_sender_.get())},
                        {"k2", sender(cfg_.systematic_orders ? sys_sender_.get() : nullptr)}};
   result["publisher_healthy"] = pub_->healthy();

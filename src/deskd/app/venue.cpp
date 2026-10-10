@@ -228,6 +228,7 @@ HdrInputs Deskd::header() const {
   h.preflight = ops_->preflight();
   h.daily_stop = cfg_.daily_stop;
   h.kx_lag_ms = feeds_.KX.view().lag_ms;
+  if (const auto l = gw_->latency()) h.gw_ack_ms = l->ack20_p50;
   if (!rest_) return h;
   const auto s = rest_->snapshot();
   // Read-only until the operator turns Manual orders on (deskd.manual_orders) with a write path.

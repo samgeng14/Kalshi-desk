@@ -1,5 +1,6 @@
 #include "deskd/gw/gateway.h"
 
+#include <algorithm>
 #include <chrono>
 
 #include "deskd/app/log.h"
@@ -132,6 +133,36 @@ bool Gateway::sync_kill() {
   }
   if (changed && sys_) reset_groups();   // KILL's sender triggered them; the next Start needs them active
   return false;
+}
+
+void Gateway::note_latency(const KalshiWriteReply& r) {
+  const auto* o = manual_->ledger().find(r.cid);
+  if (!o || !r.ack_ms) return;
+  LatSample s;
+  if (o->intent.t_click_ms > 0 && r.ack_ms >= o->intent.t_click_ms) s.click_ack = static_cast<int>(r.ack_ms - o->intent.t_click_ms);
+  s.recv_ack = static_cast<int>(std::max<std::int64_t>(0, r.ack_ms - o->intent.t_recv_ms));
+  s.wire = static_cast<int>(r.exchange.write_to_done_ms());
+  lat_.push_back(s);
+  if (lat_.size() > 200) lat_.pop_front();
+  auto pct = [](std::vector<int> v, double q) -> std::optional<int> {
+    if (v.empty()) return std::nullopt;
+    std::sort(v.begin(), v.end());
+    return v[std::min(v.size() - 1, static_cast<std::size_t>(q * (v.size() - 1) + 0.5))];
+  };
+  std::vector<int> click, recv, wire, last20;
+  for (std::size_t i = 0; i < lat_.size(); ++i) {
+    if (lat_[i].click_ack >= 0) click.push_back(lat_[i].click_ack);
+    recv.push_back(lat_[i].recv_ack);
+    wire.push_back(lat_[i].wire);
+    if (i + 20 >= lat_.size()) last20.push_back(lat_[i].recv_ack);
+  }
+  auto v = std::make_shared<Latency>();
+  v->n = static_cast<int>(lat_.size());
+  v->click_ack_p50 = pct(click, 0.5); v->click_ack_p90 = pct(click, 0.9);
+  v->recv_ack_p50 = pct(recv, 0.5); v->recv_ack_p90 = pct(recv, 0.9);
+  v->wire_p50 = pct(wire, 0.5); v->wire_p90 = pct(wire, 0.9);
+  v->ack20_p50 = pct(last20, 0.5);
+  std::atomic_store(&latency_, std::shared_ptr<const Latency>(std::move(v)));
 }
 
 // The first time the ledger stops, its reason is logged and kept for /ops/status.
@@ -343,6 +374,7 @@ void Gateway::manual_reply(const KalshiWriteReply& r) {
     }
   const bool ok = manual_->apply(r);
   if (!ok) DLOG_ERR("reply for order %s contradicts the order book: reconcile before trading", r.cid.c_str());
+  if (ok && r.outcome.kind == K::ACK && r.create) note_latency(r);
   publish_order(r.cid);
   // A cancel asked for while the write was in flight goes out once the order id is known.
   if (const auto* o = manual_->ledger().find(r.cid))

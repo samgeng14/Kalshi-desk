@@ -13,6 +13,7 @@
 // applied on this thread before any later Start sees the switch clear.
 #include <atomic>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <map>
 #include <set>
@@ -91,6 +92,16 @@ class Gateway {
   static constexpr Money kCostBudget = 5 * 10000;
   std::shared_ptr<const SysView> sys_view() const { return std::atomic_load(&sys_view_); }
 
+  // Any thread: the order path's latency (stage 4: click-to-ack p90 under 100 ms), over the last
+  // 200 creates the venue acknowledged: click (the page's clock) to ack, deskd's receipt to ack,
+  // and the write on the wire; ms. ack20_p50 is the contract's hdr.lat.gw_ack_ms (ack - receive,
+  // p50 of the last 20).
+  struct Latency {
+    int n = 0;
+    std::optional<int> click_ack_p50, click_ack_p90, recv_ack_p50, recv_ack_p90, wire_p50, wire_p90, ack20_p50;
+  };
+  std::shared_ptr<const Latency> latency() const { return std::atomic_load(&latency_); }
+
   // queues m in its lane (lane_of); false when that lane is full: dropped, gap marked
   bool post(GwMsg m);
   BoundedQueue<GwMsg>& inbox() { return inbox_; }
@@ -151,6 +162,10 @@ class Gateway {
   std::unique_ptr<SysBook> sys_;
   std::shared_ptr<const std::pair<bool, std::string>> groups_view_;   // std::atomic_load / std::atomic_store
   std::shared_ptr<const SysView> sys_view_;                          // std::atomic_load / std::atomic_store
+  std::shared_ptr<const Latency> latency_;                           // std::atomic_load / std::atomic_store
+  struct LatSample { int click_ack = -1, recv_ack = 0, wire = 0; };
+  std::deque<LatSample> lat_;                                         // gw thread
+  void note_latency(const KalshiWriteReply& r);
   std::map<std::string, std::int64_t> lane_published_;   // lane id -> when its row last went out
   std::set<std::string> lanes_dirty_;
   std::int64_t sys_view_ms_ = 0, groups_paced_ms_ = 0, sys_day_ms_ = 0;

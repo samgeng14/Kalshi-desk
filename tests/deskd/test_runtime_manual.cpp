@@ -189,6 +189,11 @@ void orders_cancel_kill() {
   if(o["status"]!=200) std::fprintf(stderr,"post: %s\n",o.dump().c_str());
   CHECK(o["status"]==200 && o["ord"]["st"]=="WORK");
   CHECK(r.resting()==1);
+  {   // the order path's latency: two acknowledged creates, click to ack measured
+    const auto lat=r.d->status()["latency"];
+    CHECK(lat["n"]==2 && lat["click_ack_p50"].is_number() && lat["recv_ack_p90"].is_number() && lat["wire_p50"].is_number());
+    if(lat["click_ack_p90"].is_number()) std::printf("click to ack p90 %d ms on the fake\n",lat["click_ack_p90"].get<int>());
+  }
   auto cx=r.post("/api/cancel",{{"cids",{"Mrt-post-1"}}});
   CHECK(cx && cx->status==200 && json::parse(cx->body)["n"]==1);
   CHECK(r.until([&]{ return r.resting()==0; }));
