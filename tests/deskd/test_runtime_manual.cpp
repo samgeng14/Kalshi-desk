@@ -793,10 +793,38 @@ void shard_preflight() {
     for(const auto& x:json::parse(st->body).value("preflight",json::array())) if(x["id"]=="SHARD") return x["ok"]==true;
     return false; },20000));
 }
+// Orders on the account this run did not place: a previous run's (M-prefixed) and the website's
+// (no client id). The page shows them from the REST read; the x on one cancels it by order id,
+// and cancel_all with own ANY cancels every one (conformance review: they could not be cancelled
+// short of KILL, and they blocked their market).
+void foreign_cancels() {
+  std::string old_oid, web_oid;
+  Run r(true,[&](fakex::Engine& e,std::int64_t now) {
+    fakex::NewOrder o; o.ticker=TK; o.side=fakex::Side::BID; o.count=100; o.price=3500; o.client_order_id="Mold-run-1";
+    old_oid=e.create(o,now).order_id;
+    o.client_order_id.clear(); o.price=3400;
+    web_oid=e.create(o,now).order_id;
+  });
+  CHECK(!old_oid.empty() && !web_oid.empty());
+  CHECK(r.ready());
+  CHECK(r.resting()==2);
+  // the x on the previous run's order: its cid as the page shows it
+  auto cx=r.post("/api/cancel",{{"cids",{"Mold-run-1"}}});
+  CHECK(cx && cx->status==200);
+  if(cx && cx->status==200) CHECK(json::parse(cx->body)["cids"]==json::array({"Mold-run-1"}));
+  CHECK(r.until([&]{ return r.resting()==1; }));
+  // cancel_all, any owner: the website's order too
+  auto all=r.post("/api/cancel_all",{{"v","K"},{"own","ANY"}});
+  CHECK(all && all->status==200);
+  CHECK(r.until([&]{ return r.resting()==0; }));
+  CHECK(r.d->status()["gw"]["ledger_healthy"]==true);
+  // and a manual order on the market goes now that nothing foreign rests there
+  CHECK(r.until([&]{ return r.order("Mforeign-1","BUY","0.3900",1.0,"POST",60)["status"]==200; },10000));
+}
 }  // namespace
 
 int main() {
   std::signal(SIGPIPE,SIG_IGN);
-  off_by_default(); orders_cancel_kill(); stop_reasons(); financial_fair(); systematic(); systematic_maker(); systematic_band(); systematic_races(); systematic_group_trigger(); systematic_book(); takeover(); shard_preflight();
+  off_by_default(); orders_cancel_kill(); stop_reasons(); financial_fair(); systematic(); systematic_maker(); systematic_band(); systematic_races(); systematic_group_trigger(); systematic_book(); takeover(); shard_preflight(); foreign_cancels();
   return finish("deskd-runtime-manual");
 }

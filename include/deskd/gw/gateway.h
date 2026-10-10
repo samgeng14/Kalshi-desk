@@ -148,6 +148,10 @@ class Gateway {
   void manual_reply(const KalshiWriteReply& r);
   void manual_private(const PrivateEvent& e);
   std::vector<std::string> cancel_manual(const CancelIntent& c);
+  // Resting orders on the account this run did not place (a previous run's, the website's): a
+  // cancel that covers them cancels them by order id on send-cx; their cids as the page shows them
+  std::vector<std::string> cancel_foreign(const CancelIntent& c);
+  std::map<std::string, std::int64_t> foreign_cx_;   // page cid -> when its cancel was queued
   void send_cancel(const std::string& cid);
   void publish_order(const std::string& cid);
   std::string order_json(const std::string& cid) const;

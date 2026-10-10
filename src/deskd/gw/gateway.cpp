@@ -6,6 +6,7 @@
 #include <fstream>
 
 #include "deskd/app/log.h"
+#include "deskd/app/projection.h"
 #include "deskd/app/worker.h"
 #include "deskd/gw/kill.h"
 #include "deskd/gw/manual_book.h"
@@ -300,6 +301,10 @@ void Gateway::handle(GwMsg& m) {
     }
     for (const auto& g : gone) r.cids.push_back(std::get<PlaceIntent>(g).cid);
     for (auto& cid : cancel_manual(cx)) r.cids.push_back(std::move(cid));
+    if (manual_) {
+      sync_snapshot();
+      for (auto& cid : cancel_foreign(cx)) r.cids.push_back(std::move(cid));
+    }
     if (c->reply) {
       try { c->reply->set_value(std::move(r)); } catch (const std::future_error&) {}
     }
@@ -433,6 +438,14 @@ void Gateway::place_manual(PlaceIntent& p) {
 void Gateway::manual_reply(const KalshiWriteReply& r) {
   if (!manual_) return;
   using K = kalshi::WriteOutcome::Kind;
+  if (const auto f = foreign_cx_.find(r.cid); r.op == WireOp::CANCEL && f != foreign_cx_.end()) {
+    // not this run's order: the next account read (and the private feed) shows how it ended;
+    // until then (10 s) a cancel that covers it again is not sent again
+    f->second = now_ms();
+    DLOG_INFO("cancel of %s, an order this run did not place: %s", r.cid.c_str(),
+              r.outcome.kind == K::ACK ? "acknowledged" : (r.outcome.why.empty() ? r.local_code : r.outcome.why).c_str());
+    return;
+  }
   if (r.op == WireOp::CANCEL) {
     const auto why = cancel_why_.find(r.cid);
     if (r.cancel && !manual_->ledger().cancelled(r.cid, *r.cancel, why == cancel_why_.end() ? "USER" : why->second,
@@ -543,6 +556,48 @@ std::vector<std::string> Gateway::cancel_manual(const CancelIntent& c) {
     publish_order(cid);
   }
   return cids;
+}
+
+std::vector<std::string> Gateway::cancel_foreign(const CancelIntent& c) {
+  std::vector<std::string> out;
+  if (!snapshot_seen_ || !path_->cancel || (c.scope == CancelIntent::Scope::MARKET && c.venue != Venue::K)) return out;
+  std::set<std::string> ours;
+  for (const auto& [cid, o] : manual_->ledger().orders()) if (!o.oid.empty()) ours.insert(o.oid);
+  const auto now = now_ms();
+  for (auto it = foreign_cx_.begin(); it != foreign_cx_.end();) it = now - it->second > 60000 ? foreign_cx_.erase(it) : std::next(it);
+  for (const auto& row : snapshot_seen_->orders) {
+    if (row.status != kalshi::OrderStatus::RESTING || row.remaining <= 0 || ours.count(row.order_id)) continue;
+    if (!row.client_order_id.empty() && manual_->ledger().find(row.client_order_id)) continue;
+    const std::string cid = screen_cid(row);
+    const char first = row.client_order_id.empty() ? 0 : row.client_order_id.front();
+    const bool own_ok = c.own == CancelIntent::Own::ANY || (c.own == CancelIntent::Own::MAN && first == 'M') ||
+                        (c.own == CancelIntent::Own::SYS && first == 'S');
+    const Side side = row.side == kalshi::BookSide::BID ? Side::BUY : Side::SELL;
+    bool covered = false;
+    switch (c.scope) {
+      case CancelIntent::Scope::CID: covered = c.cid == cid; break;
+      case CancelIntent::Scope::MARKET:
+        covered = c.ticker == row.ticker && own_ok && (!c.has_side || side == c.side) && (!c.px || row.yes_price == c.px);
+        break;
+      case CancelIntent::Scope::LANE: covered = first == 'S' && lane_of_cid(row.client_order_id) == c.lane; break;
+      case CancelIntent::Scope::ALL: covered = own_ok; break;
+    }
+    if (!covered) continue;
+    const auto sent = foreign_cx_.find(cid);
+    if (sent != foreign_cx_.end() && now - sent->second < 10000) continue;   // asked already; its reply is coming
+    KalshiWriteJob j;
+    j.kind = KalshiWriteJob::Kind::CANCEL;
+    j.cid = cid;
+    j.oid = row.order_id;
+    j.ticker = row.ticker;
+    j.shard = row.exchange_index.value_or(0);
+    if (path_->cancel(std::move(j))) {
+      foreign_cx_[cid] = now;
+      out.push_back(cid);
+      DLOG_INFO("cancelling %s on %s, an order this run did not place", cid.c_str(), row.ticker.c_str());
+    }
+  }
+  return out;
 }
 
 void Gateway::send_cancel(const std::string& cid) {
