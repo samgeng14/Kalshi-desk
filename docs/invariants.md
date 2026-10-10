@@ -53,3 +53,31 @@ The seven focused private/REST/MD/publisher/web/process/ops suites pass. A demo 
 `deskd_read_probe.py --require-private` passed five contract checks with eight live books,
 KX and KXP up without gaps, and no exchange orders sent. The observed clock offset was -44 ms;
 this is read-path evidence, not a click-to-ack measurement. Manual submission remains pending.
+
+## Stage 3 order-state core — 2026-10-08
+
+- Each cid retains its own state; a second timeout cannot overwrite the first UNKNOWN order.
+  UNKNOWN is PEND with an empty reason, retains its reservation, and blocks its market/shard.
+- Cids are never reused. Exchange ids cannot be rebound to another cid. Contradictory identity,
+  quantity or execution evidence latches the ledger unhealthy and blocks subsequent inserts.
+- Only a new trade_id returns APPLIED for execution accounting. REST and WS copies may have
+  different fill ids and timestamp precision; conflicting economic details fail closed.
+  Ack/order/cancel cumulative fill counts take the maximum and never duplicate executions.
+- Terminal orders cannot be resurrected by old REST rows or a late create response. A full
+  execution still wins a cancel race. A cancel requested before the order id arrives persists.
+- Reservations remain on reported but undelivered fills, including terminal orders. After five
+  seconds these orders require a fills read. Zero-reduction cancel responses do not prove zero
+  fills; they keep the order uncertain until an authoritative order state arrives.
+- Absence proof requires both complete histories, the right market/shard, coverage starting
+  at least five seconds before send, and a read begun after expiry + 5 seconds (or send + two
+  minutes without expiry). A read that merely finishes after the deadline does not qualify.
+- Integer fractional quantities and upward-rounded proportional reservations preserve each
+  shard's collateral. Tests cover all 24 full-fill and 120 partial-fill/cancel event permutations,
+  duplicate and contradictory fills, stale snapshots, malformed counts, and 5,000 UNKNOWN ids.
+
+This is a standalone gateway-owned state component. It is not wired to runtime submission;
+positions, fee admission, persistence, senders and web order responses remain to integrate.
+
+Validation: all 18 deskd/frontend suites passed (242 seconds); after the final zero-reduction
+cancel/late-ack correction, `deskd-all` rebuilt without warnings and the ledger suite passed
+again. The final targeted rerun covers the new partial and complete late-ack cases as well.

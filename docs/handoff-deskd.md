@@ -39,6 +39,12 @@ Nothing is pushed. `ui/desk/js/contract.js` is the API contract deskd must serve
   stale until a complete consistent read succeeds. Demo proof: KX and KXP up without gaps,
   eight books, contract 1.5.0 captures pass, zero orders sent. Manual still read-only; incremental
   gateway order/fill accounting and the write path remain to implement.
+- Stage 3 order-state core: `gw/order_ledger` implements per-cid UNKNOWN, exchange-id mapping,
+  monotone cumulative counts, deduplicated executions, pending cancels, and shard reservations.
+  A cumulative fill without its execution retains collateral; a zero-reduction cancel requires
+  a terminal order read/event. Pure state tests exercise 5,000 UNKNOWN orders and all 144
+  permutations of full-fill and partial-fill/cancel races, checking records against contract
+  1.5.0. This component is not yet wired into the runtime's gateway or HTTP order routes.
 - Oracle VM `deskd-recorder` for the recorder: `ssh -i ~/.ssh/oracle_deskd ubuntu@64.181.211.165` (Ubuntu 24.04 aarch64, 1 OCPU, 6 GB, 145 GB). Nothing installed yet.
 
 ## Next, in order
@@ -47,11 +53,19 @@ Nothing is pushed. `ui/desk/js/contract.js` is the API contract deskd must serve
    to pub; gw's Manual owner must receive the same books and REST revisions before accepting
    orders. The strict /api/health schema stays unchanged; clock detail is in hdr.lat and
    /ops/status. Browser access was declined, so the real-page visual check is still open.
-2. **Stage 3, the Manual order path** (plan section 3): PlaceIntent validation, fat-finger guard, worst-case reservation per shard, cid prefix `M-`, journal, `send-k1`; Take = IOC at the touch plus slippage cap; Post = post_only + GTC + expiration_time + cancel_order_on_pause with a backup client cancel; Flatten = IOC reduce_only; cancels on `send-cx`; `exchange_index` on every write; UNKNOWN on 5xx/timeout/cut body, which blocks the market until a REST read clears it; fills de-duplicated by trade_id; token bucket per shard; web routes wait at most 50 ms for gw then answer queued; the latency timeline per order and `tools/latency_report.py`.
+2. **Stage 3, the Manual order path** (plan section 3): wire `gw/order_ledger` into the gateway
+   alongside the execution/position ledger; authoritative series fees; PlaceIntent validation,
+   fat-finger guard, worst-case reservation per shard, preserved `M...` cid, journal, `send-k1`;
+   Take = IOC at the supplied slippage cap; Post = post_only + GTC + expiration_time +
+   cancel_order_on_pause with a backup client cancel; Flatten = IOC reduce_only; cancels on
+   `send-cx`; exchange_index on every write; per-shard token buckets; bounded 50 ms web replies;
+   latency timelines and `tools/latency_report.py`. UNKNOWN and execution deduplication are
+   implemented in the standalone ledger, but their sender/private/REST integration remains open.
 3. **Stage 4, prove it:** the real page against the fake (browser pane) and against demo; `tools/demo_checks` (duplicate client_order_id, shortest expiry, post_only cross refusal, reduce_only, group trigger/reset, self-trade shapes); 50+ demo orders; `docs/invariants.md` entries. Done when: click-to-ack p90 under 100 ms, Take fills at the shown price 90%+ in 1c books, nothing lives 2 s past expiry.
 4. Then four reviews (orders, safety, latency/UI/contract, plan conformance), fixes, a final verification.
 5. **Recorder** (plan section 7) on `desk/recorder`: asyncio, explicit subscription lists, hourly zstd Parquet with manifest and gaps, R2 uploader, deploy kit for the VM (setup.sh, systemd, deploy.sh). Soak an hour locally before deploying. The operator still has to create a production read-only Kalshi key, an R2 bucket with a write-only token, and a healthchecks.io check.
-6. Week 2 (plan section 9): private socket, UNKNOWN table, risk book, Kill and order groups, Stop.
+6. Week 2 (plan section 9): complete the risk book, Kill and order groups, Stop; private socket
+   and UNKNOWN foundations have been brought forward for a correct Manual path.
 
 ### Stage 3 integration notes
 
@@ -69,6 +83,14 @@ Nothing is pushed. `ui/desk/js/contract.js` is the API contract deskd must serve
   series fees before relying on this presentation fallback for cash admission.
 - Publisher inbox overflow latches its header read-only and requires a restart. The gateway
   must include `pub.healthy()` in its entry prerequisites when Manual writes are wired.
+- `OrderLedger` belongs exclusively to gw. Admission supplies a resolved expiry and conservative
+  all-in reservation; its arithmetic bounds are not risk limits. A caller books a position only
+  on `FillResult::APPLIED`, in the same gateway turn; cumulative ack/order/cancel counts never
+  book it again. `UNMAPPED` events must be buffered/reconciled, and unhealthy ledger state blocks
+  admission. `History` requires complete orders AND fills with verified query coverage; do not
+  set these flags from an open-orders-only read. Positions, persisted journal, fee calculation,
+  recovery of existing foreign orders, cancel dispatch, and actual HTTP writes remain separate
+  integration work. Header RO must remain true until all of that is connected and tested.
 
 Read-only demo verification after launch (use the port deskd prints):
 
