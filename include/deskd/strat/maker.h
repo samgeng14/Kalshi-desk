@@ -9,8 +9,14 @@
 //   quotes  post-only both sides; the YES bid at the best bid or one tick better, never above
 //           fair - e - 0.1c x q, and the ask likewise; both sides in minutes 0-10 of the window,
 //           only the reducing side after; an IOC flatten from T-60 s while |q| > 10
-//   pulls   the book stale, the private feed down, the reference not fresh, the anchor too far
-//           from the microprice, and (owner) a fill of ours
+//   pulls   the book stale, the private feed down, the reference not fresh (the underlying's
+//           Pyth gap, gate or no gate), the anchor too far from the microprice, and (owner) a
+//           fill of ours or a 0.5 sigma move of the underlying while quotes rest
+//   book    the lane's own resting quotes are taken out of the book first: the touch, the
+//           sizes and the microprice are everyone else's (else a quote one tick inside the
+//           touch moves the touch, and the next decision chases it)
+//   flatten the T-60 s IOC goes ahead of the pulls, and of the lane pause, the event cap and the
+//           pause after our fill: those stop new risk, never the last minute's reduction
 //
 // quote() is pure; MakerEngine owns a lane's working quotes through gw (strat thread only).
 #include <cstdint>
@@ -98,8 +104,15 @@ class MakerEngine {
     std::function<std::shared_ptr<const rest::Snapshot>()> snapshot;
     std::function<std::optional<MdBook>(const std::string&)> book;
     // the market's model anchor: gated once its strike replication gate has passed (plan
-    // section 5: 50 windows in a row); a gated anchor with no fresh fair pulls the quotes
-    struct Anchor { bool gated = false; std::optional<Px> fair; };
+    // section 5: 50 windows in a row); a gated anchor with no fresh fair pulls the quotes.
+    // fresh: the underlying's Pyth value is fresh (by the gap rule), whatever the gate; spot and
+    // sd_log (sigma x sqrt(time left), in log terms) when the model has them, for the 0.5 sigma pull
+    struct Anchor {
+      bool gated = false;
+      std::optional<Px> fair;
+      bool fresh = true;
+      double spot = 0, sd_log = 0;
+    };
     std::function<Anchor(const std::string&)> anchor;
     std::function<bool()> private_up, reference_fresh;
     std::function<bool(GwMsg)> post;                              // gw's inbox
@@ -126,11 +139,14 @@ class MakerEngine {
   Decide decide_;
   std::map<std::string, std::map<int, Side_>> sides_;   // ticker -> 0 bid, 1 ask, 2 flatten
   std::map<std::string, Qty> last_pos_;
-  std::map<std::string, std::int64_t> cool_until_;      // after a fill of ours
+  std::map<std::string, std::int64_t> cool_until_;      // after a fill of ours, or a 0.5 sigma move
+  std::map<std::string, double> quote_spot_;            // the underlying when the quotes went out
+  std::map<std::string, std::string> cool_why_;
   std::map<std::string, std::string> last_pull_;
   std::uint64_t seq_ = 0;
   std::int64_t places_ = 0, cancels_ = 0, refusals_ = 0;
   std::string new_cid();
+  static void without_own(MdBook& b, const Gateway::SysView& v, const std::string& tk);
   std::int64_t event_worst(const Gateway::SysView& v, const rest::Snapshot& s, const std::string& event) const;
 };
 

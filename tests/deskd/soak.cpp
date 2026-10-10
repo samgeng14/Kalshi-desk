@@ -125,6 +125,7 @@ int main() {
   while(mono_ms()<end) {
     std::this_thread::sleep_for(std::chrono::milliseconds(250));
     const auto now=now_ms();
+    s.venue.f->pyth("Commodities.Index.NATGAS/USD",3.1,now);   // the venue's relay of the reference
     s.venue.f->with_engine([&](fakex::Engine& e,std::int64_t t) {
       // the next window two minutes before it opens; the street wanders, and sometimes takes
       if(s.next_open-t<120000) s.add_window(e,t);

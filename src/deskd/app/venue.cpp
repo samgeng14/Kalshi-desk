@@ -1,5 +1,6 @@
 #include "deskd/app/runtime.h"
 #include <algorithm>
+#include <cmath>
 #include "deskd/app/log.h"
 #include "deskd/app/projection.h"
 #include "deskd/gw/kalshi_sign.h"
@@ -174,10 +175,17 @@ void Deskd::attach_manual() {
     env.anchor = [this](const std::string& tk) {
       MakerEngine::Env::Anchor a;
       const Underlying* u = underlying_for(tk);
-      if (!u || !fair_ || !fair_->gated(u->key)) return a;
-      a.gated = true;
+      if (!u || !fair_) return a;   // no Pyth underlying: no reference rule applies
+      // the underlying's Pyth value by the gap rule, gate or no gate; never seen counts as a gap
+      const auto symbol = pyth_->symbol_for(u->patterns);
+      const auto ref = symbol.empty() ? std::nullopt : pyth_->view(symbol, -1, now_ms());
+      a.fresh = ref && ref->fresh;
       const auto board = fair_->board();
       const auto f = board->find(tk);
+      if (ref) a.spot = ref->value;
+      if (f != board->end() && f->second.sigma > 0 && f->second.tau_s > 0) a.sd_log = f->second.sigma * std::sqrt(f->second.tau_s);
+      if (!fair_->gated(u->key)) return a;
+      a.gated = true;
       if (f != board->end()) a.fair = f->second.fair;
       return a;
     };
@@ -199,6 +207,7 @@ void Deskd::attach_manual() {
     MakerParams lip;
     lip.mo_after = 200;   // plan section 5: "Rule after 200 fills" retires LIP-15 below -1.5c
     lip.mo_floor = 150;
+    lip.ttl_s = 15;       // plan section 2: maker orders rest 5-15 s (late fills are the toxic ones)
     lip_ = std::make_unique<MakerEngine>("M1", cfg_.lip_series, env, lip);
     // BAND 96-99 (lane M2): the weather highs first (deskd.band_series); no anchor; 5 a market,
     // $15 an event (a city's day), and it stops quoting once its day is down $20 (plan section 5)

@@ -1,4 +1,5 @@
 // The maker engine's decision (strat/maker.h): plan section 5's quote rules, worked by hand.
+#include <cmath>
 #include "check.h"
 #include "deskd/strat/maker.h"
 #include "deskd/rest/state.h"
@@ -173,9 +174,115 @@ void engine_limits() {
   stopped.step(OPEN + 1000);
   CHECK(posted.empty() && stopped.status()["last"][tk] == "not running");
 }
+
+// The maker-math review (2026-10-10), each with its worked example.
+void review_fixes() {
+  // the grid at $0 and $1: the range's own end is not a price, and no lower range wins instead
+  CHECK(grid_floor(10000, TAPER) == Px{9990} && grid_ceil(0, TAPER) == Px{10});
+  CHECK(grid_floor(10000, CENT) == Px{9900} && grid_ceil(0, CENT) == Px{100} && !grid_floor(-50, CENT));
+  // a cap through the touch joins it instead of dropping the quote: 0.45 x10 / 0.46 x30, micro
+  // 0.4525; short 18, the bid cap 0.4605 is past the ask: bid the best bid
+  auto b = book(4500, 1000, 4600, 3000);
+  auto d = maker_quote(input(b, OPEN + 60000, -1800));
+  CHECK(d.quotes.size() == 1 && d.quotes[0].side == Side::BUY && d.quotes[0].price == 4500);
+  // long 13: the ask floor 0.4495 is under the bid: offer at the best ask
+  d = maker_quote(input(b, OPEN + 60000, 1300));
+  CHECK(d.quotes.size() == 1 && d.quotes[0].side == Side::SELL && d.quotes[0].price == 4600);
+  // the T-60 s flatten goes ahead of the pulls: an anchor 4c off the microprice, a quiet reference
+  b = book(4000, 500, 4600, 500);
+  auto in = input(b, CLOSE - 45000, 1500);
+  in.anchor = 4700;
+  d = maker_quote(in);
+  CHECK(d.quotes.size() == 1 && d.quotes[0].ioc && d.quotes[0].side == Side::SELL && d.quotes[0].price == 4000);
+  in.anchor.reset();
+  in.reference_fresh = false;
+  d = maker_quote(in);
+  CHECK(d.quotes.size() == 1 && d.quotes[0].ioc);
+  // a quiet reference pulls the quotes with no anchor gated
+  in = input(b);
+  in.reference_fresh = false;
+  CHECK(maker_quote(in).pull == "reference not fresh");
+}
+
+// The engine against its own quotes: they come off the book before it decides, the flatten goes
+// through a lane pause, and a 0.5 sigma move of the underlying pulls what rests.
+void engine_own_quotes() {
+  const std::string tk = "KXNATGAS15M-26OCT101500-00";
+  auto view = std::make_shared<Gateway::SysView>();
+  view->run = RunState::RUN;
+  view->lanes_on = {"M1"};
+  auto snap = std::make_shared<rest::Snapshot>();
+  kalshi::MarketRow m; m.ticker = tk; m.event_ticker = "KXNATGAS15M-26OCT101500"; m.status = "active";
+  m.open_ms = OPEN; m.close_ms = CLOSE; m.price_ranges = CENT;
+  snap->markets[tk] = m;
+  MdBook shown = book(4000, 500, 4600, 500);
+  MakerEngine::Env::Anchor anchor;
+  std::vector<GwMsg> posted;
+  MakerEngine::Env env;
+  env.view = [&] { return std::shared_ptr<const Gateway::SysView>(view); };
+  env.snapshot = [&] { return std::shared_ptr<const rest::Snapshot>(snap); };
+  env.book = [&](const std::string&) { return std::optional<MdBook>(shown); };
+  env.anchor = [&](const std::string&) { return anchor; };
+  env.private_up = [] { return true; };
+  env.post = [&](GwMsg g) { posted.push_back(std::move(g)); return true; };
+  MakerEngine e("M1", {"KXNATGAS15M"}, env, MakerParams{});
+  anchor.spot = 3.1;
+  anchor.sd_log = 0.002;
+  e.step(OPEN + 60000);
+  CHECK(posted.size() == 2);
+  // they rest: the venue's book now shows them as its touch
+  auto rest = [&] {
+    view->orders.clear();
+    for (const auto& g : posted)
+      if (const auto* pi = std::get_if<PlaceIntent>(&g)) {
+        Gateway::SysOrder o;
+        o.cid = pi->cid; o.lane = "M1"; o.ticker = tk; o.side = pi->side; o.price = pi->price; o.count = pi->count;
+        o.left = pi->count; o.state = OrdState::WORK;
+        view->orders[o.cid] = o;
+      }
+  };
+  rest();
+  CHECK(view->orders.size() == 2);
+  shown.bids = {{4100, 1000}, {4000, 500}};
+  shown.asks = {{4500, 1000}, {4600, 500}};
+  posted.clear();
+  e.step(OPEN + 61000);
+  CHECK(posted.empty());   // everyone else's touch is still 0.40 / 0.46: the quotes stay
+  // the others leave 0.40: our bid is alone above them, and goes to one tick over 0.39
+  shown.bids = {{4100, 1000}, {3900, 500}};
+  e.step(OPEN + 62000);
+  CHECK(posted.size() == 1 && std::holds_alternative<CancelIntent>(posted[0]));
+  // the underlying moves 0.6 sigma while the quotes rest: both are pulled
+  shown.bids = {{4100, 1000}, {4000, 500}};
+  posted.clear();
+  MakerEngine moved("M1", {"KXNATGAS15M"}, env, MakerParams{});
+  view->orders.clear();
+  moved.step(OPEN + 60000);
+  rest();
+  anchor.spot = 3.1 * std::exp(0.0012);
+  posted.clear();
+  moved.step(OPEN + 61000);
+  int cancels = 0;
+  for (const auto& g : posted) cancels += std::holds_alternative<CancelIntent>(g);
+  CHECK(cancels == 2 && moved.status()["last"][tk] == "the underlying moved 0.5 sigma");
+  // a paused lane still flattens at T-60 s
+  view->orders.clear();
+  view->positions["M1|" + tk] = 1500;
+  view->lane_day["M1"] = -100000000;
+  MakerParams paused; paused.lane_pause = 1;
+  MakerEngine late("M1", {"KXNATGAS15M"}, env, paused);
+  shown = book(4000, 500, 4600, 500);
+  posted.clear();
+  late.step(CLOSE - 30000);
+  CHECK(posted.size() == 1);
+  if (posted.size() == 1) {
+    const auto* pi = std::get_if<PlaceIntent>(&posted[0]);
+    CHECK(pi && pi->tif == Tif::IOC && pi->side == Side::SELL && pi->count == 1500 && pi->reduce_only);
+  }
+}
 }  // namespace
 
 int main() {
-  grid(); quotes(); anchor_and_pulls(); band(); engine_limits();
+  grid(); quotes(); anchor_and_pulls(); band(); engine_limits(); review_fixes(); engine_own_quotes();
   return finish("deskd-maker");
 }

@@ -4,6 +4,7 @@
 // KILL's cancel-all clears the venue.
 #include <httplib.h>
 #include <sys/stat.h>
+#include <atomic>
 #include <csignal>
 #include <filesystem>
 #include <fstream>
@@ -102,7 +103,21 @@ struct Run {
   }
   // a new deskd process on the same data directory and venue
   void restart() { d->stop(); d.reset(); launch(); }
-  ~Run() { d->stop(); }
+  // the venue's pyth_value relay for one underlying, every 200 ms (LIP-15 quotes only while its
+  // underlying's reference is fresh)
+  std::atomic<bool> relaying{false};
+  std::thread relay;
+  void relay_pyth(const std::string& symbol,double value) {
+    relaying=true;
+    relay=std::thread([this,symbol,value] {
+      while(relaying) { venue.f->pyth(symbol,value,now_ms()); std::this_thread::sleep_for(std::chrono::milliseconds(200)); }
+    });
+  }
+  ~Run() {
+    relaying=false;
+    if(relay.joinable()) relay.join();
+    d->stop();
+  }
   httplib::Result post(const std::string& path,const json& body) {
     httplib::Client c("127.0.0.1",d->port()); c.set_read_timeout(6,0);
     return c.Post(path,httplib::Headers{{"X-Desk",d->token()}},body.dump(),"application/json");
@@ -424,6 +439,7 @@ void systematic_maker() {
     e.street_add(W,false,4000,500,now);   // YES bid 0.40 x5
     e.street_add(W,true,5400,500,now);    // NO bid 0.54 x5: YES ask 0.46 x5
   },true);
+  r.relay_pyth("Commodities.Index.NATGAS/USD",3.1);
   CHECK(r.ready());
   Stream st(r.d->port(),"rt-maker-1");
   CHECK(r.until([&]{ return !st.envelopes().empty(); }));

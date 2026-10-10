@@ -15,7 +15,10 @@ Px grid_step(Px p, const std::vector<kalshi::PriceRange>& grid) {
   return 100;
 }
 
+// Both clamp to the tradable (0, $1) first: at the edge a range's own end ($1, or 0) is not a
+// price, and without the clamp a lower range would win (9000 for $1 on the tapered grid).
 std::optional<Px> grid_floor(Px p, const std::vector<kalshi::PriceRange>& grid) {
+  p = std::min<Px>(p, kOneDollar - 1);
   std::optional<Px> best;
   for (const auto& r : grid) {
     if (r.step <= 0 || p < r.start) continue;
@@ -26,6 +29,7 @@ std::optional<Px> grid_floor(Px p, const std::vector<kalshi::PriceRange>& grid) 
 }
 
 std::optional<Px> grid_ceil(Px p, const std::vector<kalshi::PriceRange>& grid) {
+  p = std::max<Px>(p, 1);
   std::optional<Px> best;
   for (const auto& r : grid) {
     if (r.step <= 0 || p > r.end) continue;
@@ -53,23 +57,11 @@ MakerDecision maker_quote(const MakerInput& in, const MakerParams& p) {
   const Px bb = in.book->bids.front().px, ba = in.book->asks.front().px;
   const Qty bs = in.book->bids.front().qty, as = in.book->asks.front().qty;
   if (bb >= ba || bs <= 0 || as <= 0) return pull("crossed book");
-  const Px tick = grid_step(bb, *in.grid);
-  const long double micro = (static_cast<long double>(bb) * as + static_cast<long double>(ba) * bs) / (bs + as);
-  long double fair = (ba - bb) > p.mid_over_ticks * tick ? (bb + ba) / 2.0L : micro;
-  Px e = p.edge_alone;
-  if (in.anchor) {
-    if (!in.reference_fresh) return pull("reference not fresh");
-    if (std::fabs(static_cast<double>(*in.anchor - micro)) > p.anchor_gap) return pull("anchor and microprice over 3c apart");
-    fair = (fair + *in.anchor) / 2.0L;
-    e = p.edge_anchor + in.maker_fee;
-  }
-  d.fair = static_cast<Px>(std::llround(static_cast<double>(fair)));
   const Qty q = in.position;
-  const long double skew = static_cast<long double>(p.skew_per_contract) * q / kOneContract;
-  const Px bid_cap = static_cast<Px>(std::floor(static_cast<double>(fair - e - skew)));
-  const Px ask_floor = static_cast<Px>(std::ceil(static_cast<double>(fair + e - skew)));
+  // T-60 s: a position over 10 contracts goes, IOC at the touch. Before the pull rules below,
+  // which are for quotes: an anchor far from the book or a quiet reference is exactly when the
+  // last minute's model is steepest, and never a reason to ride a position into settlement.
   const std::int64_t left = in.close_ms - in.now_ms;
-  // T-60 s: a position over 10 contracts goes, IOC at the touch
   if (left <= p.flatten_ms) {
     if (std::abs(q) > p.flatten_over) {
       d.quotes.push_back({q > 0 ? Side::SELL : Side::BUY, q > 0 ? bb : ba, std::abs(q) / kOneContract * kOneContract, true});
@@ -77,20 +69,39 @@ MakerDecision maker_quote(const MakerInput& in, const MakerParams& p) {
     }
     return pull("last minute");
   }
+  // a gap in the underlying's reference pulls, gate or no gate (plan section 5)
+  if (!in.reference_fresh) return pull("reference not fresh");
+  const Px tick = grid_step(bb, *in.grid);
+  const long double micro = (static_cast<long double>(bb) * as + static_cast<long double>(ba) * bs) / (bs + as);
+  long double fair = (ba - bb) > p.mid_over_ticks * tick ? (bb + ba) / 2.0L : micro;
+  Px e = p.edge_alone;
+  if (in.anchor) {
+    if (std::fabs(static_cast<double>(*in.anchor - micro)) > p.anchor_gap) return pull("anchor and microprice over 3c apart");
+    fair = (fair + *in.anchor) / 2.0L;
+    e = p.edge_anchor + in.maker_fee;
+  }
+  d.fair = static_cast<Px>(std::llround(static_cast<double>(fair)));
+  const long double skew = static_cast<long double>(p.skew_per_contract) * q / kOneContract;
+  const Px bid_cap = static_cast<Px>(std::floor(static_cast<double>(fair - e - skew)));
+  const Px ask_floor = static_cast<Px>(std::ceil(static_cast<double>(fair + e - skew)));
   const bool two_sided = in.now_ms - in.open_ms < p.two_sided_ms;
   auto whole = [](Qty x) { return x / kOneContract * kOneContract; };
+  // The bid: one tick better than the best bid, or the best bid itself when that would reach the
+  // ask (a 1-tick book), never above fair - e - skew. The cap is held under the ask before it is
+  // rounded to the grid, so a cap at or through the ask joins the touch instead of dropping the
+  // quote. The ask mirrors it.
   if (two_sided || q < 0) {
-    const auto better = grid_ceil(bb + 1, *in.grid), cap = grid_floor(bid_cap, *in.grid);
-    if (better && cap) {
-      const Px px = std::min(*better, *cap);
+    const auto better = grid_ceil(bb + 1, *in.grid), cap = grid_floor(std::min<Px>(bid_cap, ba - 1), *in.grid);
+    if (cap) {
+      const Px px = better ? std::min(*better, *cap) : *cap;
       const Qty size = two_sided ? p.size : std::min(p.size, whole(-q));
       if (px >= bb && px < ba && size > 0) d.quotes.push_back({Side::BUY, px, size, false});
     }
   }
   if (two_sided || q > 0) {
-    const auto better = grid_floor(ba - 1, *in.grid), floor = grid_ceil(ask_floor, *in.grid);
-    if (better && floor) {
-      const Px px = std::max(*better, *floor);
+    const auto better = grid_floor(ba - 1, *in.grid), floor = grid_ceil(std::max<Px>(ask_floor, bb + 1), *in.grid);
+    if (floor) {
+      const Px px = better ? std::max(*better, *floor) : *floor;
       const Qty size = two_sided ? p.size : std::min(p.size, whole(q));
       if (px <= ba && px > bb && size > 0) d.quotes.push_back({Side::SELL, px, size, false});
     }
@@ -146,6 +157,23 @@ std::int64_t MakerEngine::event_worst(const Gateway::SysView& v, const rest::Sna
   return w;
 }
 
+// Everyone else's book: Systematic's resting quotes on this market (acknowledged and not ended)
+// come off their levels, and a level they made alone goes.
+void MakerEngine::without_own(MdBook& b, const Gateway::SysView& v, const std::string& tk) {
+  auto take = [](std::vector<MdLevel>& side, Px px, Qty q) {
+    for (auto it = side.begin(); it != side.end(); ++it) {
+      if (it->px != px) continue;
+      it->qty -= q;
+      if (it->qty <= 0) side.erase(it);
+      return;
+    }
+  };
+  for (const auto& [cid, o] : v.orders) {
+    if (o.ticker != tk || o.terminal || o.left <= 0 || (o.state != OrdState::WORK && o.state != OrdState::PART)) continue;
+    take(o.side == Side::BUY ? b.bids : b.asks, o.price, o.left);
+  }
+}
+
 std::string MakerEngine::new_cid() {
   // S<lane>-<ms in base 36>-<seq>: at most 40 characters, [A-Za-z0-9-]
   std::string t;
@@ -187,19 +215,34 @@ void MakerEngine::step(std::int64_t now) {
     const auto pos_it = view->positions.find(lane_ + "|" + tk);
     const Qty pos = pos_it == view->positions.end() ? 0 : pos_it->second;
     // a fill of ours pulls both sides for a second (plan: pull on our fill)
-    if (last_pos_.count(tk) && last_pos_[tk] != pos) cool_until_[tk] = now + 1000;
+    if (last_pos_.count(tk) && last_pos_[tk] != pos) { cool_until_[tk] = now + 1000; cool_why_[tk] = "our fill"; }
     last_pos_[tk] = pos;
     MakerDecision d;
     const auto m = snap->markets.find(tk);
     std::optional<MdBook> book = env_.book ? env_.book(tk) : std::nullopt;
+    if (book) without_own(*book, *view, tk);
+    const auto a = env_.anchor ? env_.anchor(tk) : Env::Anchor{};
+    // the underlying moved 0.5 sigma (of its move to the close) since the quotes went out: both go
+    bool resting = false;
+    for (const auto& [slot, s] : slots) if (!s.cid.empty()) resting = true;
+    if (!resting) quote_spot_.erase(tk);
+    else if (a.spot > 0 && a.sd_log > 0 && quote_spot_.count(tk) &&
+             std::fabs(std::log(a.spot / quote_spot_[tk])) > 0.5 * a.sd_log) {
+      cool_until_[tk] = now + 1000;
+      cool_why_[tk] = "the underlying moved 0.5 sigma";
+      quote_spot_.erase(tk);
+    }
+    // what stops new risk; the T-60 s flatten still goes
     const auto day = view->lane_day.find(lane_);
+    std::string hold;
+    if (p_.lane_pause > 0 && day != view->lane_day.end() && day->second <= -p_.lane_pause) hold = "lane paused: its day is past the loss limit";
+    else if (p_.mo_after > 0 && env_.markout && env_.markout().first >= p_.mo_after && env_.markout().second < -p_.mo_floor)
+      hold = "lane paused: its 60 s markout is below the floor";
+    else if (m != snap->markets.end() && p_.event_cap > 0 && event_worst(*view, *snap, m->second.event_ticker) >= p_.event_cap)
+      hold = "event cap";
+    else if (now < cool_until_[tk]) hold = cool_why_[tk];
     if (!running) d.pull = "not running";
     else if (m == snap->markets.end()) d.pull = "not listed";
-    else if (p_.lane_pause > 0 && day != view->lane_day.end() && day->second <= -p_.lane_pause) d.pull = "lane paused: its day is past the loss limit";
-    else if (p_.mo_after > 0 && env_.markout && env_.markout().first >= p_.mo_after && env_.markout().second < -p_.mo_floor)
-      d.pull = "lane paused: its 60 s markout is below the floor";
-    else if (p_.event_cap > 0 && event_worst(*view, *snap, m->second.event_ticker) >= p_.event_cap) d.pull = "event cap";
-    else if (now < cool_until_[tk]) d.pull = "our fill";
     else {
       MakerInput in;
       in.book = book ? &*book : nullptr;
@@ -209,13 +252,18 @@ void MakerEngine::step(std::int64_t now) {
       in.open_ms = m->second.open_ms.value_or(now);
       in.close_ms = m->second.close_ms.value_or(now);
       in.private_up = env_.private_up && env_.private_up();
-      const auto a = env_.anchor ? env_.anchor(tk) : Env::Anchor{};
+      in.reference_fresh = a.fresh;
       if (a.gated) {
         in.anchor = a.fair ? a.fair : std::optional<Px>(0);
-        in.reference_fresh = a.fair.has_value();
+        in.reference_fresh = a.fresh && a.fair.has_value();
         if (a.fair) in.maker_fee = maker_fee(m->second, *a.fair);
       }
       d = decide_(in, p_);
+      if (!hold.empty()) {
+        d.quotes.erase(std::remove_if(d.quotes.begin(), d.quotes.end(), [](const MakerQuote& q) { return !q.ioc; }),
+                       d.quotes.end());
+        if (d.quotes.empty()) d.pull = hold;
+      }
     }
     last_pull_[tk] = d.pull.empty() ? "quoting" : d.pull;
     // slot 0 bid, 1 ask, 2 the flatten
@@ -262,7 +310,12 @@ void MakerEngine::step(std::int64_t now) {
       s.answer = s.reply->get_future();
       pi.reply = s.reply;
       const auto cid = pi.cid;
-      if (env_.post(std::move(pi))) { s.cid = cid; s.acted_ms = now; ++places_; }
+      if (env_.post(std::move(pi))) {
+        s.cid = cid;
+        s.acted_ms = now;
+        ++places_;
+        if (a.spot > 0 && !quote_spot_.count(tk)) quote_spot_[tk] = a.spot;
+      }
     }
     // a market no longer quoted and with nothing working is forgotten
     if (!running || !open.count(tk)) {
