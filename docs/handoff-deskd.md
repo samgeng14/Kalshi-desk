@@ -78,12 +78,14 @@ Nothing is pushed. `ui/desk/js/contract.js` is the API contract deskd must serve
    to pub; gw's Manual owner must receive the same books and REST revisions before accepting
    orders. The strict /api/health schema stays unchanged; clock detail is in hdr.lat and
    /ops/status. Browser access was declined, so the real-page visual check is still open.
-2. **Stage 3, the Manual order path** (plan section 3). Next concrete step: own a `ManualBook`
-   in `Gateway`; post REST snapshots and books to gw (new GwMsg variants, or gw reads the
-   immutable snapshot each turn); `/api/order` posts a PlaceIntent with a reply promise and
-   waits at most 50 ms; start `KalshiSender` MANUAL/CANCEL on send-k1/send-cx with their pools;
-   feed `KalshiWriteReply` and private events back to gw; keep header RO until the fake-exchange
-   end-to-end test passes. Then: wire `gw/order_ledger` into the gateway
+2. **Stage 3, the Manual order path** (plan section 3). Done 2026-10-10: `Gateway::attach_manual`
+   runs admission, reservation, send-k1 replies and cancels on the gw thread; `/api/order`,
+   `/api/cancel`, `/api/cancel_all` post to gw (`test_manual_gw` against the fake over TLS).
+   Next concrete step: in `app/runtime` + `app/venue`, build the k1 and cancel `SparePool`s and
+   `KalshiSender`s (MANUAL on send-k1; the CANCEL role beside today's send-cx KILL path), a
+   lock-free book board from `on_book`, the health function (KX/KXP feeds, `pub.healthy()`,
+   sender health) and `attach_manual`; feed private fills to the ledger; a runtime test against
+   the fake; then header RO off and the demo proof. Then: wire `gw/order_ledger` into the gateway
    alongside the execution/position ledger; authoritative series fees; PlaceIntent validation,
    fat-finger guard, worst-case reservation per shard, preserved `M...` cid, journal, `send-k1`;
    Take = IOC at the supplied slippage cap; Post = post_only + GTC + expiration_time +
