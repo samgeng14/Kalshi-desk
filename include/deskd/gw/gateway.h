@@ -146,7 +146,7 @@ class Gateway {
   std::shared_ptr<const SysView> sys_view_;                          // std::atomic_load / std::atomic_store
   std::map<std::string, std::int64_t> lane_published_;   // lane id -> when its row last went out
   std::set<std::string> lanes_dirty_;
-  std::int64_t sys_view_ms_ = 0, groups_paced_ms_ = 0;
+  std::int64_t sys_view_ms_ = 0, groups_paced_ms_ = 0, sys_day_ms_ = 0;
   bool sys_dirty_ = true;
   void place_sys(PlaceIntent& p);
   void group_reply(const KalshiWriteReply& r);

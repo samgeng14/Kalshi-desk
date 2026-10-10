@@ -10,7 +10,7 @@
 //   X1 ESPN EXP      IOC    $5   EXPERIMENT: $1-2 takes on ESPN's direction
 // Every lane starts off; the operator turns one on (POST /api/lane/{id}).
 //
-// Order groups (plan section 3): one per lane and shard, each with a contracts limit over the
+// Order groups (plan section 3): one per lane that is on and shard, each with a contracts limit over the
 // venue's rolling 15 s window of fills (about 2.5 x the per-side size x the markets in it).
 // Stop and KILL trigger them (the venue cancels every order in a triggered group and refuses new
 // ones); gw resets them once nothing is running, so the next Start finds them active. The GROUPS

@@ -684,7 +684,8 @@ void Gateway::sys_tick(std::int64_t now) {
   sync_snapshot();
   // a new ET day: the lanes' counters start again, and a daily-stop HALT ends
   const auto midnight = et_midnight_ms(now);
-  if (sys_->day(sys_->lanes().front().id) == nullptr || sys_->day(sys_->lanes().front().id)->day_start_ms < midnight) {
+  if (midnight > sys_day_ms_) {
+    sys_day_ms_ = midnight;
     sys_->roll(midnight);
     if (own_.state == RunState::HALTED && own_.since_ms < midnight) {
       own_ = RunView{RunState::STOP, now, 0, "new day"};
@@ -708,7 +709,8 @@ void Gateway::sys_tick(std::int64_t now) {
           DLOG_WARN("order group for %s on shard %d: no reply in 15 s, asking again", l.id.c_str(), shard);
           g.state = g.id.empty() ? SysBook::GroupState::NONE : SysBook::GroupState::TRIGGERED;
         }
-        if (g.state == SysBook::GroupState::NONE && now - g.asked_ms > 5000) { group_job(l.id, shard, "create"); asked = true; }
+        // created for a lane that is on (each restart would otherwise leave every lane's groups behind)
+        if (g.state == SysBook::GroupState::NONE && sys_->on(l.id) && now - g.asked_ms > 5000) { group_job(l.id, shard, "create"); asked = true; }
         else if (g.state == SysBook::GroupState::TRIGGERED && own_.state != RunState::RUN && now - g.asked_ms > 1000) {
           group_job(l.id, shard, "reset");
           asked = true;
