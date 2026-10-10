@@ -36,6 +36,7 @@ bool Deskd::init_venue(std::string* err) {
   md_->set_trade_callback([this](const MdTrade& t) { on_trade(t); });
   rest::Options ro;
   if (options_.rest_poll_ms > 0) ro.poll_ms = options_.rest_poll_ms;
+  if (options_.rest_listing_ms > 0) ro.listing_poll_ms = options_.rest_listing_ms;
   if (options_.rest_gap_ms >= 0) ro.request_gap_ms = options_.rest_gap_ms;
   rest_ = std::make_unique<rest::State>(*factory_, *re, signer_.get(),
       [this](std::shared_ptr<const rest::Snapshot> s) { on_rest(std::move(s)); }, ro);
@@ -151,6 +152,7 @@ void Deskd::attach_manual() {
     };
     p.daily_stop = cfg_.daily_stop;
     p.groups = &groups_;
+    p.sys_state_file = cfg_.data_dir + "/systematic.json";
     p.lanes = default_lanes();
     for (auto& l : p.lanes) {
       if (l.id == "M1") l.series = cfg_.lip_series;
@@ -219,6 +221,8 @@ void Deskd::attach_manual() {
     if (!j.is_discarded()) pub_->post(PubData{"ord", std::move(j)});
   };
   gw_->attach_manual(p);
+  // a restart reads back to the saved book's last orders, so their later fills keep their lane
+  if (gw_->sys_saved_ms()) rest_->set_orders_since(gw_->sys_saved_ms() - 65000);
 }
 
 HdrInputs Deskd::header() const {
@@ -333,6 +337,7 @@ void Deskd::refresh_live() {
 
 void Deskd::on_rest(std::shared_ptr<const rest::Snapshot>) {
   if (!rest_) return;
+  if (const auto held = gw_->sys_held()) rest_->set_held(*held);   // read until they settle
   refresh_live();
   const auto s = rest_->snapshot();
   for (const auto& tk : s->live) {

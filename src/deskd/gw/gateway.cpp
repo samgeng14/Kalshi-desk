@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
+#include <fstream>
 
 #include "deskd/app/log.h"
 #include "deskd/app/worker.h"
@@ -22,7 +24,9 @@ Gateway::Gateway(KillSwitch& kill, PreflightFn preflight, std::size_t normal_cap
   kill_.on_trip([this] { inbox_.kick(); });
 }
 
-Gateway::~Gateway() = default;
+Gateway::~Gateway() {
+  if (sys_ && sys_restore_error_.empty()) save_sys();
+}
 
 void Gateway::attach_manual(const ManualPath& path) {
   path_ = std::make_unique<ManualPath>(path);
@@ -30,7 +34,57 @@ void Gateway::attach_manual(const ManualPath& path) {
   if (path_->sys_send) {
     sys_ = std::make_unique<SysBook>(path_->lanes.empty() ? default_lanes() : path_->lanes);
     std::atomic_store(&groups_view_, std::make_shared<const std::pair<bool, std::string>>(false, "order groups not created yet"));
+    // The book a previous run left: its positions, and today's day and HALT. One that cannot be
+    // read blocks Systematic (an empty book would reopen every limit and the daily stop).
+    std::ifstream in(path_->sys_state_file);
+    if (!path_->sys_state_file.empty() && in) {
+      const auto j = nlohmann::json::parse(in, nullptr, false);
+      const auto day0 = et_midnight_ms(now_ms());
+      SysBook::Halt h;
+      std::string why;
+      if (!j.is_discarded() && sys_->restore(j, day0, &h, &why)) {
+        sys_day_ms_ = day0;
+        sys_saved_ms_ = j.value("saved_ms", std::int64_t{0});
+        if (h.on) {
+          own_ = RunView{RunState::HALTED, h.ms, 0, h.why};
+          publish();
+        }
+        DLOG_INFO("Systematic book restored from %s: %zu position(s)%s", path_->sys_state_file.c_str(), sys_->held().size(),
+                  h.on ? ", HALTED by the daily stop" : "");
+      } else {
+        sys_restore_error_ = "the saved Systematic book " + path_->sys_state_file + " cannot be read (" +
+                             (j.is_discarded() ? std::string("not JSON") : why) + "): move it aside to start an empty one";
+        DLOG_ERR("%s", sys_restore_error_.c_str());
+      }
+    }
+    // today begins now, before any account read is reconciled into it (a later roll would wipe it)
+    if (!sys_day_ms_) {
+      sys_day_ms_ = et_midnight_ms(now_ms());
+      sys_->roll(sys_day_ms_);
+    }
   }
+}
+
+void Gateway::save_sys() {
+  if (!sys_ || path_->sys_state_file.empty() || !sys_restore_error_.empty()) return;
+  const SysBook::Halt h{own_.state == RunState::HALTED, own_.since_ms, own_.why};
+  const auto now = now_ms();
+  const std::string tmp = path_->sys_state_file + ".tmp";
+  {
+    std::ofstream out(tmp, std::ios::trunc);
+    out << sys_->to_json(h, now).dump();
+    out.flush();
+    if (!out) {
+      DLOG_ERR("cannot write %s: Systematic's book is not saved", tmp.c_str());
+      return;
+    }
+  }
+  if (std::rename(tmp.c_str(), path_->sys_state_file.c_str()) != 0) {
+    DLOG_ERR("cannot replace %s: Systematic's book is not saved", path_->sys_state_file.c_str());
+    return;
+  }
+  sys_save_due_ = false;
+  sys_save_ms_ = now;
 }
 
 bool Gateway::post(GwMsg m) {
@@ -49,6 +103,13 @@ RunView Gateway::run_view() const {
 
 namespace {
 std::string qty_text(Qty q) { return nlohmann::json(qty_to_number(q)).dump(); }
+// "SM1-..." -> "M1": Systematic's client ids carry their lane (the contract's S<lane>- prefix)
+std::string lane_of_cid(const std::string& cid) {
+  const auto dash = cid.find('-');
+  return cid.size() > 2 && cid.front() == 'S' && dash != std::string::npos && dash > 1 ? cid.substr(1, dash - 1) : "";
+}
+// a fill's identity on both of its paths (the private feed and the REST read)
+std::string fill_key(const kalshi::FillRow& f) { return f.trade_id.empty() ? f.fill_id : f.trade_id; }
 bool own_matches(CancelIntent::Own f, Owner o) {
   return f == CancelIntent::Own::ANY || (f == CancelIntent::Own::MAN && o == Owner::MAN) ||
          (f == CancelIntent::Own::SYS && o == Owner::SYS);
@@ -117,7 +178,8 @@ bool Gateway::sync_kill() {
     stats_.erased_by_kill.fetch_add(n);
     // Writes not yet on the wire never leave: the senders check the generation before each byte.
     stats_.kills_seen.fetch_add(1);
-    if (changed || own_.state == RunState::RUN) {
+    // a daily-stop HALT outlives a KILL and its re-arm: it ends only at ET midnight
+    if (own_.state != RunState::HALTED && (changed || own_.state == RunState::RUN)) {
       own_ = RunView{RunState::STOP, kill_.since_ms(), 0, ""};
       publish();
     }
@@ -127,7 +189,7 @@ bool Gateway::sync_kill() {
   }
   // Re-armed. Later: reset every order group; GROUPS fails until order_group_updates confirms
   // them. A Start gw already answered RUN after the re-arm stands.
-  if (changed && own_.state != RunState::RUN) {
+  if (changed && own_.state == RunState::STOP) {
     own_ = RunView{RunState::STOP, kill_.rearmed_ms(), 0, ""};
     publish();
   }
@@ -310,11 +372,7 @@ void Gateway::publish_order(const std::string& cid) {
 }
 
 void Gateway::place_manual(PlaceIntent& p) {
-  auto snapshot = path_->snapshot ? path_->snapshot() : nullptr;
-  if (snapshot != snapshot_seen_) {
-    manual_->set_snapshot(snapshot);
-    snapshot_seen_ = std::move(snapshot);
-  }
+  sync_snapshot();
   if (path_->book) {
     if (auto b = path_->book(p.ticker)) manual_->set_book(*b);
   }
@@ -434,8 +492,10 @@ void Gateway::manual_private(const PrivateEvent& e) {
       const OrderLedger::Order* o = cid.empty() ? nullptr : ledger.find(cid);
       if (!o) for (const auto& [c, x] : ledger.orders()) if (x.oid == e.fill.order_id) o = &x;
       if (o && o->intent.owner == Owner::SYS) {
-        sys_->fill(o->intent.lane, o->intent.cid, e.fill.ticker,
-                   e.fill.side == kalshi::BookSide::BID ? Side::BUY : Side::SELL, e.fill.count, e.fill.yes_price, e.fill.fee, at);
+        if (sys_->fill(o->intent.lane, o->intent.cid, e.fill.ticker,
+                       e.fill.side == kalshi::BookSide::BID ? Side::BUY : Side::SELL, e.fill.count, e.fill.yes_price,
+                       e.fill.fee, at, fill_key(e.fill)))
+          sys_save_due_ = true;
         lanes_dirty_.insert(o->intent.lane);
       }
     }
@@ -493,7 +553,55 @@ void Gateway::sync_snapshot() {
   if (snapshot != snapshot_seen_) {
     manual_->set_snapshot(snapshot);
     snapshot_seen_ = std::move(snapshot);
+    if (sys_ && snapshot_seen_ && snapshot_seen_->account_ready && snapshot_seen_->account_ms != reconciled_ms_) {
+      reconciled_ms_ = snapshot_seen_->account_ms;
+      sys_reconcile(*snapshot_seen_);
+    }
   }
+}
+
+// Each account read, against Systematic's book (plan section 3: "REST read of that ticker's
+// fills"): every fill of today on a Systematic order counts once by trade id, so a fill the
+// private feed lost (a socket gap, a fill before the 201) still moves the lane's position, and
+// the first read after a start rebuilds the day the saved book could not have seen; and a market
+// the lanes hold that has settled realizes their position at its result.
+void Gateway::sys_reconcile(const rest::Snapshot& s) {
+  const std::int64_t day0 = sys_->day_start_ms() ? sys_->day_start_ms() : et_midnight_ms(now_ms());
+  std::map<std::string, std::string> cid_of;   // order id -> client order id
+  for (const auto& o : s.orders) if (!o.client_order_id.empty()) cid_of[o.order_id] = o.client_order_id;
+  for (const auto& [cid, o] : manual_->ledger().orders()) if (!o.oid.empty()) cid_of[o.oid] = cid;
+  int applied = 0, settled = 0;
+  for (const auto& f : s.fills) {
+    if (f.ts_ms < day0) continue;   // yesterday's are in the positions carried over
+    const auto it = cid_of.find(f.order_id);
+    if (it == cid_of.end()) continue;
+    const std::string lane = lane_of_cid(it->second);
+    if (lane.empty() || !sys_->lane(lane)) continue;
+    if (sys_->fill(lane, it->second, f.ticker, f.side == kalshi::BookSide::BID ? Side::BUY : Side::SELL, f.count,
+                   f.yes_price, f.fee, f.ts_ms, fill_key(f))) {
+      ++applied;
+      lanes_dirty_.insert(lane);
+    }
+  }
+  if (applied && sys_rebuilt_)
+    DLOG_WARN("%d Systematic fill(s) the private feed did not deliver, applied from the REST read", applied);
+  else if (applied)
+    DLOG_INFO("Systematic's day: %d fill(s) from the venue's read since the book was saved", applied);
+  for (const auto& [lane, tk] : sys_->held()) {
+    const auto m = s.markets.find(tk);
+    if (m == s.markets.end() || m->second.status == "active" || m->second.status == "open") continue;
+    if (m->second.result != "yes" && m->second.result != "no") continue;
+    const Micros pnl = sys_->settle(lane, tk, m->second.result == "yes" ? kOneDollar : 0, now_ms());
+    DLOG_INFO("%s settled %s: lane %s realizes %s", tk.c_str(), m->second.result.c_str(), lane.c_str(),
+              money_str(pnl / 100).c_str());
+    lanes_dirty_.insert(lane);
+    ++settled;
+  }
+  if (applied || settled || !sys_rebuilt_) {
+    sys_dirty_ = true;
+    sys_save_due_ = true;
+  }
+  sys_rebuilt_ = true;
 }
 
 std::set<int> Gateway::shards() const {
@@ -503,11 +611,17 @@ std::set<int> Gateway::shards() const {
   return out;
 }
 
+// The live mid, else the last one gw saw (a closed window's book is gone, and its last mid is the
+// best price for it until it settles); none: the market was never priced (counted worthless).
 std::optional<Px> Gateway::mark(const std::string& ticker) const {
-  if (!path_->book) return std::nullopt;
-  const auto b = path_->book(ticker);
-  if (!b || b->stale || b->bids.empty() || b->asks.empty()) return std::nullopt;
-  return (b->bids.front().px + b->asks.front().px) / 2;
+  const auto b = path_->book ? path_->book(ticker) : std::nullopt;
+  if (b && !b->stale && !b->bids.empty() && !b->asks.empty()) {
+    const Px m = (b->bids.front().px + b->asks.front().px) / 2;
+    last_mark_[ticker] = m;
+    return m;
+  }
+  const auto it = last_mark_.find(ticker);
+  return it == last_mark_.end() ? std::nullopt : std::optional<Px>(it->second);
 }
 
 void Gateway::sys_money(Micros* used, Micros* ceiling, Micros* eff) const {
@@ -564,8 +678,10 @@ void Gateway::place_sys(PlaceIntent& p) {
   const auto* lane = sys_->lane(p.lane);
   if (!lane) return refuse("BAD_REQUEST", "no lane " + p.lane);
   if (!sys_->on(p.lane)) return refuse("BAD_STATE", "lane " + p.lane + " is off");
+  if (!sys_restore_error_.empty()) return refuse("RO", sys_restore_error_);
   sync_snapshot();
   if (!snapshot_seen_) return refuse("STALE", "no account read yet");
+  if (!sys_rebuilt_) return refuse("STALE", "Systematic's day is rebuilt from the venue's fills first");
   const auto m = snapshot_seen_->markets.find(p.ticker);
   if (m == snapshot_seen_->markets.end() || !m->second.exchange_index) return refuse("UNKNOWN_MARKET", "no Kalshi market " + p.ticker);
   if (!lane->series.empty() &&
@@ -584,24 +700,33 @@ void Gateway::place_sys(PlaceIntent& p) {
   if (lane->style == "IOC" && sys_fees() >= kCostBudget * 100)
     return refuse("SYS_CEILING", "the IOC lanes' daily cost budget " + money_str(kCostBudget) + " is spent");
   Micros reserved_lane = 0, used_all = 0;
+  Qty lane_pending = 0;
   for (const auto& [cid, o] : manual_->ledger().orders()) {
     if (o.intent.owner != Owner::SYS) continue;
     used_all += o.reservation();
     if (o.terminal()) continue;
     if (o.intent.lane == p.lane) reserved_lane += o.reservation();
-    if (o.intent.ticker == p.ticker && o.intent.side == p.side) pending += o.left;
+    if (o.intent.ticker == p.ticker && o.intent.side == p.side) {
+      pending += o.left;
+      if (o.intent.lane == p.lane) lane_pending += o.left;
+    }
   }
   const Qty grow = (p.side == Side::BUY ? 1 : -1) * (pending + p.count);
   if (std::abs(pos + grow) > lane->inventory && std::abs(pos + grow) > std::abs(pos))
     return refuse("SYS_CEILING", "inventory: " + qty_text(pos) + " held, " + qty_text(pending) + " working, limit " + qty_text(lane->inventory));
-  // the lane's budget and the venue's 70% ceiling, at this order's worst case
-  const Micros worst = (p.side == Side::BUY ? p.price : kOneDollar - p.price) * p.count;
+  // The lane's budget and the venue's 70% ceiling, at the worst case of the part of this order
+  // that grows the lane's position (after its working orders on the same side): a reducing
+  // order, the T-60 s flatten among them, is never refused for money (plan section 4).
+  const Qty dir_pos = (p.side == Side::BUY ? 1 : -1) * sys_->position(p.lane, p.ticker) + lane_pending;
+  const Qty grows = std::max<Qty>(0, dir_pos + p.count) - std::max<Qty>(0, dir_pos);
+  const Micros worst = (p.side == Side::BUY ? p.price : kOneDollar - p.price) * grows;
   for (const auto& l : sys_->lanes()) used_all += sys_->open_worst(l.id);
-  if (sys_->open_worst(p.lane) + reserved_lane + worst > lane->budget * 100)
+  if (grows > 0 && sys_->open_worst(p.lane) + reserved_lane + worst > lane->budget * 100)
     return refuse("SYS_CEILING", "lane " + p.lane + " budget " + money_str(lane->budget));
   const Micros equity = (snapshot_seen_->balance.available + snapshot_seen_->balance.portfolio_value.value_or(0)) * 100;
   const Micros eff = std::min<Micros>(equity * 7 / 10, used_all + manual_->venue_free());
-  if (used_all + worst > eff) return refuse("SYS_CEILING", "past the effective Systematic ceiling " + money_str(eff / 100));
+  if (grows > 0 && used_all + worst > eff)
+    return refuse("SYS_CEILING", "past the effective Systematic ceiling " + money_str(eff / 100));
   // the daily loss stop (decision 1): Systematic's day, marked at the mids
   const auto mk = [this](const std::string& tk) { return mark(tk); };
   if (path_->daily_stop > 0 && sys_->day_total(mk) <= -path_->daily_stop * 100) {
@@ -639,6 +764,7 @@ void Gateway::place_sys(PlaceIntent& p) {
   }
   stats_.sys_sent.fetch_add(1);
   sys_->sent(p.lane, now_ms());
+  sys_save_due_ = true;
   lanes_dirty_.insert(p.lane);
   if (p.reply) pending_[cid] = p.reply;
 }
@@ -755,6 +881,7 @@ void Gateway::halt(const std::string& why) {
   DLOG_WARN("Systematic HALTED: %s", why.c_str());
   own_ = RunView{RunState::HALTED, now_ms(), 0, why};
   publish();
+  save_sys();   // a restart keeps the HALT
   cancel_sys([](const std::string&) { return true; }, "HALT");
   trigger_groups();
   for (const auto& l : sys_->lanes()) lanes_dirty_.insert(l.id);
@@ -763,8 +890,8 @@ void Gateway::halt(const std::string& why) {
 
 void Gateway::sys_tick(std::int64_t now) {
   if (now - sys_view_ms_ < 100) return;
-  sync_snapshot();
-  // a new ET day: the lanes' counters start again, and a daily-stop HALT ends
+  // a new ET day: the lanes' counters start again, and a daily-stop HALT ends (before the next
+  // account read is reconciled into the new day)
   const auto midnight = et_midnight_ms(now);
   if (midnight > sys_day_ms_) {
     sys_day_ms_ = midnight;
@@ -774,7 +901,9 @@ void Gateway::sys_tick(std::int64_t now) {
       publish();
     }
     for (const auto& l : sys_->lanes()) lanes_dirty_.insert(l.id);
+    sys_save_due_ = true;
   }
+  sync_snapshot();
   const auto mk = [this](const std::string& tk) { return mark(tk); };
   if (own_.state == RunState::RUN && path_->daily_stop > 0 && sys_->day_total(mk) <= -path_->daily_stop * 100) halt("daily stop");
   // Order groups: one per lane and shard, created one at a time while Systematic can write;
@@ -841,7 +970,13 @@ void Gateway::sys_tick(std::int64_t now) {
     std::atomic_store(&sys_view_, std::shared_ptr<const SysView>(std::move(v)));
     sys_dirty_ = false;
     sys_view_ms_ = now;
+    std::set<std::string> held;
+    for (const auto& [lane, tk] : sys_->held()) held.insert(tk);
+    const auto old_held = std::atomic_load(&sys_held_);
+    if (!old_held || *old_held != held)
+      std::atomic_store(&sys_held_, std::make_shared<const std::set<std::string>>(std::move(held)));
   }
+  if (sys_save_due_ && now - sys_save_ms_ >= 2000) save_sys();
 }
 
 }  // namespace deskd

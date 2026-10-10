@@ -17,9 +17,16 @@
 // preflight row passes when every lane that is on has an active group on every shard.
 //
 // A lane's day (contract S.lane): real = realized P&L net of fees of today's fills, by average
-// cost per market; unrl = the lane's open positions at the mid; open = their worst case (a long
-// can lose its cost, a short its 1 - price); used = open + the reservations of the lane's working
-// orders. Positions carry over midnight; the counters and real start again at ET midnight.
+// cost per market, and of today's settlements; unrl = the lane's open positions at the mid (the
+// last mid seen when there is none now, and the worst case, as if worth nothing, when there never
+// was one: the daily stop never counts a position it cannot price as flat); open = their worst
+// case (a long can lose its cost, a short its 1 - price); used = open + the reservations of the
+// lane's working orders. Positions carry over midnight; the counters and real start again at ET
+// midnight.
+//
+// Fills arrive twice, from the private feed and from each REST read, and each counts once by its
+// trade id. A settlement (the market's result, from REST) realizes the position at $1 or $0.
+// to_json / restore carry the book across a restart: the day, the positions and HALT.
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -83,8 +90,14 @@ class SysBook {
     std::map<std::string, Inv> inv;     // by market
   };
   void sent(const std::string& lane, std::int64_t at);
-  void fill(const std::string& lane, const std::string& cid, const std::string& ticker, Side side, Qty count,
-            Px yes_price, Micros fee, std::int64_t at);
+  // false: already counted (the same trade id), or nothing to count
+  bool fill(const std::string& lane, const std::string& cid, const std::string& ticker, Side side, Qty count,
+            Px yes_price, Micros fee, std::int64_t at, const std::string& trade_id = "");
+  // the market settled at value (10000 YES won, 0 NO won): the lane's position there is realized
+  // and gone; its realized P&L, or 0 when it held nothing there
+  Micros settle(const std::string& lane, const std::string& ticker, Px value, std::int64_t at);
+  // (lane, ticker) of every open position
+  std::vector<std::pair<std::string, std::string>> held() const;
   // ET midnight: the counters and real start again; positions stay. day_start is that midnight.
   void roll(std::int64_t day_start_ms);
   const Day* day(const std::string& lane) const;
@@ -95,6 +108,14 @@ class SysBook {
   Micros open_worst(const std::string& lane) const;
   // Systematic's day across lanes: real - fees + unrl (the daily stop's measure; no LIP yet)
   Micros day_total(const MarkFn& mark) const;
+  std::int64_t day_start_ms() const { return day_start_ms_; }
+
+  // ---- across a restart
+  struct Halt { bool on = false; std::int64_t ms = 0; std::string why; };
+  nlohmann::json to_json(const Halt& halt, std::int64_t saved_ms) const;
+  // A saved book: positions always; the day's counters, trade ids and HALT only when it was saved
+  // on the ET day that began at day_start_ms. false (and nothing changed) on a malformed one.
+  bool restore(const nlohmann::json& j, std::int64_t day_start_ms, Halt* halt, std::string* why);
   // the contract's lane row
   nlohmann::json lane_json(const LaneSpec& l, RunState run, Micros reserved, int working, Micros eff_left,
                            const MarkFn& mark, const std::string& blocked) const;
@@ -104,6 +125,7 @@ class SysBook {
   std::set<std::string> on_;
   std::map<std::pair<std::string, int>, Group> groups_;
   std::map<std::string, Day> days_;
+  std::set<std::string> trades_;   // today's counted trade ids, every lane
   std::int64_t day_start_ms_ = 0;
 };
 

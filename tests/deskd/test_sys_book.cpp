@@ -43,7 +43,8 @@ void lane_day() {
   CHECK(b.day("M2")->real == 2250000 + (3000 - 4500) * 500);
   CHECK(b.open_worst("M2") == 10000 * 500 - 1500000);   // a short can lose 1 - its price
   CHECK(b.unrealized("M2", mark) == 1500000 - 5500 * 500);
-  CHECK(b.unrealized("M2", [](const std::string&) { return std::optional<Px>(); }) == 0);   // no mark, no claim
+  // never priced: counted worthless, never flat (a short of 5 at 0.30 owes $1 a contract)
+  CHECK(b.unrealized("M2", [](const std::string&) { return std::optional<Px>(); }) == 1500000 - 10000 * 500);
   // the contract's row
   const auto row = b.lane_json(*b.lane("M2"), RunState::RUN, 780000, 1, 100000000, mark, "");
   CHECK(row["state"] == "OFF" && row["why"] == "" && row["sent"] == 1 && row["fills"] == 4 && row["hit"] == 4);
@@ -58,9 +59,46 @@ void lane_day() {
   b.roll(t + 86400000);
   CHECK(b.day("M2")->sent == 0 && b.day("M2")->real == 0 && b.position("M2", "TK-A") == -500);
 }
+
+// A fill counted once by trade id (it arrives on the private feed and on every REST read); a
+// settlement realizes the position at $1 or $0; the book across a restart.
+void settle_and_restore() {
+  SysBook b;
+  const std::int64_t day = 1791000000000, t = day + 3600000;
+  b.roll(day);
+  CHECK(b.fill("M1", "SM1-1", "TK-A", Side::BUY, 1000, 6000, 0, t, "trade-1"));
+  CHECK(!b.fill("M1", "SM1-1", "TK-A", Side::BUY, 1000, 6000, 0, t, "trade-1"));   // the REST copy
+  CHECK(b.position("M1", "TK-A") == 1000 && b.day("M1")->fills == 1);
+  CHECK(b.fill("M2", "SM2-1", "TK-B", Side::SELL, 500, 9700, 3500, t, "trade-2"));
+  CHECK(b.held().size() == 2);
+  // TK-A settles NO: the long of 10 at 0.60 loses $6.00, and the position is gone
+  CHECK(b.settle("M1", "TK-A", 0, t + 1) == -6000000);
+  CHECK(b.position("M1", "TK-A") == 0 && b.day("M1")->real == -6000000 && b.open_worst("M1") == 0);
+  CHECK(b.settle("M1", "TK-A", 0, t + 2) == 0);   // once
+  CHECK(b.day_total({}) == -6000000 + (9700 - 10000) * 500 - 3500);   // TK-B unpriced: worst case
+  // HALTED, saved, and read back on the same day: the day, the trade ids and the HALT
+  const SysBook::Halt h{true, t + 5, "daily stop"};
+  const json saved = b.to_json(h, t + 6);
+  SysBook c;
+  SysBook::Halt back;
+  std::string why;
+  CHECK(c.restore(saved, day, &back, &why));
+  CHECK(back.on && back.ms == t + 5 && back.why == "daily stop");
+  CHECK(c.day("M1")->real == -6000000 && c.position("M2", "TK-B") == -500 && c.day("M2")->fees == 3500);
+  CHECK(!c.fill("M2", "SM2-1", "TK-B", Side::SELL, 500, 9700, 3500, t, "trade-2"));   // still counted once
+  // read back the next day: the positions only, no HALT
+  SysBook n;
+  CHECK(n.restore(saved, day + 86400000, &back, &why) && !back.on);
+  CHECK(n.position("M2", "TK-B") == -500 && n.day("M2")->fees == 0 && n.day("M1")->real == 0);
+  CHECK(n.fill("M2", "SM2-1", "TK-B", Side::SELL, 500, 9700, 3500, t, "trade-2"));   // a new day's ids
+  // a malformed one changes nothing
+  SysBook m;
+  CHECK(!m.restore(json{{"v", 1}, {"lanes", 3}}, day, &back, &why) && !why.empty() && m.held().empty());
+  CHECK(!m.restore(json{{"v", 2}}, day, &back, &why));
+}
 }  // namespace
 
 int main() {
-  lanes_and_groups(); lane_day();
+  lanes_and_groups(); lane_day(); settle_and_restore();
   return finish("deskd-sys_book");
 }

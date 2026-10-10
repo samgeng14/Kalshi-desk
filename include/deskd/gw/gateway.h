@@ -91,6 +91,11 @@ class Gateway {
   // The daily cost budget of the IOC-style lanes (contract hdr.cost.budget): past it they are CAPPED.
   static constexpr Money kCostBudget = 5 * 10000;
   std::shared_ptr<const SysView> sys_view() const { return std::atomic_load(&sys_view_); }
+  // After attach_manual: when the restored Systematic book was saved (0: none). The REST read
+  // goes back that far for orders, so the last run's fills can still be told apart by client id.
+  std::int64_t sys_saved_ms() const { return sys_saved_ms_; }
+  // Any thread: the markets Systematic holds positions in (REST reads them until they settle)
+  std::shared_ptr<const std::set<std::string>> sys_held() const { return std::atomic_load(&sys_held_); }
 
   // Any thread: the order path's latency (stage 4: click-to-ack p90 under 100 ms), over the last
   // 200 creates the venue acknowledged: click (the page's clock) to ack, deskd's receipt to ack,
@@ -170,6 +175,18 @@ class Gateway {
   std::set<std::string> lanes_dirty_;
   std::int64_t sys_view_ms_ = 0, groups_paced_ms_ = 0, sys_day_ms_ = 0;
   bool sys_dirty_ = true;
+  // Systematic's day is rebuilt from the venue's fills on the first account read after start;
+  // until then gw refuses Systematic orders (STALE)
+  bool sys_rebuilt_ = false;
+  bool sys_save_due_ = false;
+  std::int64_t sys_saved_ms_ = 0, sys_save_ms_ = 0;
+  std::string sys_halt_why_;
+  std::shared_ptr<const std::set<std::string>> sys_held_;   // std::atomic_load / std::atomic_store
+  mutable std::map<std::string, Px> last_mark_;             // gw thread: each market's last mid
+  std::int64_t reconciled_ms_ = 0;            // the account read last reconciled
+  std::string sys_restore_error_;            // a saved book that could not be read blocks Systematic
+  void sys_reconcile(const rest::Snapshot& s);
+  void save_sys();
   void place_sys(PlaceIntent& p);
   void group_reply(const KalshiWriteReply& r);
   void group_event(const std::string& id, const std::string& event);

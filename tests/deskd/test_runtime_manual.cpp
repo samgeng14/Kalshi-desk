@@ -5,6 +5,7 @@
 #include <httplib.h>
 #include <sys/stat.h>
 #include <csignal>
+#include <filesystem>
 #include <fstream>
 #include <thread>
 #include <nlohmann/json.hpp>
@@ -66,7 +67,10 @@ struct Run {
   fx::Venue venue;
   TempDir dir;
   std::unique_ptr<Deskd> d;
-  explicit Run(bool manual_orders,std::function<void(fakex::Engine&,std::int64_t)> more={},bool systematic=false) {
+  DeskdConfig c;
+  RuntimeOptions o;
+  explicit Run(bool manual_orders,std::function<void(fakex::Engine&,std::int64_t)> more={},bool systematic=false,
+               std::function<void(DeskdConfig&,RuntimeOptions&)> tune={}) {
     CHECK(venue.ok);
     venue.f->with_engine([&](fakex::Engine& e,std::int64_t now) {
       auto spec=fx::spec(TK,0); spec.close_ms=(now/1000+3600)*1000;
@@ -78,22 +82,26 @@ struct Run {
     const std::string key=dir.path+"/test-key.pem";
     { std::ofstream f(key); f<<pem; }
     ::chmod(key.c_str(),0600);
-    DeskdConfig c;
     c.data_dir=dir.path; c.ui_dir=std::string(DESKD_SOURCE_DIR)+"/ui/desk"; c.http_port=0;
     c.env="demo"; c.key_id="runtime-test"; c.pem_path=key; c.key_type="ed25519";
     c.manual_orders=manual_orders;
     c.systematic_orders=systematic;
     c.band_series={"KXRUNTIME","KXHIGHNY"};   // M2 trades the test's own market too
-    RuntimeOptions o;
     const std::string base="https://127.0.0.1:"+std::to_string(venue.port());
     o.rest_url=base+"/trade-api/v2"; o.ws_url=base+"/trade-api/ws/v2"; o.factory=fx::trust_test_ca();
     o.rest_poll_ms=700; o.rest_gap_ms=0;   // reconciles (and clock samples at varied sub-second phases) come quickly
     o.fair_watch_since_ms=now_ms()-600000;   // a window opening now is one the fair can check
+    if(tune) tune(c,o);
+    launch();
+  }
+  void launch() {
     std::string err;
     auto lock=AccountLock::acquire(dir.path,"demo","deskd-test-runtime",false,&err);
     d=std::make_unique<Deskd>(c,std::move(lock),o);
     if(!d->start(&err)) { std::fprintf(stderr,"deskd did not start: %s\n",err.c_str()); std::exit(2); }
   }
+  // a new deskd process on the same data directory and venue
+  void restart() { d->stop(); d.reset(); launch(); }
   ~Run() { d->stop(); }
   httplib::Result post(const std::string& path,const json& body) {
     httplib::Client c("127.0.0.1",d->port()); c.set_read_timeout(6,0);
@@ -598,10 +606,92 @@ void systematic_group_trigger() {
   CHECK(r.until([&]{ return r.d->gw().groups_ready(&why) && why.empty(); },15000));
   CHECK(!r.venue.f->with_engine([&](fakex::Engine& e,std::int64_t) { return e.group(gid)->triggered; }));
 }
+// Systematic's book against the venue's own records (the order-safety review, 2026-10-10):
+//   - a fill the private feed lost still moves the lane: each REST read's fills count once
+//   - a reducing order is never refused for money, past the lane's budget at its full size
+//   - a market the lane holds that settles realizes the position, and HALTs a day past the stop
+//   - KILL and its re-arm keep the HALT; so does a restart, with the day and the positions
+void systematic_book() {
+  const std::string W="KXRUNTIME-26OCT10-W", V="KXRUNTIME-26OCT10-V";
+  Run r(false,[&](fakex::Engine& e,std::int64_t now) {
+    for(const auto& tk:{W,V}) { auto spec=fx::spec(tk,0); spec.close_ms=(now/1000+3600)*1000; e.add_market(spec,now); }
+    e.street_add(W,false,6000,5000,now); e.street_add(W,true,3800,5000,now);   // YES 0.60 bid / 0.62 ask
+    e.street_add(V,false,3000,500,now);  e.street_add(V,true,6800,500,now);    // YES 0.30 bid / 0.32 ask
+  },true,[](DeskdConfig& c,RuntimeOptions& o) { c.daily_stop=10000; o.rest_listing_ms=500; });   // a $1.00 stop
+  CHECK(r.ready());
+  for(const auto& tk:{W,V}) { auto w=r.post("/api/watch",{{"v","K"},{"tk",tk},{"on",true}}); CHECK(w && w->status==200); }
+  CHECK(r.until([&]{ return r.d->status()["books_live"]>=3; },15000));
+  auto lane=r.post("/api/lane/M2",{{"on",true}});
+  CHECK(lane && lane->status==200);
+  std::string why;
+  CHECK(r.until([&]{ return r.d->gw().groups_ready(&why) && why.empty(); },20000));
+  httplib::Result start;
+  CHECK(r.until([&]{ start=r.post("/api/start",json::object()); return start && start->status==200; },10000));
+  int n=0;
+  auto sys=[&](const std::string& tk,Side side,Px px,Qty count,bool ioc=false) {
+    PlaceIntent p; p.cid="SM2-book-"+std::to_string(++n); p.owner=Owner::SYS; p.lane="M2"; p.ticker=tk; p.side=side;
+    p.price=px; p.count=count; p.tif=ioc ? Tif::IOC : Tif::POST; p.ttl_s=ioc ? 0 : 30; p.reduce_only=ioc;
+    p.reply=std::make_shared<std::promise<OrderReply>>();
+    auto f=p.reply->get_future();
+    CHECK(r.d->gw().post(std::move(p)));
+    if(f.wait_for(std::chrono::seconds(5))!=std::future_status::ready) return OrderReply{"TIMEOUT","",""};
+    auto a=f.get();
+    if(!a.code.empty()) std::fprintf(stderr,"sys %s: %s %s\n",tk.c_str(),a.code.c_str(),a.msg.c_str());
+    return a;
+  };
+  auto gw_pos=[&](const std::string& tk) {
+    const auto v=r.d->gw().sys_view();
+    return v && v->positions.count("M2|"+tk) ? v->positions.at("M2|"+tk) : Qty{0};
+  };
+  // the street sells into our resting bid
+  auto take=[&](const std::string& tk,Px px,Qty q) {
+    return r.venue.f->with_engine([&](fakex::Engine& e,std::int64_t now) { return e.street_take(tk,fakex::Side::ASK,px,q,now); });
+  };
+  // 1. the private feed loses the fill: the next REST read moves the lane anyway
+  r.venue.f->drop_ws_messages("fill",1);
+  CHECK(sys(TK,Side::BUY,4100,200).code.empty());
+  CHECK(take(TK,4100,200)==200);
+  CHECK(r.until([&]{ return gw_pos(TK)==200; },10000));
+  CHECK(r.d->status()["gw"]["ledger_healthy"]==true);
+  // 2. long 20 V at 0.31 and 20 W at 0.61: $0.82 + $6.20 + $12.20 of M2's $25
+  CHECK(sys(V,Side::BUY,3100,2000).code.empty());
+  CHECK(take(V,3100,2000)==2000);
+  CHECK(sys(W,Side::BUY,6100,2000).code.empty());
+  CHECK(take(W,6100,2000)==2000);
+  CHECK(r.until([&]{ return gw_pos(V)==2000 && gw_pos(W)==2000; },10000));
+  // 3. selling all 20 W: at its full worst case ($0.41 x 20) the lane would pass $25, but it only
+  // reduces (reduce_only waits for the REST read to show the position, as the maker's retry does)
+  OrderReply sold;
+  CHECK(r.until([&]{ sold=sys(W,Side::SELL,5900,2000,true); return sold.code!="REDUCE"; },10000));
+  CHECK(sold.code.empty());
+  CHECK(r.until([&]{ return gw_pos(W)==0; },10000));
+  CHECK(r.d->status()["run"]["state"]=="RUN");   // the day: -0.20 and the sale's fee, inside the $1.00 stop
+  // 4. TK settles NO: the long of 2 at 0.41 realizes -0.82, the day passes -$1.00: HALTED
+  r.venue.f->with_engine([&](fakex::Engine& e,std::int64_t now) { e.settle_market(TK,false,now); });
+  CHECK(r.until([&]{ return r.d->status()["run"]["state"]=="HALTED"; },15000));
+  CHECK(gw_pos(TK)==0 && gw_pos(V)==2000);
+  const auto halted_day=r.d->gw().sys_view()->day;
+  CHECK(halted_day<-1000000);
+  auto again=r.post("/api/start",json::object());
+  CHECK(again && again->status!=200 && json::parse(again->body)["err"]["code"]=="HALTED");
+  // 5. KILL and its re-arm leave it HALTED (until ET midnight)
+  CHECK(r.post("/api/kill",json::object()));
+  CHECK(r.until([&]{ return r.d->kill_switch().confirmed_gen()==r.d->kill_switch().generation(); }));
+  CHECK(r.d->kill_switch().rearm(now_ms(),mono_ms()+61000).empty());
+  CHECK(r.until([&]{ return r.d->status()["run"]["state"]=="HALTED"; }));
+  // 6. a restart: the HALT, the day and V's position come back
+  CHECK(std::filesystem::exists(r.dir.path+"/systematic.json"));
+  r.restart();
+  CHECK(r.d->status()["run"]["state"]=="HALTED");
+  CHECK(r.until([&]{ return gw_pos(V)==2000 && r.d->gw().sys_view()->day<=halted_day+100000; },15000));
+  CHECK(gw_pos(TK)==0 && gw_pos(W)==0);
+  again=r.post("/api/start",json::object());
+  CHECK(again && again->status!=200 && json::parse(again->body)["err"]["code"]=="HALTED");
+}
 }  // namespace
 
 int main() {
   std::signal(SIGPIPE,SIG_IGN);
-  off_by_default(); orders_cancel_kill(); stop_reasons(); financial_fair(); systematic(); systematic_maker(); systematic_band(); systematic_races(); systematic_group_trigger();
+  off_by_default(); orders_cancel_kill(); stop_reasons(); financial_fair(); systematic(); systematic_maker(); systematic_band(); systematic_races(); systematic_group_trigger(); systematic_book();
   return finish("deskd-runtime-manual");
 }

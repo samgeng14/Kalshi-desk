@@ -62,6 +62,8 @@ struct ManualPath {
   Money daily_stop = 0;
   GroupRegistry* groups = nullptr;
   std::vector<LaneSpec> lanes;   // empty: default_lanes()
+  // Systematic's book across a restart (its day, positions, trade ids and HALT); "" keeps none
+  std::string sys_state_file;
 };
 
 class ManualBook {

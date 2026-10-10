@@ -92,13 +92,14 @@ json universe_row(const kalshi::MarketRow& m, const Snapshot& state, const FairO
   auto bid = m.yes_bid, ask = m.yes_ask;
   if (bid && (*bid <= 0 || (m.yes_bid_size && *m.yes_bid_size == 0))) bid.reset();
   if (ask && (*ask >= 10000 || (m.yes_ask_size && *m.yes_ask_size == 0))) ask.reset();
-  const auto spread = bid && ask && *ask >= *bid ? std::optional<Px>(*ask - *bid) : std::nullopt;
+  json spread = nullptr;   // not an optional: GCC 13 warns that one may be read uninitialized
+  if (bid && ask && *ask >= *bid) spread = kalshi::price_wire(*ask - *bid);
   const auto fair = fair_of ? fair_of(m.ticker) : std::nullopt;
   const auto edge = fair ? take_edge(m, bid, ask, *fair) : std::nullopt;
   return {{"v", "K"}, {"tk", m.ticker}, {"ev", event(m)}, {"title", m.title.empty() ? m.ticker : m.title},
           {"short", label(m)}, {"cat", category(m)}, {"grp", group(m)}, {"gk", group(m)}, {"kind", kind(m)},
           {"date", outcome_date(m)}, {"close_ms", effective_close(m)}, {"bid", optional_px(bid)},
-          {"ask", optional_px(ask)}, {"sprd", optional_px(spread)},
+          {"ask", optional_px(ask)}, {"sprd", spread},
           {"vol", static_cast<double>(m.volume_24h.value_or(0)) / 100.0}, {"fee", fee(m)},
           {"fair", fair ? json(price_str(*fair)) : json(nullptr)},
           {"edge", edge ? json(money_str(*edge)) : json(nullptr)}, {"pin", state.pins.count(m.ticker) != 0},
@@ -162,6 +163,10 @@ std::shared_ptr<const Snapshot> State::snapshot() const { return std::atomic_loa
 void State::request_refresh() { refresh_requested_.store(true); }
 void State::set_pins(std::set<std::string> pins) { controls(true, std::move(pins)); }
 void State::set_live(std::set<std::string> live) { controls(false, std::move(live)); }
+void State::set_held(std::set<std::string> held) {
+  std::lock_guard<std::mutex> lock(controls_mu_);
+  held_ = std::move(held);
+}
 
 void State::controls(bool pins, std::set<std::string> values) {
   std::shared_ptr<const Snapshot> result;
@@ -283,7 +288,8 @@ bool State::account(Snapshot& next, std::string* why, Worker* worker) {
   auto orders_builder = [&](const std::string& cursor) { q.cursor = cursor; return kalshi::build_get_orders(q); };
   if (!pages(&orders, orders_builder, kalshi::parse_orders, fetch, options_.max_pages, why)) return false;
   q.status.clear();
-  q.min_ts = (started_ms_ - 5000) / 1000;
+  const std::int64_t since = orders_since_ms_ > 0 ? std::min(orders_since_ms_, started_ms_ - 5000) : started_ms_ - 5000;
+  q.min_ts = std::max(since, et_midnight_ms(now_ms()) - 86400000) / 1000;
   if (!pages(&recent, orders_builder, kalshi::parse_orders, fetch, options_.max_pages, why)) return false;
   std::map<std::string, kalshi::OrderRow> unique_orders;
   for (auto& row : orders) unique_orders[row.order_id] = std::move(row);
@@ -353,7 +359,11 @@ bool State::listing(Snapshot& next, std::string* why, Worker* worker) {
   // A position/order can outlive the public OPEN listing. Fetch its actual status rather than
   // dropping it (or guessing settled from the wall clock). Include old live markets for the
   // contract's final live=false/closed transition and its 30-minute retention rule.
-  std::set<std::string> needed = snapshot()->live;
+  std::set<std::string> needed = snapshot()->live, held;
+  {
+    std::lock_guard<std::mutex> lock(controls_mu_);
+    held = held_;
+  }
   for (const auto& p : next.positions) if (p.position) needed.insert(p.ticker);
   for (const auto& o : next.orders) if (o.status == kalshi::OrderStatus::RESTING && o.remaining) needed.insert(o.ticker);
   for (const auto& ticker : needed) if (!rows.count(ticker)) {
@@ -362,6 +372,12 @@ bool State::listing(Snapshot& next, std::string* why, Worker* worker) {
     auto market = kalshi::parse_market(body, why);
     if (!market) return false;
     rows[ticker] = std::move(*market);
+  }
+  // Systematic's held markets: one that cannot be read now costs only its own row this poll
+  for (const auto& ticker : held) if (!rows.count(ticker)) {
+    std::string body, miss;
+    if (!fetch(kalshi::build_get_market(ticker), &body, &miss)) continue;
+    if (auto market = kalshi::parse_market(body, &miss)) rows[ticker] = std::move(*market);
   }
   next.markets = std::move(rows);
   next.listing_ready = true;

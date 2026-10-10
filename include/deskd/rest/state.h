@@ -89,6 +89,13 @@ class State {
   std::shared_ptr<const Snapshot> snapshot() const;
   void set_pins(std::set<std::string> pins);  // immediate immutable publication; no network
   void set_live(std::set<std::string> live);  // ladders/lanes; positions/orders are also included
+  // Markets read by ticker on every listing poll whatever their status: Systematic's held
+  // inventory, so a market that settles after its position left the unsettled list still shows
+  // gw its result. No subscription, no publication.
+  void set_held(std::set<std::string> held);
+  // Orders created since this time are read too (default: since start): a restart reads the
+  // previous run's last orders, so their fills can be told apart by client id. Before run().
+  void set_orders_since(std::int64_t ms) { orders_since_ms_ = ms; }
   void request_refresh();
   // Set before run(). A private-event generation fences the whole paged read: an event or
   // reconnect during it means those pages cannot be accepted as one reconciled account.
@@ -114,7 +121,8 @@ class State {
   std::function<bool(std::uint64_t)> commit_;
   std::shared_ptr<const Snapshot> published_;
   std::mutex controls_mu_;  // controls/publication only, never held over I/O or callbacks
-  std::set<std::string> pins_, live_;
+  std::set<std::string> pins_, live_, held_;
+  std::int64_t orders_since_ms_ = 0;
   std::atomic<bool> refresh_requested_{false};
   ClockCheck clock_;
   std::unique_ptr<net::Conn> conn_;  // REST owner only; read connections can be reused

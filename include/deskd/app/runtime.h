@@ -65,6 +65,7 @@ struct RuntimeOptions {
   std::string ws_url = "https://demo-api.kalshi.co/trade-api/ws/v2";
   net::FactoryOptions factory;
   int rest_poll_ms = 0;   // 0 = the REST owner's default; tests shorten it
+  int rest_listing_ms = 0;   // the listing's poll (and the held markets' reads); 0 = the default
   int rest_gap_ms = -1;   // -1 = the REST owner's default request spacing
   // When the financial fair began watching (strat/fair.h checks only windows that opened a
   // minute after it); 0 = deskd's start. Tests set it earlier.

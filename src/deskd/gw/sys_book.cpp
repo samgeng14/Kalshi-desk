@@ -57,9 +57,10 @@ void SysBook::sent(const std::string& lane, std::int64_t at) {
   d.last_ms = at;
 }
 
-void SysBook::fill(const std::string& lane, const std::string& cid, const std::string& ticker, Side side, Qty count,
-                   Px px, Micros fee, std::int64_t at) {
-  if (count <= 0) return;
+bool SysBook::fill(const std::string& lane, const std::string& cid, const std::string& ticker, Side side, Qty count,
+                   Px px, Micros fee, std::int64_t at, const std::string& trade_id) {
+  if (count <= 0) return false;
+  if (!trade_id.empty() && !trades_.insert(trade_id).second) return false;
   auto& d = days_[lane];
   ++d.fills;
   d.hit.insert(cid);
@@ -84,11 +85,34 @@ void SysBook::fill(const std::string& lane, const std::string& cid, const std::s
     inv.pos += side == Side::BUY ? left : -left;
     inv.cost += px * left;
   }
+  return true;
+}
+
+Micros SysBook::settle(const std::string& lane, const std::string& ticker, Px value, std::int64_t at) {
+  auto dit = days_.find(lane);
+  if (dit == days_.end()) return 0;
+  auto it = dit->second.inv.find(ticker);
+  if (it == dit->second.inv.end() || !it->second.pos) return 0;
+  const Inv inv = it->second;
+  const Micros worth = value * std::abs(inv.pos);
+  const Micros pnl = inv.pos > 0 ? worth - inv.cost : inv.cost - worth;
+  dit->second.real += pnl;
+  dit->second.last_ms = at;
+  dit->second.inv.erase(it);
+  return pnl;
+}
+
+std::vector<std::pair<std::string, std::string>> SysBook::held() const {
+  std::vector<std::pair<std::string, std::string>> out;
+  for (const auto& [lane, d] : days_)
+    for (const auto& [tk, inv] : d.inv) if (inv.pos) out.emplace_back(lane, tk);
+  return out;
 }
 
 void SysBook::roll(std::int64_t day_start_ms) {
   if (day_start_ms <= day_start_ms_) return;
   day_start_ms_ = day_start_ms;
+  trades_.clear();   // a REST read's fills from before this midnight are not counted again (gw skips them)
   for (auto& [lane, d] : days_) {
     Day next;
     next.day_start_ms = day_start_ms;
@@ -116,8 +140,8 @@ Micros SysBook::unrealized(const std::string& lane, const MarkFn& mark) const {
   for (const auto& [tk, inv] : d->inv) {
     if (!inv.pos) continue;
     const auto m = mark ? mark(tk) : std::nullopt;
-    if (!m) continue;   // no mark: no unrealized claimed either way
-    const Micros value = *m * std::abs(inv.pos);
+    // never priced: counted as worthless (a long loses its cost, a short pays $1 a contract)
+    const Micros value = (m ? *m : (inv.pos > 0 ? 0 : kOneDollar)) * std::abs(inv.pos);
     u += inv.pos > 0 ? value - inv.cost : inv.cost - value;
   }
   return u;
@@ -138,6 +162,57 @@ Micros SysBook::day_total(const MarkFn& mark) const {
   Micros t = 0;
   for (const auto& [lane, d] : days_) t += d.real - d.fees + unrealized(lane, mark);
   return t;
+}
+
+json SysBook::to_json(const Halt& halt, std::int64_t saved_ms) const {
+  json lanes = json::object();
+  for (const auto& [lane, d] : days_) {
+    json inv = json::object();
+    for (const auto& [tk, i] : d.inv) if (i.pos) inv[tk] = {i.pos, i.cost};
+    lanes[lane] = {{"sent", d.sent}, {"fills", d.fills}, {"hit", d.hit}, {"ctrs", d.ctrs}, {"fees", d.fees},
+                   {"real", d.real}, {"last_ms", d.last_ms}, {"inv", inv}};
+  }
+  return {{"v", 1}, {"saved_ms", saved_ms}, {"day_start_ms", day_start_ms_}, {"trades", trades_}, {"lanes", lanes},
+          {"halt", halt.on ? json{{"ms", halt.ms}, {"why", halt.why}} : json(nullptr)}};
+}
+
+bool SysBook::restore(const json& j, std::int64_t day_start_ms, Halt* halt, std::string* why) {
+  try {
+    if (!j.is_object() || j.value("v", 0) != 1) {
+      if (why) *why = "not a version 1 Systematic book";
+      return false;
+    }
+    const bool today = j.at("day_start_ms").get<std::int64_t>() == day_start_ms;
+    std::map<std::string, Day> days;
+    for (const auto& [lane, l] : j.at("lanes").items()) {
+      if (!this->lane(lane)) continue;   // a lane this build no longer has
+      Day d;
+      d.day_start_ms = day_start_ms;
+      for (const auto& [tk, i] : l.at("inv").items()) d.inv[tk] = Inv{i.at(0).get<Qty>(), i.at(1).get<Micros>()};
+      if (today) {
+        d.sent = l.at("sent").get<int>();
+        d.fills = l.at("fills").get<int>();
+        d.hit = l.at("hit").get<std::set<std::string>>();
+        d.ctrs = l.at("ctrs").get<Qty>();
+        d.fees = l.at("fees").get<Micros>();
+        d.real = l.at("real").get<Micros>();
+        d.last_ms = l.at("last_ms").get<std::int64_t>();
+      }
+      days[lane] = std::move(d);
+    }
+    std::set<std::string> trades;
+    if (today) trades = j.at("trades").get<std::set<std::string>>();
+    Halt h;
+    if (today && j.at("halt").is_object()) h = Halt{true, j["halt"].at("ms").get<std::int64_t>(), j["halt"].at("why").get<std::string>()};
+    days_ = std::move(days);
+    trades_ = std::move(trades);
+    day_start_ms_ = day_start_ms;
+    if (halt) *halt = h;
+    return true;
+  } catch (const json::exception& e) {
+    if (why) *why = std::string("malformed: ") + e.what();
+    return false;
+  }
 }
 
 json SysBook::lane_json(const LaneSpec& l, RunState run, Micros reserved, int working, Micros eff_left,
