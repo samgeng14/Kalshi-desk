@@ -45,6 +45,11 @@ Nothing is pushed. `ui/desk/js/contract.js` is the API contract deskd must serve
   a terminal order read/event. Pure state tests exercise 5,000 UNKNOWN orders and all 144
   permutations of full-fill and partial-fill/cancel races, checking records against contract
   1.5.0. This component is not yet wired into the runtime's gateway or HTTP order routes.
+- Stage 3 send workers (2026-10-09): dedicated `KalshiSender` Manual/cancel roles, preopened
+  one-write connections, revoked/deadline/KILL-generation permits, precise write outcomes and
+  timings, and cancel-all independent of gateway and queue capacity. Fake TLS proofs cover
+  accepted-but-lost replies, no retries, duplicate cids, soft refusals, result-queue loss, a
+  frozen gateway, and KILL overtaking an in-flight Manual write. Runtime wiring remains open.
 - Oracle VM `deskd-recorder` for the recorder: `ssh -i ~/.ssh/oracle_deskd ubuntu@64.181.211.165` (Ubuntu 24.04 aarch64, 1 OCPU, 6 GB, 145 GB). Nothing installed yet.
 
 ## Next, in order

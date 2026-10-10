@@ -305,6 +305,7 @@ add_library(deskd_core STATIC
   src/deskd/net/conn.cpp
   src/deskd/net/pool.cpp
   src/deskd/net/send.cpp
+  src/deskd/net/kalshi_sender.cpp
   src/deskd/gw/gateway.cpp
   src/deskd/gw/order_ledger.cpp
   src/deskd/gw/kill.cpp
@@ -441,7 +442,7 @@ foreach(t http pub_data order_ledger)
   target_precompile_headers(deskd-test-${t} REUSE_FROM deskd_core)
   add_test(NAME deskd-${t} COMMAND deskd-test-${t})
 endforeach()
-foreach(t net wire md rest private)
+foreach(t net wire md rest private sender)
   add_executable(deskd-test-${t} tests/deskd/test_${t}.cpp)
   target_link_libraries(deskd-test-${t} PRIVATE deskd_core fake_kalshi)
   target_precompile_headers(deskd-test-${t} REUSE_FROM deskd_core)
@@ -460,4 +461,5 @@ add_dependencies(deskd-test-wire kalshi-demo-probe)
 add_custom_target(deskd-all DEPENDS deskd deskctl deskd-test-bus deskd-test-ops deskd-test-web deskd-test-process
                                     fake-kalshi deskd-test-fake-engine deskd-test-fake-wire
                                     deskd-test-http deskd-test-net deskd-test-wire deskd-test-md
-                                    deskd-test-pub_data deskd-test-rest deskd-test-private deskd-test-order_ledger kalshi-demo-probe)
+                                    deskd-test-pub_data deskd-test-rest deskd-test-private deskd-test-order_ledger
+                                    deskd-test-sender kalshi-demo-probe)

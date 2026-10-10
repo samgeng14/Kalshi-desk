@@ -81,3 +81,24 @@ positions, fee admission, persistence, senders and web order responses remain to
 Validation: all 18 deskd/frontend suites passed (242 seconds); after the final zero-reduction
 cancel/late-ack correction, `deskd-all` rebuilt without warnings and the ledger suite passed
 again. The final targeted rerun covers the new partial and complete late-ack cases as well.
+
+## Stage 3 send workers — 2026-10-09
+
+- Manual and cancels use separate queues, threads and preopened connection pools. Every write
+  consumes its connection. There are no automatic create/cancel retries; duplicate cid
+  refusals become UNKNOWN for reconciliation of the original order.
+- A queued Manual job must carry an unrevoked permit, a future monotonic deadline, its current
+  KILL generation, and a Manual cid. These are checked again after connection acquisition and
+  signing. Cancel jobs have no entry-health dependency.
+- KILL is observed atomically outside the cancel inbox and calls cancel-all without gateway
+  cooperation. Only a confirmed cancel-all extends the venue lockout from its acknowledgement.
+  An unconfirmed attempt leaves the sender unhealthy; another explicit KILL can try again.
+- Result delivery failure latches the sender unhealthy and trips KILL. Future runtime admission
+  must check BOTH sender health latches, publisher health and ledger health; re-arming KILL
+  alone must not bypass any of them.
+- Fake TLS tests prove one accepted order per lost/500/cut/timed-out create response, no hidden
+  resend, the duplicate-cid rule, soft post-cross/rate refusals, and permit/expiry checks. KILL
+  works with gw frozen and a full cancel queue, and completes while Manual awaits a stalled
+  create response. All four sender/order-ledger/wire/net suites passed (15.4 seconds).
+
+These workers are not yet installed in runtime; no demo or production write was made by them.
