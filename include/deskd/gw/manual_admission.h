@@ -14,6 +14,7 @@ struct ManualContext {
   bool public_ready = false, private_ready = false, clock_trusted = false;
   bool publisher_healthy = false, ledger_healthy = false;
   bool manual_sender_healthy = false, cancel_sender_healthy = false;
+  std::string owner_why;   // which execution owner is not ready, and why ("" = not known)
   bool trading_active = false, shard_active = false;
   bool duplicate_cid = false, unknown_order = false, foreign_order = false;
   // Current spendable cash AFTER all existing exchange and local commitments; never subtract

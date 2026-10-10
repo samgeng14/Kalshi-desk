@@ -217,10 +217,43 @@ void orders_cancel_kill() {
   const std::string cmd=std::string("\"")+DESKD_NODE+"\" \""+DESKD_SOURCE_DIR+"/tests/deskd/contract_check.cjs\" \""+file+"\"";
   CHECK(std::system(cmd.c_str())==0);
 }
+// A create the venue processed but answered 400: send-k1 stops and trips KILL, and the private
+// feed's sight of the order contradicts the refusal, so the ledger stops too. Every RO refusal
+// and /ops/status name the owner and its reason; after the confirmed cancel-all and a re-arm,
+// send-k1 is back and only the ledger (restart deskd) still holds orders.
+void stop_reasons() {
+  Run r(true);
+  CHECK(r.ready());
+  fakex::HttpFault hard; hard.kind=fakex::HttpFault::Kind::STATUS_AFTER_ACCEPT; hard.status=400;
+  r.venue.f->add_fault(hard);
+  auto o=r.order("Mrt-hard-1","BUY","0.4100",1,"POST",60);
+  // The 400 and the private feed's sight of the order race: whichever lands second contradicts
+  // the first (BAD_REQUEST when the 400 wins, INTERNAL when the order was seen first).
+  CHECK(o["err"]["code"]=="BAD_REQUEST" || o["err"]["code"]=="INTERNAL");
+  CHECK(r.until([&]{ return r.d->kill_switch().active(); }));
+  CHECK(r.until([&]{ return r.resting()==0; }));   // KILL's cancel-all took the order the venue kept
+  CHECK(r.until([&]{ return !r.d->status()["gw"]["ledger_why"].get<std::string>().empty(); }));
+  auto s=r.d->status();
+  CHECK(s["senders"]["k1"]["healthy"]==false);
+  CHECK(s["senders"]["k1"]["why"].get<std::string>().find("invalid or unauthorized")!=std::string::npos);
+  CHECK(s["gw"]["ledger_healthy"]==false);
+  CHECK(s["gw"]["ledger_why"].get<std::string>().rfind("Mrt-hard-1: ",0)==0);
+  CHECK(r.until([&]{ return r.d->kill_switch().confirmed_gen()==r.d->kill_switch().generation(); }));
+  CHECK(r.d->kill_switch().rearm(now_ms(),mono_ms()+61000).empty());
+  s=r.d->status();
+  CHECK(s["senders"]["k1"]["healthy"]==true && s["senders"]["cx"]["healthy"]==true);
+  o=r.order("Mrt-after-1","BUY","0.4200",1,"IOC");
+  if(o["status"]!=409) std::fprintf(stderr,"after: %s\n",o.dump().c_str());
+  CHECK(o["status"]==409 && o["err"]["code"]=="RO");
+  const auto msg=o["err"]["msg"].get<std::string>();
+  if(msg.rfind("order ledger stopped: Mrt-hard-1: ",0)!=0) std::fprintf(stderr,"RO msg: %s\n",msg.c_str());
+  CHECK(msg.rfind("order ledger stopped: Mrt-hard-1: ",0)==0 && msg.find("restart deskd")!=std::string::npos);
+  CHECK(!r.venue.has_cid("Mrt-after-1"));
+}
 }  // namespace
 
 int main() {
   std::signal(SIGPIPE,SIG_IGN);
-  off_by_default(); orders_cancel_kill();
+  off_by_default(); orders_cancel_kill(); stop_reasons();
   return finish("deskd-runtime-manual");
 }

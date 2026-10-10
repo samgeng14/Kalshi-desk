@@ -50,6 +50,11 @@ class Gateway {
   // Any thread: the cids gw's order book owns. Their rows come from gw alone (contract ORDER
   // REVISIONS: the page keeps the highest rev), so the REST publisher leaves them out.
   std::shared_ptr<const std::set<std::string>> manual_cids() const { return std::atomic_load(&owned_); }
+  // Why the Manual order ledger stopped ("" while healthy): any thread, for /ops/status.
+  std::string ledger_why() const {
+    const auto why = std::atomic_load(&ledger_why_);
+    return why ? *why : std::string();
+  }
 
   // queues m in its lane (lane_of); false when that lane is full: dropped, gap marked
   bool post(GwMsg m);
@@ -99,6 +104,8 @@ class Gateway {
   std::map<std::string, OrderPromise> pending_;  // web threads waiting on a Manual order's write
   std::set<std::string> cancel_sent_;            // cids whose cancel went to the cancel sender
   std::shared_ptr<const std::set<std::string>> owned_;   // std::atomic_load / std::atomic_store
+  std::shared_ptr<const std::string> ledger_why_;        // std::atomic_load / std::atomic_store
+  void note_ledger();
 };
 
 }  // namespace deskd

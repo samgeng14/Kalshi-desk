@@ -38,6 +38,7 @@ struct ManualHealth {
   bool public_feed = false, private_feed = false, publisher = false;
   bool manual_sender = false, cancel_sender = false;
   std::uint64_t kill_generation = 0;
+  std::string why;   // why the first owner above that is not ready is not, for the RO refusal
 };
 
 // What gw needs from the rest of deskd to run the Manual path. Every function is called on the

@@ -117,13 +117,15 @@ static void unknown_table_and_proof() {
 }
 static void bad_evidence() {
   auto l=ledger(); auto f=execution();
-  CHECK(l.fill(f,"",t+1)==OrderLedger::FillResult::UNMAPPED && l.healthy());
+  CHECK(l.fill(f,"",t+1)==OrderLedger::FillResult::UNMAPPED && l.healthy() && l.why_unhealthy().empty());
   CHECK(l.fill(f,"Mledger-1",t+2)==OrderLedger::FillResult::APPLIED);
   f.count=251; CHECK(l.fill(f,"Mledger-1",t+3)==OrderLedger::FillResult::INVALID);
   CHECK(!l.healthy() && l.find("Mledger-1")->executions==250 && l.reserved(0)==3150000);
+  CHECK(l.why_unhealthy().find("fill")!=std::string::npos && l.why_unhealthy().find("arrived twice")!=std::string::npos);
   CHECK(!l.insert(intent("Mnew-1"),0,1));
   auto other=ledger(); auto a=ack(); a.fill_count=1001;
   CHECK(!other.acknowledged("Mledger-1",a,t+2) && !other.healthy()); CHECK(other.reserved(0)==4200000);
+  CHECK(other.why_unhealthy().rfind("Mledger-1: acknowledged filled 1001",0)==0);
   auto reject=ledger(); CHECK(reject.rejected("Mledger-1","SHARD_CASH",t+2));
   CHECK(reject.reserved(0)==0); record(reject);
   CHECK(!reject.acknowledged("Mledger-1",ack(),t+3) && !reject.healthy());
@@ -132,6 +134,10 @@ static void bad_evidence() {
   auto malformed=ledger();
   CHECK(!malformed.observed(row(250,0,kalshi::OrderStatus::EXECUTED),t+3));
   CHECK(!malformed.healthy() && malformed.reserved(0)==4200000);
+  CHECK(malformed.why_unhealthy().find("is executed with")!=std::string::npos);
+  // the first contradiction is the one kept
+  CHECK(!malformed.observed(row(250,0,kalshi::OrderStatus::EXECUTED),t+4));
+  CHECK(malformed.why_unhealthy().find("Mledger-1:")==0);
 }
 static void fractional_and_permutations() {
   auto p=intent(); p.count=3; p.side=Side::SELL;

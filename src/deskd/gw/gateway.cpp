@@ -125,6 +125,14 @@ bool Gateway::sync_kill() {
   return false;
 }
 
+// The first time the ledger stops, its reason is logged and kept for /ops/status.
+void Gateway::note_ledger() {
+  if (!manual_ || manual_->ledger().healthy() || std::atomic_load(&ledger_why_)) return;
+  const auto& why = manual_->ledger().why_unhealthy();
+  DLOG_ERR("Manual order ledger stopped (orders refused RO until deskd restarts): %s", why.c_str());
+  std::atomic_store(&ledger_why_, std::make_shared<const std::string>(why));
+}
+
 void Gateway::handle(GwMsg& m) {
   if (auto* p = std::get_if<PlaceIntent>(&m)) {
     if (manual_ && p->owner == Owner::MAN) return place_manual(*p);
@@ -138,10 +146,12 @@ void Gateway::handle(GwMsg& m) {
   }
   if (auto* w = std::get_if<ManualWrite>(&m)) {
     if (w->reply) manual_reply(*w->reply);
+    note_ledger();
     return;
   }
   if (auto* e = std::get_if<PrivateMsg>(&m)) {
     if (e->event && manual_) manual_private(*e->event);
+    note_ledger();
     return;
   }
   if (auto* c = std::get_if<CancelIntent>(&m)) {

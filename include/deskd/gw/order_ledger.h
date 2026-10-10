@@ -60,15 +60,18 @@ class OrderLedger {
   kalshi::Micros reserved(int shard) const;
   std::vector<std::string> fills_due(std::int64_t now) const;
   bool healthy() const { return healthy_; }
+  // The first contradiction that made the ledger unhealthy, with the order it names ("" while healthy).
+  const std::string& why_unhealthy() const { return why_unhealthy_; }
   const std::map<std::string, Order>& orders() const { return orders_; }
  private:
   bool bind(Order& order, const std::string& oid);
-  bool invalid();
+  bool invalid(const Order& order, const std::string& why);
   std::map<std::string, Order> orders_;
   std::map<std::string, std::string> by_oid_;
   std::map<std::string, kalshi::FillRow> fills_;
   std::map<std::string, std::int64_t> missing_since_;
   bool healthy_ = true;
+  std::string why_unhealthy_;
   void missing(Order& order, std::int64_t at);
 };
 }

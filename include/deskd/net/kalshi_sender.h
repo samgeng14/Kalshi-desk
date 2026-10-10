@@ -4,6 +4,8 @@
 #include <atomic>
 #include <functional>
 #include <memory>
+#include <mutex>
+#include <string>
 #include <optional>
 #include "deskd/bus/queue.h"
 #include "deskd/gw/kalshi_wire.h"
@@ -51,7 +53,10 @@ class KalshiSender {
   // stats, which the web's KILL route waits on. Call before run().
   void set_stats(SenderStats* stats) { stats_ = stats; }
   void run(Worker& self);
-  bool healthy() const { return healthy_.load(); }
+  // A failure trips KILL and stops this sender (RO) until the venue confirms a cancel-all sent
+  // after it and KILL is re-armed: the operator has seen it and the venue holds none of our orders.
+  bool healthy() const;
+  std::string fail_reason() const;   // the last failure ("" if none); kept after recovery
   std::uint64_t kill_seen() const { return kill_seen_.load(); }
   std::uint64_t attempted() const { return attempted_.load(); }
  private:
@@ -63,7 +68,10 @@ class KalshiSender {
   ReplyFn reply_;
   AlertFn alert_;
   Options options_;
-  std::atomic<bool> healthy_{true};
+  std::atomic<bool> failed_{false};
+  std::atomic<std::uint64_t> failed_gen_{0};
+  mutable std::mutex why_m_;
+  std::string why_;
   SenderStats* stats_ = nullptr;
   std::atomic<std::uint64_t> kill_seen_{0}, attempted_{0};
   std::string admission(const KalshiWriteJob& job, const Worker& self) const;

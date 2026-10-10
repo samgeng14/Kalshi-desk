@@ -1,5 +1,8 @@
 #include "deskd/net/kalshi_sender.h"
 #include <algorithm>
+#include <cctype>
+#include <chrono>
+#include <thread>
 #include "deskd/app/log.h"
 #include "deskd/app/worker.h"
 #include "deskd/gw/kalshi_sign.h"
@@ -29,9 +32,24 @@ std::string KalshiSender::admission(const KalshiWriteJob& j,const Worker& self) 
   if(j.create.expiration_s && j.create.expiration_s<=now_ms()/1000+1) return "EXPIRY";
   return "";
 }
+bool KalshiSender::healthy() const {
+  if(!failed_.load()) return true;
+  return !kill_.active() && kill_.confirmed_gen()>=failed_gen_.load();
+}
+std::string KalshiSender::fail_reason() const {
+  std::lock_guard<std::mutex> lk(why_m_);
+  return why_;
+}
 void KalshiSender::fail_closed(const std::string& why) {
-  healthy_.store(false);
-  if(!kill_.active()) kill_.trip(now_ms(),mono_ms(),why);
+  { std::lock_guard<std::mutex> lk(why_m_); why_=why; }
+  // A Manual failure always sends a fresh cancel-all, KILL active or not, so recovery waits on
+  // one that went out after it. The cancel sender never re-trips itself: an unconfirmed
+  // cancel-all would retry without end; the operator presses KILL again instead.
+  if(role_==Role::MANUAL || !kill_.active()) kill_.trip(now_ms(),mono_ms(),why);
+  // Never lowered: a newer failure needs a newer cancel-all.
+  for(auto g=kill_.generation(), old=failed_gen_.load(); g>old && !failed_gen_.compare_exchange_weak(old,g);) {}
+  if(role_==Role::CANCEL && kill_.confirmed_gen()>=failed_gen_.load()) failed_gen_.fetch_add(1);
+  failed_.store(true);
   if(alert_) alert_(why);
 }
 void KalshiSender::deliver(KalshiWriteReply reply) {
@@ -94,8 +112,27 @@ void KalshiSender::take_kill(Worker& self) {
     stats_->kills.fetch_add(1); stats_->last_kill_ms.store(now_ms()); stats_->kill_gen_seen.store(generation);
   }
   auto reply=execute(kalshi::build_cancel_all(),"",self,nullptr);
-  if(reply.outcome.kind==kalshi::WriteOutcome::Kind::ACK) kill_.cancel_all_done(now_ms(),mono_ms());
-  else fail_closed("KILL cancel-all unconfirmed; reconcile and press KILL again");
+  // A 429 is refused before the venue processed anything, so sending again is safe; a cancel-all
+  // costs a whole batch's write tokens, so a KILL right after a burst of clicks can meet one.
+  // Waits honour Retry-After and stop as soon as a newer KILL takes over.
+  for(int attempt=0; attempt<5 && reply.outcome.kind==kalshi::WriteOutcome::Kind::REFUSED &&
+      reply.outcome.cls==RejectClass::RETRYABLE && kill_.generation()==generation && !self.stopping(); ++attempt) {
+    std::int64_t wait=250LL<<attempt;
+    const auto after=reply.exchange.res.header("retry-after");
+    if(!after.empty() && after.size()<3 && std::all_of(after.begin(),after.end(),[](unsigned char c){return std::isdigit(c);}))
+      wait=std::max<std::int64_t>(wait,std::min<std::int64_t>(5000,std::stoll(after)*1000));
+    DLOG_WARN("KILL cancel-all answered 429; sending again in %lld ms",static_cast<long long>(wait));
+    const auto until=mono_ms()+wait;
+    while(mono_ms()<until && kill_.generation()==generation && !self.stopping()) {
+      self.beat(); std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    if(kill_.generation()!=generation || self.stopping()) break;
+    reply=execute(kalshi::build_cancel_all(),"",self,nullptr);
+  }
+  if(reply.outcome.kind==kalshi::WriteOutcome::Kind::ACK) kill_.cancel_all_done(now_ms(),mono_ms(),generation);
+  else if(kill_.generation()==generation)   // a newer KILL is about to send its own
+    fail_closed("KILL cancel-all unconfirmed ("+(reply.outcome.why.empty() ? reply.local_code : reply.outcome.why).substr(0,120)+
+                "); reconcile and press KILL again");
   deliver(std::move(reply));
 }
 void KalshiSender::run(Worker& self) {

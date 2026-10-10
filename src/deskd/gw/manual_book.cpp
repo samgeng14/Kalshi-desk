@@ -104,6 +104,10 @@ ManualContext ManualBook::context(const PlaceIntent& in, const ManualHealth& h, 
   c.ledger_healthy = ledger_.healthy();
   c.manual_sender_healthy = h.manual_sender;
   c.cancel_sender_healthy = h.cancel_sender;
+  // The same order admission checks them in: Manual off first, then the publisher, the ledger,
+  // and the two senders.
+  if (h.read_only || !h.publisher || ledger_.healthy()) c.owner_why = h.why;
+  else c.owner_why = "order ledger stopped: " + ledger_.why_unhealthy() + "; restart deskd to reconcile";
   c.public_ready = h.public_feed;
   c.private_ready = h.private_feed;
   c.duplicate_cid = ledger_.find(in.cid) != nullptr;

@@ -43,7 +43,7 @@ bool through_two(Px p,Px touch,Side side,const std::vector<kalshi::PriceRange>& 
 }
 ManualAdmission admit_manual(const PlaceIntent& input,const ManualContext& c) {
   ManualAdmission a; a.intent=input;
-  auto refuse=[&](const char* code,const char* text) { a.code=code; a.message=text; return a; };
+  auto refuse=[&](const char* code,const std::string& text) { a.code=code; a.message=text; return a; };
   if(c.now_ms<=0 || c.now_ms>std::numeric_limits<std::int64_t>::max()-1800000 ||
      !cid_ok(input.cid) || input.owner!=Owner::MAN || !input.lane.empty() ||
      (input.side!=Side::BUY && input.side!=Side::SELL) ||
@@ -64,7 +64,7 @@ ManualAdmission admit_manual(const PlaceIntent& input,const ManualContext& c) {
   if(c.killed) return refuse("KILLED","KILL lockout active");
   if(c.read_only || !c.publisher_healthy || !c.ledger_healthy ||
      !c.manual_sender_healthy || !c.cancel_sender_healthy)
-    return refuse("RO","an execution owner is not ready");
+    return refuse("RO",c.owner_why.empty() ? "an execution owner is not ready" : c.owner_why);
   if(!c.account_ready || !c.public_ready || !c.private_ready || c.unknown_order ||
      !c.book || c.book->ticker!=input.ticker || c.book->stale)
     return refuse("STALE","book, private account or order reconciliation is pending");

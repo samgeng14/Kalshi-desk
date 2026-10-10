@@ -79,6 +79,16 @@ void Deskd::attach_manual() {
     h.publisher = pub_->healthy();
     h.manual_sender = man_sender_->healthy();
     h.cancel_sender = cx_sender_->healthy();
+    auto stopped = [this](const char* who, const KalshiSender& s) {
+      std::string why = std::string(who) + " stopped: " + s.fail_reason();
+      why += kill_.active() ? "; re-arm KILL once its cancel-all is confirmed (press KILL again if it was not)"
+                            : "; press KILL, then re-arm once its cancel-all is confirmed";
+      return why;
+    };
+    if (h.read_only) h.why = "Manual orders are off (deskd.manual_orders in config/desk.json)";
+    else if (!h.publisher) h.why = "the page publisher dropped updates; restart deskd";
+    else if (!h.manual_sender) h.why = stopped("send-k1", *man_sender_);
+    else if (!h.cancel_sender) h.why = stopped("send-cx", *cx_sender_);
     return h;
   };
   p.send = [this](KalshiWriteJob j) { return q_man_.push(std::move(j)); };

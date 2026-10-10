@@ -194,6 +194,8 @@ json Deskd::status() const {
                 {"manual_cancels", gs.manual_cancels.load()},
                 {"private_applied", gs.private_applied.load()},
                 {"manual_orders", cfg_.manual_orders && man_sender_ != nullptr},
+                {"ledger_healthy", gw_->ledger_why().empty()},
+                {"ledger_why", gw_->ledger_why()},
                 {"kills_seen", gs.kills_seen.load()}}},
               {"send_cx",
                {{"kills", cx_stats_.kills.load()},
@@ -205,6 +207,11 @@ json Deskd::status() const {
               {"log", {{"dropped", log_dropped()}}},
               {"workers", workers}};
   result["feeds"] = feeds_json(feeds_);
+  auto sender = [](const KalshiSender* s) {
+    if (!s) return json(nullptr);
+    return json{{"healthy", s->healthy()}, {"why", s->fail_reason()}, {"attempted", s->attempted()}};
+  };
+  result["senders"] = {{"k1", sender(man_sender_.get())}, {"cx", sender(cx_sender_.get())}};
   result["publisher_healthy"] = pub_->healthy();
   if (rest_) {
     const auto s = rest_->snapshot();
