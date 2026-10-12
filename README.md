@@ -14,21 +14,23 @@ whether a model proposed it, you typed it, or a bot fired it.
                        reconcile: balance, positions, orders, fills, settlements ──► eval / gate
 ```
 
-## The desk (deskd): PAPER and LIVE
+## The desk (deskd): one desk, a PAPER | LIVE toggle
 
 ```sh
-python3 tools/desk.py setup            # once: ~/.kalshi/deskd-demo.json from ~/.kalshi/demo.json, data dir
-python3 tools/desk.py paper            # the Kalshi demo account, http://127.0.0.1:8788/
-python3 tools/desk.py setup live --key ~/.kalshi/prod.json   # once, when you want LIVE
-python3 tools/desk.py live             # production, http://127.0.0.1:8789/, after you type LIVE
+python3 tools/desk.py setup            # once: PAPER (the Kalshi demo account) from ~/.kalshi/demo.json
+python3 tools/desk.py setup live       # once: LIVE (real Kalshi) from ~/.kalshi/prod.json (or --key FILE)
+python3 tools/desk.py                  # the desk: PAPER, and LIVE too after you type LIVE; one browser tab
 python3 tools/desk.py sim              # the fake exchange: no network, no key, http://127.0.0.1:8790/
-python3 tools/desk.py status           # both desks
+python3 tools/desk.py status           # both accounts
+python3 tools/desk.py kill paper|live  # KILL, as the screen's button
 ```
 
-Two desks, one per account, each its own deskd (lock, data dir, port), so both can run at once.
-The header tag says which one you are on (PAPER amber, LIVE red, SIM) and a click opens the
-other, asking first before LIVE. The live config starts with Systematic off; set
-`"systematic_orders": true` in `~/.kalshi/deskd-prod.json` yourself when you want lanes there.
+The header's PAPER | LIVE toggle flips the tab between the two accounts (asking first before
+LIVE), keeping the screen's tab. Underneath each account is its own deskd (its own lock, order
+ledger and venue connections; ports 8788 and 8789), so a fault on one never touches the other's
+orders; one command starts both and Ctrl-C stops both. The live config starts with Systematic
+off; set `"systematic_orders": true` in `~/.kalshi/deskd-prod.json` yourself when you want lanes
+there. `python3 tools/desk.py paper` or `live` runs one alone.
 
 ## Build (macOS)
 

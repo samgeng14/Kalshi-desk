@@ -125,9 +125,10 @@
   }
 
   // ---------------------------------------------------------------------------------------------
-  // PAPER / LIVE: two desks, one per Kalshi account, each its own deskd on its own port (paper:
-  // the demo account, 8788; live: production, 8789; tools/desk.py). The tag names this one; a
-  // click opens the other (<meta name="desk-peer">), asking first when that one is LIVE.
+  // PAPER | LIVE: one toggle, two accounts. Each account is its own deskd (its own lock, ledger,
+  // venue connections and port: paper, the demo account, 8788; live, production, 8789), both
+  // started by `python3 tools/desk.py`; the toggle flips this tab to the other one
+  // (<meta name="desk-peer">), on the same tab of the screen, asking first before LIVE.
   // ---------------------------------------------------------------------------------------------
   var desk = { peer: '', venue: '', mode: '' };
   function meta(name) {
@@ -135,16 +136,20 @@
     catch (e) { return ''; }
   }
   function modeCell(mode) {   // mode: the header's DEMO | LIVE ('' before the first header)
-    var sim = Desk.transport.mode === 'demo' || desk.venue === 'sim';
-    var t = mode === 'LIVE' ? ['LIVE', 'tag crit', 'LIVE: the production Kalshi account, real money'] :
-      sim ? ['SIM', 'tag warn', 'SIM: ' + (Desk.transport.mode === 'demo' ? 'the simulated desk in this page' : 'the fake exchange on this machine') + ', nothing reaches Kalshi'] :
-      ['PAPER', 'tag warn', 'PAPER: the Kalshi demo account, play money'];
-    if (!mode) t[0] = '-';
     desk.mode = mode;
-    cell('h-mode', t[0], t[1]);
-    var other = mode === 'LIVE' ? 'PAPER' : 'LIVE';
-    var can = switchable();
-    D.setAttr($('hc-mode'), 'title', t[2] + (can ? '. Click: open the ' + other + ' desk, ' + desk.peer : ''));
+    var sim = Desk.transport.mode === 'demo' || desk.venue === 'sim', live = mode === 'LIVE', can = switchable();
+    var what = live ? 'LIVE: the production Kalshi account, real money' :
+      sim ? 'SIM: ' + (Desk.transport.mode === 'demo' ? 'the simulated desk in this page' : 'the fake exchange on this machine') + ', nothing reaches Kalshi' :
+      'PAPER: the Kalshi demo account, play money';
+    if (can) {
+      // the toggle: PAPER left, LIVE right, this desk's side lit
+      cell('h-mode', 'PAPER', live ? 'tag sw' : 'tag warn');
+      cell('h-mode-b', 'LIVE', live ? 'tag crit' : 'tag sw');
+    } else {
+      cell('h-mode', !mode ? '-' : live ? 'LIVE' : sim ? 'SIM' : 'PAPER', live ? 'tag crit' : 'tag warn');
+      cell('h-mode-b', '', 'tag hide');
+    }
+    D.setAttr($('hc-mode'), 'title', what + (can ? '. Click to switch to ' + (live ? 'PAPER' : 'LIVE') : ''));
     D.setClass($('hc-mode'), 'peer', can);
   }
   // only between the two accounts' desks: the in-page simulation and the fake exchange have none
@@ -154,10 +159,11 @@
     var toLive = desk.mode !== 'LIVE', name = toLive ? 'LIVE' : 'PAPER';
     // is it up? the other desk refuses this cross-port fetch (403), but a refusal still answers
     fetch(desk.peer + 'api/health', { mode: 'no-cors', cache: 'no-store', credentials: 'omit' }).then(function () {
-      if (toLive && !root.confirm('Open the LIVE desk at ' + desk.peer + '?\n\nOrders there trade the production Kalshi account with real money.')) return;
-      root.location.assign(desk.peer);
+      if (toLive && !root.confirm('Switch to LIVE?\n\nOrders there trade your real Kalshi account with real money.')) return;
+      root.location.assign(desk.peer + '?tab=' + (Desk.tabs.cur || 'manual'));   // the same tab of the screen
     }, function () {
-      Desk.store.localAlert('WARN', 'DESK', 'the ' + name + ' desk is not running at ' + desk.peer + ': start it with python3 tools/desk.py ' + (toLive ? 'live' : 'paper'));
+      Desk.store.localAlert('WARN', 'DESK', name + ' is not running: start both with python3 tools/desk.py' +
+        (toLive ? ' (after python3 tools/desk.py setup live, once)' : ''));
     });
   }
 

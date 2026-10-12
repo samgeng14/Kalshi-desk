@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 """Start the desk: PAPER (the Kalshi demo account, play money) or LIVE (production, real money).
 
-    python3 tools/desk.py setup                  # once: the paper desk's config and data dir
-    python3 tools/desk.py setup live --key ~/.kalshi/prod.json   # once, when you want LIVE
-    python3 tools/desk.py paper                  # http://127.0.0.1:8788/
-    python3 tools/desk.py live                   # http://127.0.0.1:8789/, after you type LIVE
+    python3 tools/desk.py setup                  # once: PAPER's config and data dir
+    python3 tools/desk.py setup live             # once, for LIVE (key ~/.kalshi/prod.json, or --key FILE)
+    python3 tools/desk.py                        # the desk: PAPER, and LIVE too after you type LIVE
+    python3 tools/desk.py paper | live           # one of them alone
     python3 tools/desk.py sim                    # the fake exchange, no network, no key
-    python3 tools/desk.py status                 # both desks, through deskctl
+    python3 tools/desk.py status                 # both, through deskctl
     python3 tools/desk.py kill paper|live        # KILL, as the screen's button
 
-Two desks, one per account: each is its own deskd with its own account lock, data directory and
-port, so both can run at once. The header's PAPER / LIVE tag opens the other one. Nothing here
-ever starts LIVE by itself: `live` runs only from a terminal, after you type LIVE.
+One desk, one browser tab, a PAPER | LIVE toggle in the header. Underneath, each account is its
+own deskd (its own lock, order ledger, venue connections; PAPER on port 8788, LIVE on 8789), so a
+fault in one never touches the other's orders; the toggle flips the tab between them, asking
+first before LIVE. Nothing here starts LIVE by itself: only from a terminal, after you type LIVE.
 
 Files (setup writes them only when missing; it never overwrites one):
   paper: key ~/.kalshi/demo.json, config ~/.kalshi/deskd-demo.json, data <data>/demo
@@ -65,8 +66,14 @@ def read_json(path):
     return json.loads(text)
 
 
+_noted = set()
+
+
 def binary(name):
     path = os.path.join(BUILD, name)
+    if name in _noted:
+        return path
+    _noted.add(name)
     if not os.path.exists(path):
         die('%s is missing: build it first (cd build-deskd && nice -n 15 ninja -j 4 deskd deskctl)' % path)
     # a stale binary runs yesterday's desk: say so (the build is yours to run)
@@ -120,7 +127,7 @@ def setup(which, key_override):
         say('%s data dir made: %s' % (which, d['data']))
     else:
         say('%s data dir: %s' % (which, d['data']))
-    say('start it with: python3 tools/desk.py %s' % which)
+    say('start the desk with: python3 tools/desk.py' + ('  (type LIVE when it asks)' if which == 'live' else ''))
 
 
 # ---- run -------------------------------------------------------------------------------------
@@ -138,14 +145,16 @@ def up(port, timeout_s):
     return False
 
 
-def run(which, open_browser, port):
+def prepare(which, port=None, required=True):
+    """The deskd command for one desk, or None (with required, a missing setup ends here)."""
     d = DESKS[which]
     deskd = binary('deskd')
     config = os.path.expanduser(d['config'])
-    if not os.path.exists(config):
-        die('no %s config %s: run python3 tools/desk.py setup%s first' % (which, config, ' live --key FILE' if which == 'live' else ''))
-    if not os.path.isdir(d['data']):
-        die('no %s data dir %s: run python3 tools/desk.py setup%s first' % (which, d['data'], ' live' if which == 'live' else ''))
+    hint = 'python3 tools/desk.py setup%s' % (' live --key FILE' if which == 'live' else '')
+    if not os.path.exists(config) or not os.path.isdir(d['data']):
+        if required:
+            die('%s is not set up (no %s or %s): run %s first' % (which, config, d['data'], hint))
+        return None
     try:
         cfg = read_json(config)
     except (OSError, ValueError) as e:
@@ -153,37 +162,72 @@ def run(which, open_browser, port):
     if cfg.get('env') != d['env']:
         die('%s says env %r: the %s desk needs %r' % (config, cfg.get('env'), which, d['env']))
     port = port or d['port']
-    sysm = bool((cfg.get('deskd') or {}).get('systematic_orders'))
-    if which == 'live':
-        if not sys.stdin.isatty():
-            die('the live desk starts only from a terminal, after you type LIVE')
-        print('\n  %s\n  config   %s\n  data     %s\n  web      http://127.0.0.1:%d/\n  Manual   %s\n  Systematic %s\n'
-              % (d['what'], config, d['data'], port, 'on' if (cfg.get('deskd') or {}).get('manual_orders') else 'off',
-                 'ON' if sysm else 'off'))
-        if input('  Type LIVE to start it: ').strip() != 'LIVE':
-            die('not started')
-    cmd = [deskd, '--config', config, '--data-dir', d['data'], '--port', str(port)] + d['flags']
-    say('%s on http://127.0.0.1:%d/ (Ctrl-C stops it)' % (d['what'], port))
-    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))   # stops deskd as Ctrl-C does
-    p = subprocess.Popen(cmd)
+    return {'which': which, 'port': port, 'config': config, 'cfg': cfg,
+            'cmd': [deskd, '--config', config, '--data-dir', d['data'], '--port', str(port)] + d['flags']}
+
+
+def confirm_live(spec, optional):
+    """LIVE starts only from a terminal, after LIVE is typed; optional: Enter skips it."""
+    d, cfg = DESKS['live'], spec['cfg'].get('deskd') or {}
+    if not sys.stdin.isatty():
+        if optional:
+            say('LIVE not started: it starts only from a terminal, after you type LIVE')
+            return False
+        die('the live desk starts only from a terminal, after you type LIVE')
+    print('\n  %s\n  config     %s\n  data       %s\n  Manual     %s\n  Systematic %s\n'
+          % (d['what'], spec['config'], d['data'], 'on' if cfg.get('manual_orders') else 'off',
+             'ON' if cfg.get('systematic_orders') else 'off'))
+    ans = input('  Type LIVE to start it%s: ' % (' too (Enter: PAPER only)' if optional else '')).strip()
+    if ans == 'LIVE':
+        return True
+    if not optional:
+        die('not started')
+    say('LIVE not started; the toggle says so if you flip to it')
+    return False
+
+
+def launch(specs, open_browser):
+    """Run the desks in this terminal, each log line labelled; Ctrl-C (or SIGTERM) stops them all."""
+    import threading
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    procs = []
+
+    def relay(p, label):
+        for line in p.stdout:
+            sys.stdout.write(label + line)
+            sys.stdout.flush()
+
     try:
-        if up(port, 20):
-            if open_browser:
-                webbrowser.open('http://127.0.0.1:%d/' % port)
-        elif p.poll() is None:
-            say('not answering on port %d yet; see its log above' % port)
-        while p.poll() is None:
+        for spec in specs:
+            p = subprocess.Popen(spec['cmd'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+            procs.append((spec, p))
+            threading.Thread(target=relay, args=(p, '%-6s' % spec['which'].upper()), daemon=True).start()
+        for spec, p in procs:
+            if up(spec['port'], 20):
+                say('%s up on http://127.0.0.1:%d/' % (DESKS[spec['which']]['what'], spec['port']))
+            elif p.poll() is None:
+                say('%s not answering on port %d yet; see its log' % (spec['which'], spec['port']))
+        first = procs[0][0]
+        if open_browser and procs[0][1].poll() is None:
+            webbrowser.open('http://127.0.0.1:%d/' % first['port'])
+        say('the PAPER | LIVE toggle in the header flips the tab; Ctrl-C stops %s' % ('both' if len(procs) > 1 else 'it'))
+        while all(p.poll() is None for _, p in procs):
             time.sleep(0.5)
+        for spec, p in procs:
+            if p.poll() is not None:
+                say('%s exited (%s)%s' % (spec['which'], p.returncode, '; stopping the other' if len(procs) > 1 else ''))
     except KeyboardInterrupt:
         pass
     finally:
-        if p.poll() is None:
-            p.send_signal(signal.SIGTERM)
+        for _, p in procs:
+            if p.poll() is None:
+                p.send_signal(signal.SIGTERM)
+        for _, p in procs:
             try:
                 p.wait(timeout=15)
             except subprocess.TimeoutExpired:
                 p.kill()
-    return p.returncode or 0
+    return max([p.returncode or 0 for _, p in procs] or [0])
 
 
 def deskctl(args):
@@ -192,7 +236,7 @@ def deskctl(args):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n\n')[0], usage=__doc__.split('\n\n')[1])
-    ap.add_argument('cmd', choices=['setup', 'paper', 'live', 'sim', 'status', 'kill'])
+    ap.add_argument('cmd', nargs='?', default='up', choices=['up', 'setup', 'paper', 'live', 'sim', 'status', 'kill'])
     ap.add_argument('which', nargs='?', help='setup and kill: paper or live')
     ap.add_argument('--key', help='setup: the key file (default ~/.kalshi/demo.json, ~/.kalshi/prod.json)')
     ap.add_argument('--port', type=int, help='paper and live: the web port (default 8788 paper, 8789 live)')
@@ -203,8 +247,22 @@ def main():
         if which not in DESKS:
             die('setup paper or setup live')
         setup(which, a.key)
+    elif a.cmd == 'up':
+        # PAPER always; LIVE too when it is set up and you type LIVE. One tab, the toggle flips it.
+        if a.port:
+            die('--port is for paper or live alone: the toggle needs the two default ports')
+        specs = [prepare('paper')]
+        live = prepare('live', required=False)
+        if live is None:
+            say('LIVE is not set up (python3 tools/desk.py setup live --key FILE): PAPER only')
+        elif confirm_live(live, optional=True):
+            specs.append(live)
+        sys.exit(launch(specs, not a.no_open))
     elif a.cmd in ('paper', 'live'):
-        sys.exit(run(a.cmd, not a.no_open, a.port))
+        spec = prepare(a.cmd, a.port)
+        if a.cmd == 'live':
+            confirm_live(spec, optional=False)
+        sys.exit(launch([spec], not a.no_open))
     elif a.cmd == 'sim':
         if a.port:
             rest += ['--port', str(a.port)]
