@@ -208,8 +208,10 @@ void MakerEngine::step(std::int64_t now) {
       const auto r = s.answer.get();
       if (!r.code.empty()) {
         ++refusals_;
-        if (last_pull_[tk] != r.code) DLOG_INFO("%s %s: gw refused %s (%s)", lane_.c_str(), tk.c_str(), r.code.c_str(), r.msg.c_str());
-        last_pull_[tk] = r.code;
+        const auto prev = last_pull_.find(tk);   // this thread is the only writer: no lock to read
+        if (prev == last_pull_.end() || prev->second != r.code)
+          DLOG_INFO("%s %s: gw refused %s (%s)", lane_.c_str(), tk.c_str(), r.code.c_str(), r.msg.c_str());
+        set_last(tk, r.code);
         s.cid.clear();
         s.backoff_until = now + 10000;
       }
@@ -268,7 +270,7 @@ void MakerEngine::step(std::int64_t now) {
         if (d.quotes.empty()) d.pull = hold;
       }
     }
-    last_pull_[tk] = d.pull.empty() ? "quoting" : d.pull;
+    set_last(tk, d.pull.empty() ? "quoting" : d.pull);
     // slot 0 bid, 1 ask, 2 the flatten
     std::map<int, MakerQuote> want;
     for (const auto& q : d.quotes) want[q.ioc ? 2 : q.side == Side::BUY ? 0 : 1] = q;
@@ -329,10 +331,19 @@ void MakerEngine::step(std::int64_t now) {
   }
 }
 
+void MakerEngine::set_last(const std::string& tk, const std::string& why) {
+  std::lock_guard<std::mutex> lk(status_mu_);
+  last_pull_[tk] = why;
+}
+
 json MakerEngine::status() const {
   json markets = json::object();
-  for (const auto& [tk, why] : last_pull_) markets[tk] = why;
-  return {{"lane", lane_}, {"places", places_}, {"cancels", cancels_}, {"refusals", refusals_}, {"last", markets}};
+  {
+    std::lock_guard<std::mutex> lk(status_mu_);
+    for (const auto& [tk, why] : last_pull_) markets[tk] = why;
+  }
+  return {{"lane", lane_}, {"places", places_.load()}, {"cancels", cancels_.load()}, {"refusals", refusals_.load()},
+          {"last", markets}};
 }
 
 }  // namespace deskd

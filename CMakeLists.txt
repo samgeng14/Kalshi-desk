@@ -470,6 +470,10 @@ add_executable(deskd-soak tests/deskd/soak.cpp)
 target_link_libraries(deskd-soak PRIVATE deskd_core fake_kalshi)
 target_precompile_headers(deskd-soak REUSE_FROM deskd_core)
 add_test(NAME deskd-soak COMMAND deskd-soak)
+if(DESKD_TSAN)
+  # OpenSSL is not instrumented: tests/deskd/tsan.supp says which of its reports are not races
+  set_tests_properties(deskd-soak PROPERTIES ENVIRONMENT "TSAN_OPTIONS=suppressions=${CMAKE_SOURCE_DIR}/tests/deskd/tsan.supp")
+endif()
 set_tests_properties(deskd-soak PROPERTIES TIMEOUT 300)
 
 # tools/kalshi_demo_probe: signed reads (and, asked for, one tiny post-only order and its cancel)

@@ -7,7 +7,8 @@
 //   - gw's lane position equals the venue's position (allowing 5 s for the private feed)
 //   - gw refuses none of the maker's quotes
 // and at the end, Stop leaves nothing resting. ctest runs it for 60 s; for the real soak:
-//   DESKD_SOAK_SECONDS=14400 ./deskd-soak        (configure with -DDESKD_TSAN=ON for TSan)
+//   DESKD_SOAK_SECONDS=14400 TSAN_OPTIONS=suppressions=tests/deskd/tsan.supp ./deskd-soak
+// (configure with -DDESKD_TSAN=ON for TSan; tsan.supp names the uninstrumented OpenSSL reports)
 #include <httplib.h>
 #include <sys/stat.h>
 #include <csignal>

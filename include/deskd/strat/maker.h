@@ -22,8 +22,10 @@
 #include <cstdint>
 #include <functional>
 #include <future>
+#include <atomic>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <string>
@@ -124,7 +126,7 @@ class MakerEngine {
   MakerEngine(std::string lane, std::vector<std::string> series, Env env, MakerParams params = {},
               Decide decide = {});
   void step(std::int64_t now_ms);
-  nlohmann::json status() const;
+  nlohmann::json status() const;   // any thread (deskd's /ops/status reads it from the web's)
  private:
   struct Side_ {
     std::string cid;                   // the working (or pending) quote, "" = none
@@ -142,9 +144,14 @@ class MakerEngine {
   std::map<std::string, std::int64_t> cool_until_;      // after a fill of ours, or a 0.5 sigma move
   std::map<std::string, double> quote_spot_;            // the underlying when the quotes went out
   std::map<std::string, std::string> cool_why_;
+  // what status() shows, written by step() and read from any thread: the per-market reason
+  // under status_mu_ (an unguarded map was iterated by /ops/status while step() inserted into
+  // it: a TSan race and a possible crash), the counters atomic
+  mutable std::mutex status_mu_;
   std::map<std::string, std::string> last_pull_;
   std::uint64_t seq_ = 0;
-  std::int64_t places_ = 0, cancels_ = 0, refusals_ = 0;
+  std::atomic<std::int64_t> places_{0}, cancels_{0}, refusals_{0};
+  void set_last(const std::string& tk, const std::string& why);
   std::string new_cid();
   static void without_own(MdBook& b, const Gateway::SysView& v, const std::string& tk);
   std::int64_t event_worst(const Gateway::SysView& v, const rest::Snapshot& s, const std::string& event) const;
