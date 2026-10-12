@@ -164,6 +164,7 @@ def run(which, open_browser, port):
             die('not started')
     cmd = [deskd, '--config', config, '--data-dir', d['data'], '--port', str(port)] + d['flags']
     say('%s on http://127.0.0.1:%d/ (Ctrl-C stops it)' % (d['what'], port))
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))   # stops deskd as Ctrl-C does
     p = subprocess.Popen(cmd)
     try:
         if up(port, 20):

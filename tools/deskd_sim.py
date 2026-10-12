@@ -13,7 +13,7 @@ The market day (all on the fake's clock, starting now):
   - KXNATGAS15M windows every 15 minutes (the open one and the next two listed ahead), each with
     a strike, a two-sided street book and natural gas's pyth_value every half second, so the
     15-minute fair and lane M1 (LIP-15) have what they need
-  - KXHIGHNY bands with a 0.97 favourite, for lane M2 (BAND 96-99)
+  - today's KXHIGHNY bands with a 0.97 favourite, for lane M2 (BAND 96-99)
   - KXSIM-PRACTICE, an ordinary 1c market with a book on both sides, for Manual clicks
   - the street trading now and then on every market
 The fake is a sandbox: its matching, fees and books are close to Kalshi's, not Kalshi itself.
@@ -36,11 +36,12 @@ BUILD = os.path.join(ROOT, 'build-deskd')
 NATGAS = 'Commodities.Index.NATGAS/USD'
 
 
+MONTHS = ['JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN', 'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC']
+
+
 def window_ticker(close_s):
-    t = time.gmtime(close_s - 5 * 3600)   # Kalshi names a window by its ET close (EST here; the fake does not care)
-    return 'KXNATGAS15M-%02d%s%02d%02d%02d-%02d' % (
-        t.tm_year % 100, ['JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN', 'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC'][t.tm_mon - 1],
-        t.tm_mday, t.tm_hour, t.tm_min, t.tm_min)
+    t = time.gmtime(close_s - 4 * 3600)   # Kalshi names a window by its ET close (EDT here; the fake does not care)
+    return 'KXNATGAS15M-%02d%s%02d%02d%02d-%02d' % (t.tm_year % 100, MONTHS[t.tm_mon - 1], t.tm_mday, t.tm_hour, t.tm_min, t.tm_min)
 
 
 def scenario(minutes, seed=7):
@@ -63,15 +64,18 @@ def scenario(minutes, seed=7):
             'strike_type': 'greater_or_equal', 'floor_strike': round(spot, 3)}})
         ev.append({'t': list_at, 'snapshot': {'ticker': tk, 'yes': [['0.4500', '40.00'], ['0.4400', '60.00']],
                                               'no': [['0.5100', '40.00'], ['0.5000', '60.00']]}})
-    # weather: a favourite at 0.97 and the rest of the ladder
+    # weather: today's NYC high (named by its ET day, as Kalshi's), a favourite at 0.97 and the rest
+    et = time.gmtime(now_s - 4 * 3600)
+    day = '%02d%s%02d' % (et.tm_year % 100, MONTHS[et.tm_mon - 1], et.tm_mday)
     for strike, bid in (('B70', '0.9700'), ('B72', '0.0200'), ('B68', '0.0100')):
-        tk = 'KXHIGHNY-SIM-' + strike
-        ev.append({'t': 0, 'market': {'ticker': tk, 'exchange_index': 0, 'ticks': 'linear_cent', 'close_in_ms': minutes * 60000 + 3600000}})
+        tk = 'KXHIGHNY-%s-%s' % (day, strike)
+        ev.append({'t': 0, 'market': {'ticker': tk, 'exchange_index': 0, 'ticks': 'linear_cent', 'open_in_ms': -60000,
+                                      'close_in_ms': minutes * 60000 + 3600000}})
         b = float(bid)
         ev.append({'t': 0, 'snapshot': {'ticker': tk, 'yes': [[bid, '50.00']],
                                         'no': [['%.4f' % (1 - b - 0.02), '30.00']]}})
     # the practice market
-    ev.append({'t': 0, 'market': {'ticker': 'KXSIM-PRACTICE', 'exchange_index': 0, 'ticks': 'linear_cent',
+    ev.append({'t': 0, 'market': {'ticker': 'KXSIM-PRACTICE', 'exchange_index': 0, 'ticks': 'linear_cent', 'open_in_ms': -60000,
                                   'close_in_ms': minutes * 60000 + 3600000}})
     ev.append({'t': 0, 'snapshot': {'ticker': 'KXSIM-PRACTICE', 'yes': [['0.4000', '200.00'], ['0.3900', '300.00']],
                                     'no': [['0.5800', '150.00'], ['0.5700', '300.00']]}})
@@ -98,6 +102,8 @@ def main():
     for b in (fake, deskd):
         if not os.path.exists(b):
             sys.exit('%s is missing: build first (cd build-deskd && nice -n 15 ninja -j 4 deskd fake-kalshi)' % b)
+    # SIGTERM stops both as Ctrl-C does (a background job ignores SIGINT)
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     work = tempfile.mkdtemp(prefix='deskd-sim-')
     procs = []
     try:

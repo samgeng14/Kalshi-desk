@@ -208,7 +208,7 @@ button.hc:hover { background: var(--bg2); }
   flex: 0 0 64px; width: 64px; display: flex; align-items: center; justify-content: center; border-left: 1px solid var(--line);
   font: 11px/1 var(--font-num); font-variant-numeric: tabular-nums; color: var(--tx1); overflow: hidden;
 }
-.hh.warn { color: var(--warn); } .hh.crit { background: var(--crit); color: #fff; font-weight: 700; }
+.hh.warn { color: var(--warn); } .hh.off { color: var(--tx2); } .hh.crit { background: var(--crit); color: #fff; font-weight: 700; }
 .hclock { flex: 0 0 64px; display: flex; align-items: center; justify-content: center; border-left: 1px solid var(--line); font: 12px/1 var(--font-num); color: var(--tx1); }
 #kill {
   flex: 0 0 72px; width: 72px; height: 27px; border: 0; border-left: 1px solid var(--line);

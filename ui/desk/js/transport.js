@@ -248,6 +248,9 @@
   function subKeys(a) { return (a || []).map(function (x) { return x.v + '|' + x.tk; }).sort().join(','); }
   function sendSubs() {
     if (!T.impl) return;
+    // live: only once the stream is open (the backend answers 409 BAD_STATE for a sid with no
+    // stream, as every boot did); the stream's 'open' re-sends them (main.js)
+    if (T.mode === 'live' && !(T.impl.es && T.impl.es.readyState === 1)) return;
     var body = wantSubs(), sig = JSON.stringify(body);
     if (sig === lastSub) return;
     lastSub = sig;

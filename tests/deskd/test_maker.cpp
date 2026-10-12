@@ -173,6 +173,18 @@ void engine_limits() {
   MakerEngine stopped("M2", {"KXHIGHNY"}, env, p, band_quote);
   stopped.step(OPEN + 1000);
   CHECK(posted.empty() && stopped.status()["last"][tk] == "not running");
+  // an active market without open_time has opened (the sandbox's weather rows had none, and M2
+  // sat idle); one listed ahead, "initialized", is still not quoted
+  view->run = RunState::RUN;
+  snap->markets[tk].open_ms.reset();
+  MakerEngine no_open("M2", {"KXHIGHNY"}, env, p, band_quote);
+  no_open.step(OPEN + 1000);
+  CHECK(posted.size() == 1);
+  snap->markets[tk].status = "initialized";
+  posted.clear();
+  MakerEngine ahead("M2", {"KXHIGHNY"}, env, p, band_quote);
+  ahead.step(OPEN + 1000);
+  CHECK(posted.empty());
 }
 
 // The maker-math review (2026-10-10), each with its worked example.

@@ -113,8 +113,15 @@
   function cell(id, text, cls) { var el = $(id); if (!el) return; D.setText(el, text); if (cls !== undefined && el.className !== cls) el.className = cls; }
   function sum(a, b) { return (a || 0) + (b || 0); }
   function health(id, label, state, valueText) {
-    // state: 'ok' | 'warn' | 'crit'
+    // state: 'ok' | 'warn' | 'crit' | 'off'
     cell(id, label + ' ' + valueText, 'hh' + (state === 'ok' ? '' : ' ' + state));
+  }
+  // Polymarket not connected at all (deskd has no PM venue yet): read-only, no cash, its feed
+  // never up. Shown OFF and dim rather than as a failing key; a PM that was up and failed still
+  // reads RO / DOWN.
+  function pmOff(S) {
+    var h = S.hdr, f = S.feeds;
+    return !!(h && h.cash.P.ro && h.cash.P.total === 0 && (!f || (!f.PM.up && f.PM.lag_ms === null)));
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -180,8 +187,8 @@
       cell('h-pm', F.money(h.cash.P.total));
       // PM has no shards: its free cash shows only while orders hold some of it
       cell('h-pm-free', h.cash.P.ro || Math.abs(h.cash.P.total - h.cash.P.free) < 100 ? '' : 'free ' + F.money(h.cash.P.free));
-      D.setAttr($('hc-pm'), 'title', h.cash.P.ro ? 'read-only: PM key failing' : 'free ' + F.money(h.cash.P.free));
-      D.setClass($('h-pm-ro'), 'on', h.cash.P.ro);
+      D.setAttr($('hc-pm'), 'title', pmOff(S) ? 'Polymarket: not connected on this desk' : h.cash.P.ro ? 'read-only: PM key failing' : 'free ' + F.money(h.cash.P.free));
+      D.setClass($('h-pm-ro'), 'on', h.cash.P.ro && !pmOff(S));
       // the day's P&L flashes when its realized part moves by a cent (a fill that closed, an exit,
       // a settlement: green up, red down), at most once every 1.5 s; marks and the LIP accrual
       // move it every second while the lanes run, so a move of the total flashes only with FULL
@@ -213,7 +220,8 @@
       else if (!f.KX.up || !f.KXP.up) health('h-kx', 'KX', 'crit', 'DOWN');
       else if (f.KX.gap || f.KXP.gap) health('h-kx', 'KX', 'crit', 'GAP');
       else { var kl = lat && lat.kx_lag_ms !== null ? lat.kx_lag_ms : f.KX.lag_ms; health('h-kx', 'KX', kl !== null && kl > 1000 ? 'warn' : 'ok', kl === null ? '-' : kl + 'ms'); }
-      if (h && h.cash.P.ro) health('h-pmh', 'PM', 'warn', 'RO');
+      if (h && pmOff(S)) health('h-pmh', 'PM', 'off', 'OFF');
+      else if (h && h.cash.P.ro) health('h-pmh', 'PM', 'warn', 'RO');
       else if (!f) health('h-pmh', 'PM', 'warn', '-');
       else if (!f.PM.up) health('h-pmh', 'PM', 'crit', 'DOWN');
       else { var pl = lat && lat.pm_lag_ms !== null ? lat.pm_lag_ms : f.PM.lag_ms; health('h-pmh', 'PM', pl !== null && pl > 1000 ? 'warn' : 'ok', pl === null ? '-' : pl + 'ms'); }
@@ -257,7 +265,7 @@
       D.setClass(document.body, 'stale', S.stale);
       D.setAttr(document.body, 'data-kstale', S.vstale.K ? '1' : null);
       D.setAttr(document.body, 'data-pstale', S.vstale.P ? '1' : null);
-      var why = S.stale ? 'STALE ' + S.staleWhy : (S.vstale.K || S.vstale.P || '');
+      var why = S.stale ? 'STALE ' + S.staleWhy : (S.vstale.K || (pmOff(S) ? '' : S.vstale.P) || '');   // no PM: no alarm
       cell('sb-stale', why, 'sbc' + (why ? ' crit' : ' off'));
     }
     if (d.has('hk') || d.all) {

@@ -192,7 +192,9 @@ void MakerEngine::step(std::int64_t now) {
     const bool mine = std::any_of(series_.begin(), series_.end(), [&](const std::string& s) {
       return tk.size() > s.size() && tk.compare(0, s.size(), s) == 0 && tk[s.size()] == '-';
     });
-    if (mine && m.open_ms && *m.open_ms <= now && m.close_ms && *m.close_ms > now && (m.status == "active" || m.status == "open"))
+    // an active market with no open_time has opened (as rest::market_json reads it); one listed
+    // ahead is "initialized"/"unopened", never active
+    if (mine && (!m.open_ms || *m.open_ms <= now) && m.close_ms && *m.close_ms > now && (m.status == "active" || m.status == "open"))
       markets.insert(tk);
   }
   if (env_.want) env_.want(running ? markets : std::set<std::string>{});
