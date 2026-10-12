@@ -14,17 +14,19 @@ own deskd (its own lock, order ledger, venue connections; PAPER on port 8788, LI
 fault in one never touches the other's orders; the toggle flips the tab between them, asking
 first before LIVE. Nothing here starts LIVE by itself: only from a terminal, after you type LIVE.
 
-Files (setup writes them only when missing; it never overwrites one):
+Files (setup writes a config when missing; an existing one gets only its key fields from the key
+file and its order switches on, the previous version kept beside it as .bak-<time>):
   paper: key ~/.kalshi/demo.json, config ~/.kalshi/deskd-demo.json, data <data>/demo
   live:  key ~/.kalshi/prod.json (or --key), config ~/.kalshi/deskd-prod.json, data <data>/prod
   <data>: ~/Library/Application Support/kalshi-desk on a Mac, else $XDG_DATA_HOME/kalshi-desk
 A key file is {"env": "demo"|"prod", "key_id", "private_key_path" (or "pem_path"), "key_type"}.
-The paper config turns Manual and Systematic orders on; the live one Manual only (Systematic
-stays off until you set "systematic_orders": true in it yourself).
+PAPER gets Manual and Systematic orders on; LIVE Manual only (Systematic stays off until you
+set "systematic_orders": true in ~/.kalshi/deskd-prod.json yourself).
 """
 import argparse
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -90,38 +92,87 @@ def binary(name):
 
 # ---- setup -----------------------------------------------------------------------------------
 
+def load_key(which, key_path):
+    """The key file's fields deskd's config carries; never printed."""
+    d = DESKS[which]
+    if not os.path.exists(key_path):
+        die('no key file %s: %s' % (key_path, 'save the demo key there (Kalshi demo > API keys)' if which == 'paper'
+                                   else 'save your production API key there, or pass --key FILE'))
+    try:
+        key = read_json(key_path)
+    except (OSError, ValueError) as e:
+        die('%s: %s' % (key_path, e))
+    if key.get('env') != d['env']:
+        die('%s says env %r; the %s desk takes an env %r key' % (key_path, key.get('env'), which, d['env']))
+    key_id = str(key.get('key_id') or '').strip()
+    pem = key.get('private_key_path') or key.get('pem_path') or ''
+    if not key_id or 'PUT-YOUR' in key_id.upper():
+        die('%s has no real key_id yet: open it (open -e %s), put your Kalshi API key ID in place of the '
+            'placeholder, save, and run this again' % (key_path, key_path))
+    if not pem:
+        die('%s needs private_key_path (or pem_path)' % key_path)
+    if not os.path.exists(os.path.expanduser(pem)):
+        die('%s names the private key %s, which does not exist' % (key_path, pem))
+    return {'key_id': key_id, 'pem_path': pem, 'key_type': key.get('key_type')}
+
+
+def write_config(path, cfg, header):
+    tmp = path + '.tmp'
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w') as f:
+        f.write(header)
+        json.dump(cfg, f, indent=2)
+        f.write('\n')
+    os.replace(tmp, path)
+
+
 def setup(which, key_override):
+    """The account's deskd config from its key file: written when missing; when it exists, its key
+    fields follow the key file and its order switches are turned on (PAPER: Manual and Systematic;
+    LIVE: Manual only), the previous file kept beside it. Everything else in it is left alone."""
     d = DESKS[which]
     key_path = os.path.expanduser(key_override or d['key'])
     config = os.path.expanduser(d['config'])
-    if os.path.exists(config):
-        say('%s config %s exists: kept as it is' % (which, config))
-    else:
-        if not os.path.exists(key_path):
-            die('no key file %s: %s' % (key_path, 'save the demo key there (Kalshi demo > API keys)' if which == 'paper'
-                                       else 'save a production API key there, or pass --key FILE'))
-        try:
-            key = read_json(key_path)
-        except (OSError, ValueError) as e:
-            die('%s: %s' % (key_path, e))
-        if key.get('env') != d['env']:
-            die('%s says env %r; the %s desk takes an env %r key' % (key_path, key.get('env'), which, d['env']))
-        pem = key.get('private_key_path') or key.get('pem_path') or ''
-        if not key.get('key_id') or not pem:
-            die('%s needs key_id and private_key_path (or pem_path)' % key_path)
-        if not os.path.exists(os.path.expanduser(pem)):
-            die('%s names the private key %s, which does not exist' % (key_path, pem))
-        cfg = {'env': d['env'], 'key_id': key['key_id'], 'pem_path': pem, 'key_type': key.get('key_type', 'rsa'),
+    key = load_key(which, key_path)
+    want_on = ['manual_orders', 'systematic_orders'] if which == 'paper' else ['manual_orders']
+    header = '// tools/desk.py setup %s, from %s%s\n' % (which, key_path, '' if which == 'paper' else
+        '\n// Systematic stays off on the live desk until you set "systematic_orders": true here.')
+    if not os.path.exists(config):
+        cfg = {'env': d['env'], 'key_id': key['key_id'], 'pem_path': key['pem_path'], 'key_type': key['key_type'] or 'rsa',
                'deskd': {'manual_orders': True, 'systematic_orders': d['systematic'], 'daily_stop_dollars': 30}}
         os.makedirs(os.path.dirname(config), exist_ok=True)
-        fd = os.open(config, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, 'w') as f:
-            f.write('// written by tools/desk.py setup %s from %s\n' % (which, key_path))
-            if which == 'live':
-                f.write('// Systematic stays off on the live desk until you set "systematic_orders": true here.\n')
-            json.dump(cfg, f, indent=2)
-            f.write('\n')
-        say('%s config written: %s (Manual on, Systematic %s)' % (which, config, 'on' if d['systematic'] else 'off'))
+        write_config(config, cfg, header)
+        say('%s config written: %s' % (which, config))
+    else:
+        try:
+            cfg = read_json(config)
+        except (OSError, ValueError) as e:
+            die('%s is not readable (%s): fix it or move it aside, then run setup again' % (config, e))
+        changed = []
+        if cfg.get('env') != d['env']:
+            cfg['env'] = d['env']; changed.append('env')
+        if cfg.get('key_id') != key['key_id']:
+            cfg['key_id'] = key['key_id']; changed.append('key_id')
+        if os.path.expanduser(cfg.get('pem_path') or '') != os.path.expanduser(key['pem_path']):
+            cfg['pem_path'] = key['pem_path']; changed.append('pem_path')
+        if key['key_type'] and cfg.get('key_type', 'rsa') != key['key_type']:
+            cfg['key_type'] = key['key_type']; changed.append('key_type')
+        if not isinstance(cfg.get('deskd'), dict):
+            cfg['deskd'] = {}
+        for k in want_on:
+            if cfg['deskd'].get(k) is not True:
+                cfg['deskd'][k] = True; changed.append(k)
+        if changed:
+            bak = '%s.bak-%s' % (config, time.strftime('%Y%m%d-%H%M%S'))
+            shutil.copy2(config, bak)
+            os.chmod(bak, 0o600)
+            write_config(config, cfg, header)
+            say('%s config updated: %s (%s; the previous one is %s)' % (which, config, ', '.join(changed), bak))
+        else:
+            say('%s config up to date: %s' % (which, config))
+    dd = cfg.get('deskd') or {}
+    say('%s: Manual %s, Systematic %s' % (which.upper(), 'on' if dd.get('manual_orders') else 'off',
+                                         'on' if dd.get('systematic_orders') else 'off'))
     if not os.path.isdir(d['data']):
         os.makedirs(d['data'], mode=0o700)
         say('%s data dir made: %s' % (which, d['data']))
@@ -161,6 +212,9 @@ def prepare(which, port=None, required=True):
         die('%s: %s' % (config, e))
     if cfg.get('env') != d['env']:
         die('%s says env %r: the %s desk needs %r' % (config, cfg.get('env'), which, d['env']))
+    if 'PUT-YOUR' in str(cfg.get('key_id') or '').upper():
+        die('%s has the placeholder key_id: put your real key ID in %s, then python3 tools/desk.py setup%s'
+            % (config, d['key'], ' live' if which == 'live' else ''))
     port = port or d['port']
     return {'which': which, 'port': port, 'config': config, 'cfg': cfg,
             'cmd': [deskd, '--config', config, '--data-dir', d['data'], '--port', str(port)] + d['flags']}
