@@ -14,6 +14,22 @@ whether a model proposed it, you typed it, or a bot fired it.
                        reconcile: balance, positions, orders, fills, settlements ──► eval / gate
 ```
 
+## The desk (deskd): PAPER and LIVE
+
+```sh
+python3 tools/desk.py setup            # once: ~/.kalshi/deskd-demo.json from ~/.kalshi/demo.json, data dir
+python3 tools/desk.py paper            # the Kalshi demo account, http://127.0.0.1:8788/
+python3 tools/desk.py setup live --key ~/.kalshi/prod.json   # once, when you want LIVE
+python3 tools/desk.py live             # production, http://127.0.0.1:8789/, after you type LIVE
+python3 tools/desk.py sim              # the fake exchange: no network, no key, http://127.0.0.1:8790/
+python3 tools/desk.py status           # both desks
+```
+
+Two desks, one per account, each its own deskd (lock, data dir, port), so both can run at once.
+The header tag says which one you are on (PAPER amber, LIVE red, SIM) and a click opens the
+other, asking first before LIVE. The live config starts with Systematic off; set
+`"systematic_orders": true` in `~/.kalshi/deskd-prod.json` yourself when you want lanes there.
+
 ## Build (macOS)
 
 ```sh

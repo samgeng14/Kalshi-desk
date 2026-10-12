@@ -1,6 +1,28 @@
-# deskd handoff (2026-10-07)
+# deskd handoff (2026-10-07, updated 2026-10-12)
 
 The desk is being rebuilt as `deskd`, an event-driven C++17 trading desk, per `docs/impl_plan.md` (the operator-approved plan; read sections 2-4, 8 and 9 first). This file says where everything is and what to do next.
+
+## Paper and live (2026-10-12)
+
+The dashboard runs two desks, one per Kalshi account: **PAPER** is the demo account (play
+money, port 8788) and **LIVE** is production (port 8789, `deskd --live`). Each is its own deskd
+with its own account lock, data dir and port. The header's mode tag (PAPER amber, LIVE red, SIM
+for the fake exchange) opens the other desk on a click, with a real-money confirm before LIVE.
+`tools/desk.py` sets them up and starts them (`setup`, `paper`, `live`, `sim`, `status`, `kill`;
+see README). Rules in code:
+
+- `--live` takes a production credential (config `env: "prod"`) and only that; a demo key runs
+  only without it. The venue's hosts must be that account's (production: api.elections.kalshi.com).
+  Any mismatch never starts and dials nothing. The send guard still wants `--live` plus the
+  production account lock for every production connection.
+- `tools/desk.py live` runs only from a terminal, after typing LIVE; the live config it writes has
+  Systematic off. Agents never run it: LIVE is the operator's to start.
+- `tools/desk.py sim` (`tools/deskd_sim.py`) is a full sandbox: fake-kalshi with a scripted day
+  (15-minute natgas windows with pyth for M1, today's KXHIGHNY bands for M2, a practice market),
+  deskd `--sim` against it. Verified in Chromium 2026-10-12: Manual order, x, DEL ALL, KILL and
+  re-arm; Systematic lanes M1 and M2 quoting, Start, Stop cancelling.
+
+The work is on GitHub: `samgeng14/kalshi-desk`, branch `claude/pensive-meitner-8k2wae` (draft PR #1).
 
 ## Where
 
@@ -15,7 +37,7 @@ Nothing is pushed. `ui/desk/js/contract.js` is the API contract deskd must serve
 
 ## Rules (hard)
 
-- Never place an order on production. Never pass `--live`. deskd refuses production hosts without `--live` plus the production account lock; keep it that way.
+- Never place an order on production. Agents never pass `--live` (the operator starts LIVE with `tools/desk.py live`). deskd refuses production hosts without `--live` plus the production account lock; keep it that way.
 - The only credential to use is the Kalshi DEMO key: `~/.kalshi/demo.json` (Ed25519), deskd config `~/.kalshi/deskd-demo.json`, data dir `~/Library/Application Support/kalshi-desk/demo/`. Demo REST `https://demo-api.kalshi.co/trade-api/v2`, WebSocket `wss://demo-api.kalshi.co/trade-api/ws/v2`. Demo balance is $500 play money (shard 0). Small sizes; cancel everything you leave resting.
 - Never read the main repo's `data/`, `config/desk.json`, `.secrets/`, or `~/Downloads`. Never log, print or commit key material.
 - Builds: `build-deskd/` only, Ninja, `nice -n 15`, at most `-j 4`, one build at a time (README has the arm64 recipe). Never a second build dir.
