@@ -183,15 +183,22 @@ def setup(which, key_override):
 
 # ---- run -------------------------------------------------------------------------------------
 
-def up(port, timeout_s):
+def running(port):
+    """The deskd answering on this port now: its /ops/status (pid, mode, ...), or None."""
+    try:
+        with urllib.request.urlopen('http://127.0.0.1:%d/ops/status' % port, timeout=1) as r:
+            return json.loads(r.read())
+    except (OSError, ValueError):
+        return None
+
+
+def up(port, pid, timeout_s):
+    """True once the deskd we started (this pid, not another on the port) answers."""
     end = time.time() + timeout_s
     while time.time() < end:
-        try:
-            with urllib.request.urlopen('http://127.0.0.1:%d/api/health' % port, timeout=1) as r:
-                if r.status == 200:
-                    return True
-        except OSError:
-            pass
+        st = running(port)
+        if st and st.get('pid') == pid:
+            return True
         time.sleep(0.3)
     return False
 
@@ -251,13 +258,20 @@ def launch(specs, open_browser):
             sys.stdout.write(label + line)
             sys.stdout.flush()
 
+    # a desk already on one of the ports (an older run still going): say which, start nothing
+    for spec in specs:
+        st = running(spec['port'])
+        if st:
+            since = time.strftime('%Y-%m-%d %H:%M', time.localtime(st.get('started_ms', 0) / 1000)) if st.get('started_ms') else '?'
+            die('port %d already has a desk running (pid %s, %s, since %s): stop it with  kill %s  then run this again'
+                % (spec['port'], st.get('pid'), st.get('mode'), since, st.get('pid')))
     try:
         for spec in specs:
             p = subprocess.Popen(spec['cmd'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
             procs.append((spec, p))
             threading.Thread(target=relay, args=(p, '%-6s' % spec['which'].upper()), daemon=True).start()
         for spec, p in procs:
-            if up(spec['port'], 20):
+            if up(spec['port'], p.pid, 20):
                 say('%s up on http://127.0.0.1:%d/' % (DESKS[spec['which']]['what'], spec['port']))
             elif p.poll() is None:
                 say('%s not answering on port %d yet; see its log' % (spec['which'], spec['port']))
@@ -269,7 +283,10 @@ def launch(specs, open_browser):
             time.sleep(0.5)
         for spec, p in procs:
             if p.poll() is not None:
-                say('%s exited (%s)%s' % (spec['which'], p.returncode, '; stopping the other' if len(procs) > 1 else ''))
+                say('%s stopped (exit %s)%s' % (spec['which'].upper(), p.returncode, '; stopping the other' if len(procs) > 1 else ''))
+                if p.returncode == 3:
+                    say('it could not take its account: if its line above names another desk\'s pid, stop that one'
+                        ' (kill <pid>) and run this again')
     except KeyboardInterrupt:
         pass
     finally:
