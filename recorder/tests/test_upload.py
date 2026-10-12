@@ -8,6 +8,7 @@ import json
 import os
 import tempfile
 import threading
+import importlib.util
 import unittest
 
 from recorder import upload
@@ -76,6 +77,10 @@ class FakeR2(http.server.BaseHTTPRequestHandler):
         pass
 
 
+HAVE_PYARROW = importlib.util.find_spec('pyarrow') is not None
+
+
+@unittest.skipUnless(HAVE_PYARROW, 'pyarrow is not installed (pip install -r recorder/requirements.txt)')
 class RunTest(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.TemporaryDirectory()

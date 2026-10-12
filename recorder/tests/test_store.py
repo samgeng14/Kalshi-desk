@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 import tempfile
+import importlib.util
 import unittest
 
 from recorder.store import Store, read_manifest
@@ -14,6 +15,10 @@ def row(t, n=0):
     return {'recv_us': t, 'mono_us': n, 'conn': 1, 'type': 'orderbook_delta', 'sid': 1, 'seq': n, 'ticker': 'TK', 'raw': '{}'}
 
 
+HAVE_PYARROW = importlib.util.find_spec('pyarrow') is not None
+
+
+@unittest.skipUnless(HAVE_PYARROW, 'pyarrow is not installed (pip install -r recorder/requirements.txt)')
 class StoreTest(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.TemporaryDirectory()

@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import importlib.util
 import unittest
 
 from cryptography.hazmat.primitives import serialization
@@ -35,6 +36,10 @@ SCENARIO = [
 ]
 
 
+HAVE_PYARROW = importlib.util.find_spec('pyarrow') is not None
+
+
+@unittest.skipUnless(HAVE_PYARROW, 'pyarrow is not installed (pip install -r recorder/requirements.txt)')
 @unittest.skipUnless(os.path.exists(FAKE), 'build build-deskd/fake-kalshi first (or set FAKE_KALSHI)')
 class RecorderAgainstFake(unittest.TestCase):
     def test_record(self):
