@@ -1,0 +1,40 @@
+# deskd recorder (recorder/rec.py): read-only Kalshi market data to Parquet, 24/7.
+# Installed by recorder/deploy/setup.sh; docs/deploy-oracle.md section 4.
+[Unit]
+Description=deskd recorder (read-only Kalshi markets to Parquet)
+Wants=network-online.target
+After=network-online.target time-sync.target
+StartLimitIntervalSec=0
+
+[Service]
+# READY=1 after the first discovery; WATCHDOG=1 only while the socket is subscribed and
+# discovery succeeds, so a recorder that stopped advancing is restarted
+Type=notify
+NotifyAccess=main
+WatchdogSec=120
+User=recorder
+Group=recorder
+WorkingDirectory=/opt/deskd-recorder/current
+EnvironmentFile=/etc/deskd-recorder/recorder.env
+# secrets only through systemd credentials, never the environment or a command line
+LoadCredential=kalshi-key.pem:/etc/deskd-recorder/credentials/kalshi-readonly.pem
+LoadCredential=kalshi-key-id:/etc/deskd-recorder/credentials/kalshi-readonly.id
+# optional: SetCredential is the fallback while the file does not exist
+SetCredential=hc-url:
+LoadCredential=hc-url:/etc/deskd-recorder/credentials/healthchecks.url
+ExecStart=/opt/deskd-recorder/.venv/bin/python -m recorder.rec
+Restart=always
+RestartSec=5
+TimeoutStartSec=120
+# SIGTERM: the spool is flushed and synced; the hour is compacted once it is over (by this run or the next)
+TimeoutStopSec=30
+MemoryMax=3G
+Nice=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/deskd-recorder
+
+[Install]
+WantedBy=multi-user.target
