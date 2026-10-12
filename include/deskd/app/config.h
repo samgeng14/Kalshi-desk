@@ -47,6 +47,11 @@ struct DeskdConfig {
   std::vector<std::string> lip_series = {"KXNATGAS15M"};
   // The series lane M2 (BAND 96-99) quotes: the plan's five weather cities first.
   std::vector<std::string> band_series = {"KXHIGHNY", "KXHIGHCHI", "KXHIGHMIA", "KXHIGHAUS", "KXHIGHLAX"};
+  // The other desk the header's PAPER/LIVE tag switches to: the paper desk (demo account) and
+  // the live one (production) are two deskd processes, each with its own account lock, data and
+  // port. http://127.0.0.1:PORT/ or http://localhost:PORT/ only; "" = the other default port
+  // (8788 paper, 8789 live; tools/desk.py starts them there).
+  std::string peer_url;
   // from the command line only
   bool live = false;
 };
@@ -55,6 +60,11 @@ struct DeskdConfig {
 // missing file, bad JSON, a wrong type, an unknown "deskd" key, or "live" in the file.
 DeskdConfig load_deskd_config(const std::string& path);
 
-std::string expand_home(const std::string& path);  // "~/x" -> "$HOME/x", as src/config.cpp
+std::string expand_home(const std::string& path);
+
+// http://127.0.0.1:PORT/ or http://localhost:PORT/ (PORT 1-65535, the slash optional, nothing after)
+bool peer_url_ok(const std::string& url);
+// cfg.peer_url, else the other desk's default on 127.0.0.1: 8789 (live) from paper, 8788 from live
+std::string peer_url_for(const DeskdConfig& cfg);  // "~/x" -> "$HOME/x", as src/config.cpp
 
 }  // namespace deskd

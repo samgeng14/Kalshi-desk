@@ -11,6 +11,7 @@
 //   http://127.0.0.1:<port> or http://localhost:<port>, is refused 403 FORBIDDEN, GET included.
 //   An ordinary page on another site sends Host 127.0.0.1:8788, so the Host rule alone let it
 //   hold every stream slot (review, 2026-10-06). deskctl and curl send neither header.
+//   One exception, peer_navigation below: the PAPER/LIVE switch's click from the other desk.
 // - These run before routing and before httplib reads a body, on every method; a refused POST's
 //   connection is closed after the reply, so its unread body is never parsed as a request.
 // - Token: every POST carries X-Desk with the per-start token written into the served page
@@ -43,9 +44,17 @@ bool token_ok(const std::string& got, const std::string& want);   // constant ti
 // why a request is cross-site, or "": Sec-Fetch-Site cross-site or same-site, or an Origin
 // (origin non-null: the header was sent) other than this desk's own page
 std::string cross_site_refusal(const std::string& sec_fetch_site, const std::string* origin, int port);
+// The header's PAPER/LIVE switch: a click on the other desk's page (another port on 127.0.0.1, so
+// Sec-Fetch-Site same-site) opening this one. Let past cross_site_refusal: a user-activated
+// top-level GET of the page, as a document, with no Origin. A navigation reads nothing back to the
+// page that started it, and holds no stream; a frame, fetch, script or any other path stays refused.
+bool peer_navigation(const std::string& method, const std::string& path, const std::string& site,
+                     const std::string& mode, const std::string& dest, const std::string& user, bool has_origin);
 // html with the token written into <meta name="desk-token" content="">; false when the page
 // has no such empty meta (then the page would boot without a token and every POST would fail)
 bool inject_token(const std::string& html, const std::string& token, std::string* out);
+// html with value (attribute-escaped) written into <meta name="NAME" content="">; false without it
+bool inject_meta(const std::string& html, const std::string& name, const std::string& value, std::string* out);
 std::string random_token();   // 32 hex characters from the system's CSPRNG
 
 struct WebDeps {
@@ -53,6 +62,10 @@ struct WebDeps {
   int threads = 16;
   int keepalive_s = 2;
   std::string token;
+  // the header's PAPER/LIVE switch (<meta name="desk-peer">, "desk-venue"): the other desk's page
+  // and this desk's venue, "demo", "prod" or "sim" (the fake exchange). "" leaves the meta empty.
+  std::string peer_url;
+  std::string venue;
   Pub* pub = nullptr;
   Gateway* gw = nullptr;
   KillSwitch* kill = nullptr;

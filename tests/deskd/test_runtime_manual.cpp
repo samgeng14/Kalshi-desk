@@ -97,7 +97,7 @@ struct Run {
   }
   void launch() {
     std::string err;
-    auto lock=AccountLock::acquire(dir.path,"demo","deskd-test-runtime",false,&err);
+    auto lock=AccountLock::acquire(dir.path,c.live?"prod":"demo","deskd-test-runtime",false,&err);
     d=std::make_unique<Deskd>(c,std::move(lock),o);
     if(!d->start(&err)) { std::fprintf(stderr,"deskd did not start: %s\n",err.c_str()); std::exit(2); }
   }
@@ -853,10 +853,54 @@ void foreign_cancels() {
   // and a manual order on the market goes now that nothing foreign rests there
   CHECK(r.until([&]{ return r.order("Mforeign-1","BUY","0.3900",1.0,"POST",60)["status"]==200; },10000));
 }
+// Paper and live: a demo credential runs without --live, a production one only with it, each on
+// its own account's hosts; any mismatch never starts (and dials nothing). A live desk against the
+// fake on loopback then trades as the paper one does: the production hosts are never dialled here.
+void live_mode() {
+  TempDir dir;
+  const std::string key=dir.path+"/k.pem";
+  { std::ofstream f(key); f<<pem; }
+  ::chmod(key.c_str(),0600);
+  auto refused=[&](const std::string& env,bool live,const std::string& host,const std::string& want) {
+    DeskdConfig c; c.data_dir=dir.path; c.ui_dir=std::string(DESKD_SOURCE_DIR)+"/ui/desk"; c.http_port=0;
+    c.env=env; c.key_id="k"; c.pem_path=key; c.key_type="ed25519"; c.live=live; c.manual_orders=true;
+    RuntimeOptions o;
+    if(!host.empty()) { o.rest_url="https://"+host+"/trade-api/v2"; o.ws_url="https://"+host+"/trade-api/ws/v2"; }
+    std::string err;
+    auto lock=AccountLock::acquire(dir.path,live?"prod":"demo","deskd-test-live",false,&err);
+    Deskd d(c,std::move(lock),o);
+    const bool started=d.start(&err);
+    if(started) d.stop();
+    if(started || err.find(want)==std::string::npos) std::fprintf(stderr,"live_mode: wanted \"%s\", got \"%s\"\n",want.c_str(),err.c_str());
+    return !started && err.find(want)!=std::string::npos;
+  };
+  CHECK(refused("demo",true,"","--live takes a production credential"));
+  CHECK(refused("prod",false,"","runs only with --live"));
+  CHECK(refused("staging",false,"","must be \"demo\" (paper) or \"prod\" (live)"));
+  CHECK(refused("prod",true,"demo-api.kalshi.co","not a production Kalshi host"));
+  CHECK(refused("demo",false,"api.elections.kalshi.com","not a demo Kalshi host"));
+  CHECK(refused("prod",true,"example.com","not a production Kalshi host"));
+  CHECK(std::string(kProdRestUrl)=="https://api.elections.kalshi.com/trade-api/v2");
+  CHECK(std::string(kProdWsUrl)=="https://api.elections.kalshi.com/trade-api/ws/v2");
+
+  Run r(true,{},false,[](DeskdConfig& c,RuntimeOptions&) { c.env="prod"; c.live=true; });
+  CHECK(r.ready());
+  CHECK(r.d->status()["mode"]=="LIVE" && r.d->status()["account"]=="prod");
+  // the page names its venue and the paper desk's page for the header's switch
+  httplib::Client page("127.0.0.1",r.d->port());
+  auto html=page.Get("/");
+  CHECK(html && html->status==200);
+  if(html) {
+    CHECK(html->body.find("<meta name=\"desk-venue\" content=\"sim\">")!=std::string::npos);
+    CHECK(html->body.find("<meta name=\"desk-peer\" content=\"http://127.0.0.1:8788/\">")!=std::string::npos);
+  }
+  auto o=r.order("Mrt-live-1","BUY","0.4200",1,"IOC");
+  CHECK(o["status"]==200 && o["ord"]["st"]=="FILL");
+}
 }  // namespace
 
 int main() {
   std::signal(SIGPIPE,SIG_IGN);
-  off_by_default(); orders_cancel_kill(); stop_reasons(); financial_fair(); systematic(); systematic_maker(); systematic_band(); systematic_races(); systematic_group_trigger(); systematic_book(); takeover(); shard_preflight(); foreign_cancels();
+  off_by_default(); orders_cancel_kill(); stop_reasons(); financial_fair(); systematic(); systematic_maker(); systematic_band(); systematic_races(); systematic_group_trigger(); systematic_book(); takeover(); shard_preflight(); foreign_cancels(); live_mode();
   return finish("deskd-runtime-manual");
 }

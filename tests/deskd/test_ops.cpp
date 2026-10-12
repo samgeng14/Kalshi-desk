@@ -309,6 +309,17 @@ static void test_config() {
     return false;
   };
   CHECK(throws(R"({"deskd": {"live": true}})", "command-line flag only"));
+  // the PAPER/LIVE switch's other desk: loopback http only
+  CHECK(e.peer_url.empty() && peer_url_for(e) == "http://127.0.0.1:8789/");
+  DeskdConfig live_cfg = e;
+  live_cfg.live = true;
+  CHECK(peer_url_for(live_cfg) == "http://127.0.0.1:8788/");
+  CHECK(peer_url_for(load_deskd_config(write(R"({"deskd": {"peer_url": "http://localhost:9001"}})"))) == "http://localhost:9001/");
+  CHECK(peer_url_ok("http://127.0.0.1:8789/") && peer_url_ok("http://localhost:1"));
+  for (const char* bad : {"https://127.0.0.1:8789/", "http://127.0.0.1:8789/x", "http://127.0.0.1:0/", "http://127.0.0.1:70000/",
+                          "http://evil.example:8789/", "http://127.0.0.1:/", "http://127.0.0.1:8789\"><script>"})
+    CHECK(!peer_url_ok(bad));
+  CHECK(throws(R"({"deskd": {"peer_url": "http://kalshi.com/"}})", "peer_url must be"));
   CHECK(throws(R"({"deskd": {"lip_series": ["kxgold15m"]}})", "not a series ticker"));
   CHECK(throws(R"({"deskd": {"lip_series": "KXGOLD15M"}})", "wrong type"));
   CHECK(throws(R"({"deskd": {"band_series": ["KX HIGH"]}})", "band_series has"));

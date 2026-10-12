@@ -21,15 +21,32 @@ using json = nlohmann::json;
 bool Deskd::init_venue(std::string* err) {
   // A credential-less desk remains a local, read-only skeleton (including all week-0 tests).
   if (cfg_.key_id.empty() && cfg_.pem_path.empty()) return true;
-  if (cfg_.env != "demo" || cfg_.live) {
-    if (err) *err = "this rebuild stage connects only a demo credential without --live";
+  // The credential names its account and --live must agree with it: a demo key runs without
+  // --live (paper), a production key only with it (live). Either way the venue's hosts must be
+  // that account's; loopback (the fake exchange: tests, --sim) is the one other venue allowed.
+  if (cfg_.env != "demo" && cfg_.env != "prod") {
+    if (err) *err = "the config's env is \"" + cfg_.env + "\": it must be \"demo\" (paper) or \"prod\" (live)";
     return false;
   }
-  signer_ = KalshiSigner::load(cfg_.key_id, cfg_.pem_path, cfg_.key_type, &key_error_);
-  if (!signer_) { if (err) *err = key_error_; return false; }
+  if (cfg_.live != (cfg_.env == "prod")) {
+    if (err) *err = cfg_.live ? "--live takes a production credential (env \"prod\"); this config's is a demo one"
+                              : "a production credential (env \"prod\") runs only with --live";
+    return false;
+  }
   auto re = net::Endpoint::parse(options_.rest_url, err);
   auto we = net::Endpoint::parse(options_.ws_url, err);
   if (!re || !we) return false;
+  for (const net::Endpoint* ep : {&*re, &*we}) {
+    const HostClass cls = classify_host(ep->host);
+    if (cls == HostClass::LOOPBACK) continue;
+    if (cls != (cfg_.live ? HostClass::PRODUCTION : HostClass::DEMO)) {
+      if (err) *err = ep->host + " is not a " + (cfg_.live ? "production" : "demo") + " Kalshi host; this credential trades the " +
+                      (cfg_.live ? "production" : "demo") + " account";
+      return false;
+    }
+  }
+  signer_ = KalshiSigner::load(cfg_.key_id, cfg_.pem_path, cfg_.key_type, &key_error_);
+  if (!signer_) { if (err) *err = key_error_; return false; }
   factory_ = std::make_unique<net::ConnFactory>(guard_, options_.factory);
   if (!factory_->ok(err)) return false;
   md_ = std::make_unique<KalshiMd>(*we, *factory_, *signer_, feeds_.KX,
@@ -561,6 +578,20 @@ void Deskd::on_book(const MdBook& b) {
   // STALE is a venue-wide heartbeat flag; never publish a gapped reconstruction as a price.
   if (b.stale) return;
   publish_book(b.ticker);
+}
+
+std::string Deskd::venue_name() const {
+  if (cfg_.key_id.empty() && cfg_.pem_path.empty()) return "";
+  std::string why;
+  const auto ep = net::Endpoint::parse(options_.rest_url, &why);
+  if (!ep) return "";
+  switch (classify_host(ep->host)) {
+    case HostClass::LOOPBACK: return "sim";
+    case HostClass::DEMO: return "demo";
+    case HostClass::PRODUCTION: return "prod";
+    case HostClass::UNKNOWN: break;
+  }
+  return "";
 }
 
 json Deskd::mkt_row(const kalshi::MarketRow& m, bool pin, bool live) const {

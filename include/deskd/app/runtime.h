@@ -58,6 +58,11 @@ class Markouts;
 struct MdBook;
 namespace rest { class State; struct Snapshot; }
 
+// Kalshi's production hosts: main sets them with --live (and only then; the defaults below are
+// the demo account's). init_venue checks the hosts belong to the credential's account.
+inline constexpr const char* kProdRestUrl = "https://api.elections.kalshi.com/trade-api/v2";
+inline constexpr const char* kProdWsUrl = "https://api.elections.kalshi.com/trade-api/ws/v2";
+
 // Endpoint injection for loopback integration tests. The same SendGuard applies to every
 // connection; this cannot grant production access. Normal runs use the demo defaults.
 struct RuntimeOptions {
@@ -173,6 +178,9 @@ class Deskd {
   void publish_market(const std::string& ticker);
   HdrInputs header() const;
   std::vector<PreflightRow> venue_preflight() const;
+  // "demo", "prod" or "sim" (the fake exchange on loopback) by the venue's REST host; "" with
+  // no credential. The page's desk-venue meta: the PAPER/LIVE tag reads it.
+  std::string venue_name() const;
 };
 
 }  // namespace deskd

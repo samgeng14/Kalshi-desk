@@ -352,6 +352,27 @@ static void test_guards_and_page(Desk& k) {
   }
   CHECK(cross_site_refusal("Cross-Site", nullptr, 8788).find("cross-site") != std::string::npos);
   CHECK(cross_site_refusal("same-origin", nullptr, 8788).empty());
+  // the PAPER/LIVE switch: the other desk's page (same-site) may open this page by a click, nothing else
+  {
+    const httplib::Headers nav{{"Sec-Fetch-Site", "same-site"}, {"Sec-Fetch-Mode", "navigate"},
+                               {"Sec-Fetch-Dest", "document"}, {"Sec-Fetch-User", "?1"}};
+    auto page = get(port, "/", "", nav);
+    CHECK(page && page->status == 200 && page->body.find("desk-token\" content=\"" + token) != std::string::npos);
+    auto api = get(port, "/api/health", "", nav);
+    CHECK(api && api->status == 403);
+    auto frame = get(port, "/", "", {{"Sec-Fetch-Site", "same-site"}, {"Sec-Fetch-Mode", "navigate"},
+                                     {"Sec-Fetch-Dest", "iframe"}, {"Sec-Fetch-User", "?1"}});
+    CHECK(frame && frame->status == 403);
+    auto unasked = get(port, "/", "", {{"Sec-Fetch-Site", "same-site"}, {"Sec-Fetch-Mode", "navigate"}, {"Sec-Fetch-Dest", "document"}});
+    CHECK(unasked && unasked->status == 403);
+    auto far = get(port, "/", "", {{"Sec-Fetch-Site", "cross-site"}, {"Sec-Fetch-Mode", "navigate"},
+                                   {"Sec-Fetch-Dest", "document"}, {"Sec-Fetch-User", "?1"}});
+    CHECK(far && far->status == 403);
+    CHECK(peer_navigation("GET", "/index.html", "Same-Site", "navigate", "document", "?1", false));
+    CHECK(!peer_navigation("GET", "/", "same-site", "navigate", "document", "?1", true));
+    CHECK(!peer_navigation("POST", "/", "same-site", "navigate", "document", "?1", false));
+    CHECK(!peer_navigation("GET", "/js/main.js", "same-site", "navigate", "document", "?1", false));
+  }
 
   // over 64 KiB: Host, origin and token still come first; a good one is BAD_REQUEST
   {

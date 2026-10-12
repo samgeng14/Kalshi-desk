@@ -66,6 +66,8 @@ Deskd::Deskd(DeskdConfig cfg, std::unique_ptr<AccountLock> lock, RuntimeOptions 
   wd.threads = cfg_.web_threads;
   wd.keepalive_s = cfg_.keepalive_s;
   wd.token = token_;
+  wd.peer_url = peer_url_for(cfg_);
+  wd.venue = venue_name();
   wd.pub = pub_.get();
   wd.gw = gw_.get();
   wd.kill = &kill_;

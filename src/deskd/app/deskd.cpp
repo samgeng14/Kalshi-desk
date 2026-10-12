@@ -7,8 +7,11 @@
 // on a loopback address, its test CA trusted for loopback only: a paper-trading sandbox with
 // no network and the browser tests' venue. Never with --live; a non-loopback URL is refused.
 //
-// Starts non-live: production venue hosts are refused unless --live is given AND the production
-// account's lock is held (net/guard.h). No config file is read unless --config names one.
+// Starts non-live (paper: the demo account): production venue hosts are refused unless --live is
+// given AND the production account's lock is held (net/guard.h). --live is the live desk: the
+// production hosts and a production credential (the config's env "prod"); a demo credential with
+// --live, or a production one without it, is refused. No config file is read unless --config
+// names one. tools/desk.py starts either.
 //
 // The account lock is <lock dir>/kalshi-<prod|demo>.lock, one fixed absolute file (app/lock.h):
 // wherever deskd is started from, a second deskd on the same account is refused (exit 3). The
@@ -49,7 +52,7 @@ void usage() {
                "  --data-dir DIR  holds deskd.heartbeat (default data; must exist)\n"
                "  --ui-dir DIR    the screen, served from disk (default %s/ui/desk)\n"
                "  --port N        web port on 127.0.0.1 (default 8788)\n"
-               "  --live          allow the production venue hosts (never without the account lock)\n"
+               "  --live          the live desk: production hosts, a production credential (env prod), the prod lock\n"
                "  --sim URL       the fake exchange on loopback (https://127.0.0.1:PORT, as fake-kalshi prints it)\n"
                "  --sim-ca FILE   its test CA (fake-kalshi --tls DIR writes DIR/ca.pem), trusted for loopback only\n"
                "The account lock is <lock dir>/kalshi-prod.lock with --live, else kalshi-demo.lock;\n"
@@ -112,6 +115,12 @@ int main(int argc, char** argv) {
   if (port >= 0) cfg.http_port = port;
   cfg.live = live;
   RuntimeOptions options;
+  if (live) {
+    // the production account: its hosts, its lock (below), and a production credential
+    // (env "prod"; Deskd::start refuses any other with --live)
+    options.rest_url = kProdRestUrl;
+    options.ws_url = kProdWsUrl;
+  }
   if (!sim_url.empty() || !sim_ca.empty()) {
     // the fake exchange: loopback only, its CA for loopback only, and never with --live
     std::string why;
@@ -168,8 +177,6 @@ int main(int argc, char** argv) {
     return 3;
   }
   DLOG_INFO("account lock %s (%s account), data %s", lock->path().c_str(), lock->env().c_str(), cfg.data_dir.c_str());
-  if (!cfg.live && cfg.env == "prod")
-    DLOG_WARN("%s says env prod, but deskd follows --live: production hosts stay refused", cfg.config_path.c_str());
   if (cfg.live) DLOG_WARN("--live: production venue hosts allowed while %s is held", lock->path().c_str());
 
   Deskd desk(cfg, std::move(lock), options);

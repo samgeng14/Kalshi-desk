@@ -117,6 +117,43 @@
     cell(id, label + ' ' + valueText, 'hh' + (state === 'ok' ? '' : ' ' + state));
   }
 
+  // ---------------------------------------------------------------------------------------------
+  // PAPER / LIVE: two desks, one per Kalshi account, each its own deskd on its own port (paper:
+  // the demo account, 8788; live: production, 8789; tools/desk.py). The tag names this one; a
+  // click opens the other (<meta name="desk-peer">), asking first when that one is LIVE.
+  // ---------------------------------------------------------------------------------------------
+  var desk = { peer: '', venue: '', mode: '' };
+  function meta(name) {
+    try { var el = document.querySelector('meta[name="' + name + '"]'); return el ? el.getAttribute('content') || '' : ''; }
+    catch (e) { return ''; }
+  }
+  function modeCell(mode) {   // mode: the header's DEMO | LIVE ('' before the first header)
+    var sim = Desk.transport.mode === 'demo' || desk.venue === 'sim';
+    var t = mode === 'LIVE' ? ['LIVE', 'tag crit', 'LIVE: the production Kalshi account, real money'] :
+      sim ? ['SIM', 'tag warn', 'SIM: ' + (Desk.transport.mode === 'demo' ? 'the simulated desk in this page' : 'the fake exchange on this machine') + ', nothing reaches Kalshi'] :
+      ['PAPER', 'tag warn', 'PAPER: the Kalshi demo account, play money'];
+    if (!mode) t[0] = '-';
+    desk.mode = mode;
+    cell('h-mode', t[0], t[1]);
+    var other = mode === 'LIVE' ? 'PAPER' : 'LIVE';
+    var can = switchable();
+    D.setAttr($('hc-mode'), 'title', t[2] + (can ? '. Click: open the ' + other + ' desk, ' + desk.peer : ''));
+    D.setClass($('hc-mode'), 'peer', can);
+  }
+  // only between the two accounts' desks: the in-page simulation and the fake exchange have none
+  function switchable() { return !!(desk.peer && desk.mode && Desk.transport.mode === 'live' && desk.venue !== 'sim'); }
+  function switchDesk() {
+    if (!switchable()) return;
+    var toLive = desk.mode !== 'LIVE', name = toLive ? 'LIVE' : 'PAPER';
+    // is it up? the other desk refuses this cross-port fetch (403), but a refusal still answers
+    fetch(desk.peer + 'api/health', { mode: 'no-cors', cache: 'no-store', credentials: 'omit' }).then(function () {
+      if (toLive && !root.confirm('Open the LIVE desk at ' + desk.peer + '?\n\nOrders there trade the production Kalshi account with real money.')) return;
+      root.location.assign(desk.peer);
+    }, function () {
+      Desk.store.localAlert('WARN', 'DESK', 'the ' + name + ' desk is not running at ' + desk.peer + ': start it with python3 tools/desk.py ' + (toLive ? 'live' : 'paper'));
+    });
+  }
+
   function renderHeader(d) {
     var S = Desk.store, h = S.hdr, now = Date.now();
     if (d.has('act') || d.has('tab') || d.all) {
@@ -165,9 +202,9 @@
       if (hcSys && hcSys.className !== sysCls) hcSys.className = sysCls;
       D.setAttr($('h-sys'), 'title', 'K ' + F.money(h.sys.K.used) + '/' + F.money(h.sys.K.eff) + ' ceil ' + F.money(h.sys.K.ceiling) +
         '  P ' + F.money(h.sys.P.used) + '/' + F.money(h.sys.P.eff) + ' ceil ' + F.money(h.sys.P.ceiling));
-      cell('h-mode', h.mode, 'tag ' + (h.mode === 'DEMO' ? 'warn' : 'dim'));
+      modeCell(h.mode);
     } else if (!h && Desk.transport.mode) {
-      cell('h-mode', Desk.transport.mode === 'demo' ? 'DEMO' : 'LIVE', 'tag ' + (Desk.transport.mode === 'demo' ? 'warn' : 'dim'));
+      modeCell(Desk.transport.mode === 'demo' ? 'DEMO' : '');
     }
     if (d.has('clock') || d.has('feeds') || d.has('hdr') || d.has('stale') || d.has('lat') || d.all) {
       var f = S.feeds, lat = h ? h.lat : null;
@@ -427,6 +464,9 @@
       tabs.set(mode === 'SYS' ? 'systematic' : 'manual'); A.seen(mode); R.mark('act');
     }, now);
     $('kill').addEventListener('click', onKill);
+    desk.peer = meta('desk-peer'); desk.venue = meta('desk-venue');
+    if (desk.peer && desk.peer.charAt(desk.peer.length - 1) !== '/') desk.peer += '/';
+    $('hc-mode').addEventListener('click', switchDesk);
     press($('sb-alert'), function () { H.openLog(); }, now);
     press($('sb-keys'), function () { H.openKeys(); }, now);
     press($('sb-set'), function () { H.openSet(); }, now);

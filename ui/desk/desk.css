@@ -190,6 +190,7 @@ body:not([data-split])[data-tab="systematic"] #tab-sys, body:not([data-split])[d
   #h-kal-free, #h-pm-free, #h-day-split { display: none; }      /* on the cells' titles instead */
 }
 #hc-mode { flex: 0 0 48px; justify-content: center; padding: 0 2px; }
+#hc-mode.peer { cursor: pointer; } #hc-mode.peer:hover { background: var(--bg2); }
 /* ACT: events not seen yet (fills and exits by default; the alert filters in settings); amber
    while any; a click shows the tab they happened on */
 button.hc { height: 27px; border: 0; border-left: 1px solid var(--line); background: transparent; color: inherit; cursor: pointer; }

@@ -58,11 +58,40 @@ bool token_ok(const std::string& got, const std::string& want) {
   return diff == 0;
 }
 
+bool peer_navigation(const std::string& method, const std::string& path, const std::string& site,
+                     const std::string& mode, const std::string& dest, const std::string& user, bool has_origin) {
+  auto lower = [](std::string v) {
+    for (char& c : v) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return v;
+  };
+  return method == "GET" && (path == "/" || path == "/index.html") && lower(site) == "same-site" &&
+         lower(mode) == "navigate" && lower(dest) == "document" && user == "?1" && !has_origin;
+}
+
 bool inject_token(const std::string& html, const std::string& token, std::string* out) {
   static const std::string kEmpty = "<meta name=\"desk-token\" content=\"\">";
   const std::size_t at = html.find(kEmpty);
   if (at == std::string::npos) return false;
   *out = html.substr(0, at) + "<meta name=\"desk-token\" content=\"" + token + "\">" + html.substr(at + kEmpty.size());
+  return true;
+}
+
+bool inject_meta(const std::string& html, const std::string& name, const std::string& value, std::string* out) {
+  const std::string empty = "<meta name=\"" + name + "\" content=\"\">";
+  const std::size_t at = html.find(empty);
+  if (at == std::string::npos) return false;
+  std::string v;
+  for (char c : value) {
+    switch (c) {
+      case '&': v += "&amp;"; break;
+      case '<': v += "&lt;"; break;
+      case '>': v += "&gt;"; break;
+      case '"': v += "&quot;"; break;
+      case '\'': v += "&#39;"; break;
+      default: v.push_back(c);
+    }
+  }
+  *out = html.substr(0, at) + "<meta name=\"" + name + "\" content=\"" + v + "\">" + html.substr(at + empty.size());
   return true;
 }
 
@@ -202,6 +231,11 @@ struct WebServer::Impl {
       return "Host must be 127.0.0.1:" + std::to_string(p) + " or localhost:" + std::to_string(p);
     if (req.get_header_value_count("Origin") > 1 || req.get_header_value_count("Sec-Fetch-Site") > 1)
       return "one Origin and one Sec-Fetch-Site at most";
+    for (const char* h : {"Sec-Fetch-Mode", "Sec-Fetch-Dest", "Sec-Fetch-User"})
+      if (req.get_header_value_count(h) > 1) return std::string("one ") + h + " at most";
+    if (peer_navigation(req.method, req.path, req.get_header_value("Sec-Fetch-Site"), req.get_header_value("Sec-Fetch-Mode"),
+                        req.get_header_value("Sec-Fetch-Dest"), req.get_header_value("Sec-Fetch-User"), req.has_header("Origin")))
+      return "";
     const std::string origin = req.get_header_value("Origin");
     return cross_site_refusal(req.get_header_value("Sec-Fetch-Site"), req.has_header("Origin") ? &origin : nullptr, p);
   }
@@ -373,6 +407,11 @@ struct WebServer::Impl {
     if (!read_file(d.ui_dir + "/index.html", &html)) return reply_err(res, "INTERNAL", "cannot read the ui dir's index.html");
     if (!inject_token(html, d.token, &page))
       return reply_err(res, "INTERNAL", "index.html has no empty desk-token meta to write the token into");
+    // the PAPER/LIVE switch's metas: an older page without them still works, the tag just stays put
+    for (const auto& kv : {std::make_pair("desk-peer", d.peer_url), std::make_pair("desk-venue", d.venue)}) {
+      std::string next;
+      if (!kv.second.empty() && inject_meta(page, kv.first, kv.second, &next)) page.swap(next);
+    }
     res.set_header("Cache-Control", "no-store");   // the token changes every start
     res.set_content(page, "text/html; charset=utf-8");
   }

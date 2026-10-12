@@ -4,6 +4,7 @@
 
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <nlohmann/json.hpp>
 #include <set>
@@ -66,7 +67,8 @@ DeskdConfig load_deskd_config(const std::string& path) {
   static const std::set<std::string> known = {"data_dir",    "lock_dir",    "ui_dir",
                                               "http_port",   "web_threads", "keepalive_s",
                                               "max_streams", "heartbeat_window_ms", "daily_stop_dollars",
-                                              "manual_orders", "systematic_orders", "lip_series", "band_series"};
+                                              "manual_orders", "systematic_orders", "lip_series", "band_series",
+                                              "peer_url"};
   for (auto kv = d.begin(); kv != d.end(); ++kv) {
     if (kv.key() == "live")
       throw std::runtime_error(where + ": \"live\" is a command-line flag only (--live), never a file setting");
@@ -84,6 +86,10 @@ DeskdConfig load_deskd_config(const std::string& path) {
   take(d, "systematic_orders", c.systematic_orders, where);
   take(d, "lip_series", c.lip_series, where);
   take(d, "band_series", c.band_series, where);
+  take(d, "peer_url", c.peer_url, where);
+  if (!c.peer_url.empty() && !peer_url_ok(c.peer_url))
+    throw std::runtime_error(where + ": peer_url must be http://127.0.0.1:PORT/ or http://localhost:PORT/, not \"" +
+                             c.peer_url.substr(0, 80) + "\"");
   for (const auto* list : {&c.lip_series, &c.band_series})
     for (const auto& s : *list) {
       const bool ok = !s.empty() && s.size() <= 40 &&
@@ -107,6 +113,23 @@ DeskdConfig load_deskd_config(const std::string& path) {
   if (c.keepalive_s < 1) throw std::runtime_error(where + ": keepalive_s below 1");
   if (c.heartbeat_window_ms < 1000) throw std::runtime_error(where + ": heartbeat_window_ms below 1000");
   return c;
+}
+
+bool peer_url_ok(const std::string& url) {
+  std::string rest;
+  for (const char* prefix : {"http://127.0.0.1:", "http://localhost:"})
+    if (url.compare(0, std::strlen(prefix), prefix) == 0) rest = url.substr(std::strlen(prefix));
+  if (rest.empty()) return false;
+  if (rest.back() == '/') rest.pop_back();
+  if (rest.empty() || rest.size() > 5 || !std::all_of(rest.begin(), rest.end(), [](unsigned char ch) { return std::isdigit(ch); }))
+    return false;
+  const int port = std::stoi(rest);
+  return port >= 1 && port <= 65535;
+}
+
+std::string peer_url_for(const DeskdConfig& cfg) {
+  if (!cfg.peer_url.empty()) return cfg.peer_url.back() == '/' ? cfg.peer_url : cfg.peer_url + "/";
+  return cfg.live ? "http://127.0.0.1:8788/" : "http://127.0.0.1:8789/";
 }
 
 }  // namespace deskd
