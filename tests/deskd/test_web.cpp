@@ -874,6 +874,20 @@ static void test_stop_ends_streams() {
   CHECK(a.complete.load() && b.complete.load());
 }
 
+// A second desk on a port already in use is refused, never let in beside the first (httplib's
+// default SO_REUSEPORT bound it and split the page's connections between the two)
+static void test_port_taken() {
+  Desk k;
+  WebDeps deps;
+  deps.ui_dir = std::string(DESKD_SOURCE_DIR) + "/ui/desk";
+  WebServer second(deps);
+  std::string err;
+  CHECK(second.bind(k.port(), &err) == 0);
+  CHECK(err.find("in use") != std::string::npos);
+  auto h = get(k.port(), "/api/health");
+  CHECK(h && h->status == 200 && json::parse(h->body)["epoch"] == k.d->epoch());
+}
+
 // false when node is missing: the conformance check did not run, and ctest must say so (77,
 // SKIP_RETURN_CODE in CMakeLists.txt) rather than report a pass
 static bool test_contract() {
@@ -912,6 +926,7 @@ int main() {
   test_kill_with_cx_full();
   test_control_waits();
   test_stop_ends_streams();
+  test_port_taken();
   const bool node_ran = test_contract();
   const int rc = finish("deskd-web");
   return rc == 0 && !node_ran ? 77 : rc;

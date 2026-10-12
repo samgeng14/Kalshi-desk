@@ -724,6 +724,13 @@ WebServer::WebServer(WebDeps deps) : impl_(new Impl(std::move(deps))) { impl_->r
 WebServer::~WebServer() { stop(); }
 
 int WebServer::bind(int port, std::string* err) {
+  // SO_REUSEADDR alone, never httplib's default SO_REUSEPORT: with it a second deskd on the same
+  // port bound without an error and the kernel shared the page's connections between the two
+  // (a paper and a live desk on one port: each click to either). Now the second one is refused.
+  impl_->svr.set_socket_options([](socket_t s) {
+    int one = 1;
+    ::setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+  });
   int bound = 0;
   if (port == 0) {
     bound = impl_->svr.bind_to_any_port("127.0.0.1");
@@ -748,10 +755,12 @@ void WebServer::stop() {
   // chunk. svr.stop() at once cut them off mid-response instead (httplib's chunked loop leaves on
   // is_shutting_down() before the provider's sink.done()): the browser logged
   // ERR_INCOMPLETE_CHUNKED_ENCODING on every SIGTERM. Wait up to 300 ms for them.
-  impl_->d.pub->streams().close_all();
-  const std::int64_t end = mono_ms() + 300;
-  while (impl_->d.pub->streams().open_count() > 0 && mono_ms() < end)
-    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  if (impl_->d.pub) {
+    impl_->d.pub->streams().close_all();
+    const std::int64_t end = mono_ms() + 300;
+    while (impl_->d.pub->streams().open_count() > 0 && mono_ms() < end)
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
   impl_->svr.stop();
 }
 
