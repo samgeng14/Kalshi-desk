@@ -3,6 +3,7 @@
 #include <httplib.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <atomic>
 #include <cctype>
 #include <chrono>
@@ -404,7 +405,10 @@ struct WebServer::Impl {
 
   void serve_page(httplib::Response& res) {
     std::string html, page;
-    if (!read_file(d.ui_dir + "/index.html", &html)) return reply_err(res, "INTERNAL", "cannot read the ui dir's index.html");
+    if (!read_file(d.ui_dir + "/index.html", &html)) {
+      const int e = errno;
+      return reply_err(res, "INTERNAL", "cannot read " + d.ui_dir + "/index.html: " + std::strerror(e));
+    }
     if (!inject_token(html, d.token, &page))
       return reply_err(res, "INTERNAL", "index.html has no empty desk-token meta to write the token into");
     // the PAPER/LIVE switch's metas: an older page without them still works, the tag just stays put

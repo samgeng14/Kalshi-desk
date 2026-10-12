@@ -223,8 +223,12 @@ def prepare(which, port=None, required=True):
         die('%s has the placeholder key_id: put your real key ID in %s, then python3 tools/desk.py setup%s'
             % (config, d['key'], ' live' if which == 'live' else ''))
     port = port or d['port']
+    # the screen: always this checkout's, whatever the build or the config names
+    ui = os.path.join(ROOT, 'ui', 'desk')
+    if not os.access(os.path.join(ui, 'index.html'), os.R_OK):
+        die('%s/index.html is missing or unreadable: this checkout is incomplete (git status; git checkout -- ui)' % ui)
     return {'which': which, 'port': port, 'config': config, 'cfg': cfg,
-            'cmd': [deskd, '--config', config, '--data-dir', d['data'], '--port', str(port)] + d['flags']}
+            'cmd': [deskd, '--config', config, '--data-dir', d['data'], '--ui-dir', ui, '--port', str(port)] + d['flags']}
 
 
 def confirm_live(spec, optional):

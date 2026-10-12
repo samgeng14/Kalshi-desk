@@ -161,6 +161,11 @@ int main() {
             &err) == 3);
   CHECK(err.find("held by another process") != std::string::npos);
   CHECK(err.find("pid " + std::to_string(first)) != std::string::npos);
+  // a ui dir with no page: refused at once with the path and why (it used to start and answer
+  // every browser INTERNAL "cannot read the ui dir's index.html")
+  CHECK(run({DESKD_BIN, "--data-dir", d.path, "--ui-dir", d.file("no-ui"), "--port", std::to_string(free_port())}, d,
+            "noui", &out, &err) == 2);
+  CHECK(err.find("cannot read " + d.file("no-ui") + "/index.html") != std::string::npos);
   // and from another working directory with its own relative data dir: the same account, the
   // same file, refused (the review started two this way and both came up)
   CHECK(run({DESKD_BIN, "--data-dir", "data", "--ui-dir", ui, "--port", std::to_string(free_port())}, d, "otherdir", &out,

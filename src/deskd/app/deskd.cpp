@@ -23,11 +23,13 @@
 // unusable.
 #include <signal.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include <chrono>
 #include <climits>
 #include <csignal>
 #include <cstdio>
+#include <cerrno>
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
@@ -112,6 +114,13 @@ int main(int argc, char** argv) {
   if (!data_dir.empty()) cfg.data_dir = expand_home(data_dir);
   if (!ui_dir.empty()) cfg.ui_dir = expand_home(ui_dir);
   if (cfg.ui_dir.empty()) cfg.ui_dir = std::string(DESKD_SOURCE_DIR) + "/ui/desk";
+  // The screen is read from disk on every page load: a desk whose ui dir has no readable page
+  // would start and answer every browser with INTERNAL. Say so now, with the path and why.
+  if (::access((cfg.ui_dir + "/index.html").c_str(), R_OK) != 0) {
+    std::fprintf(stderr, "deskd: refusing to start: cannot read %s/index.html (%s); --ui-dir names the screen's directory\n",
+                 cfg.ui_dir.c_str(), std::strerror(errno));
+    return 2;
+  }
   if (port >= 0) cfg.http_port = port;
   cfg.live = live;
   RuntimeOptions options;
