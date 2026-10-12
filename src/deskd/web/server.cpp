@@ -59,13 +59,13 @@ bool token_ok(const std::string& got, const std::string& want) {
 }
 
 bool peer_navigation(const std::string& method, const std::string& path, const std::string& site,
-                     const std::string& mode, const std::string& dest, const std::string& user, bool has_origin) {
+                     const std::string& mode, const std::string& dest, bool has_origin) {
   auto lower = [](std::string v) {
     for (char& c : v) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     return v;
   };
   return method == "GET" && (path == "/" || path == "/index.html") && lower(site) == "same-site" &&
-         lower(mode) == "navigate" && lower(dest) == "document" && user == "?1" && !has_origin;
+         lower(mode) == "navigate" && lower(dest) == "document" && !has_origin;
 }
 
 bool inject_token(const std::string& html, const std::string& token, std::string* out) {
@@ -231,10 +231,10 @@ struct WebServer::Impl {
       return "Host must be 127.0.0.1:" + std::to_string(p) + " or localhost:" + std::to_string(p);
     if (req.get_header_value_count("Origin") > 1 || req.get_header_value_count("Sec-Fetch-Site") > 1)
       return "one Origin and one Sec-Fetch-Site at most";
-    for (const char* h : {"Sec-Fetch-Mode", "Sec-Fetch-Dest", "Sec-Fetch-User"})
+    for (const char* h : {"Sec-Fetch-Mode", "Sec-Fetch-Dest"})
       if (req.get_header_value_count(h) > 1) return std::string("one ") + h + " at most";
     if (peer_navigation(req.method, req.path, req.get_header_value("Sec-Fetch-Site"), req.get_header_value("Sec-Fetch-Mode"),
-                        req.get_header_value("Sec-Fetch-Dest"), req.get_header_value("Sec-Fetch-User"), req.has_header("Origin")))
+                        req.get_header_value("Sec-Fetch-Dest"), req.has_header("Origin")))
       return "";
     const std::string origin = req.get_header_value("Origin");
     return cross_site_refusal(req.get_header_value("Sec-Fetch-Site"), req.has_header("Origin") ? &origin : nullptr, p);

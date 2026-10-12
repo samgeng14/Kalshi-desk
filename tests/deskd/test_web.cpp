@@ -363,15 +363,21 @@ static void test_guards_and_page(Desk& k) {
     auto frame = get(port, "/", "", {{"Sec-Fetch-Site", "same-site"}, {"Sec-Fetch-Mode", "navigate"},
                                      {"Sec-Fetch-Dest", "iframe"}, {"Sec-Fetch-User", "?1"}});
     CHECK(frame && frame->status == 403);
-    auto unasked = get(port, "/", "", {{"Sec-Fetch-Site", "same-site"}, {"Sec-Fetch-Mode", "navigate"}, {"Sec-Fetch-Dest", "document"}});
-    CHECK(unasked && unasked->status == 403);
+    // after the "Switch to LIVE?" confirm (Chrome) or from Safari there is no Sec-Fetch-User
+    auto confirmed = get(port, "/?tab=systematic", "", {{"Sec-Fetch-Site", "same-site"}, {"Sec-Fetch-Mode", "navigate"},
+                                                        {"Sec-Fetch-Dest", "document"}});
+    CHECK(confirmed && confirmed->status == 200);
+    auto script = get(port, "/js/main.js", "", {{"Sec-Fetch-Site", "same-site"}, {"Sec-Fetch-Mode", "no-cors"},
+                                                {"Sec-Fetch-Dest", "script"}});
+    CHECK(script && script->status == 403);
     auto far = get(port, "/", "", {{"Sec-Fetch-Site", "cross-site"}, {"Sec-Fetch-Mode", "navigate"},
                                    {"Sec-Fetch-Dest", "document"}, {"Sec-Fetch-User", "?1"}});
     CHECK(far && far->status == 403);
-    CHECK(peer_navigation("GET", "/index.html", "Same-Site", "navigate", "document", "?1", false));
-    CHECK(!peer_navigation("GET", "/", "same-site", "navigate", "document", "?1", true));
-    CHECK(!peer_navigation("POST", "/", "same-site", "navigate", "document", "?1", false));
-    CHECK(!peer_navigation("GET", "/js/main.js", "same-site", "navigate", "document", "?1", false));
+    CHECK(peer_navigation("GET", "/index.html", "Same-Site", "navigate", "document", false));
+    CHECK(!peer_navigation("GET", "/", "same-site", "navigate", "document", true));
+    CHECK(!peer_navigation("POST", "/", "same-site", "navigate", "document", false));
+    CHECK(!peer_navigation("GET", "/js/main.js", "same-site", "navigate", "document", false));
+    CHECK(!peer_navigation("GET", "/", "same-site", "no-cors", "document", false));
   }
 
   // over 64 KiB: Host, origin and token still come first; a good one is BAD_REQUEST

@@ -44,12 +44,14 @@ bool token_ok(const std::string& got, const std::string& want);   // constant ti
 // why a request is cross-site, or "": Sec-Fetch-Site cross-site or same-site, or an Origin
 // (origin non-null: the header was sent) other than this desk's own page
 std::string cross_site_refusal(const std::string& sec_fetch_site, const std::string* origin, int port);
-// The header's PAPER/LIVE switch: a click on the other desk's page (another port on 127.0.0.1, so
-// Sec-Fetch-Site same-site) opening this one. Let past cross_site_refusal: a user-activated
-// top-level GET of the page, as a document, with no Origin. A navigation reads nothing back to the
-// page that started it, and holds no stream; a frame, fetch, script or any other path stays refused.
+// The header's PAPER | LIVE toggle: the other desk's page (another port on 127.0.0.1, so
+// Sec-Fetch-Site same-site) opening this one. Let past cross_site_refusal: a top-level GET of the
+// page, as a document, with no Origin. A navigation reads nothing back to the page that started
+// it and holds no stream; a frame, fetch, script or any other path stays refused. User
+// activation (Sec-Fetch-User) is not required: Safari never sends it, and Chrome drops it when
+// the toggle navigates after its "Switch to LIVE?" confirm (the operator's 403 on 2026-10-12).
 bool peer_navigation(const std::string& method, const std::string& path, const std::string& site,
-                     const std::string& mode, const std::string& dest, const std::string& user, bool has_origin);
+                     const std::string& mode, const std::string& dest, bool has_origin);
 // html with the token written into <meta name="desk-token" content="">; false when the page
 // has no such empty meta (then the page would boot without a token and every POST would fail)
 bool inject_token(const std::string& html, const std::string& token, std::string* out);
