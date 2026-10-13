@@ -253,6 +253,7 @@ void MakerEngine::step(std::int64_t now) {
       hold = "lane paused: its 60 s markout is below the floor";
     else if (m != snap->markets.end() && p_.event_cap > 0 && event_worst(*view, *snap, m->second.event_ticker) >= p_.event_cap)
       hold = "event cap";
+    else if (const auto r = env_.release ? env_.release(tk, now) : std::string(); !r.empty()) hold = "data release: " + r;
     else if (now < cool_until_[tk]) hold = cool_why_[tk];
     // a resting quote carries an exchange-side expiry, which gw admits only on a trusted clock:
     // hold them rather than send what gw must refuse (and back off 10 s); the flatten still goes

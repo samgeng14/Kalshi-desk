@@ -181,6 +181,12 @@ void engine_limits() {
   no_clock.step(OPEN + 1000);
   CHECK(posted.empty() && no_clock.status()["last"][tk] == "the clock is not trusted for an expiry");
   snap->clock.post_trusted = true;
+  // a data release's window (strat/calendar.h): no resting quote, and it says which release
+  env.release = [&](const std::string& t, std::int64_t) { return t == tk ? std::string("CPI") : std::string(); };
+  MakerEngine release("M2", {"KXHIGHNY"}, env, p, band_quote);
+  release.step(OPEN + 1000);
+  CHECK(posted.empty() && release.status()["last"][tk] == "data release: CPI");
+  env.release = {};
   // an active market without open_time has opened (the sandbox's weather rows had none, and M2
   // sat idle); one listed ahead, "initialized", is still not quoted
   view->run = RunState::RUN;

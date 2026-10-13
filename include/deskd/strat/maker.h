@@ -133,6 +133,9 @@ class MakerEngine {
     // the fill model (strat/fill_model.h) for a resting quote: P(complete fill within ttl_s)
     std::function<double(const std::string& tk, bool buy, Qty ahead, Qty size, int ttl_s)> fill_p;
     std::function<void(const std::string& lvl, const std::string& msg)> alert;
+    // the data release whose window holds now for this market ("" = none; strat/calendar.h):
+    // its resting quotes go, the T-60 s flatten still goes
+    std::function<std::string(const std::string& tk, std::int64_t now_ms)> release;
   };
   using Decide = std::function<MakerDecision(const MakerInput&, const MakerParams&)>;
   MakerEngine(std::string lane, std::vector<std::string> series, Env env, MakerParams params = {},

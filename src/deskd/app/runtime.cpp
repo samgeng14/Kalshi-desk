@@ -265,6 +265,7 @@ json Deskd::status() const {
                 {"queued", q_cx_.size()},
                 {"dropped", q_cx_.dropped()}}},
               {"kill", {{"generation", kill_.generation()}, {"active", kill_.active()}}},
+              {"calendar", {{"path", cfg_.calendar}, {"releases", calendar_.size()}, {"why", calendar_why_}}},
               {"store",
                {{"path", store_.path()},
                 {"received", store_.received()},

@@ -43,6 +43,7 @@
 #include "deskd/net/conn.h"
 #include "deskd/net/send.h"
 #include "deskd/store/store.h"
+#include "deskd/strat/calendar.h"
 #include "deskd/strat/fill_model.h"
 #include "deskd/web/pub.h"
 #include "deskd/web/server.h"
@@ -126,6 +127,8 @@ class Deskd {
   std::unique_ptr<MakerEngine> lip_;   // lane M1's quoter, on the strat thread
   std::unique_ptr<MakerEngine> band_;  // lane M2's
   std::unique_ptr<Markouts> markouts_;   // every fill's 1/10/60 s markout
+  ReleaseCalendar calendar_;             // read once at start; const after
+  std::string calendar_why_;
   FillModel fill_model_;                 // each market's trade tape: how likely an order is to fill
   std::map<std::string, std::set<std::string>> strat_want_;   // under live_mu_: by lane, the markets it quotes
   std::string key_error_;

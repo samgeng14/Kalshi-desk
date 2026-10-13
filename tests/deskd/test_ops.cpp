@@ -323,6 +323,8 @@ static void test_config() {
   // the write rate limit tier (gw/write_budget.h): Basic until the upgrade
   CHECK(e.write_tier == "basic" && load_deskd_config(write(R"({"deskd": {"write_tier": "advanced"}})")).write_tier == "advanced");
   CHECK(throws(R"({"deskd": {"write_tier": "premier"}})", "write_tier is"));
+  // the data-release calendar's path (deskd's command line fills in the repo's)
+  CHECK(e.calendar.empty() && load_deskd_config(write(R"({"deskd": {"calendar": "/tmp/cal.json"}})")).calendar == "/tmp/cal.json");
   CHECK(throws(R"({"deskd": {"lip_series": ["kxgold15m"]}})", "not a series ticker"));
   CHECK(throws(R"({"deskd": {"lip_series": "KXGOLD15M"}})", "wrong type"));
   CHECK(throws(R"({"deskd": {"band_series": ["KX HIGH"]}})", "band_series has"));

@@ -1,4 +1,5 @@
 #include "deskd/app/runtime.h"
+#include <unistd.h>
 #include <algorithm>
 #include <cmath>
 #include "deskd/app/log.h"
@@ -79,6 +80,18 @@ bool Deskd::init_venue(std::string* err) {
       options_.fair_watch_since_ms ? options_.fair_watch_since_ms : now_ms());
   md_->set_idle_callback([this] { republish_refs(); });
   markouts_ = std::make_unique<Markouts>();
+  // the data releases that pull the makers' quotes: a bad file refuses the start (the operator
+  // wrote it to be obeyed); a missing one runs without, and says so
+  if (!cfg_.calendar.empty()) {
+    calendar_why_ = calendar_.load(cfg_.calendar);
+    if (!calendar_why_.empty()) {
+      if (::access(cfg_.calendar.c_str(), F_OK) == 0) {
+        if (err) *err = "calendar: " + calendar_why_;
+        return false;
+      }
+      DLOG_WARN("no data-release calendar (%s): the makers quote through releases", calendar_why_.c_str());
+    }
+  }
   if (!options_.espn_url.empty()) {
     std::string why;
     if (auto ep = net::Endpoint::parse(options_.espn_url, &why)) {
@@ -225,6 +238,7 @@ void Deskd::attach_manual() {
       return e.why.empty() ? e.p_full : 0.0;
     };
     env.alert = [this](const std::string& lvl, const std::string& msg) { pub_->alert(lvl, "SYS", msg); };
+    env.release = [this](const std::string& tk, std::int64_t now) { return calendar_.active(tk, now); };
     auto want = [this](const std::string& lane) {
       return [this, lane](std::set<std::string> markets) {
         bool changed = false;
@@ -255,6 +269,7 @@ void Deskd::attach_manual() {
     band_env.anchor = {};
     band_env.want = want("M2");
     band_env.markout = [this] { const auto m = markouts_->lane_mean("M2", "60s"); return std::make_pair(m.fills, m.mean); };
+    band_env.release = [this](const std::string& tk, std::int64_t now) { return calendar_.active(tk, now); };
     band_ = std::make_unique<MakerEngine>("M2", cfg_.band_series, band_env, band, band_quote);
   }
   p.send = [this](KalshiWriteJob j) { return q_man_.push(std::move(j)); };

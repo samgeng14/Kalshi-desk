@@ -39,6 +39,9 @@ struct DeskdConfig {
   // The account's write rate limit tier (gw/write_budget.h): "basic" (100 tokens a second) until
   // the free Advanced upgrade is run, then "advanced" (300)
   std::string write_tier = "basic";
+  // The data releases that pull the makers' quotes (strat/calendar.h); "" = none here, and deskd's
+  // command line fills in the repo's config/calendar.json
+  std::string calendar;
   // Manual orders to the (demo) venue. Off by default: gw still admits and answers, but every
   // order is refused RO and the header stays read-only until the operator turns it on.
   bool manual_orders = false;

@@ -57,13 +57,19 @@ The work is on GitHub: `samgeng14/kalshi-desk`, branch `claude/pensive-meitner-8
   segments, ack, the private feed's first word and fill, the cancel, done) and each fill go to
   `data/ops.sqlite` through the store thread (tables `orders`, `fills`). Read it with
   `tools/latency_report.py`.
+- **Data releases:** `config/calendar.json` (ET weekly or dated releases, by series prefix; path
+  `deskd.calendar`) holds the makers' resting quotes from 60 s before a release to 5 minutes
+  after, as plan section 5 asks ("data release: NAME" in the lane's market status). It ships with
+  EIA's Thursday 10:30 natural-gas storage report only. Add holiday moves from EIA's schedule, and
+  CPI, payrolls and FOMC dates before gold or FX lanes trade. A missing file runs without it (and
+  says so); a malformed one refuses the start.
 - **Demo checks:** `tools/demo_checks` (the probe's `--order-check --group-check --venue-checks
   --feeds-check`). Venue checks: duplicate cid, shortest expiry, reduce_only on a resting order
   and on a flat IOC, post-only at the ask, self-trade both ways. Amend and
   `target_balance_allocation` are not run yet (unverified request shapes).
 - **Still to do from the plan:** the demo proof on the Mac (`tools/demo_checks`, then 50+ demo
-  orders); markouts, the money ledger and LIP windows in ops.sqlite and its nightly copy; the
-  data-release calendar; LIP share and payout; engines for S1, C1 and X1.
+  orders); the money ledger and LIP windows in ops.sqlite and its nightly copy (markouts are in);
+  LIP share and payout; engines for S1, C1 and X1.
 
 ## Where
 
