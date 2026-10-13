@@ -488,7 +488,7 @@ void test_groups() {
   bool saw = false;
   for (const auto& x : of_type(ev, "order_group_updates")) saw = saw || x.msg["event_type"] == "triggered";
   CHECK(saw);
-  CHECK(e.create(in_group(T, Side::BID, 3000, 100), T0 + 3).err.details == "order group triggered");
+  CHECK(e.create(in_group(T, Side::BID, 3000, 100), T0 + 3).err.code == "exceeded_order_group_contracts_limit");
   CHECK(!e.create(ord(T, Side::BID, 3000, 100), T0 + 3).err);  // outside the group: fine
   e.drain_events();
 

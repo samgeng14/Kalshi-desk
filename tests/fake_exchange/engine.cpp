@@ -771,7 +771,9 @@ CreateResult Engine::create(const NewOrder& n, std::int64_t now_ms) {
       return r;
     }
     if (g->triggered) {
-      r.err = refuse(400, "invalid_order", "invalid order", "order group triggered");
+      // what demo answered an order into its triggered group, verbatim (demo checks, 2026-10-13)
+      r.err = refuse(400, "exceeded_order_group_contracts_limit",
+                     "placing this order would exceed your the order group contracts limit");
       return r;
     }
   }

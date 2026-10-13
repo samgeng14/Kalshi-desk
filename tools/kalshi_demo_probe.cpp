@@ -682,6 +682,25 @@ struct DemoProbe {   // not Probe: bus/msg.h has a message of that name
     return poll_order(order_id, 1500, [](const OrderRow&) { return true; }, &others, &body);
   }
 
+  // the live touch from the market's book (the listing's is too old for the checks that need it)
+  struct Touch {
+    std::optional<Px> bid, ask;
+    Qty bid_qty = 0;
+  };
+  std::optional<Touch> touch(const std::string& tk) {
+    std::string why;
+    net::Exchange x = send(build_get_orderbook(tk, 5), "orderbook", false);
+    auto ob = ok2xx(x) ? parse_orderbook(x.res.body, &why) : std::nullopt;
+    if (!ob) return std::nullopt;
+    Touch t;
+    if (!ob->yes.empty()) {
+      t.bid = ob->yes.back().first;
+      t.bid_qty = ob->yes.back().second;
+    }
+    if (!ob->no.empty()) t.ask = kOneDollar - ob->no.back().first;
+    return t;
+  }
+
   bool venue_checks(const std::vector<MarketRow>& rows) {
     std::printf("\nvenue checks (%s):\n", base.host.c_str());
     auto m = choose(rows);
@@ -739,39 +758,54 @@ struct DemoProbe {   // not Probe: bus/msg.h has a message of that name
       verdict("reduce_only_ioc_flat", filled || stops_desk(p.w) ? "NOT OK" : "OK",
               shape(p.w) + (p.ack ? ", filled " + count_wire(p.ack->fill_count) : ""));
     }
-    if (m->yes_ask && *m->yes_ask > 100) {   // a post-only bid at the ask: cancelled or refused, never filled
-      CreateOrder o = base_order(*m, "pocx");
-      o.price = *m->yes_ask;
-      const Placed p = place(o, "create (post-only at the ask)");
-      std::string seen = shape(p.w);
-      bool ok = !stops_desk(p.w);
-      if (p.w.kind == WriteOutcome::Kind::REFUSED) {
-        KalshiWriteReply r;
-        r.op = WireOp::CREATE;
-        r.outcome = p.w;
-        seen += " -> deskd " + ManualBook::refusal_code(r);
-        ok = ok && ManualBook::refusal_code(r) == "POST_CROSS";
-      } else if (p.ack) {
-        const auto row = read_order(p.order_id);
-        seen += ", filled " + count_wire(p.ack->fill_count) + ", then " + (row ? order_status_name(row->status) : "unread");
-        ok = p.ack->fill_count == 0 && row && row->status != OrderStatus::RESTING;
-        cancel_quietly(p.order_id, o);
+    {   // a post-only bid at the live ask: cancelled or refused, never filled
+      const auto t = touch(m->ticker);
+      if (!t || !t->ask) {
+        verdict("post_only_cross", "SEEN", "skipped: no ask on this market's book to cross");
+      } else {
+        CreateOrder o = base_order(*m, "pocx");
+        o.price = *t->ask;
+        const Placed p = place(o, "create (post-only at the ask)");
+        std::string seen = shape(p.w);
+        bool ok = !stops_desk(p.w) && p.w.kind != WriteOutcome::Kind::NOT_SENT;
+        if (p.w.kind == WriteOutcome::Kind::REFUSED) {
+          KalshiWriteReply r;
+          r.op = WireOp::CREATE;
+          r.outcome = p.w;
+          seen += " -> deskd " + ManualBook::refusal_code(r);
+          ok = ok && ManualBook::refusal_code(r) == "POST_CROSS";
+        } else if (p.ack) {
+          const auto row = read_order(p.order_id);
+          seen += ", filled " + count_wire(p.ack->fill_count) + ", then " + (row ? order_status_name(row->status) : "unread");
+          ok = p.ack->fill_count == 0 && row && row->status != OrderStatus::RESTING;
+          cancel_quietly(p.order_id, o);
+        }
+        verdict("post_only_cross", ok ? "OK" : "NOT OK", seen);
       }
-      verdict("post_only_cross", ok ? "OK" : "NOT OK", seen);
     }
-    // self-trade: our bid one tick inside the spread, met by our own IOC sell at that price
-    const bool room = m->yes_bid && m->yes_ask && *m->yes_ask - *m->yes_bid >= 200;
+    // self-trade: our bid one tick inside the live spread, the best bid alone, met by our own IOC
+    // sell at that price. The listing's touch is too old for this: on demo a bot bid at or above
+    // ours in between, our sell traded with it, and the check called that a self-trade (2026-10-13).
     for (const Stp stp : {Stp::TAKER_AT_CROSS, Stp::MAKER}) {
       const std::string name = std::string("self_trade_") + stp_name(stp);
-      if (!room) {
-        verdict(name, "SEEN", "skipped: the spread is under 2 ticks, so our bid cannot be the best");
+      const auto t = touch(m->ticker);
+      if (!t || !t->bid || !t->ask || *t->ask - *t->bid < 200) {
+        verdict(name, "SEEN", "skipped: the live spread is under 2 ticks or one side is empty, so our bid cannot be the best");
         continue;
       }
       CreateOrder rest = base_order(*m, "stpr");
-      rest.price = *m->yes_bid + 100;
+      rest.price = *t->bid + 100;
       const Placed r = place(rest, "create (self-trade: the resting bid)");
       if (r.w.kind != WriteOutcome::Kind::ACK) {
         verdict(name, "NOT OK", "the resting bid was not placed: " + shape(r.w));
+        continue;
+      }
+      // ours must be the best bid, alone at its price, or the sell meets someone else first
+      const auto now = touch(m->ticker);
+      if (!now || !now->bid || *now->bid != rest.price || now->bid_qty != rest.count) {
+        verdict(name, "SEEN", "skipped: another bid was at or above ours before the sell went (best bid " +
+                                  (now && now->bid ? price_wire(*now->bid) : std::string("-")) + ")");
+        cancel_quietly(r.order_id, rest);
         continue;
       }
       CreateOrder take = base_order(*m, "stpt");
@@ -781,37 +815,53 @@ struct DemoProbe {   // not Probe: bus/msg.h has a message of that name
       take.expiration_s = 0;
       take.price = rest.price;
       take.stp = stp;
-      const Placed t = place(take, "create (self-trade: our IOC sell)");
+      const Placed tk = place(take, "create (self-trade: our IOC sell)");
       const auto rested = read_order(r.order_id);
-      const bool self_fill = (t.ack && t.ack->fill_count > 0) || (rested && rested->filled > 0);
-      std::string seen = "taker " + shape(t.w) + (t.ack ? ", filled " + count_wire(t.ack->fill_count) : "") +
-                         "; the resting bid " + (rested ? order_status_name(rested->status) : "unread");
-      // taker_at_cross: the taker stops and the bid rests; maker: the bid goes
-      const bool shape_ok = stp == Stp::TAKER_AT_CROSS ? rested && rested->status == OrderStatus::RESTING
-                                                       : rested && rested->status == OrderStatus::CANCELED;
-      verdict(name, !self_fill && !stops_desk(t.w) && shape_ok ? "OK" : "NOT OK", seen);
+      const Qty took = tk.ack ? tk.ack->fill_count : 0;
+      std::string seen = "taker " + shape(tk.w) + (tk.ack ? ", filled " + count_wire(took) : "") + "; the resting bid " +
+                         (rested ? order_status_name(rested->status) + std::string(", filled ") + count_wire(rested->filled) : "unread");
+      if (rested && rested->filled > 0) {
+        verdict(name, "NOT OK", "SELF TRADE: our two orders traded with each other; " + seen);
+      } else if (took > 0) {
+        // our bid untouched and the sell filled: it met another bid that came in after the book read
+        verdict(name, "SEEN", "inconclusive: the sell met another participant's bid (this account now holds the " +
+                                  count_wire(took) + " it sold); " + seen);
+      } else {
+        // taker_at_cross: the taker stops and the bid rests; maker: the bid goes
+        const bool shape_ok = stp == Stp::TAKER_AT_CROSS ? rested && rested->status == OrderStatus::RESTING
+                                                         : rested && rested->status == OrderStatus::CANCELED;
+        verdict(name, !stops_desk(tk.w) && shape_ok ? "OK" : "NOT OK", seen);
+      }
       cancel_quietly(r.order_id, rest);
     }
     verdict("amend_expiry", "SEEN", "not run: no amends in the first live weeks (plan section 3); its body is unverified");
     verdict("target_balance_alloc", "SEEN", "not run: the endpoint's shape is unverified");
 
-    // nothing of this check rests
+    // nothing of this check rests; demo's resting list can show a cancelled order for a moment
     std::string why;
     ListQuery q;
     q.status = "resting";
     q.limit = 200;
-    net::Exchange x = send(build_get_orders(q), "resting orders after the checks");
     std::size_t left = 0;
-    if (auto page = ok2xx(x) ? parse_orders(x.res.body, &why) : std::nullopt)
-      for (const auto& row : page->rows)
-        if (row.client_order_id.rfind("P-", 0) == 0) {
-          ++left;
-          WireRequest cx;
-          if (build_cancel(row.order_id, row.exchange_index.value_or(0), row.ticker, -1, &cx, &why)) send(cx, "cancel (left over)");
-        }
+    bool listed = false;
+    for (int i = 0; i < 6; ++i) {
+      net::Exchange x = send(build_get_orders(q), "resting orders after the checks", i == 0);
+      auto page = ok2xx(x) ? parse_orders(x.res.body, &why) : std::nullopt;
+      listed = page.has_value();
+      left = 0;
+      if (page)
+        for (const auto& row : page->rows)
+          if (row.client_order_id.rfind("P-", 0) == 0) {
+            ++left;
+            WireRequest cx;
+            if (build_cancel(row.order_id, row.exchange_index.value_or(0), row.ticker, -1, &cx, &why)) send(cx, "cancel (left over)");
+          }
+      if (!left || !listed) break;
+      std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    }
     std::printf("  this check's orders resting: %zu\n", left);
     if (!a.dump.empty()) std::ofstream(a.dump + "/kalshi_demo_venue_checks.json") << checks.dump(1);
-    return checks_ok && left == 0 && ok2xx(x);
+    return checks_ok && left == 0 && listed;
   }
 
   // ---- the socket (--feeds-check, --group-check) ---------------------------------------------

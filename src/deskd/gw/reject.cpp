@@ -46,7 +46,10 @@ RejectClass classify_refusal(WireOp op, int status, const std::string& text) {
   if (is_post_only_cross(b)) return RejectClass::SOFT_MARKET;
   if (has("self trade") || has("self-trade") || has("self_trade") || has("selftrade"))
     return RejectClass::SOFT_SELF_TRADE;
-  if (has("order group triggered") || has("order_group_triggered") || has("order group is triggered"))
+  // demo, 2026-10-13, an order into a triggered group: 400 exceeded_order_group_contracts_limit
+  // "placing this order would exceed your the order group contracts limit"
+  if (has("order group triggered") || has("order_group_triggered") || has("order group is triggered") ||
+      has("exceeded_order_group_contracts_limit") || has("order group contracts limit"))
     return RejectClass::SOFT_GROUP;
   if (has("market closed") || has("market_closed") || has("market is closed") || has("closed to new orders") ||
       has("market not open") || has("market_not_open") || has("market is not open") || has("trading is paused") ||

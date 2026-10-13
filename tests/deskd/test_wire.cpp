@@ -651,6 +651,10 @@ static void test_classify() {
   CHECK(refused(WireOp::CREATE, 400, err("trading_paused", "trading is paused")) == RejectClass::SOFT_MARKET);
   CHECK(refused(WireOp::CREATE, 400, err("insufficient_balance", "insufficient balance")) == RejectClass::SOFT_COLLATERAL);
   CHECK(refused(WireOp::CREATE, 400, err("invalid_order", "invalid order", "order group triggered")) == RejectClass::SOFT_GROUP);
+  // demo's own answer (demo checks, 2026-10-13): the group did its job, never a desk bug
+  CHECK(refused(WireOp::CREATE, 400, err("exceeded_order_group_contracts_limit",
+                                         "placing this order would exceed your the order group contracts limit", "")) ==
+        RejectClass::SOFT_GROUP);
   CHECK(refused(WireOp::CREATE, 400, err("self_trade", "order would self trade")) == RejectClass::SOFT_SELF_TRADE);
   CHECK(refused(WireOp::CREATE, 409, err("order_already_exists", "an order with this client_order_id already exists")) ==
         RejectClass::DUPLICATE);

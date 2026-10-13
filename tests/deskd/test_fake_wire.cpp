@@ -362,7 +362,7 @@ void test_rest() {
   CHECK(call(c, "PUT", "/portfolio/order_groups/" + gid + "/trigger").status() == 200);
   CHECK(call(c, "GET", "/portfolio/orders/" + gr1).j["order"]["status"] == "canceled");
   r = call(c, "POST", ORDERS, order(T, "bid", "1", "0.30", "good_till_canceled", "", {{"order_group_id", gid}}));
-  CHECK(r.status() == 400 && r.j["error"]["details"] == "order group triggered");
+  CHECK(r.status() == 400 && r.j["error"]["code"] == "exceeded_order_group_contracts_limit");
   CHECK(call(c, "PUT", "/portfolio/order_groups/" + gid + "/trigger?exchange_index=2").status() == 404);
   CHECK(call(c, "PUT", "/portfolio/order_groups/" + gid + "/reset").status() == 200);
   CHECK(call(c, "PUT", "/portfolio/order_groups/" + gid + "/limit", {{"contracts_limit_fp", "10.00"}}).status() == 200);
