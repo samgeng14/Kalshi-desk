@@ -553,7 +553,7 @@ void State::incentives(Snapshot& next, Worker* worker) {
   }
   if (!why.empty()) {
     // the last good read stays; LIP is an estimate, never a reason to refuse anything
-    DLOG_WARN("rest: incentive programs: %s", why.c_str());
+    DLOG_WARN("incentive programs: %s", why.c_str());
     return;
   }
   next.lip = std::move(lip);
@@ -612,7 +612,7 @@ void State::backfill_trades(Worker* worker) {
     if (trades_cb_) trades_cb_(ticker, from, std::move(rows));
     return;
   }
-  DLOG_WARN("rest: trades for %s: %s", ticker.c_str(), why.c_str());
+  DLOG_WARN("trades for %s: %s", ticker.c_str(), why.c_str());
   std::lock_guard<std::mutex> lock(controls_mu_);
   trades_failed_[ticker] = mono_ms();
 }

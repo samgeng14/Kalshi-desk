@@ -7,6 +7,7 @@
     python3 tools/desk.py paper | live           # one of them alone
     python3 tools/desk.py sim                    # the fake exchange, no network, no key
     python3 tools/desk.py status                 # both, through deskctl
+    python3 tools/desk.py report [paper|live]    # what went wrong: status, KILLs, refusals, the log's tail
     python3 tools/desk.py kill paper|live        # KILL, as the screen's button
 
 One desk, one browser tab, a PAPER | LIVE toggle in the header. Underneath, each account is its
@@ -18,6 +19,7 @@ Files (setup writes a config when missing; an existing one gets only its key fie
 file and its order switches on, the previous version kept beside it as .bak-<time>):
   paper: key ~/.kalshi/demo.json, config ~/.kalshi/deskd-demo.json, data <data>/demo
   live:  key ~/.kalshi/prod.json (or --key), config ~/.kalshi/deskd-prod.json, data <data>/prod
+Each desk's log goes to the terminal and to <data>/<demo|prod>/deskd.log (20 MB, then .1).
   <data>: ~/Library/Application Support/kalshi-desk on a Mac, else $XDG_DATA_HOME/kalshi-desk
 A key file is {"env": "demo"|"prod", "key_id", "private_key_path" (or "pem_path"), "key_type"}.
 PAPER gets Manual and Systematic orders on; LIVE Manual only (Systematic stays off until you
@@ -257,10 +259,21 @@ def launch(specs, open_browser):
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     procs = []
 
-    def relay(p, label):
+    def relay(p, label, path):
+        # the terminal, and the desk's log file: `desk.py report` reads it back after a problem
+        log = open_log(path)
         for line in p.stdout:
             sys.stdout.write(label + line)
             sys.stdout.flush()
+            if log:
+                try:
+                    log.write(line)
+                    if log.tell() > LOG_MAX:
+                        log.close()
+                        os.replace(path, path + '.1')
+                        log = open_log(path)
+                except OSError:
+                    log = None
 
     # a desk already on one of the ports (an older run still going): say which, start nothing
     for spec in specs:
@@ -273,7 +286,8 @@ def launch(specs, open_browser):
         for spec in specs:
             p = subprocess.Popen(spec['cmd'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
             procs.append((spec, p))
-            threading.Thread(target=relay, args=(p, '%-6s' % spec['which'].upper()), daemon=True).start()
+            threading.Thread(target=relay, args=(p, '%-6s' % spec['which'].upper(), log_path(spec['which'])),
+                             daemon=True).start()
         for spec, p in procs:
             if up(spec['port'], p.pid, 20):
                 say('%s up on http://127.0.0.1:%d/' % (DESKS[spec['which']]['what'], spec['port']))
@@ -309,10 +323,77 @@ def deskctl(args):
     return subprocess.call([binary('deskctl')] + args)
 
 
+# ---- the log and the report ------------------------------------------------------------------
+
+LOG_MAX = 20 * 1024 * 1024
+
+
+def log_path(which):
+    return os.path.join(DESKS[which]['data'], 'deskd.log')
+
+
+def open_log(path):
+    try:
+        f = open(path, 'a', encoding='utf-8', buffering=1)
+        f.write('---- desk.py started this desk %s ----\n' % time.strftime('%Y-%m-%d %H:%M:%S %z'))
+        return f
+    except OSError as e:
+        say('cannot write the log %s (%s): the terminal still has it' % (path, e))
+        return None
+
+
+# what to look at first in a log: a KILL and why, a refusal, a stopped sender, an error
+REPORT_MARKS = ('KILL', 'refused', 'STALE', 'stopped', '[error]', '[warn]', 'not sent', 'contradicts', 'UNKNOWN')
+
+
+def report(which):
+    """Everything needed to tell what went wrong, to paste back: no key, key id or signature is in it."""
+    d = DESKS[which]
+    print('==== %s (port %d) ====' % (which, d['port']))
+    st = running(d['port'])
+    if st:
+        run = st.get('run') or {}
+        print('running: pid %s, %s; run %s%s' % (st.get('pid'), st.get('mode'), run.get('state'),
+                                                 ' (%s)' % run['why'] if run.get('why') else ''))
+        senders = st.get('senders') or {}
+        for name, s in sorted(senders.items()):
+            if isinstance(s, dict) and (s.get('why') or s.get('healthy') is False):
+                print('  sender %s: %s' % (name, s.get('why') or 'not healthy'))
+        rest = st.get('rest') or {}
+        if rest.get('error'):
+            print('  rest: %s' % rest['error'])
+        feeds = st.get('feeds') or {}
+        for name in ('KX', 'KXP'):
+            f = feeds.get(name) or {}
+            if f and (not f.get('up') or f.get('gap')):
+                print('  feed %s: up %s gap %s' % (name, f.get('up'), f.get('gap')))
+        gw = st.get('gw') or {}
+        if gw.get('ledger_why'):
+            print('  ledger: %s' % gw['ledger_why'])
+    else:
+        print('not running now')
+    path = log_path(which)
+    try:
+        with open(path, encoding='utf-8', errors='replace') as f:
+            lines = f.read().splitlines()
+    except OSError:
+        print('no log at %s (the log file starts with this version of desk.py)' % path)
+        return
+    start = max((i for i, l in enumerate(lines) if l.startswith('---- desk.py started')), default=0)
+    lines = lines[start:]
+    marked = [l for l in lines if any(m in l for m in REPORT_MARKS)]
+    print('-- the last run\'s KILLs, refusals, warnings and errors (%d of %d lines) --' % (min(len(marked), 120), len(marked)))
+    for l in marked[-120:]:
+        print(l)
+    print('-- its last 60 lines --')
+    for l in lines[-60:]:
+        print(l)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n\n')[0], usage=__doc__.split('\n\n')[1])
-    ap.add_argument('cmd', nargs='?', default='up', choices=['up', 'setup', 'paper', 'live', 'sim', 'status', 'kill'])
-    ap.add_argument('which', nargs='?', help='setup and kill: paper or live')
+    ap.add_argument('cmd', nargs='?', default='up', choices=['up', 'setup', 'paper', 'live', 'sim', 'status', 'kill', 'report'])
+    ap.add_argument('which', nargs='?', help='setup, kill and report: paper or live')
     ap.add_argument('--key', help='setup: the key file (default ~/.kalshi/demo.json, ~/.kalshi/prod.json)')
     ap.add_argument('--port', type=int, help='paper and live: the web port (default 8788 paper, 8789 live)')
     ap.add_argument('--no-open', action='store_true', help='do not open the browser')
@@ -348,6 +429,11 @@ def main():
             print('%s (port %d):' % (which, DESKS[which]['port']), flush=True)
             code = max(code, deskctl(['--port', str(DESKS[which]['port']), 'status']))
         sys.exit(code)
+    elif a.cmd == 'report':
+        for which in ([a.which] if a.which else ['paper', 'live']):
+            if which not in DESKS:
+                die('report paper or report live')
+            report(which)
     elif a.cmd == 'kill':
         if a.which not in DESKS:
             die('kill paper or kill live')
