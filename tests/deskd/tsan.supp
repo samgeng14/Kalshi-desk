@@ -9,3 +9,9 @@
 # on its own data is still reported.
 race:OPENSSL_sk_dup
 race:OPENSSL_sk_free
+#
+# Two TLS handshakes on the factory's shared SSL_CTX (one in the spare pool, one opening a
+# socket): libcrypto writes a certificate field under its own X509 store lock and another thread
+# compares it inside OpenSSL's verification; both ends are libcrypto's ASN.1 string routines.
+race:ASN1_STRING_set
+race:ASN1_STRING_cmp

@@ -126,6 +126,7 @@ void engine_limits() {
   kalshi::MarketRow m; m.ticker = tk; m.event_ticker = "KXHIGHNY-26OCT10"; m.status = "active";
   m.open_ms = OPEN; m.close_ms = OPEN + 86400000; m.price_ranges = CENT;
   snap->markets[tk] = m;
+  snap->clock.post_trusted = true;
   std::vector<GwMsg> posted;
   std::pair<std::int64_t, Money> mo{0, 0};
   MakerEngine::Env env;
@@ -173,6 +174,13 @@ void engine_limits() {
   MakerEngine stopped("M2", {"KXHIGHNY"}, env, p, band_quote);
   stopped.step(OPEN + 1000);
   CHECK(posted.empty() && stopped.status()["last"][tk] == "not running");
+  // an untrusted clock: no resting quote is sent (gw would refuse its expiry), and it says why
+  view->run = RunState::RUN;
+  snap->clock.post_trusted = false;
+  MakerEngine no_clock("M2", {"KXHIGHNY"}, env, p, band_quote);
+  no_clock.step(OPEN + 1000);
+  CHECK(posted.empty() && no_clock.status()["last"][tk] == "the clock is not trusted for an expiry");
+  snap->clock.post_trusted = true;
   // an active market without open_time has opened (the sandbox's weather rows had none, and M2
   // sat idle); one listed ahead, "initialized", is still not quoted
   view->run = RunState::RUN;
@@ -227,6 +235,7 @@ void engine_own_quotes() {
   kalshi::MarketRow m; m.ticker = tk; m.event_ticker = "KXNATGAS15M-26OCT101500"; m.status = "active";
   m.open_ms = OPEN; m.close_ms = CLOSE; m.price_ranges = CENT;
   snap->markets[tk] = m;
+  snap->clock.post_trusted = true;
   MdBook shown = book(4000, 500, 4600, 500);
   MakerEngine::Env::Anchor anchor;
   std::vector<GwMsg> posted;

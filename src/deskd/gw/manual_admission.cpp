@@ -67,9 +67,14 @@ ManualAdmission admit_manual(const PlaceIntent& input,const ManualContext& c) {
   if(c.read_only || !c.publisher_healthy || !c.ledger_healthy ||
      !c.manual_sender_healthy || !c.cancel_sender_healthy)
     return refuse("RO",c.owner_why.empty() ? "an execution owner is not ready" : c.owner_why);
-  if(!c.account_ready || !c.public_ready || !c.private_ready || c.unknown_order ||
-     !c.book || c.book->ticker!=input.ticker || c.book->stale)
-    return refuse("STALE","book, private account or order reconciliation is pending");
+  // STALE names which input is not current (one message for all six hid it: a soak under TSan
+  // refused a quote a minute and could not say why)
+  if(!c.account_ready) return refuse("STALE","the account read (REST) is not current yet");
+  if(!c.public_ready) return refuse("STALE","market data is not ready");
+  if(!c.private_ready) return refuse("STALE","the private order/fill feed is not up");
+  if(c.unknown_order) return refuse("STALE","an order's outcome on this market is still unknown");
+  if(!c.book || c.book->ticker!=input.ticker) return refuse("STALE","no book for this market yet");
+  if(c.book->stale) return refuse("STALE","this market's book is stale");
   if(c.foreign_order) return refuse("RO","cancel the foreign order on this market first");
   if(!m.exchange_index || *m.exchange_index<0)
     return refuse("RO","market has no authoritative exchange index");

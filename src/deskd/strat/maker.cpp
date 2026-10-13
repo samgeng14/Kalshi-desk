@@ -245,6 +245,9 @@ void MakerEngine::step(std::int64_t now) {
     else if (m != snap->markets.end() && p_.event_cap > 0 && event_worst(*view, *snap, m->second.event_ticker) >= p_.event_cap)
       hold = "event cap";
     else if (now < cool_until_[tk]) hold = cool_why_[tk];
+    // a resting quote carries an exchange-side expiry, which gw admits only on a trusted clock:
+    // hold them rather than send what gw must refuse (and back off 10 s); the flatten still goes
+    else if (!snap->clock.post_trusted) hold = "the clock is not trusted for an expiry";
     if (!running) d.pull = "not running";
     else if (m == snap->markets.end()) d.pull = "not listed";
     else if (view->held.count(tk)) d.pull = "held by Manual";   // until POST /api/release
