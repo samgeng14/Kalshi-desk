@@ -1735,6 +1735,9 @@ function manOrders(P, key) { const a = []; P.D.store.orders.forEach(o => { if (o
       for (let i = 0; i < 80; i++) { await run(250, 250); seen.add(Math.round(st.hdr.day.total / 100)); }
       check(seen.size >= 2, 'its marks move the day\'s total', seen.size);
       eq(n, 0, 'SUBTLE: DAY does not flash on marks (2026-10-06: 13 flashes in 20 s with the lanes running)');
+      // the flash gap is real time (performance.now(), 1.5 s) and these loops run 20 s of sim time
+      // in about a second of it: wait out the fill's flash first, or FULL may have nothing to show
+      await new Promise(r => setTimeout(r, 1600));
       D.ui.setFlash('full'); n = 0;
       for (let i = 0; i < 80; i++) await run(250, 250);
       check(n > 0, 'FULL: it does', n);
