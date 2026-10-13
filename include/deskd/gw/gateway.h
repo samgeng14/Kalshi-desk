@@ -24,6 +24,7 @@
 
 #include "deskd/bus/msg.h"
 #include "deskd/bus/queue.h"
+#include "deskd/gw/write_budget.h"
 
 namespace deskd {
 
@@ -136,8 +137,14 @@ class Gateway {
     std::atomic<std::uint64_t> sys_refused{0};        // Systematic intents refused by gw
     std::atomic<std::uint64_t> sys_cancels{0};        // Systematic cancels handed to send-k2
     std::atomic<std::uint64_t> group_jobs{0};         // order-group creates, triggers and resets
+    std::atomic<std::uint64_t> sys_rate_refused{0};   // Systematic creates past its 80% of a shard's write budget
+    std::atomic<std::uint64_t> venue_429{0};          // writes the venue refused 429
   };
   const Stats& stats() const { return stats_; }
+  // Any thread: each write bucket's tokens as gw last spent from it (shard -> tokens; 0 = the
+  // unscoped bucket) and the bucket's size (gw/write_budget.h)
+  std::shared_ptr<const std::map<int, double>> write_tokens() const { return std::atomic_load(&write_view_); }
+  double write_cap() const { return write_cap_.load(); }
 
  private:
   void handle(GwMsg& m);
@@ -176,6 +183,10 @@ class Gateway {
   std::map<std::string, std::string> cancel_why_;   // a cancel gw itself asked for: STOP, LANE_OFF, HALT
   std::shared_ptr<const std::set<std::string>> owned_;   // std::atomic_load / std::atomic_store
   std::shared_ptr<const std::string> ledger_why_;        // std::atomic_load / std::atomic_store
+  WriteBudget budget_;                                    // gw thread only
+  std::shared_ptr<const std::map<int, double>> write_view_;   // std::atomic_load / std::atomic_store
+  std::atomic<double> write_cap_{0};
+  void spend(int shard, double cost);   // a write sent: counted against its bucket, and published
   void note_ledger();
 
   // ---- Systematic (gw/sys_book.h); gw thread only

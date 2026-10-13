@@ -4,6 +4,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <cmath>
 #include <csignal>
 
 #include "deskd/app/log.h"
@@ -194,6 +195,16 @@ void Deskd::stop() {
   flush_logger(500);
 }
 
+namespace {
+// gw's write buckets as last spent from (gw/write_budget.h): the size, and each shard's tokens
+json write_budget_json(const Gateway& gw) {
+  json tokens = json::object();
+  if (const auto view = gw.write_tokens())
+    for (const auto& [shard, t] : *view) tokens[std::to_string(shard)] = std::round(t * 10) / 10;
+  return {{"cap", gw.write_cap()}, {"sys_share", WriteBudget::kSysShare}, {"tokens", tokens}};
+}
+}  // namespace
+
 json Deskd::status() const {
   json workers = json::array();
   const std::int64_t now = now_ms(), mono = mono_ms();
@@ -233,6 +244,9 @@ json Deskd::status() const {
                 {"sys_refused", gs.sys_refused.load()},
                 {"sys_cancels", gs.sys_cancels.load()},
                 {"group_jobs", gs.group_jobs.load()},
+                {"sys_rate_refused", gs.sys_rate_refused.load()},
+                {"venue_429", gs.venue_429.load()},
+                {"write_budget", write_budget_json(*gw_)},
                 {"systematic_orders", cfg_.systematic_orders && sys_sender_ != nullptr},
                 {"ledger_healthy", gw_->ledger_why().empty()},
                 {"ledger_why", gw_->ledger_why()},

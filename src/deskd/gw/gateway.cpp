@@ -32,6 +32,8 @@ Gateway::~Gateway() {
 void Gateway::attach_manual(const ManualPath& path) {
   path_ = std::make_unique<ManualPath>(path);
   manual_ = std::make_unique<ManualBook>();
+  budget_ = WriteBudget(path_->write_tier);
+  write_cap_.store(budget_.cap());
   if (path_->sys_send) {
     sys_ = std::make_unique<SysBook>(path_->lanes.empty() ? default_lanes() : path_->lanes);
     std::atomic_store(&groups_view_, std::make_shared<const std::pair<bool, std::string>>(false, "order groups not created yet"));
@@ -255,6 +257,12 @@ void Gateway::handle(GwMsg& m) {
   }
   if (auto* t = std::get_if<TransferIntent>(&m)) return transfer(*t);
   if (auto* w = std::get_if<ManualWrite>(&m)) {
+    if (w->reply && w->reply->outcome.http == 429) {
+      const bool one = w->reply->op == WireOp::CREATE || w->reply->op == WireOp::CANCEL;
+      budget_.venue_refused(one ? std::max(0, w->reply->shard) : 0, now_ms());
+      stats_.venue_429.fetch_add(1);
+      spend(0, 0);   // publish the emptied bucket
+    }
     if (w->reply && w->reply->op == WireOp::TRANSFER) { transfer_reply(*w->reply); return; }
     if (w->reply && w->reply->op == WireOp::GROUP) group_reply(*w->reply);
     else if (w->reply) manual_reply(*w->reply);
@@ -423,6 +431,7 @@ void Gateway::place_manual(PlaceIntent& p) {
   }
   if (sys_) takeover(p.ticker);
   publish_order(cid);   // PEND, with its reservation
+  const int shard = placed.job->shard;
   if (!path_->send || !path_->send(std::move(*placed.job))) {
     KalshiWriteReply r;
     r.cid = cid;
@@ -437,6 +446,7 @@ void Gateway::place_manual(PlaceIntent& p) {
     return;
   }
   stats_.manual_sent.fetch_add(1);
+  spend(shard, WriteBudget::kCreate);
   if (p.reply) pending_[cid] = p.reply;
 }
 
@@ -596,7 +606,9 @@ std::vector<std::string> Gateway::cancel_foreign(const CancelIntent& c) {
     j.oid = row.order_id;
     j.ticker = row.ticker;
     j.shard = row.exchange_index.value_or(0);
+    const int shard = j.shard;
     if (path_->cancel(std::move(j))) {
+      spend(shard, WriteBudget::kCancel);
       foreign_cx_[cid] = now;
       out.push_back(cid);
       DLOG_INFO("cancelling %s on %s, an order this run did not place", cid.c_str(), row.ticker.c_str());
@@ -636,6 +648,7 @@ void Gateway::transfer(TransferIntent& t) {
   j.kill_generation = kill_.generation();
   const auto cid = j.cid;
   if (!path_->send(std::move(j))) return answer_t("INTERNAL", "send-k1's queue is full");
+  spend(0, WriteBudget::kOther);
   DLOG_INFO("transfer %s: $%s from S%d to S%d", cid.c_str(), money_str(t.amount).c_str(), t.from, t.to);
   transfers_[cid] = PendingTransfer{t.reply, t.from, t.to, t.amount};
 }
@@ -672,6 +685,13 @@ void Gateway::transfer_reply(const KalshiWriteReply& r) {
   if (t.reply) { try { t.reply->set_value(std::move(out)); } catch (const std::future_error&) {} }
 }
 
+void Gateway::spend(int shard, double cost) {
+  const auto now = now_ms();
+  budget_.spend(std::max(0, shard), cost, now);
+  std::atomic_store(&write_view_, std::shared_ptr<const std::map<int, double>>(
+                                      std::make_shared<const std::map<int, double>>(budget_.all(now))));
+}
+
 void Gateway::send_cancel(const std::string& cid) {
   const auto* o = manual_->ledger().find(cid);
   if (!o || o->oid.empty()) return;
@@ -683,7 +703,9 @@ void Gateway::send_cancel(const std::string& cid) {
   j.shard = o->shard;
   const bool sys = o->intent.owner == Owner::SYS;
   const auto& via = sys ? path_->sys_cancel : path_->cancel;   // Systematic never uses send-cx
+  const int shard = j.shard;
   if (via && via(std::move(j))) {
+    spend(shard, WriteBudget::kCancel);
     cancel_sent_.insert(cid);
     (sys ? stats_.sys_cancels : stats_.manual_cancels).fetch_add(1);
     return;
@@ -909,6 +931,12 @@ void Gateway::place_sys(PlaceIntent& p) {
     halt("daily stop");
     return refuse("HALTED", "Systematic halted by the daily stop");
   }
+  // the write budget (plan section 3): Systematic leaves a fifth of each bucket to Manual and cancels
+  if (!budget_.sys_may(shard, WriteBudget::kCreate, now_ms())) {
+    stats_.sys_rate_refused.fetch_add(1);
+    return refuse("RATE", "Systematic's 80% of shard " + std::to_string(shard) + "'s write budget is spent; room again in " +
+                              std::to_string(budget_.sys_wait_ms(shard, WriteBudget::kCreate, now_ms())) + " ms");
+  }
   if (path_->book) {
     if (auto b = path_->book(p.ticker)) manual_->set_book(*b);
   }
@@ -939,6 +967,7 @@ void Gateway::place_sys(PlaceIntent& p) {
     return refuse("RO", "send-k2's queue is full");
   }
   stats_.sys_sent.fetch_add(1);
+  spend(shard, WriteBudget::kCreate);
   sys_->sent(p.lane, now_ms());
   sys_save_due_ = true;
   lanes_dirty_.insert(p.lane);
@@ -1022,6 +1051,7 @@ void Gateway::group_job(const std::string& lane, int shard, const std::string& a
     return;
   }
   stats_.group_jobs.fetch_add(1);
+  spend(0, WriteBudget::kOther);
   g.asked_ms = now_ms();
   g.state = action == "create" ? SysBook::GroupState::CREATING
           : action == "trigger" ? SysBook::GroupState::TRIGGERING : SysBook::GroupState::RESETTING;

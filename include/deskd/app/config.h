@@ -36,6 +36,9 @@ struct DeskdConfig {
   int heartbeat_window_ms = 5000;    // gw, md-k and priv-k must each move within this
   Money daily_stop = 30 * 10000;     // u; decision 1, the recommended $30
   Money equity_floor = 150 * 10000;  // u; plan section 4 limit 5: the account under it halts Systematic
+  // The account's write rate limit tier (gw/write_budget.h): "basic" (100 tokens a second) until
+  // the free Advanced upgrade is run, then "advanced" (300)
+  std::string write_tier = "basic";
   // Manual orders to the (demo) venue. Off by default: gw still admits and answers, but every
   // order is refused RO and the header stays read-only until the operator turns it on.
   bool manual_orders = false;

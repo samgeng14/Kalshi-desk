@@ -42,7 +42,7 @@ struct KalshiWriteReply {
   std::optional<kalshi::CreateAck> create;
   std::optional<kalshi::CancelAck> cancel;
   std::string group_action, group_id, lane;   // GROUP: what was asked; create's ack fills group_id
-  int shard = -1;
+  int shard = -1;   // the job's
   std::int64_t entered_ms = 0, sent_ms = 0, ack_ms = 0;
   net::Exchange exchange; // monotonic write/first-byte/done timeline; never logged with its body
   bool pool_miss = false;

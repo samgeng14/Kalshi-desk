@@ -320,6 +320,9 @@ static void test_config() {
                           "http://evil.example:8789/", "http://127.0.0.1:/", "http://127.0.0.1:8789\"><script>"})
     CHECK(!peer_url_ok(bad));
   CHECK(throws(R"({"deskd": {"peer_url": "http://kalshi.com/"}})", "peer_url must be"));
+  // the write rate limit tier (gw/write_budget.h): Basic until the upgrade
+  CHECK(e.write_tier == "basic" && load_deskd_config(write(R"({"deskd": {"write_tier": "advanced"}})")).write_tier == "advanced");
+  CHECK(throws(R"({"deskd": {"write_tier": "premier"}})", "write_tier is"));
   CHECK(throws(R"({"deskd": {"lip_series": ["kxgold15m"]}})", "not a series ticker"));
   CHECK(throws(R"({"deskd": {"lip_series": "KXGOLD15M"}})", "wrong type"));
   CHECK(throws(R"({"deskd": {"band_series": ["KX HIGH"]}})", "band_series has"));

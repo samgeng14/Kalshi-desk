@@ -195,6 +195,7 @@ void KalshiSender::run(Worker& self) {
       r.outcome.kind=kalshi::WriteOutcome::Kind::NOT_SENT;
       r.local_code=code.empty() ? "BAD_REQUEST" : code; r.outcome.why=why;
     } else r=execute(std::move(request),job->cid,self,&*job);
+    r.shard=job->shard;   // gw's write budget bills a 429 to it
     if(job->kind==JK::GROUP) {
       r.group_action=job->group_action; r.lane=job->lane; r.shard=job->shard;
       if(r.group_id.empty()) r.group_id=job->group_id;

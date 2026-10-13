@@ -29,6 +29,7 @@
 #include "deskd/gw/manual_admission.h"
 #include "deskd/gw/order_ledger.h"
 #include "deskd/gw/sys_book.h"
+#include "deskd/gw/write_budget.h"
 #include "deskd/net/kalshi_sender.h"
 
 namespace deskd {
@@ -63,6 +64,8 @@ struct ManualPath {
   // the floor (plan section 4, limit 5): the account's equity (cash and positions, the venue's
   // marks) under it halts Systematic; 0 = none
   Money equity_floor = 0;
+  // the account's write rate limit (gw/write_budget.h): Basic until the Advanced upgrade is run
+  WriteBudget::Tier write_tier = WriteBudget::basic();
   GroupRegistry* groups = nullptr;
   std::vector<LaneSpec> lanes;   // empty: default_lanes()
   // Systematic's book across a restart (its day, positions, trade ids, HALT and the markets

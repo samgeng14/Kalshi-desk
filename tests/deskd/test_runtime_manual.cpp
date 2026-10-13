@@ -412,6 +412,11 @@ void systematic() {
   CHECK(r.d->kill_switch().rearm(now_ms(),mono_ms()+61000).empty());
   CHECK(r.until([&]{ return triggered()==0 && r.d->gw().groups_ready(&why); },20000));
   CHECK(r.d->status()["gw"]["sys_sent"]==1);
+  {   // its writes were counted against the Basic buckets (gw/write_budget.h); none refused
+    const auto wb=r.d->status()["gw"]["write_budget"];
+    CHECK(wb["cap"]==100 && wb["sys_share"]==0.8 && !wb["tokens"].empty());
+    CHECK(r.d->status()["gw"]["sys_rate_refused"]==0 && r.d->status()["gw"]["venue_429"]==0);
+  }
   // the lane rows, orders and replies the page got, checked by contract.js itself
   bool lane_on_stream=false;
   for(const auto& e:of(st,"lane")) if(e["data"]["id"]=="M2" && e["data"]["on"]==true) lane_on_stream=true;
