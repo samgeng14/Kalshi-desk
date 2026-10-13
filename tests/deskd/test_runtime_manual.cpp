@@ -674,9 +674,14 @@ void systematic_book() {
   CHECK(r.until([&]{ return gw_pos(TK)==200; },10000));
   CHECK(r.d->status()["gw"]["ledger_healthy"]==true);
   // 2. long 20 V at 0.31 and 20 W at 0.61: $0.82 + $6.20 + $12.20 of M2's $25
-  CHECK(sys(V,Side::BUY,3100,2000).code.empty());
+  // (the dropped fill above leaves a sequence gap the next fill reveals: the private feed then
+  // resyncs, and an order sent in that moment is refused STALE; sent again once it is back)
+  OrderReply placed;
+  CHECK(r.until([&]{ placed=sys(V,Side::BUY,3100,2000); return placed.code!="STALE"; },10000));
+  CHECK(placed.code.empty());
   CHECK(take(V,3100,2000)==2000);
-  CHECK(sys(W,Side::BUY,6100,2000).code.empty());
+  CHECK(r.until([&]{ placed=sys(W,Side::BUY,6100,2000); return placed.code!="STALE"; },10000));
+  CHECK(placed.code.empty());
   CHECK(take(W,6100,2000)==2000);
   CHECK(r.until([&]{ return gw_pos(V)==2000 && gw_pos(W)==2000; },10000));
   // 3. selling all 20 W: at its full worst case ($0.41 x 20) the lane would pass $25, but it only
