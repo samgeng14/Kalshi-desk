@@ -57,6 +57,7 @@ bool Deskd::init_venue(std::string* err) {
   if (options_.rest_poll_ms > 0) ro.poll_ms = options_.rest_poll_ms;
   if (options_.rest_listing_ms > 0) ro.listing_poll_ms = options_.rest_listing_ms;
   if (options_.rest_gap_ms >= 0) ro.request_gap_ms = options_.rest_gap_ms;
+  ro.lip_series = cfg_.lip_series;   // LIP programs for the share estimate (strat/lip.h)
   rest_ = std::make_unique<rest::State>(*factory_, *re, signer_.get(),
       [this](std::shared_ptr<const rest::Snapshot> s) { on_rest(std::move(s)); }, ro);
   // the fill model's last hour of a market's prints, read once its book first arrives
@@ -747,5 +748,32 @@ json Deskd::watch(const json& request) {
   const auto m = mkt_row(it->second,pin,current->live.count(tk));
   pub_->post(PubData{"mkt",m});   // the market's row follows on the stream
   return {{"ok",true},{"pin",pin}};
+}
+// Our LIP share on each program's market, once a second (strat/lip.h), from the venue's book (our
+// quotes in it) and Systematic's resting orders; each window that ends goes to store.
+void Deskd::lip_step(std::int64_t now) {
+  if (!rest_ || !gw_) return;
+  const auto snap = rest_->snapshot();
+  if (!snap->lip.empty()) {
+    const auto books = std::atomic_load(&books_);
+    const auto view = gw_->sys_view();
+    for (const auto& [tk, program] : snap->lip) {
+      if (!books) break;
+      const auto b = books->find(tk);
+      if (b == books->end()) continue;
+      std::vector<LipOwn> ours;
+      if (view)
+        for (const auto& [cid, o] : view->orders)
+          if (o.ticker == tk && !o.terminal && o.left > 0 && (o.state == OrdState::WORK || o.state == OrdState::PART))
+            ours.push_back({o.side == Side::BUY, o.price, o.left});
+      lip_meter_.sample(tk, program, b->second, ours, now);
+    }
+  }
+  for (auto& row : lip_meter_.finished(now)) {
+    DLOG_INFO("LIP %s: %s s scored of %s, mean share %s, est $%s of $%s", row["tk"].get<std::string>().c_str(),
+              row["scored_s"].dump().c_str(), row["seconds"].dump().c_str(), row["mean_share"].dump().c_str(),
+              row["est"].get<std::string>().c_str(), row["reward"].get<std::string>().c_str());
+    store_.inbox().push(StoreRecord{"lip_windows", row.dump()});
+  }
 }
 }

@@ -825,6 +825,14 @@ WireRequest build_get_trades(const TradesQuery& q) {
   return get("/markets/trades", s, false);
 }
 
+WireRequest build_get_incentive_programs(const std::string& status, const std::string& cursor, int limit) {
+  std::string s;
+  add_q(s, "status", status);
+  add_q(s, "limit", limit, limit > 0);
+  add_q(s, "cursor", cursor);
+  return get("/incentive_programs", s, false);
+}
+
 std::string request_bytes(const WireRequest& r, const std::string& host_header,
                           const std::vector<std::pair<std::string, std::string>>& auth_headers,
                           const std::string& user_agent) {
@@ -939,6 +947,48 @@ std::optional<Page<FillRow>> parse_fills(const std::string& body, std::string* w
 std::optional<Page<TradeRow>> parse_trades(const std::string& body, std::string* why) {
   return read_page<TradeRow>(body, "trades", read_trade, why);
 }
+std::optional<Page<IncentiveRow>> parse_incentive_programs(const std::string& body, std::string* why) {
+  auto j = parse_object(body, why);
+  if (!j) return std::nullopt;
+  Page<IncentiveRow> page;
+  const auto it = j->find("incentive_programs");
+  if (it != j->end() && !it->is_null()) {
+    if (!it->is_array()) {
+      if (why) *why = "incentive_programs: not an array";
+      return std::nullopt;
+    }
+    for (const auto& row : *it) {
+      Rd r(row, "incentive_programs[" + std::to_string(page.rows.size()) + "]");
+      IncentiveRow p;
+      p.market_ticker = r.str_or_empty("market_ticker");
+      p.type = r.str_or_empty("incentive_type");
+      if (r.ok() && p.type == "liquidity") {
+        p.period_reward = r.integer("period_reward");
+        if (auto t = r.ocount("target_size_fp")) p.target_size = *t;
+        p.discount_bps = static_cast<int>(r.oint("discount_factor_bps").value_or(0));
+        p.start_ms = r.otime("start_date").value_or(0);
+        p.end_ms = r.otime("end_date").value_or(0);
+        if (r.ok() && (p.market_ticker.empty() || !p.start_ms || p.end_ms <= p.start_ms || p.period_reward < 0 ||
+                       p.discount_bps < 0 || p.discount_bps > 10000))
+          r.fail("liquidity", "a program without a market, a period, or a sane reward and discount");
+      }
+      if (!r.ok()) {
+        if (why) *why = r.err;
+        return std::nullopt;
+      }
+      page.rows.push_back(std::move(p));
+    }
+  }
+  for (const char* key : {"next_cursor", "cursor"}) {
+    const auto c = j->find(key);
+    if (c != j->end() && c->is_string() && !c->get<std::string>().empty()) {
+      page.cursor = c->get<std::string>();
+      break;
+    }
+  }
+  return page;
+}
+
 std::optional<Page<PositionRow>> parse_positions(const std::string& body, std::string* why) {
   return read_page<PositionRow>(body, "market_positions", read_position, why);
 }

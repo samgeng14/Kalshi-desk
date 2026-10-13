@@ -2,11 +2,12 @@
 // store (plan section 7): the only writer of data/ops.sqlite. Rows reach it by message from gw:
 // "orders" (an order's whole timeline once it ends: click, web, gw, the wire, the venue's ack,
 // the private feed, fills, the cancel, the end), "fills" (each fill once, by trade id) and, from
-// strat, "markouts" (each fill's 1/10/60 s markout against the mid, per contract). It
+// strat, "markouts" (each fill's 1/10/60 s markout against the mid, per contract) and
+// "lip_windows" (each LIP program window's estimated share and dollars, strat/lip.h). It
 // writes them in one transaction every quarter second, in WAL mode, so a reader (research,
 // tools/latency_report.py) never blocks it. A full inbox loses the row and gw counts it; a
 // database that cannot be opened or written says why in /ops/status and the desk trades on.
-// Not yet: the money ledger, LIP windows, the nightly copy.
+// Not yet: the money ledger (LIP payouts against these estimates among it), the nightly copy.
 #include <atomic>
 #include <cstdint>
 #include <memory>
@@ -19,7 +20,7 @@ namespace deskd {
 class Worker;
 
 struct StoreRecord {
-  std::string table;   // "orders", "fills" or "markouts"
+  std::string table;   // "orders", "fills", "markouts" or "lip_windows"
   std::string json;
 };
 

@@ -805,6 +805,33 @@ RestReply rest_route(Engine& e, const net::Request& r, const std::string& path, 
       return ok(200, json{{"orderbook_fp", json{{"yes_dollars", side(false)}, {"no_dollars", side(true)}}}});
     }
   }
+  // GET /incentive_programs (public): status active (running now) or all; limit; cursor "i<n>". The
+  // documented `type` filter is ignored, as the venue ignores it (scripts/incentive_audit.py).
+  if (seg[0] == "incentive_programs" && r.method == "GET" && seg.size() == 1) {
+    bool b = false;
+    const auto limit = qint(r, "limit", &b);
+    if (b || (limit && (*limit < 1 || *limit > 10000))) return bad("limit must be 1-10000");
+    const std::string status = qstr(r, "status"), cursor = qstr(r, "cursor");
+    long long skip = 0;
+    if (!cursor.empty()) {
+      if (cursor[0] != 'i' || cursor.size() > 18 || cursor.find_first_not_of("0123456789", 1) != std::string::npos)
+        return bad("bad cursor");
+      skip = std::stoll(cursor.substr(1));
+    }
+    const long long n = limit ? *limit : 100;
+    json out = json::array();
+    long long seen = 0;
+    bool more = false;
+    for (const auto& p : e.incentives()) {
+      if (status == "active" && (now < p.start_ms || now >= p.end_ms)) continue;
+      if (seen++ < skip) continue;
+      if (static_cast<long long>(out.size()) == n) { more = true; break; }
+      out.push_back({{"market_ticker", p.ticker}, {"incentive_type", p.type}, {"period_reward", p.reward},
+                     {"target_size_fp", qty_str(p.target)}, {"discount_factor_bps", p.discount_bps},
+                     {"start_date", rfc3339(p.start_ms)}, {"end_date", rfc3339(p.end_ms)}, {"paid_out", false}});
+    }
+    return ok(200, json{{"incentive_programs", out}, {"next_cursor", more ? "i" + std::to_string(skip + n) : ""}});
+  }
   if (seg[0] == "exchange" && seg.size() == 2 && seg[1] == "status" && r.method == "GET")
     return ok(200, json{{"exchange_active", true}, {"trading_active", true}});
   return rest_error(404, "not_found", "no such route");

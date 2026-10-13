@@ -63,13 +63,25 @@ The work is on GitHub: `samgeng14/kalshi-desk`, branch `claude/pensive-meitner-8
   EIA's Thursday 10:30 natural-gas storage report only. Add holiday moves from EIA's schedule, and
   CPI, payrolls and FOMC dates before gold or FX lanes trade. A missing file runs without it (and
   says so); a malformed one refuses the start.
+- **LIP share (an estimate):** REST reads Kalshi's public `GET /incentive_programs` every 2 minutes
+  for the LIP series' markets (filtering `incentive_type` itself: the venue ignores its type
+  filter). Once a second strat estimates our share of each program's score from the book and
+  Systematic's resting quotes:
+  - a side counts from its best price out to the target size, each cent away discounted by the
+    program's `discount_factor_bps`, and ours stand at the back of a level;
+  - a second pays only when both sides reach the target;
+  - its reward is split evenly between the two sides.
+
+  `/ops/status` shows `lip.markets`, and each finished window goes to `ops.sqlite` `lip_windows`
+  (seconds, seconds scored, mean share, est $). The venue publishes the terms, not its scoring
+  code. Reconcile `lip_windows` against the payouts the account receives before trusting it.
 - **Demo checks:** `tools/demo_checks` (the probe's `--order-check --group-check --venue-checks
   --feeds-check`). Venue checks: duplicate cid, shortest expiry, reduce_only on a resting order
   and on a flat IOC, post-only at the ask, self-trade both ways. Amend and
   `target_balance_allocation` are not run yet (unverified request shapes).
 - **Still to do from the plan:** the demo proof on the Mac (`tools/demo_checks`, then 50+ demo
-  orders); the money ledger and LIP windows in ops.sqlite and its nightly copy (markouts are in);
-  LIP share and payout; engines for S1, C1 and X1.
+  orders); the money ledger in ops.sqlite (LIP payouts reconciled against `lip_windows`) and its
+  nightly copy; engines for S1, C1 and X1.
 
 ## Where
 

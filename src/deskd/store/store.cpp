@@ -29,6 +29,10 @@ CREATE TABLE IF NOT EXISTS fills(
   fid TEXT PRIMARY KEY, cid TEXT, oid TEXT, tk TEXT, side TEXT, qty REAL, px REAL, fee REAL,
   taker INTEGER, ts_ms INTEGER, recv_ms INTEGER, shard INTEGER, own TEXT, lane TEXT, json TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS fills_ts ON fills(ts_ms);
+CREATE TABLE IF NOT EXISTS lip_windows(
+  tk TEXT NOT NULL, start_ms INTEGER NOT NULL, end_ms INTEGER, seconds INTEGER, scored_s INTEGER, quoted_s INTEGER,
+  mean_share REAL, est REAL, reward REAL, target REAL, discount_bps INTEGER, json TEXT NOT NULL,
+  PRIMARY KEY(tk, start_ms));
 CREATE TABLE IF NOT EXISTS markouts(
   fid TEXT NOT NULL, h TEXT NOT NULL, mo REAL, mid REAL, json TEXT NOT NULL, PRIMARY KEY(fid, h));
 )SQL";
@@ -37,6 +41,9 @@ const char* kOrder =
     "INSERT OR REPLACE INTO orders(cid,own,lane,tk,side,tif,px,qty,filled,st,why,shard,click_ms,recv_ms,gw_ms,"
     "sent_ms,ack_ms,priv_ms,fill_ms,cx_ms,cx_ack_ms,done_ms,w_ms,fb_ms,rd_ms,json) "
     "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
+const char* kLip =
+    "INSERT OR REPLACE INTO lip_windows(tk,start_ms,end_ms,seconds,scored_s,quoted_s,mean_share,est,reward,target,"
+    "discount_bps,json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)";
 const char* kMarkout = "INSERT OR IGNORE INTO markouts(fid,h,mo,mid,json) VALUES(?,?,?,?,?)";
 const char* kFill =
     "INSERT OR IGNORE INTO fills(fid,cid,oid,tk,side,qty,px,fee,taker,ts_ms,recv_ms,shard,own,lane,json) "
@@ -71,8 +78,9 @@ const json& at(const json& j, const char* k) {
 
 struct Db {
   sqlite3* db = nullptr;
-  sqlite3_stmt *order = nullptr, *fill = nullptr, *markout = nullptr;
+  sqlite3_stmt *order = nullptr, *fill = nullptr, *markout = nullptr, *lip = nullptr;
   ~Db() {
+    sqlite3_finalize(lip);
     sqlite3_finalize(order);
     sqlite3_finalize(fill);
     sqlite3_finalize(markout);
@@ -96,7 +104,8 @@ bool open(Db& d, const std::string& path, std::string* why) {
   }
   if (sqlite3_prepare_v2(d.db, kOrder, -1, &d.order, nullptr) != SQLITE_OK ||
       sqlite3_prepare_v2(d.db, kFill, -1, &d.fill, nullptr) != SQLITE_OK ||
-      sqlite3_prepare_v2(d.db, kMarkout, -1, &d.markout, nullptr) != SQLITE_OK) {
+      sqlite3_prepare_v2(d.db, kMarkout, -1, &d.markout, nullptr) != SQLITE_OK ||
+      sqlite3_prepare_v2(d.db, kLip, -1, &d.lip, nullptr) != SQLITE_OK) {
     *why = path + ": " + d.err();
     return false;
   }
@@ -141,6 +150,17 @@ void write_markout(sqlite3_stmt* st, const json& j) {
   sqlite3_bind_text(st, ++i, text.c_str(), static_cast<int>(text.size()), SQLITE_TRANSIENT);
 }
 
+void write_lip(sqlite3_stmt* st, const json& j) {
+  int i = 0;
+  for (const char* k : {"tk", "start_ms", "end_ms", "seconds", "scored_s", "quoted_s", "mean_share"}) bind(st, ++i, at(j, k));
+  bind(st, ++i, at(j, "est"), true);
+  bind(st, ++i, at(j, "reward"), true);
+  bind(st, ++i, at(j, "target"));
+  bind(st, ++i, at(j, "discount_bps"));
+  const auto text = j.dump();
+  sqlite3_bind_text(st, ++i, text.c_str(), static_cast<int>(text.size()), SQLITE_TRANSIENT);
+}
+
 }  // namespace
 
 void StoreWorker::fail(const std::string& why) {
@@ -169,13 +189,15 @@ void StoreWorker::run(Worker& self) {
     sqlite3_exec(d.db, "BEGIN", nullptr, nullptr, nullptr);
     for (const auto& r : batch) {
       const auto j = json::parse(r.json, nullptr, false);
-      sqlite3_stmt* st = r.table == "orders" ? d.order : r.table == "fills" ? d.fill : r.table == "markouts" ? d.markout : nullptr;
+      sqlite3_stmt* st = r.table == "orders" ? d.order : r.table == "fills" ? d.fill : r.table == "markouts" ? d.markout
+                       : r.table == "lip_windows" ? d.lip : nullptr;
       if (!st || !j.is_object()) { ++bad; continue; }
       sqlite3_reset(st);
       sqlite3_clear_bindings(st);
       if (r.table == "orders") write_order(st, j);
       else if (r.table == "fills") write_fill(st, j);
-      else write_markout(st, j);
+      else if (r.table == "markouts") write_markout(st, j);
+      else write_lip(st, j);
       if (sqlite3_step(st) == SQLITE_DONE) ++done;
       else { ++bad; fail("writing " + r.table + ": " + d.err()); }
     }

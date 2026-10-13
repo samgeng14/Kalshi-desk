@@ -162,6 +162,7 @@ bool Deskd::start(std::string* err) {
       if (fair_ && rest_) fair_->step(*rest_->snapshot(), now_ms());
       if (lip_) lip_->step(now_ms());
       if (band_) band_->step(now_ms());
+      lip_step(now_ms());
       if (markouts_)
         for (auto& row : markouts_->step(now_ms())) {
           store_.inbox().push(StoreRecord{"markouts", row.dump()});
@@ -266,6 +267,8 @@ json Deskd::status() const {
                 {"dropped", q_cx_.dropped()}}},
               {"kill", {{"generation", kill_.generation()}, {"active", kill_.active()}}},
               {"calendar", {{"path", cfg_.calendar}, {"releases", calendar_.size()}, {"why", calendar_why_}}},
+              {"lip", {{"programs", rest_ ? rest_->snapshot()->lip.size() : 0}, {"markets", lip_meter_.status()},
+                       {"note", "an estimate (strat/lip.h) until payouts are reconciled"}}},
               {"store",
                {{"path", store_.path()},
                 {"received", store_.received()},

@@ -181,6 +181,9 @@ struct TradesQuery {
   int limit = 0;                  // 1..1000
 };
 WireRequest build_get_trades(const TradesQuery& q);
+// GET /incentive_programs (public): Kalshi's incentive programs, `limit` a page. The venue ignores
+// its documented `type` filter (scripts/incentive_audit.py), so callers read incentive_type.
+WireRequest build_get_incentive_programs(const std::string& status, const std::string& cursor, int limit);
 WireRequest build_get_exchange_status();
 
 // The bytes to write: request line, Host, the auth headers when given, Accept and Content-Type,
@@ -319,6 +322,19 @@ struct TradeRow {               // a public print
   std::int64_t ts_ms = 0;
 };
 std::optional<Page<TradeRow>> parse_trades(const std::string& body, std::string* why);
+// A liquidity incentive program (LIP) on one market: period_reward (in 1/10,000 $, the venue's
+// centi-cents) is paid over [start, end) on per-second book snapshots; target_size and the
+// discount per cent from the best price decide what scores (strat/lip.h)
+struct IncentiveRow {
+  std::string market_ticker, type;   // type: the row's incentive_type ("liquidity", "volume", ...)
+  std::int64_t period_reward = 0;    // 1/10,000 $
+  Qty target_size = 0;
+  int discount_bps = 0;
+  std::int64_t start_ms = 0, end_ms = 0;
+};
+// Every row's type; only liquidity rows are read whole (one that breaks its shape fails the page:
+// a shape change is loud); the others carry their ticker and type. next_cursor, else cursor.
+std::optional<Page<IncentiveRow>> parse_incentive_programs(const std::string& body, std::string* why);
 std::optional<Page<PositionRow>> parse_positions(const std::string& body, std::string* why);
 std::optional<Balance> parse_balance(const std::string& body, std::string* why);
 std::optional<MarketRow> parse_market(const std::string& body, std::string* why);   // {"market":{...}}

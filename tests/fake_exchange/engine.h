@@ -333,6 +333,16 @@ class Engine {
     std::int64_t ts_ms = 0;
   };
   const std::deque<PublicTrade>& public_trades() const { return public_trades_; }
+  // the incentive programs GET /incentive_programs lists (scripts/incentive_audit.py's fields): a
+  // liquidity program pays `reward` (1/10,000 $) over [start, end) to resting quotes near the best
+  struct Incentive {
+    std::string ticker, type = "liquidity";
+    std::int64_t start_ms = 0, end_ms = 0, reward = 0;
+    Qty target = 0;
+    int discount_bps = 0;
+  };
+  void add_incentive(Incentive i) { incentives_.push_back(std::move(i)); }
+  const std::vector<Incentive>& incentives() const { return incentives_; }
   const std::map<std::pair<int, std::string>, Position>& positions() const { return positions_; }
 
   // ---- order groups
@@ -412,6 +422,7 @@ class Engine {
   std::map<std::string, Group> groups_;
   std::vector<Event> events_;
   std::deque<PublicTrade> public_trades_;
+  std::vector<Incentive> incentives_;
   std::int64_t last_cancel_all_ms_ = std::numeric_limits<std::int64_t>::min() / 2;
   bool tape_debts_ = false;
   std::uint64_t transfers_ = 0;

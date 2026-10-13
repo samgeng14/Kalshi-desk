@@ -496,6 +496,7 @@ bool State::refresh(Worker* worker) {
     }
   }
   metadata(next,worker);
+  incentives(next, worker);
   next.ts_ms = now_ms();
   if (next.account_ready && commit_ && !commit_(fence)) {
     // These pages may straddle a private event, so they never become the account. The last
@@ -524,6 +525,39 @@ bool State::refresh(Worker* worker) {
   const bool ready = next.ready;
   publish(std::move(next));
   return ready;
+}
+
+void State::incentives(Snapshot& next, Worker* worker) {
+  if (options_.lip_series.empty() || (last_lip_mono_ && mono_ms() - last_lip_mono_ < options_.lip_poll_ms)) return;
+  last_lip_mono_ = mono_ms();
+  const std::int64_t now = now_ms();
+  std::map<std::string, kalshi::IncentiveRow> lip;
+  std::string cursor, why, body;
+  for (int page = 0; page < options_.lip_max_pages; ++page) {
+    if (!get(kalshi::build_get_incentive_programs("active", cursor, 1000), &body, &why, worker)) break;
+    const auto rows = kalshi::parse_incentive_programs(body, &why);
+    if (!rows) break;
+    for (const auto& p : rows->rows) {
+      if (p.type != "liquidity" || p.end_ms <= now) continue;   // the venue's type filter is ignored: read it here
+      const bool ours = std::any_of(options_.lip_series.begin(), options_.lip_series.end(), [&](const std::string& s) {
+        return p.market_ticker.size() > s.size() && p.market_ticker.compare(0, s.size(), s) == 0 && p.market_ticker[s.size()] == '-';
+      });
+      if (!ours) continue;
+      auto& slot = lip[p.market_ticker];
+      // the one running now, else the soonest
+      const bool running = p.start_ms <= now, held = slot.end_ms && slot.start_ms <= now;
+      if (!slot.end_ms || (running && !held) || (running == held && p.start_ms < slot.start_ms)) slot = p;
+    }
+    cursor = rows->cursor;
+    if (cursor.empty()) break;
+  }
+  if (!why.empty()) {
+    // the last good read stays; LIP is an estimate, never a reason to refuse anything
+    DLOG_WARN("rest: incentive programs: %s", why.c_str());
+    return;
+  }
+  next.lip = std::move(lip);
+  next.lip_ms = now;
 }
 
 void State::request_trades(const std::string& ticker, std::int64_t since_ms) {

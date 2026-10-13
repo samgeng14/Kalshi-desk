@@ -56,6 +56,10 @@ struct Snapshot {
   std::int64_t account_began_ms = 0, account_ms = 0, listing_ms = 0, ts_ms = 0;
   // the windows `orders` (beyond the resting ones) and `fills` cover, from the read that made them
   std::int64_t orders_from_ms = 0, fills_from_ms = 0;
+  // the liquidity incentive programs on Options::lip_series' markets (ticker -> the one running,
+  // else the next), from GET /incentive_programs; lip_ms when they were read (0: never)
+  std::map<std::string, kalshi::IncentiveRow> lip;
+  std::int64_t lip_ms = 0;
   std::uint64_t revision = 0;
   std::string error;
   std::string metadata_error;
@@ -86,6 +90,9 @@ struct Options {
   // day (13,500 orders by hour 4 of the soak) until almost every one overlapped a private event
   // and was discarded, and orders went STALE (2026-10-13).
   int incremental_overlap_ms = 300000, incremental_max_gone = 10;
+  // LIP programs (strat/lip.h): read every lip_poll_ms for markets of these series; none: never
+  std::vector<std::string> lip_series;
+  int lip_poll_ms = 120000, lip_max_pages = 10;
 };
 
 class State {
@@ -126,6 +133,7 @@ class State {
   bool account(Snapshot& next, std::string* why, Worker* worker);
   bool listing(Snapshot& next, std::string* why, Worker* worker);
   void metadata(Snapshot& next, Worker* worker);
+  void incentives(Snapshot& next, Worker* worker);
   void publish(Snapshot next);
   void backfill_trades(Worker* worker);
   void controls(bool pins, std::set<std::string> values);
@@ -147,7 +155,7 @@ class State {
   std::atomic<bool> refresh_requested_{false};
   ClockCheck clock_;
   std::unique_ptr<net::Conn> conn_;  // REST owner only; read connections can be reused
-  std::int64_t started_ms_ = 0, last_listing_mono_ = 0;
+  std::int64_t started_ms_ = 0, last_listing_mono_ = 0, last_lip_mono_ = 0;
   bool mve_filter_refused_ = false;
   std::int64_t last_request_mono_ = 0;   // the venue answered 400 to mve_filter=exclude: listed without it
   struct CachedSeries { kalshi::SeriesRow row; std::int64_t fetched_ms = 0, attempted_ms = 0; };

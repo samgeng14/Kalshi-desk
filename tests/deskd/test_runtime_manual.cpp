@@ -488,6 +488,10 @@ void systematic_maker() {
     e.add_market(spec,now);
     e.street_add(W,false,4000,500,now);   // YES bid 0.40 x5
     e.street_add(W,true,5400,500,now);    // NO bid 0.54 x5: YES ask 0.46 x5
+    // a liquidity incentive on it: $20 over the window, target 10 a side, half a cent away half
+    fakex::Engine::Incentive lip; lip.ticker=W; lip.start_ms=now-60000; lip.end_ms=now+840000;
+    lip.reward=200000; lip.target=1000; lip.discount_bps=5000;
+    e.add_incentive(lip);
   },true);
   r.relay_pyth("Commodities.Index.NATGAS/USD",3.1);
   CHECK(r.ready());
@@ -516,6 +520,16 @@ void systematic_maker() {
   const bool quoted=r.until([&]{ return has(fakex::Side::BID,4100,1000) && has(fakex::Side::ASK,4500,1000); },15000);
   if(!quoted) std::fprintf(stderr,"maker: %s\nquotes: %zu\n",r.d->status()["maker"].dump().c_str(),quotes().size());
   CHECK(quoted);
+  {   // our LIP share (strat/lip.h): 10 a side at 0.41 / 0.45 inside the street's 5s is the whole
+      // target on both sides, so all of each second's reward
+    const bool lip=r.until([&]{
+      const auto s=r.d->status()["lip"];
+      return s["programs"]==1 && s["markets"].contains(W) && s["markets"][W]["share_now"]==1.0 &&
+             s["markets"][W]["scored_s"].get<int>()>=1;
+    });
+    if(!lip) std::fprintf(stderr,"lip: %s\n",r.d->status()["lip"].dump().c_str());
+    CHECK(lip);
+  }
   // the street sells 10 into our bid
   r.venue.f->with_engine([&](fakex::Engine& e,std::int64_t now) { CHECK(e.street_take(W,fakex::Side::ASK,4100,1000,now)==1000); });
   CHECK(r.until([&]{ const auto v=r.d->gw().sys_view(); return v && v->positions.count("M1|"+W) && v->positions.at("M1|"+W)==1000; }));
