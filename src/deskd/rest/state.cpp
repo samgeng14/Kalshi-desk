@@ -281,6 +281,15 @@ bool State::account(Snapshot& next, std::string* why, Worker* worker) {
   std::vector<kalshi::PositionRow> positions;
   if (!pages(&positions, [&](const std::string& cursor) { q.cursor = cursor; return kalshi::build_get_positions(q); },
              kalshi::parse_positions, fetch, options_.max_pages, why)) return false;
+  // The day's history: whole on the first read, then only what is new since the last good one
+  // (Options::incremental_overlap_ms says why).
+  const std::int64_t since = orders_since_ms_ > 0 ? std::min(orders_since_ms_, started_ms_ - 5000) : started_ms_ - 5000;
+  const std::int64_t orders_from = std::max(since, et_midnight_ms(now_ms()) - 86400000);
+  // Fills since the earlier of this start and today's ET midnight: the day's P&L is built from them.
+  const std::int64_t fills_from = std::min(started_ms_ - 5000, et_midnight_ms(now_ms()));
+  bool whole = whole_read_next_ || !next.account_ready || next.account_began_ms <= 0 ||
+               next.orders_from_ms != orders_from || next.fills_from_ms != fills_from;
+  const std::int64_t delta_from = next.account_began_ms - options_.incremental_overlap_ms;
   q = kalshi::ListQuery{};
   q.limit = options_.page_size;
   q.status = "resting";
@@ -288,21 +297,46 @@ bool State::account(Snapshot& next, std::string* why, Worker* worker) {
   auto orders_builder = [&](const std::string& cursor) { q.cursor = cursor; return kalshi::build_get_orders(q); };
   if (!pages(&orders, orders_builder, kalshi::parse_orders, fetch, options_.max_pages, why)) return false;
   q.status.clear();
-  const std::int64_t since = orders_since_ms_ > 0 ? std::min(orders_since_ms_, started_ms_ - 5000) : started_ms_ - 5000;
-  q.min_ts = std::max(since, et_midnight_ms(now_ms()) - 86400000) / 1000;
+  q.min_ts = (whole ? orders_from : std::max(orders_from, delta_from)) / 1000;
   if (!pages(&recent, orders_builder, kalshi::parse_orders, fetch, options_.max_pages, why)) return false;
+  // an order resting at the last read that neither list has now left the book before the overlap
+  std::set<std::string> fresh;
+  for (const auto& row : orders) fresh.insert(row.order_id);
+  for (const auto& row : recent) fresh.insert(row.order_id);
+  std::vector<std::string> gone;
+  if (!whole)
+    for (const auto& row : next.orders)
+      if (row.status == kalshi::OrderStatus::RESTING && !fresh.count(row.order_id)) gone.push_back(row.order_id);
+  if (!whole && static_cast<int>(gone.size()) > options_.incremental_max_gone) {
+    whole = true;
+    gone.clear();
+    recent.clear();
+    q.min_ts = orders_from / 1000;
+    if (!pages(&recent, orders_builder, kalshi::parse_orders, fetch, options_.max_pages, why)) return false;
+  }
   std::map<std::string, kalshi::OrderRow> unique_orders;
+  if (!whole) for (const auto& row : next.orders) unique_orders[row.order_id] = row;
   for (auto& row : orders) unique_orders[row.order_id] = std::move(row);
   for (auto& row : recent) unique_orders[row.order_id] = std::move(row);
+  for (const auto& id : gone) {
+    // a failure here reads the whole day next time, which needs no order by id
+    whole_read_next_ = true;
+    if (!fetch(kalshi::build_get_order(id), &body, why)) return false;
+    auto row = kalshi::parse_order(body, why);
+    if (!row) return false;
+    if (row->order_id != id) { *why = "GET order " + id + " answered another order"; return false; }
+    unique_orders[id] = std::move(*row);
+  }
   orders.clear();
   for (auto& entry : unique_orders) orders.push_back(std::move(entry.second));
   std::vector<kalshi::FillRow> fills;
-  // Fills since the earlier of this start and today's ET midnight: the day's P&L is built from them.
-  q.min_ts = std::min(started_ms_ - 5000, et_midnight_ms(now_ms())) / 1000;
+  q.min_ts = (whole ? fills_from : std::max(fills_from, delta_from)) / 1000;
   if (!pages(&fills, [&](const std::string& cursor) { q.cursor = cursor; return kalshi::build_get_fills(q); },
              kalshi::parse_fills, fetch, options_.max_pages, why)) return false;
+  auto fill_key = [](const kalshi::FillRow& row) { return row.trade_id.empty() ? row.fill_id : row.trade_id; };
   std::map<std::string, kalshi::FillRow> unique_fills;
-  for (auto& row : fills) unique_fills[row.trade_id.empty() ? row.fill_id : row.trade_id] = std::move(row);
+  if (!whole) for (const auto& row : next.fills) unique_fills[fill_key(row)] = row;
+  for (auto& row : fills) unique_fills[fill_key(row)] = std::move(row);
   fills.clear();
   for (auto& entry : unique_fills) fills.push_back(std::move(entry.second));
   std::set<int> shards{0};
@@ -323,8 +357,11 @@ bool State::account(Snapshot& next, std::string* why, Worker* worker) {
   next.positions = std::move(positions);
   next.orders = std::move(orders);
   next.fills = std::move(fills);
+  next.orders_from_ms = orders_from;
+  next.fills_from_ms = fills_from;
   next.account_ready = true;
   next.account_ms = now_ms();
+  whole_read_next_ = false;
   return true;
 }
 
@@ -473,6 +510,8 @@ bool State::refresh(Worker* worker) {
     next.positions = prev->positions;
     next.orders = prev->orders;
     next.fills = prev->fills;
+    next.orders_from_ms = prev->orders_from_ms;
+    next.fills_from_ms = prev->fills_from_ms;
     next.account_ready = prev->account_ready;
     next.account_ms = prev->account_ms;
     next.account_began_ms = prev->account_began_ms;

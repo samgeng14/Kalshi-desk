@@ -227,6 +227,97 @@ void reconcile() {
   CHECK(cash["shards"][0]["free"]=="496.0000" && cash["shards"][0]["cash"]=="500.0000");
   CHECK(cash["total"]=="575.0000" && cash["free"]=="571.0000");
 }
+// The day's orders and fills: whole on the first read, then only what is new, merged by id; an
+// order that left the book before the window is read by its id, and too many of them, or a
+// failure, read the whole day again (rest::Options::incremental_overlap_ms).
+void incremental() {
+  fakex::FakeConfig cfg; cfg.rate_limits=false;
+  fakex::FakeKalshi fake(cfg);
+  fake.with_engine([](fakex::Engine& e,std::int64_t now) {
+    fakex::MarketSpec m; m.ticker="INC-0"; m.exchange_index=0; m.close_ms=now+3600000; e.add_market(m,now);
+    e.set_cash(0,0,500*fakex::kMicrosPerDollar,now);
+  });
+  std::string why; CHECK(fake.start(&why));
+  auto signer=key();
+  SendGuard guard(false,nullptr); net::ConnFactory factory(guard);
+  const auto endpoint=net::Endpoint::parse("http://127.0.0.1:"+std::to_string(fake.port())+"/trade-api/v2",&why);
+  std::map<std::string,std::string> id_of;   // cid -> order id
+  auto place=[&](const std::string& tag,int n) {
+    fake.with_engine([&](fakex::Engine& e,std::int64_t now) {
+      for (int i=0;i<n;++i) {
+        fakex::NewOrder o; o.ticker="INC-0"; o.client_order_id="Minc-"+tag+std::to_string(i);
+        o.price=1000+100*i; o.count=100; o.exchange_index=0; o.tif=fakex::Tif::GTC; o.post_only=true;
+        const auto r=e.create(o,now); CHECK(!r.err); id_of[o.client_order_id]=r.order_id;
+      }
+    });
+  };
+  auto find=[](const rest::Snapshot& s,const std::string& cid) -> const kalshi::OrderRow* {
+    for (const auto& o:s.orders) if (o.client_order_id==cid) return &o;
+    return nullptr;
+  };
+  auto count=[&](const std::string& what) {   // requests since the log was cleared
+    int n=0;
+    for (const auto& line:fake.wire_log())
+      if (line.size()>=what.size() && line.compare(line.size()-what.size(),what.size(),what)==0) ++n;
+    return n;
+  };
+  auto by_id=[&] {
+    int n=0;
+    for (const auto& line:fake.wire_log()) if (line.find("GET /portfolio/orders/")!=std::string::npos) ++n;
+    return n;
+  };
+  place("a",6);
+  std::this_thread::sleep_for(std::chrono::milliseconds(1100));   // older than the next read's start second
+  rest::Options opts; opts.page_size=2; opts.request_gap_ms=0; opts.incremental_overlap_ms=0; opts.incremental_max_gone=3;
+  rest::State state(factory,*endpoint,signer.get(),{},opts);
+  fake.clear_wire_log();
+  CHECK(state.refresh_once() && state.snapshot()->orders.size()==6);
+  const int whole_pages=count("GET /portfolio/orders");
+  // the best bid fills, another is cancelled: both left the book, so each is read by its id
+  fake.with_engine([&](fakex::Engine& e,std::int64_t now) {
+    CHECK(e.street_take("INC-0",fakex::Side::ASK,1500,100,now)==100);
+    CHECK(!e.cancel(id_of["Minc-a0"],"INC-0",0,0,now).err);
+  });
+  fake.clear_wire_log();
+  CHECK(state.refresh_once());
+  auto s=state.snapshot();
+  CHECK(s->orders.size()==6 && s->fills.size()==1 && by_id()==2);
+  CHECK(count("GET /portfolio/orders")<whole_pages);   // the old orders were not read again
+  CHECK(find(*s,"Minc-a5") && find(*s,"Minc-a5")->status==kalshi::OrderStatus::EXECUTED);
+  CHECK(find(*s,"Minc-a0") && find(*s,"Minc-a0")->status==kalshi::OrderStatus::CANCELED);
+  CHECK(find(*s,"Minc-a1") && find(*s,"Minc-a1")->status==kalshi::OrderStatus::RESTING);
+  // a read with nothing new keeps every row and the one fill, counted once
+  fake.clear_wire_log();
+  CHECK(state.refresh_once() && state.snapshot()->orders.size()==6 && state.snapshot()->fills.size()==1 && by_id()==0);
+  // more than incremental_max_gone left at once: the whole day again, nothing by id
+  fake.with_engine([&](fakex::Engine& e,std::int64_t now) {   // one by one: a cancel-all would cancel the next minute's too
+    for (int i=1;i<=4;++i) CHECK(!e.cancel(id_of["Minc-a"+std::to_string(i)],"INC-0",0,0,now).err);
+  });
+  fake.clear_wire_log();
+  CHECK(state.refresh_once());
+  s=state.snapshot();
+  CHECK(by_id()==0 && s->orders.size()==6 && s->fills.size()==1);
+  for (const auto& o:s->orders) CHECK(o.status!=kalshi::OrderStatus::RESTING);
+  // new orders come in the window; once older than the read's start, one that leaves is read by id,
+  // and when that read fails the account keeps its last read and the next is whole
+  place("b",2);
+  CHECK(state.refresh_once() && state.snapshot()->orders.size()==8);
+  std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+  CHECK(state.refresh_once());
+  fake.with_engine([&](fakex::Engine& e,std::int64_t now) { CHECK(!e.cancel(id_of["Minc-b0"],"INC-0",0,0,now).err); });
+  fakex::HttpFault fault; fault.method="GET"; fault.path="/portfolio/orders/"+id_of["Minc-b0"];
+  fault.kind=fakex::HttpFault::Kind::DROP_BEFORE_REPLY; fake.add_fault(fault);
+  const auto kept=state.snapshot();
+  state.refresh_once();
+  s=state.snapshot();
+  CHECK(s->account_ms==kept->account_ms && s->error.rfind("account: ",0)==0);
+  CHECK(find(*s,"Minc-b0") && find(*s,"Minc-b0")->status==kalshi::OrderStatus::RESTING);   // the last read's
+  fake.clear_wire_log();
+  CHECK(state.refresh_once() && state.snapshot()->error.empty());
+  s=state.snapshot();
+  CHECK(by_id()==0 && s->orders.size()==8 && s->fills.size()==1);
+  CHECK(find(*s,"Minc-b0")->status==kalshi::OrderStatus::CANCELED && find(*s,"Minc-b1")->status==kalshi::OrderStatus::RESTING);
+}
 void cash_projection(json& capture) {
   rest::Snapshot s; s.balances={{0,920000},{2,50000}};
   kalshi::PositionRow p; p.ticker="TEST-A"; p.exchange_index=0; p.position=500;
@@ -267,7 +358,7 @@ void cash_projection(json& capture) {
 int main() {
   ::signal(SIGPIPE,SIG_IGN);
   clock_checks(); series_fees(); json capture={{"events",json::array()},{"responses",json::array()}};
-  discovery(capture); reconcile(); cash_projection(capture);
+  discovery(capture); reconcile(); incremental(); cash_projection(capture);
   TempDir dir; std::ofstream out(dir.file("capture.json")); out<<capture.dump(); out.close();
   const std::string command="node '"+std::string(DESKD_SOURCE_DIR)+"/tests/deskd/contract_check.cjs' '"+dir.file("capture.json")+"'";
   CHECK(std::system(command.c_str())==0);

@@ -54,6 +54,8 @@ struct Snapshot {
   // account_began_ms: when the last complete account read began. Anything deskd saw finish
   // before it is in these balances and positions; anything later may not be.
   std::int64_t account_began_ms = 0, account_ms = 0, listing_ms = 0, ts_ms = 0;
+  // the windows `orders` (beyond the resting ones) and `fills` cover, from the read that made them
+  std::int64_t orders_from_ms = 0, fills_from_ms = 0;
   std::uint64_t revision = 0;
   std::string error;
   std::string metadata_error;
@@ -77,6 +79,13 @@ struct Options {
   // treats the read's age itself (an account read over 60 s old is STALE) and counts every order
   // of its own the read cannot reflect at worst case.
   int account_keep_ms = 60000, listing_keep_ms = 300000;
+  // The day's orders and fills are read whole once, then from the last read's start less this
+  // overlap and merged by id (fills never change; an order is final once it leaves the book, and
+  // one that left since the last read is read by id). A whole read again after a failure, a new
+  // ET day, or more than incremental_max_gone such orders. Whole reads every poll grew with the
+  // day (13,500 orders by hour 4 of the soak) until almost every one overlapped a private event
+  // and was discarded, and orders went STALE (2026-10-13).
+  int incremental_overlap_ms = 300000, incremental_max_gone = 10;
 };
 
 class State {
@@ -134,6 +143,7 @@ class State {
   std::map<std::string, std::int64_t> trades_wanted_;   // ticker -> since ms (under controls_mu_)
   std::map<std::string, std::int64_t> trades_failed_;   // ticker -> mono ms of the last failure
   std::int64_t orders_since_ms_ = 0;
+  bool whole_read_next_ = false;   // REST owner only
   std::atomic<bool> refresh_requested_{false};
   ClockCheck clock_;
   std::unique_ptr<net::Conn> conn_;  // REST owner only; read connections can be reused

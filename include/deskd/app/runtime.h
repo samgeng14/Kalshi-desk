@@ -157,6 +157,7 @@ class Deskd {
   PreflightRow groups_row() const;
   std::shared_ptr<const DayPnl> day_;   // std::atomic_load / std::atomic_store; rest thread writes
   std::set<std::string> fills_sent_;    // rest thread only
+  std::size_t unknown_basis_said_ = 0;  // rest thread only: the warning's count as last logged
   void on_trade(const MdTrade& t);
   void publish_book(const std::string& ticker);
   std::optional<Px> mid(const std::string& ticker) const;

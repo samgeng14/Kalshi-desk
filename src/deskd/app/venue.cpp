@@ -426,9 +426,10 @@ void Deskd::on_rest(std::shared_ptr<const rest::Snapshot>) {
   }
   // Today's fills (new ones only; each is keyed by fid) and today's P&L per market.
   auto day = std::make_shared<DayPnl>(day_pnl(*s, et_midnight_ms(now_ms()), [this](const std::string& tk) { return mid(tk); }));
-  if (day->unknown_basis)
+  if (day->unknown_basis && day->unknown_basis != unknown_basis_said_)   // once per count, not every poll
     DLOG_WARN("%zu of today's fills reduce a position whose cost before today is not recoverable: they count only their fee",
               day->unknown_basis);
+  unknown_basis_said_ = day->unknown_basis;
   for (const auto& f : day->fills) {
     const auto fid = f.at("fid").get<std::string>();
     if (!fills_sent_.insert(fid).second) continue;
