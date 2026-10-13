@@ -162,7 +162,11 @@ bool Deskd::start(std::string* err) {
       if (fair_ && rest_) fair_->step(*rest_->snapshot(), now_ms());
       if (lip_) lip_->step(now_ms());
       if (band_) band_->step(now_ms());
-      if (markouts_) for (auto& row : markouts_->step(now_ms())) pub_->post(PubData{"mo", std::move(row)});
+      if (markouts_)
+        for (auto& row : markouts_->step(now_ms())) {
+          store_.inbox().push(StoreRecord{"markouts", row.dump()});
+          pub_->post(PubData{"mo", std::move(row)});
+        }
     });
   });
   if (!cfg_.data_dir.empty()) store_.set_path(cfg_.data_dir + "/ops.sqlite");

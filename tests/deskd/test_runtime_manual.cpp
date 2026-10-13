@@ -245,8 +245,13 @@ void orders_cancel_kill() {
       CHECK(!"the timelines and the fill are in ops.sqlite");
       std::system(("python3 -c \"import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); [print('DBG',r[:26]) for r in c.execute('select * from orders')]; [print('DBG',r[:14]) for r in c.execute('select * from fills')]\" '"+db+"' >&2").c_str());
     }
+    // and the take's 1 s markout against the mid (strat writes markouts too)
+    CHECK(r.until([&]{
+      return sql_count(db,"SELECT count(*) FROM markouts m JOIN fills f ON m.fid=f.fid WHERE f.cid='Mrt-take-1'"
+                          " AND m.h='1s' AND m.mid>0 AND m.mo IS NOT NULL")==1;
+    }));
     const auto store=r.d->status()["store"];
-    CHECK(store["failed"]==0 && store["why"]=="" && store["written"].get<int>()>=3);
+    CHECK(store["failed"]==0 && store["why"]=="" && store["written"].get<int>()>=4);
     CHECK(r.d->status()["gw"]["records_lost"]==0);
     if(!std::string(DESKD_PYTHON).empty()) {   // the latency report reads it
       const std::string out=r.dir.path+"/latency.txt";
