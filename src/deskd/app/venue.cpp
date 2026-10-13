@@ -154,6 +154,8 @@ void Deskd::attach_manual() {
     else if (!h.cancel_sender) h.why = stopped("send-cx", *cx_sender_);
     return h;
   };
+  p.write_tier = cfg_.write_tier == "advanced" ? WriteBudget::advanced() : WriteBudget::basic();
+  p.record = [this](const std::string& table, std::string row) { return store_.inbox().push(StoreRecord{table, std::move(row)}); };
   if (cfg_.systematic_orders) {
     p.sys_send = [this](KalshiWriteJob j) { return q_sys_.push(std::move(j)); };
     p.sys_cancel = [this](KalshiWriteJob j) { return q_sys_.push(std::move(j), Lane::PRIORITY); };
@@ -179,7 +181,6 @@ void Deskd::attach_manual() {
     };
     p.daily_stop = cfg_.daily_stop;
     p.equity_floor = cfg_.equity_floor;
-    p.write_tier = cfg_.write_tier == "advanced" ? WriteBudget::advanced() : WriteBudget::basic();
     p.groups = &groups_;
     p.sys_state_file = cfg_.data_dir + "/systematic.json";
     p.lanes = default_lanes();

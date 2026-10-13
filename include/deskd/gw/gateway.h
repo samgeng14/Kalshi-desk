@@ -139,6 +139,8 @@ class Gateway {
     std::atomic<std::uint64_t> group_jobs{0};         // order-group creates, triggers and resets
     std::atomic<std::uint64_t> sys_rate_refused{0};   // Systematic creates past its 80% of a shard's write budget
     std::atomic<std::uint64_t> venue_429{0};          // writes the venue refused 429
+    std::atomic<std::uint64_t> records_sent{0};       // order timelines and fills handed to store
+    std::atomic<std::uint64_t> records_lost{0};       // ...that store's full inbox refused
   };
   const Stats& stats() const { return stats_; }
   // Any thread: each write bucket's tokens as gw last spent from it (shard -> tokens; 0 = the
@@ -187,6 +189,23 @@ class Gateway {
   std::shared_ptr<const std::map<int, double>> write_view_;   // std::atomic_load / std::atomic_store
   std::atomic<double> write_cap_{0};
   void spend(int shard, double cost);   // a write sent: counted against its bucket, and published
+  // Each order's stamps the ledger does not keep (it has click, recv, sent, ack, done): gw's
+  // admission, the create's wire segments, the private feed's first word and first fill, the
+  // cancel asked and answered. The whole timeline goes to store when the order ends (plan
+  // section 9, "every order logs its timeline"; tools/latency_report.py reads it).
+  struct Stamps {
+    std::int64_t gw = 0, priv = 0, fill = 0, cx = 0, cx_ack = 0;
+    double w_ms = -1, fb_ms = -1, rd_ms = -1;   // start to written, written to first byte, to done
+    bool replied = false;   // the create's reply is in (a fill can end an IOC before it): then it is recorded
+  };
+  std::map<std::string, Stamps> stamps_;   // gw thread only; an order's entry leaves when it is recorded
+  // Recorded once the order has ended, its create's reply is in, the private feed has spoken of it
+  // (and of its fill, if it filled), and a cancel sent has its reply: the venue's replies and its
+  // socket race. `force`: the
+  // order ended over 5 s ago, and what has not come is not coming (gw's tick).
+  void record_if_done(const std::string& cid, bool force = false);
+  std::int64_t timelines_swept_ms_ = 0;
+  void record(const char* table, std::string json);
   void note_ledger();
 
   // ---- Systematic (gw/sys_book.h); gw thread only

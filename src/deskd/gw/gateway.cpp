@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <fstream>
 
@@ -167,6 +168,14 @@ void Gateway::run(Worker& self) {
       stats_.handled.fetch_add(1, std::memory_order_relaxed);
     }
     if (sys_) sys_tick(now_ms());
+    if (manual_ && now_ms() - timelines_swept_ms_ >= 1000) {   // timelines whose last stamps never came
+      timelines_swept_ms_ = now_ms();
+      std::vector<std::string> due;
+      for (const auto& [cid, s] : stamps_)
+        if (const auto* o = manual_->ledger().find(cid); o && o->terminal() && o->done_ms && timelines_swept_ms_ - o->done_ms > 5000)
+          due.push_back(cid);
+      for (const auto& cid : due) record_if_done(cid, true);
+    }
     self.beat();
   }
 }
@@ -401,9 +410,36 @@ std::string Gateway::order_json(const std::string& cid) const {
 
 void Gateway::publish_order(const std::string& cid) {
   if (!cid.empty() && cid.front() == 'S') sys_dirty_ = true;
+  record_if_done(cid);
   if (!path_->publish) return;
   const auto row = order_json(cid);
   if (!row.empty()) path_->publish(row);
+}
+
+void Gateway::record(const char* table, std::string json) {
+  if (!path_->record) return;
+  if (path_->record(table, std::move(json))) stats_.records_sent.fetch_add(1);
+  else stats_.records_lost.fetch_add(1);
+}
+
+void Gateway::record_if_done(const std::string& cid, bool force) {
+  const auto it = stamps_.find(cid);
+  const auto* o = it == stamps_.end() || !it->second.replied ? nullptr : manual_->ledger().find(cid);
+  if (!o || !o->terminal()) return;
+  const auto& s = it->second;
+  if (!force && !o->refused && (!s.priv || (o->filled > 0 && !s.fill) || (s.cx && !s.cx_ack))) return;
+  auto j = o->json();
+  auto ms = [](std::int64_t v) { return v ? nlohmann::json(v) : nlohmann::json(nullptr); };
+  auto seg = [](double v) { return v >= 0 ? nlohmann::json(std::round(v * 1000) / 1000) : nlohmann::json(nullptr); };
+  j["t"]["gw"] = ms(s.gw);
+  j["t"]["priv"] = ms(s.priv);
+  j["t"]["fill"] = ms(s.fill);
+  j["t"]["cx"] = ms(s.cx);
+  j["t"]["cx_ack"] = ms(s.cx_ack);
+  j["wire"] = {{"w_ms", seg(s.w_ms)}, {"fb_ms", seg(s.fb_ms)}, {"rd_ms", seg(s.rd_ms)}};
+  j["shard"] = o->shard;
+  record("orders", j.dump());
+  stamps_.erase(it);
 }
 
 void Gateway::place_manual(PlaceIntent& p) {
@@ -430,6 +466,7 @@ void Gateway::place_manual(PlaceIntent& p) {
     std::atomic_store(&owned_, std::shared_ptr<const std::set<std::string>>(std::move(owned)));
   }
   if (sys_) takeover(p.ticker);
+  stamps_[cid].gw = now_ms();
   publish_order(cid);   // PEND, with its reservation
   const int shard = placed.job->shard;
   if (!path_->send || !path_->send(std::move(*placed.job))) {
@@ -439,6 +476,7 @@ void Gateway::place_manual(PlaceIntent& p) {
     r.entered_ms = now_ms();
     r.local_code = "RO";
     r.outcome.kind = kalshi::WriteOutcome::Kind::NOT_SENT;
+    stamps_[cid].replied = true;
     manual_->apply(r);
     publish_order(cid);
     DLOG_ERR("order %s not sent: send-k1's inbox is full", cid.c_str());
@@ -462,6 +500,8 @@ void Gateway::manual_reply(const KalshiWriteReply& r) {
     return;
   }
   if (r.op == WireOp::CANCEL) {
+    if (const auto st = stamps_.find(r.cid); st != stamps_.end() && !st->second.cx_ack)
+      st->second.cx_ack = r.ack_ms ? r.ack_ms : now_ms();
     const auto why = cancel_why_.find(r.cid);
     if (r.cancel && !manual_->ledger().cancelled(r.cid, *r.cancel, why == cancel_why_.end() ? "USER" : why->second,
                                                  r.ack_ms ? r.ack_ms : now_ms()))
@@ -476,6 +516,13 @@ void Gateway::manual_reply(const KalshiWriteReply& r) {
       if (g.state == SysBook::GroupState::ACTIVE) g.state = SysBook::GroupState::TRIGGERED;
       lanes_dirty_.insert(o->intent.lane);
     }
+  if (const auto st = stamps_.find(r.cid); st != stamps_.end()) st->second.replied = true;
+  if (const auto st = stamps_.find(r.cid); st != stamps_.end() && r.exchange.t_start_us) {
+    const auto& x = r.exchange;
+    if (x.t_written_us) st->second.w_ms = (x.t_written_us - x.t_start_us) / 1000.0;
+    if (x.t_written_us && x.t_first_byte_us) st->second.fb_ms = (x.t_first_byte_us - x.t_written_us) / 1000.0;
+    if (x.t_first_byte_us && x.t_done_us) st->second.rd_ms = (x.t_done_us - x.t_first_byte_us) / 1000.0;
+  }
   const bool ok = manual_->apply(r);
   if (!ok) DLOG_ERR("reply for order %s contradicts the order book: reconcile before trading", r.cid.c_str());
   if (ok && r.outcome.kind == K::ACK && r.create) note_latency(r);
@@ -550,6 +597,21 @@ void Gateway::manual_private(const PrivateEvent& e) {
   if (cid.empty()) {
     for (const auto& [c, o] : ledger.orders())
       if (o.oid == (e.kind == PrivateEvent::Kind::ORDER ? e.order.order_id : e.fill.order_id)) cid = c;
+  }
+  if (const auto st = cid.empty() ? stamps_.end() : stamps_.find(cid); st != stamps_.end()) {
+    if (!st->second.priv) st->second.priv = at;
+    if (e.kind == PrivateEvent::Kind::FILL && !st->second.fill) st->second.fill = at;
+  }
+  if (e.kind == PrivateEvent::Kind::FILL) {
+    const auto* o = cid.empty() ? nullptr : ledger.find(cid);
+    const auto& f = e.fill;
+    record("fills", nlohmann::json{{"fid", fill_key(f)}, {"cid", cid}, {"oid", f.order_id}, {"tk", f.ticker},
+                                   {"side", f.side == kalshi::BookSide::BID ? "BUY" : "SELL"}, {"qty", qty_to_number(f.count)},
+                                   {"px", price_str(f.yes_price)}, {"fee", money_str(f.fee / 100)}, {"taker", f.taker},
+                                   {"ts_ms", f.ts_ms}, {"recv_ms", at}, {"shard", f.exchange_index},
+                                   {"own", o ? (o->intent.owner == Owner::SYS ? "SYS" : "MAN") : "EXT"},
+                                   {"lane", o && !o->intent.lane.empty() ? nlohmann::json(o->intent.lane) : nlohmann::json(nullptr)}}
+                        .dump());
   }
   if (!cid.empty()) {
     publish_order(cid);
@@ -706,6 +768,7 @@ void Gateway::send_cancel(const std::string& cid) {
   const int shard = j.shard;
   if (via && via(std::move(j))) {
     spend(shard, WriteBudget::kCancel);
+    if (const auto st = stamps_.find(cid); st != stamps_.end() && !st->second.cx) st->second.cx = now_ms();
     cancel_sent_.insert(cid);
     (sys ? stats_.sys_cancels : stats_.manual_cancels).fetch_add(1);
     return;
@@ -954,6 +1017,7 @@ void Gateway::place_sys(PlaceIntent& p) {
     std::atomic_store(&owned_, std::shared_ptr<const std::set<std::string>>(std::move(owned)));
   }
   placed.job->create.order_group_id = group->id;
+  stamps_[cid].gw = now_ms();
   publish_order(cid);
   if (!path_->sys_send(std::move(*placed.job))) {
     KalshiWriteReply r;
@@ -962,6 +1026,7 @@ void Gateway::place_sys(PlaceIntent& p) {
     r.entered_ms = now_ms();
     r.local_code = "RO";
     r.outcome.kind = kalshi::WriteOutcome::Kind::NOT_SENT;
+    stamps_[cid].replied = true;
     manual_->apply(r);
     publish_order(cid);
     return refuse("RO", "send-k2's queue is full");

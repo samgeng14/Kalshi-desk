@@ -165,6 +165,7 @@ bool Deskd::start(std::string* err) {
       if (markouts_) for (auto& row : markouts_->step(now_ms())) pub_->post(PubData{"mo", std::move(row)});
     });
   });
+  if (!cfg_.data_dir.empty()) store_.set_path(cfg_.data_dir + "/ops.sqlite");
   by("store")->start([this](Worker& w) { store_.run(w); });
   by("pub")->start([this](Worker& w) { pub_->run(w); });
   by("ops")->start([this](Worker& w) { ops_->run(w); });
@@ -245,6 +246,8 @@ json Deskd::status() const {
                 {"sys_cancels", gs.sys_cancels.load()},
                 {"group_jobs", gs.group_jobs.load()},
                 {"sys_rate_refused", gs.sys_rate_refused.load()},
+                {"records_sent", gs.records_sent.load()},
+                {"records_lost", gs.records_lost.load()},
                 {"venue_429", gs.venue_429.load()},
                 {"write_budget", write_budget_json(*gw_)},
                 {"systematic_orders", cfg_.systematic_orders && sys_sender_ != nullptr},
@@ -258,6 +261,12 @@ json Deskd::status() const {
                 {"queued", q_cx_.size()},
                 {"dropped", q_cx_.dropped()}}},
               {"kill", {{"generation", kill_.generation()}, {"active", kill_.active()}}},
+              {"store",
+               {{"path", store_.path()},
+                {"received", store_.received()},
+                {"written", store_.written()},
+                {"failed", store_.failed()},
+                {"why", store_.why()}}},
               {"log", {{"dropped", log_dropped()}}},
               {"workers", workers}};
   result["feeds"] = feeds_json(feeds_);

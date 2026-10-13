@@ -75,6 +75,9 @@ struct ManualPath {
   std::function<void(const std::string&)> publish_market;
   // an account read soon (after a transfer, whose cash no private event reports)
   std::function<void()> refresh;
+  // a row for store (data/ops.sqlite): table "orders" (an ended order's timeline) or "fills";
+  // false = store's inbox is full (the row is lost and counted)
+  std::function<bool(const std::string& table, std::string json)> record;
   // an alert on the stream (level, src, msg): Systematic's refusals, so a lane that cannot trade
   // says why on the page, not only in /ops/status
   std::function<void(const std::string&, const std::string&, const std::string&)> alert;

@@ -3,6 +3,7 @@
 // deskd.manual_orders off every order is refused RO; on, a click fills, rests and cancels, and
 // KILL's cancel-all clears the venue.
 #include <httplib.h>
+#include <sqlite3.h>
 #include <sys/stat.h>
 #include <atomic>
 #include <csignal>
@@ -63,6 +64,18 @@ struct Stream {
     return out;
   }
 };
+
+// one integer from a query on a sqlite file; -1 when it cannot be read
+long long sql_count(const std::string& path,const char* q) {
+  sqlite3* db=nullptr; long long n=-1;
+  if(sqlite3_open_v2(path.c_str(),&db,SQLITE_OPEN_READONLY,nullptr)==SQLITE_OK) {
+    sqlite3_stmt* st=nullptr;
+    if(sqlite3_prepare_v2(db,q,-1,&st,nullptr)==SQLITE_OK && sqlite3_step(st)==SQLITE_ROW) n=sqlite3_column_int64(st,0);
+    sqlite3_finalize(st);
+  }
+  sqlite3_close(db);
+  return n;
+}
 
 struct Run {
   fx::Venue venue;
@@ -220,6 +233,29 @@ void orders_cancel_kill() {
   auto cx=r.post("/api/cancel",{{"cids",{"Mrt-post-1"}}});
   CHECK(cx && cx->status==200 && json::parse(cx->body)["n"]==1);
   CHECK(r.until([&]{ return r.resting()==0; }));
+  {   // each ended order's timeline and each fill, in data/ops.sqlite (store), in order
+    const std::string db=r.dir.path+"/ops.sqlite";
+    const char* take="SELECT count(*) FROM orders WHERE cid='Mrt-take-1' AND st='FILL' AND own='MAN' AND tk IS NOT NULL"
+                     " AND click_ms<=recv_ms AND recv_ms<=gw_ms AND gw_ms<=sent_ms AND sent_ms<=ack_ms AND fill_ms>0"
+                     " AND priv_ms>0 AND done_ms>0 AND w_ms>=0 AND fb_ms>=0 AND rd_ms>=0 AND px=0.42 AND filled=2";
+    const char* post="SELECT count(*) FROM orders WHERE cid='Mrt-post-1' AND st='CXL' AND cx_ms>=ack_ms AND cx_ack_ms>=cx_ms"
+                     " AND fill_ms IS NULL AND done_ms>0";
+    const char* fill="SELECT count(*) FROM fills WHERE cid='Mrt-take-1' AND qty=2 AND px=0.42 AND taker=1 AND own='MAN'";
+    if(!r.until([&]{ return sql_count(db,take)==1 && sql_count(db,post)==1 && sql_count(db,fill)==1; })) {
+      CHECK(!"the timelines and the fill are in ops.sqlite");
+      std::system(("python3 -c \"import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); [print('DBG',r[:26]) for r in c.execute('select * from orders')]; [print('DBG',r[:14]) for r in c.execute('select * from fills')]\" '"+db+"' >&2").c_str());
+    }
+    const auto store=r.d->status()["store"];
+    CHECK(store["failed"]==0 && store["why"]=="" && store["written"].get<int>()>=3);
+    CHECK(r.d->status()["gw"]["records_lost"]==0);
+    if(!std::string(DESKD_PYTHON).empty()) {   // the latency report reads it
+      const std::string out=r.dir.path+"/latency.txt";
+      const std::string cmd=std::string("\"")+DESKD_PYTHON+"\" \""+DESKD_SOURCE_DIR+"/tools/latency_report.py\" --db \""+db+"\" > \""+out+"\"";
+      CHECK(std::system(cmd.c_str())==0);
+      std::ifstream f(out); const std::string text((std::istreambuf_iterator<char>(f)),std::istreambuf_iterator<char>());
+      CHECK(text.find("sent > ack")!=std::string::npos && text.find("2 orders")!=std::string::npos);
+    }
+  }
   // KILL: a resting order is cancelled by send-cx's cancel-all, and new orders are refused
   o=r.order("Mrt-post-2","BUY","0.4000",1,"POST",60);
   if(o["status"]!=200) std::fprintf(stderr,"post-2: %s resting %zu\n",o.dump().c_str(),r.resting());

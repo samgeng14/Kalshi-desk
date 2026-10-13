@@ -229,6 +229,7 @@ if(PYTHON3_EXE)
   # The alpha audit checked against ground truth: pure noise must yield nothing, an injected
   # signal must be found, and the HAC correction must shrink the t-stat overlap inflates.
   add_test(NAME alpha-decay COMMAND ${PYTHON3_EXE} ${CMAKE_SOURCE_DIR}/tests/test_alpha_decay.py)
+  add_test(NAME latency-report COMMAND ${PYTHON3_EXE} ${CMAKE_SOURCE_DIR}/tools/latency_report.py --self-test)
   # The commodity replay's own proof that it cannot see the future: it builds its data in memory,
   # moves the reference after a chosen instant and checks no earlier probability changed.
   add_test(NAME commodity-replay
@@ -338,7 +339,7 @@ add_library(deskd_core STATIC
   src/deskd/web/pub.cpp
   src/deskd/web/server.cpp)
 # net/ speaks TLS through OpenSSL 3 (Homebrew's openssl@3 on macOS), and gw/ signs with it
-target_link_libraries(deskd_core PUBLIC deskd_flags OpenSSL::SSL OpenSSL::Crypto)
+target_link_libraries(deskd_core PUBLIC deskd_flags OpenSSL::SSL OpenSSL::Crypto ${DESK_SQLITE_TARGET})
 target_precompile_headers(deskd_core PRIVATE
   <nlohmann/json.hpp> <httplib.h>
   <atomic> <chrono> <condition_variable> <deque> <functional> <future> <map> <memory> <mutex>
