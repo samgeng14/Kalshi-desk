@@ -6,6 +6,7 @@
 #include <chrono>
 #include <climits>
 #include <deque>
+#include <iterator>
 #include <limits>
 #include <set>
 #include <thread>
@@ -56,6 +57,7 @@ void MdBooks::watch(const std::vector<std::string>& tickers, std::int64_t now) {
     if (!wanted.count(it->first)) {
       it->second.stale = true; it->second.reason = "unwatched"; it->second.recv_ms = now;
       if (callback_) callback_(it->second);
+      joining_.erase(it->first);
       it = books_.erase(it);
     } else ++it;
   }
@@ -69,6 +71,7 @@ void MdBooks::watch(const std::vector<std::string>& tickers, std::int64_t now) {
 }
 void MdBooks::disconnected(const std::string& reason, std::int64_t now) {
   subs_.clear();
+  joining_.clear();   // a new connection's subscribe waits for every snapshot
   for (auto& [ticker, book] : books_) {
     (void)ticker;
     book.stale = true; book.reason = reason; book.recv_ms = now; book.sid = 0; book.seq = 0;
@@ -162,7 +165,11 @@ bool MdBooks::message(const json& frame, std::int64_t received, std::string* why
   if (!msg.contains("market_ticker") || !msg["market_ticker"].is_string()) return fail(*sid, "missing book ticker", received, why);
   const auto ticker = msg["market_ticker"].get<std::string>();
   if (!sub.tickers.count(ticker)) return fail(*sid, "book is outside its explicit subscription", received, why);
-  auto& previous = books_.at(ticker);
+  // a market unwatched in place, or watched again on a newer subscription: its frames on this sid
+  // keep the sequence above and are otherwise ignored until the next reconnect
+  const auto book = books_.find(ticker);
+  if (book == books_.end() || book->second.sid != *sid) return true;
+  auto& previous = book->second;
   MdBook next = previous;
   if (type == "orderbook_snapshot") {
     next.bids.clear(); next.asks.clear();
@@ -193,11 +200,18 @@ bool MdBooks::message(const json& frame, std::int64_t received, std::string* why
   if (!previous.last_change_ms || next.bids != previous.bids || next.asks != previous.asks) next.last_change_ms = received;
   next.seq = *seq; next.recv_ms = received; next.venue_ms = integer(frame, "sending_ts_ms");
   next.stale = false; next.reason.clear(); previous = std::move(next);
+  joining_.erase(ticker);
   if (callback_) callback_(previous);
   return true;
 }
+void MdBooks::joining(const std::vector<std::string>& tickers, std::int64_t now) {
+  for (const auto& t : tickers) if (books_.count(t)) joining_.emplace(t, now);
+}
+bool MdBooks::joining_overdue(std::int64_t now, int timeout_ms) const {
+  return std::any_of(joining_.begin(), joining_.end(), [&](const auto& p) { return now - p.second > timeout_ms; });
+}
 bool MdBooks::ready() const {
-  return std::all_of(books_.begin(), books_.end(), [](const auto& p) { return !p.second.stale; });
+  return std::all_of(books_.begin(), books_.end(), [this](const auto& p) { return !p.second.stale || joining_.count(p.first); });
 }
 
 KalshiMd::KalshiMd(net::Endpoint endpoint, net::ConnFactory& factory, const KalshiSigner& signer,
@@ -241,21 +255,24 @@ void KalshiMd::run(Worker& self) {
     std::map<std::int64_t, std::vector<std::string>> pending;
     std::set<std::int64_t> trade_commands;   // pending entries that subscribe the trade channel
     std::int64_t id = 0;
-    if (connected) {
-      for (std::size_t first = 0; first < watch.size(); first += options_.markets_per_subscription) {
-        const auto last = std::min(first + options_.markets_per_subscription, watch.size());
-        std::vector<std::string> batch(watch.begin() + first, watch.begin() + last);
+    std::size_t ignored = 0;   // markets unwatched in place whose frames still arrive
+    // books, then prints for the same markets on their own sid (display only; see subscribed_trades)
+    auto subscribe = [&](const std::vector<std::string>& list) {
+      for (std::size_t first = 0; first < list.size(); first += options_.markets_per_subscription) {
+        const auto last = std::min(first + options_.markets_per_subscription, list.size());
+        std::vector<std::string> batch(list.begin() + first, list.begin() + last);
         pending[++id] = batch;
         json command{{"id", id}, {"cmd", "subscribe"}, {"params", {{"channels", {"orderbook_delta"}}, {"market_tickers", batch}}}};
-        if (!ws.send(net::WsOp::TEXT, command.dump(), 500, &reason, [&] { self.beat(); })) { connected = false; break; }
+        if (!ws.send(net::WsOp::TEXT, command.dump(), 500, &reason, [&] { self.beat(); })) return false;
         if (!trade_callback_) continue;
-        // Prints for the same markets on their own sid (display only; see subscribed_trades)
         pending[++id] = batch;
         trade_commands.insert(id);
         json trades{{"id", id}, {"cmd", "subscribe"}, {"params", {{"channels", {"trade"}}, {"market_tickers", batch}}}};
-        if (!ws.send(net::WsOp::TEXT, trades.dump(), 500, &reason, [&] { self.beat(); })) { connected = false; break; }
+        if (!ws.send(net::WsOp::TEXT, trades.dump(), 500, &reason, [&] { self.beat(); })) return false;
       }
-    }
+      return true;
+    };
+    if (connected) connected = subscribe(watch);
     const auto started = mono_ms(); auto last_ping = started;
     std::int64_t ping_sent = 0; std::string ping_payload;
     std::deque<int> lags; int lag = -1;
@@ -265,9 +282,30 @@ void KalshiMd::run(Worker& self) {
       self.beat();
       if (idle_ && mono_ms() - last_idle >= 250) { last_idle = mono_ms(); idle_(); }
       { std::lock_guard<std::mutex> lock(mutex_); changed = version_ != version; }
-      if (changed) { reason = "watch list changed"; break; }
+      if (changed) {
+        // In place: the added markets subscribe on this connection and the removed ones stop
+        // publishing, so every other book stays live. A reconnect here made the whole feed stale
+        // at each change (a 15-minute window's roll, a pin), refusing every order STALE and
+        // pulling M1's quotes (soak, 2026-10-13).
+        std::vector<std::string> next;
+        std::uint64_t next_version = 0;
+        { std::lock_guard<std::mutex> lock(mutex_); next = desired_; next_version = version_; }
+        std::vector<std::string> added, removed;
+        std::set_difference(next.begin(), next.end(), watch.begin(), watch.end(), std::back_inserter(added));
+        std::set_difference(watch.begin(), watch.end(), next.begin(), next.end(), std::back_inserter(removed));
+        ignored += removed.size();
+        if (next.empty() || !pending.empty() || ignored > options_.max_ignored) { reason = "watch list changed"; break; }
+        books.watch(next, now_ms());
+        books.joining(added, now_ms());
+        watch = std::move(next);
+        version = next_version;
+        changed = false;
+        if (!subscribe(added)) break;
+        continue;
+      }
       const auto mono = mono_ms();
       if (!books.ready() && mono - started > options_.snapshot_timeout_ms) { reason = "market snapshot timeout"; break; }
+      if (books.joining_overdue(now_ms(), options_.snapshot_timeout_ms)) { reason = "market snapshot timeout"; break; }
       if (ping_sent && mono - ping_sent > options_.pong_timeout_ms) { reason = "market-data pong timeout"; break; }
       if (!ping_sent && mono - last_ping >= options_.ping_ms) {
         ping_payload = "md-" + std::to_string(mono); ping_sent = mono; last_ping = mono;

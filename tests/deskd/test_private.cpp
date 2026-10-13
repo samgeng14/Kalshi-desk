@@ -63,10 +63,11 @@ void socket() {
   SendGuard guard(false,nullptr); net::ConnFactory factory(guard);
   const auto endpoint=net::Endpoint::parse("http://127.0.0.1:"+std::to_string(fake.port())+"/trade-api/ws/v2",&why);
   FeedState feed; std::atomic<int> requests{0}; std::mutex mu; std::vector<PrivateEvent> events;
+  std::atomic<bool> take{false}; std::vector<bool> gap_seen;   // take: gw accepts the events
   KalshiPrivate::Options options; options.ping_ms=80; options.pong_ms=500;
   options.backoff_min_ms=20; options.backoff_max_ms=100;
   KalshiPrivate priv(*endpoint,factory,*signer,feed,[&](const auto& event) {
-    std::lock_guard<std::mutex> lk(mu); events.push_back(event); return false;
+    std::lock_guard<std::mutex> lk(mu); events.push_back(event); gap_seen.push_back(feed.view().gap); return take.load();
   },[&]{++requests;},options);
   CHECK(priv.fence()==0 && !priv.reconcile(0));
   Worker worker("private-test"); worker.start([&](Worker& w){priv.run(w);});
@@ -96,6 +97,35 @@ void socket() {
   CHECK(until([&]{return !feed.view().gap;}));
   std::this_thread::sleep_for(std::chrono::milliseconds(300));
   CHECK(feed.view().up && !feed.view().gap && requests>=2);
+  {   // trusted events gw takes never mark the feed a gap, not even while they cross over
+    take=true;
+    std::size_t from=0; { std::lock_guard<std::mutex> lk(mu); from=events.size(); }
+    const int asked=requests.load();
+    fake.with_engine([](fakex::Engine& e,std::int64_t now) {
+      fakex::NewOrder o; o.ticker="TEST-A"; o.client_order_id="Mprivate-2";
+      o.count=100; o.price=4200; o.tif=fakex::Tif::IOC; o.exchange_index=0;
+      CHECK(!e.create(o,now).err);
+    });
+    CHECK(until([&]{std::lock_guard<std::mutex> lk(mu); return events.size()>=from+2;}));
+    std::lock_guard<std::mutex> lk(mu);
+    for(std::size_t i=from;i<gap_seen.size();++i) CHECK(!gap_seen[i]);
+    CHECK(!feed.view().gap && requests.load()==asked);   // nothing to reconcile
+  }
+  {   // an untrusted one (the last read not reconciled) shows the gap before it crosses over
+    take=false;
+    std::size_t from=0; { std::lock_guard<std::mutex> lk(mu); from=events.size(); }
+    fake.with_engine([](fakex::Engine& e,std::int64_t now) {
+      fakex::NewOrder o; o.ticker="TEST-A"; o.client_order_id="Mprivate-3";
+      o.count=100; o.price=4200; o.tif=fakex::Tif::IOC; o.exchange_index=0;
+      CHECK(!e.create(o,now).err);
+    });
+    CHECK(until([&]{std::lock_guard<std::mutex> lk(mu); return events.size()>=from+2;}));
+    std::lock_guard<std::mutex> lk(mu);
+    CHECK(!gap_seen[from]);                                   // trusted, but gw did not take it...
+    for(std::size_t i=from+1;i<gap_seen.size();++i) CHECK(gap_seen[i]);   // ...so the rest are not trusted
+    CHECK(feed.view().gap);
+  }
+  CHECK(priv.reconcile(priv.fence()));
   worker.request_stop(); worker.join();
   CHECK(!feed.view().up && priv.fence()==0);
 }

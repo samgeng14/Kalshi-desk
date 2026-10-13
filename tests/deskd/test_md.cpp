@@ -151,11 +151,11 @@ void socket_integration() {
   auto endpoint = net::Endpoint::parse("http://127.0.0.1:" + std::to_string(exchange.port()) + "/trade-api/ws/v2", &why);
   CHECK(endpoint.has_value()); if (!endpoint) return;
   FeedState feed;
-  std::mutex mutex; std::map<std::string, MdBook> latest; int stale = 0;
+  std::mutex mutex; std::map<std::string, MdBook> latest; int stale = 0; std::map<std::string, int> stale_of;
   KalshiMd::Options options; options.markets_per_subscription = 2; options.ping_ms = 80;
   options.pong_timeout_ms = 500; options.backoff_min_ms = 20; options.backoff_max_ms = 100;
   KalshiMd md(*endpoint, factory, *key, feed, [&](const MdBook& book) {
-    std::lock_guard<std::mutex> lock(mutex); latest[book.ticker] = book; if (book.stale) ++stale;
+    std::lock_guard<std::mutex> lock(mutex); latest[book.ticker] = book; if (book.stale) { ++stale; ++stale_of[book.ticker]; }
   }, options);
   CHECK(!md.set_watch({}, &why)); CHECK(!md.set_watch({"BAD\r\n"}, &why));
   CHECK(md.set_watch({"TEST-C", "TEST-B", "TEST-A"}, &why));
@@ -183,6 +183,31 @@ void socket_integration() {
   CHECK(wait_for([&] { return feed.view().up && !feed.view().gap; }));
   exchange.drop_ws_connections();
   CHECK(wait_for([&] { return factory.stats().connects >= 3 && feed.view().up && !feed.view().gap; }));
+  {   // a watch-list change on a live connection: in place, no reconnect; the other books never
+      // go stale and the feed never gaps
+    const auto connects = factory.stats().connects;
+    std::map<std::string, int> was; { std::lock_guard<std::mutex> lock(mutex); was = stale_of; }
+    CHECK(md.set_watch({"TEST-B", "TEST-C"}, &why));
+    CHECK(wait_for([&] { std::lock_guard<std::mutex> lock(mutex); return latest.at("TEST-A").reason == "unwatched"; }));
+    // TEST-A's frames still come on its old subscription and are ignored
+    exchange.with_engine([](fakex::Engine& e, std::int64_t now) { e.street_add("TEST-A", false, 3700, 100, now); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    CHECK(feed.view().up && !feed.view().gap);
+    // watched again: a new subscription and its own snapshot
+    CHECK(md.set_watch({"TEST-A", "TEST-B", "TEST-C"}, &why));
+    CHECK(wait_for([&] { std::lock_guard<std::mutex> lock(mutex); return latest.at("TEST-A").reason.empty() && !latest.at("TEST-A").stale; }));
+    std::size_t levels = 0; { std::lock_guard<std::mutex> lock(mutex); levels = latest.at("TEST-A").bids.size(); }
+    // a delta on it applies once, though both its subscriptions carry it
+    exchange.with_engine([](fakex::Engine& e, std::int64_t now) { e.street_add("TEST-A", false, 3600, 100, now); });
+    CHECK(wait_for([&] { std::lock_guard<std::mutex> lock(mutex); return latest.at("TEST-A").bids.size() == levels + 1; }));
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      CHECK(latest.at("TEST-A").bids.size() == levels + 1 && latest.at("TEST-A").bids.back().qty == 100);
+      CHECK(stale_of["TEST-B"] == was["TEST-B"] && stale_of["TEST-C"] == was["TEST-C"]);
+    }
+    CHECK(factory.stats().connects == connects && feed.view().up && !feed.view().gap);
+  }
   md.clear_watch();
   CHECK(wait_for([&] { std::lock_guard<std::mutex> lock(mutex); return latest.at("TEST-A").reason == "unwatched"; }));
   CHECK(md.set_watch({"TEST-B"}, &why));

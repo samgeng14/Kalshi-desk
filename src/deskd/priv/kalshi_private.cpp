@@ -167,10 +167,17 @@ void KalshiPrivate::run(Worker& worker) {
       if (!event) break;
       const auto old=generation_.fetch_add(1,std::memory_order_acq_rel);
       const bool trusted=confirmed_.load(std::memory_order_acquire)==old;
-      feed_.set(true,true,lag); // publish uncertainty before handing the event across owners
+      // An untrusted event's uncertainty is published before it crosses owners, and one gw did not
+      // take right after. A trusted one that gw took raises none: gw applies it in order, and
+      // marking every event a gap until the next pass refused orders "private feed not up" between
+      // two lines of this loop (16 in a 4-hour TSan soak, 2026-10-13).
+      if (!trusted) feed_.set(true,true,lag);
       const bool applied=event_ && event_(*event);
       if (trusted && applied) confirmed_.store(old+1,std::memory_order_release);
-      else if (reconcile_) reconcile_();
+      else {
+        feed_.set(true,true,lag);
+        if (reconcile_) reconcile_();
+      }
       if (j.contains("sending_ts_ms") && j["sending_ts_ms"].is_number_integer()) {
         const auto delta=now_ms()-j["sending_ts_ms"].get<std::int64_t>();
         if (delta>=0 && delta<=INT_MAX) lag=static_cast<int>(delta);

@@ -58,7 +58,11 @@ class MdBooks {
   bool subscribed_trades(std::int64_t sid, const std::vector<std::string>& tickers, std::string* why);
   std::uint64_t trade_gaps() const { return trade_gaps_; }
   bool message(const nlohmann::json& frame, std::int64_t recv_ms, std::string* why);
-  bool ready() const;
+  // Markets added to a live connection (KalshiMd changes its watch list in place): each waits for
+  // its own snapshot, its book stale meanwhile, without making the feed as a whole not ready.
+  void joining(const std::vector<std::string>& tickers, std::int64_t now_ms);
+  bool joining_overdue(std::int64_t now_ms, int timeout_ms) const;
+  bool ready() const;   // every watched book live, except those still joining
   const std::map<std::string, MdBook>& books() const { return books_; }
  private:
   struct Sub { std::int64_t last_seq = 0; std::set<std::string> tickers; bool broken = false; bool trades = false; };
@@ -68,6 +72,7 @@ class MdBooks {
   std::uint64_t trade_gaps_ = 0;
   std::map<std::string, MdBook> books_;
   std::map<std::int64_t, Sub> subs_;
+  std::map<std::string, std::int64_t> joining_;   // ticker -> when it was added
 };
 
 class KalshiMd {
@@ -81,6 +86,10 @@ class KalshiMd {
     int backoff_max_ms = 15000;
     std::size_t markets_per_subscription = 250;
     std::size_t max_watch = 10000;
+    // A watch-list change subscribes the added markets on the live connection and stops
+    // publishing the removed ones, whose frames are ignored until the next reconnect; past this
+    // many of those (or while a subscription is unanswered) it reconnects instead.
+    std::size_t max_ignored = 200;
   };
   using Callback = MdBooks::Callback;
   // Endpoint uses https/http (TLS/loopback), with /trade-api/ws/v2 as base_path.
