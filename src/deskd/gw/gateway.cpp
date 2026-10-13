@@ -54,7 +54,7 @@ void Gateway::attach_manual(const ManualPath& path) {
           publish();
         }
         DLOG_INFO("Systematic book restored from %s: %zu position(s)%s", path_->sys_state_file.c_str(), sys_->held().size(),
-                  h.on ? ", HALTED by the daily stop" : "");
+                  h.on ? (", HALTED: " + h.why).c_str() : "");
       } else {
         sys_restore_error_ = "the saved Systematic book " + path_->sys_state_file + " cannot be read (" +
                              (j.is_discarded() ? std::string("not JSON") : why) + "): move it aside to start an empty one";
