@@ -76,6 +76,8 @@ struct WebDeps {
   std::function<nlohmann::json(const nlohmann::json&)> universe;
   // {ok,mkt} or the contract's error body. No network I/O on a web request.
   std::function<nlohmann::json(const nlohmann::json&)> watch;
+  // GET /api/fill: {ok, fill} or the contract's error body. No network I/O on a web request.
+  std::function<nlohmann::json(const nlohmann::json&)> fill;
 };
 
 class WebServer {

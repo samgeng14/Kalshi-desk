@@ -23,6 +23,7 @@
 #include <functional>
 #include <future>
 #include <atomic>
+#include <deque>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -58,6 +59,13 @@ struct MakerParams {
   // -mo_floor per contract stops it (BAND: 100 fills, 1c; LIP-15: 200 fills, 1.5c); 0 = none
   std::int64_t mo_after = 0;
   Money mo_floor = 0;
+  // Fill pace (operator, 2026-10-13: a fill every 5-10 minutes). Quoting with no fill for
+  // fill_target_ms lowers the edge floor by edge_step, again each further fill_target_ms, never
+  // below edge_min (the plan's 0.5c, plus the maker fee with an anchor); a fill puts it back. It
+  // moves the quote toward fair only where the floor was what held it back; 0 = off.
+  std::int64_t fill_target_ms = 600000;
+  Px edge_step = 25;                   // 0.25c
+  Px edge_min = 50;                    // 0.5c
 };
 
 struct MakerInput {
@@ -68,6 +76,7 @@ struct MakerInput {
   Qty position = 0;                    // the lane's signed position here
   std::int64_t now_ms = 0, open_ms = 0, close_ms = 0;
   bool private_up = false, reference_fresh = true;
+  Px edge_relax = 0;                   // how far the fill pace has lowered the edge floor (MakerParams)
 };
 
 struct MakerQuote {
@@ -121,6 +130,9 @@ class MakerEngine {
     std::function<void(std::set<std::string>)> want;              // markets whose books it needs
     // the lane's 60 s markouts so far: fills marked and the mean per contract
     std::function<std::pair<std::int64_t, Money>()> markout;
+    // the fill model (strat/fill_model.h) for a resting quote: P(complete fill within ttl_s)
+    std::function<double(const std::string& tk, bool buy, Qty ahead, Qty size, int ttl_s)> fill_p;
+    std::function<void(const std::string& lvl, const std::string& msg)> alert;
   };
   using Decide = std::function<MakerDecision(const MakerInput&, const MakerParams&)>;
   MakerEngine(std::string lane, std::vector<std::string> series, Env env, MakerParams params = {},
@@ -151,6 +163,14 @@ class MakerEngine {
   std::map<std::string, std::string> last_pull_;
   std::uint64_t seq_ = 0;
   std::atomic<std::int64_t> places_{0}, cancels_{0}, refusals_{0};
+  // the fill pace: when the lane last filled or began quoting, its fills in the last 30 minutes,
+  // how many fill_target_ms steps the edge floor is down, and the expected wait for the next fill
+  std::int64_t quoting_since_ms_ = 0, pace_checked_ms_ = 0;
+  std::deque<std::int64_t> fill_times_;
+  std::atomic<std::int64_t> last_fill_ms_{0};      // atomics: status() reads them from another thread
+  std::atomic<int> relax_steps_{0}, fills_30m_{0};
+  double est_every_s_ = -1;   // under status_mu_ with last_pull_
+  void pace(std::int64_t now, bool running, bool quoting, const Gateway::SysView& v, const rest::Snapshot& s);
   void set_last(const std::string& tk, const std::string& why);
   std::string new_cid();
   static void without_own(MdBook& b, const Gateway::SysView& v, const std::string& tk);

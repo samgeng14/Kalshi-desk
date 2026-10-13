@@ -43,6 +43,7 @@
 #include "deskd/net/conn.h"
 #include "deskd/net/send.h"
 #include "deskd/store/store.h"
+#include "deskd/strat/fill_model.h"
 #include "deskd/web/pub.h"
 #include "deskd/web/server.h"
 
@@ -125,6 +126,7 @@ class Deskd {
   std::unique_ptr<MakerEngine> lip_;   // lane M1's quoter, on the strat thread
   std::unique_ptr<MakerEngine> band_;  // lane M2's
   std::unique_ptr<Markouts> markouts_;   // every fill's 1/10/60 s markout
+  FillModel fill_model_;                 // each market's trade tape: how likely an order is to fill
   std::map<std::string, std::set<std::string>> strat_want_;   // under live_mu_: by lane, the markets it quotes
   std::string key_error_;
   mutable std::mutex live_mu_;
@@ -172,6 +174,8 @@ class Deskd {
   void on_rest(std::shared_ptr<const rest::Snapshot> state);
   void on_book(const MdBook& book);
   nlohmann::json watch(const nlohmann::json& request);
+  // GET /api/fill: the fill model at the asked price and around the touch (contract 1.6)
+  nlohmann::json fill(const nlohmann::json& query);
   // a market's mkt row: rest::market_json with man (Manual took it over) from gw
   nlohmann::json mkt_row(const kalshi::MarketRow& m, bool pin, bool live) const;
   PreflightRow shard_row(const rest::Snapshot& s, bool fresh) const;

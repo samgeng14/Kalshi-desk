@@ -897,10 +897,70 @@ void live_mode() {
   auto o=r.order("Mrt-live-1","BUY","0.4200",1,"IOC");
   CHECK(o["status"]==200 && o["ord"]["st"]=="FILL");
 }
+// The fill model end to end: prints made before deskd started reach it by the REST backfill
+// (/markets/trades), GET /api/fill reads the queue ahead from the live book, and its replies are
+// contract 1.6's.
+void fill_estimates() {
+  Run r(true,[](fakex::Engine& e,std::int64_t now) {
+    e.street_add(TK,false,4000,1000,now);   // YES bid 0.40 x10 more (x15 in all)
+    for(int i=0;i<6;++i) e.street_take(TK,fakex::Side::ASK,4000,100,now);   // six 1-lot sellers hit it: x9 left
+    e.street_take(TK,fakex::Side::BID,4200,100,now);   // a 1-lot buyer lifts the ask: x2 left
+  });
+  CHECK(r.ready());
+  json caps=json::array();
+  auto fill=[&](const std::string& query) {
+    httplib::Client c("127.0.0.1",r.d->port()); c.set_read_timeout(6,0);
+    auto res=c.Get("/api/fill?"+query);
+    json j=res ? json::parse(res->body,nullptr,false) : json();
+    if(res) caps.push_back({{"key","GET /api/fill"},{"status",res->status},{"json",j}});
+    j["status"]=res ? res->status : 0;
+    return j;
+  };
+  // the backfill brings the hour before the start: the estimate stands
+  json f;
+  CHECK(r.until([&]{ f=fill("tk="+TK+"&side=BUY&px=0.4000&qty=1&ttl=60"); return f["status"]==200 && f["fill"]["why"]==""; },15000));
+  if(f["status"]!=200) { std::fprintf(stderr,"fill: %s\n",f.dump().c_str()); return; }
+  const json& F=f["fill"];
+  CHECK(F["windows"].get<int>()>=3000 && F["tape_s"].get<int>()>=3500);
+  // joining the 0.40 bid: the nine left are ahead of it; six 1-lots in the hour never clear them
+  CHECK(F["at"]["px"]=="0.4000" && F["at"]["ahead"]==9 && F["at"]["p_full"]==0.0);
+  // the curve: 0.41 (improves the touch, nobody ahead: the six sellers would have hit it in the
+  // windows that held them), the touch, three ticks behind
+  CHECK(F["curve"].size()==5 && F["curve"][0]["px"]=="0.4100" && F["curve"][0]["ahead"]==0 &&
+        F["curve"][0]["p_full"].get<double>()<0.1);
+  // the windows that hold the six sells grow as time passes them (up to 60 of the hour's 3,540)
+  CHECK(r.until([&]{ return fill("tk="+TK+"&side=BUY&px=0.4100&qty=1&ttl=60")["fill"]["at"]["p_full"].get<double>()>0; },20000));
+  CHECK(F["curve"][1]["px"]=="0.4000" && F["curve"][4]["px"]=="0.3700");
+  CHECK(F["p80_px"].is_null());   // nothing rests its way to 80% in this quiet market: take
+  CHECK(F["take"]==json({{"px","0.4200"},{"depth",2}}));
+  // at or through the ask it crosses: fills now while the depth there covers it
+  auto x=fill("tk="+TK+"&side=BUY&px=0.4200&qty=2&ttl=15");
+  CHECK(x["status"]==200 && x["fill"]["at"]["p_full"]==1.0 && x["fill"]["at"]["med_s"]==0.0);
+  x=fill("tk="+TK+"&side=BUY&px=0.4200&qty=3&ttl=15");
+  CHECK(x["status"]==200 && x["fill"]["at"]["p_full"]==0.0 && x["fill"]["at"]["p_any"]==1.0);
+  // an ask fills from buyers: one 1-lot in the hour
+  x=fill("tk="+TK+"&side=SELL&px=0.4100&qty=1&ttl=60");
+  CHECK(x["status"]==200 && x["fill"]["at"]["ahead"]==0 && x["fill"]["at"]["p_full"].get<double>()>0 &&
+        x["fill"]["curve"][0]["px"]=="0.4100");
+  // refusals in the contract's shape
+  x=fill("tk=KXNOPE-1&side=BUY&px=0.4000&qty=1&ttl=15");
+  CHECK(x["status"]==404 && x["err"]["code"]=="UNKNOWN_MARKET");
+  x=fill("tk="+TK+"&side=BUY&px=1.2000&qty=1&ttl=15");
+  CHECK(x["status"]==400 && x["err"]["code"]=="BAD_REQUEST");
+  x=fill("tk="+TK+"&side=BUY&px=0.4000&qty=1&ttl=0");
+  CHECK(x["status"]==400);
+  if(!std::string(DESKD_NODE).empty()) {
+    TempDir d;
+    const std::string file=d.path+"/fill-capture.json";
+    { std::ofstream(file) << json{{"responses",caps}}.dump(); }
+    const std::string cmd=std::string("\"")+DESKD_NODE+"\" \""+DESKD_SOURCE_DIR+"/tests/deskd/contract_check.cjs\" \""+file+"\"";
+    CHECK(std::system(cmd.c_str())==0);
+  }
+}
 }  // namespace
 
 int main() {
   std::signal(SIGPIPE,SIG_IGN);
-  off_by_default(); orders_cancel_kill(); stop_reasons(); financial_fair(); systematic(); systematic_maker(); systematic_band(); systematic_races(); systematic_group_trigger(); systematic_book(); takeover(); shard_preflight(); foreign_cancels(); live_mode();
+  off_by_default(); orders_cancel_kill(); stop_reasons(); financial_fair(); systematic(); systematic_maker(); systematic_band(); systematic_races(); systematic_group_trigger(); systematic_book(); takeover(); shard_preflight(); foreign_cancels(); live_mode(); fill_estimates();
   return finish("deskd-runtime-manual");
 }

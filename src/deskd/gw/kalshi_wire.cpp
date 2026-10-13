@@ -244,6 +244,23 @@ FillRow read_fill(Rd& r) {
   return f;
 }
 
+TradeRow read_trade(Rd& r) {
+  TradeRow t;
+  t.trade_id = r.str("trade_id");
+  t.ticker = r.str("ticker");
+  t.count = r.count("count_fp");
+  t.yes_price = r.px("yes_price_dollars");
+  const std::string side = r.str("taker_side");
+  if (r.ok()) {
+    if (side == "yes") t.taker_bought_yes = true;
+    else if (side == "no") t.taker_bought_yes = false;
+    else r.fail("taker_side", "not yes or no");
+  }
+  if (auto ts = r.otime("created_time")) t.ts_ms = *ts;
+  else if (r.ok()) r.fail("created_time", "missing");
+  return t;
+}
+
 PositionRow read_position(Rd& r) {
   PositionRow p;
   p.ticker = r.str("ticker");
@@ -798,6 +815,15 @@ WireRequest build_get_orderbook(const std::string& ticker, int depth) {
   return get("/markets/" + url_encode(ticker) + "/orderbook", s, false);
 }
 WireRequest build_get_exchange_status() { return get("/exchange/status", "", false); }
+WireRequest build_get_trades(const TradesQuery& q) {
+  std::string s;
+  add_q(s, "ticker", q.ticker);
+  add_q(s, "min_ts", q.min_ts, q.min_ts > 0);
+  add_q(s, "max_ts", q.max_ts, q.max_ts > 0);
+  add_q(s, "limit", q.limit, q.limit > 0);
+  add_q(s, "cursor", q.cursor);
+  return get("/markets/trades", s, false);
+}
 
 std::string request_bytes(const WireRequest& r, const std::string& host_header,
                           const std::vector<std::pair<std::string, std::string>>& auth_headers,
@@ -909,6 +935,9 @@ std::optional<Page<OrderRow>> parse_orders(const std::string& body, std::string*
 }
 std::optional<Page<FillRow>> parse_fills(const std::string& body, std::string* why) {
   return read_page<FillRow>(body, "fills", read_fill, why);
+}
+std::optional<Page<TradeRow>> parse_trades(const std::string& body, std::string* why) {
+  return read_page<TradeRow>(body, "trades", read_trade, why);
 }
 std::optional<Page<PositionRow>> parse_positions(const std::string& body, std::string* why) {
   return read_page<PositionRow>(body, "market_positions", read_position, why);

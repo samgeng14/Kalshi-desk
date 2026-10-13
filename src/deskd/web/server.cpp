@@ -539,6 +539,27 @@ void WebServer::Impl::routes() {
     reply_json(res, 200, d.universe ? d.universe(q) : universe_json(q, now_ms()));
   });
 
+  // How likely a resting order is to fill (contract 1.6): the ticket's FILL line and P80 price
+  svr.Get("/api/fill", [this](const httplib::Request& req, httplib::Response& res) {
+    json q = json::object();
+    for (const auto& kv : req.params) {   // contract.js parseQuery: ttl a count, qty a size, the rest strings
+      const std::string& v = kv.second;
+      const bool digits = !v.empty() && v.size() < 10 && v.find_first_not_of("0123456789") == std::string::npos;
+      const auto dot = v.find('.');
+      const bool decimal = !v.empty() && v.size() < 14 && v.find_first_not_of("0123456789.") == std::string::npos &&
+                           dot != 0 && v.find('.', dot == std::string::npos ? v.size() : dot + 1) == std::string::npos &&
+                           (dot == std::string::npos || (v.size() - dot - 1 >= 1 && v.size() - dot - 1 <= 2));
+      if (kv.first == "ttl" && digits) q[kv.first] = std::stoll(v);
+      else if (kv.first == "qty" && decimal) q[kv.first] = std::stod(v);
+      else q[kv.first] = v;
+    }
+    const std::vector<std::string> errs = check_fill_query(q);
+    if (!errs.empty()) return reply_err(res, "BAD_REQUEST", errs[0]);
+    if (!d.fill) return reply_err(res, "UNKNOWN_MARKET", "no venue connected: nothing to estimate");
+    const json out = d.fill(q);
+    reply_json(res, out.value("ok", false) ? 200 : err_http(out.at("err").at("code")), out);
+  });
+
   // deskctl status. Outside /api/: not part of the screen's contract, and never the token.
   svr.Get("/ops/status", [this](const httplib::Request&, httplib::Response& res) {
     json s = d.status ? d.status() : json::object();

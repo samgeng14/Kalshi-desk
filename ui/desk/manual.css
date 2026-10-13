@@ -10,7 +10,7 @@
 #tab-manual .off { display: none !important; }
 #tab-manual .lb { flex: 0 0 auto; font: 10px/1 var(--font-ui); color: var(--tx2); text-transform: uppercase; letter-spacing: .04em; }
 #tab-manual .v { color: var(--tx0); }
-#tab-manual .v.up { color: var(--up); } #tab-manual .v.dn { color: var(--dn); }
+#tab-manual .v.up { color: var(--up); } #tab-manual .v.dn { color: var(--dn); } #tab-manual .v.warn { color: var(--warn); }
 #tab-manual .tag.own { color: var(--tx0); box-shadow: inset 0 0 0 1px var(--line2); }
 #tab-manual .tag.own.dim { color: var(--tx2); }
 #tab-manual .tag.own:empty, #tab-manual .tag:empty { display: none; }

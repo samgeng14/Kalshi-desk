@@ -756,6 +756,36 @@ RestReply rest_route(Engine& e, const net::Request& r, const std::string& path, 
     return rest_error(404,"not_found","series not found");
   }
   if (seg[0] == "markets" && r.method == "GET" && seg.size() == 1) return list_markets(e, r, now);
+  // GET /markets/trades (get-trades.md): public prints, newest first; ticker, min_ts / max_ts in
+  // Unix seconds, limit 1-1000 (default 100), cursor
+  if (seg[0] == "markets" && r.method == "GET" && seg.size() == 2 && seg[1] == "trades") {
+    bool b = false;
+    const auto limit = qint(r, "limit", &b), min_ts = qint(r, "min_ts", &b), max_ts = qint(r, "max_ts", &b);
+    if (b || (limit && (*limit < 1 || *limit > 1000))) return bad("limit must be 1-1000; min_ts and max_ts integers");
+    const std::string ticker = qstr(r, "ticker"), cursor = qstr(r, "cursor");
+    long long skip = 0;
+    if (!cursor.empty()) {
+      if (cursor[0] != 't' || cursor.size() > 18 || cursor.find_first_not_of("0123456789", 1) != std::string::npos)
+        return bad("bad cursor");
+      skip = std::stoll(cursor.substr(1));
+    }
+    const long long n = limit ? *limit : 100;
+    json out = json::array();
+    long long seen = 0;
+    bool more = false;
+    const auto& all = e.public_trades();
+    for (auto it = all.rbegin(); it != all.rend(); ++it) {
+      if (!ticker.empty() && it->ticker != ticker) continue;
+      if (min_ts && it->ts_ms < *min_ts * 1000) continue;
+      if (max_ts && it->ts_ms > *max_ts * 1000) continue;
+      if (seen++ < skip) continue;
+      if (static_cast<long long>(out.size()) == n) { more = true; break; }
+      out.push_back({{"trade_id", it->trade_id}, {"ticker", it->ticker}, {"count_fp", qty_str(it->qty)},
+                     {"yes_price_dollars", px_str(it->yes_px)}, {"no_price_dollars", px_str(kDollar - it->yes_px)},
+                     {"taker_side", it->taker_side}, {"created_time", rfc3339(it->ts_ms)}});
+    }
+    return ok(200, json{{"trades", out}, {"cursor", more ? "t" + std::to_string(skip + n) : ""}});
+  }
   if (seg[0] == "markets" && r.method == "GET" && seg.size() >= 2) {
     const Market* m = e.market(seg[1]);
     if (!m) return rest_error(404, "not_found", "market not found");

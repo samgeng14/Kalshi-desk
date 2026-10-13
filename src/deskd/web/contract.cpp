@@ -448,4 +448,20 @@ std::vector<std::string> check_universe_query(const json& q) {
   return errs;
 }
 
+std::vector<std::string> check_fill_query(const json& q) {
+  static const json schema = {
+      {"v?", json::array({"enum", "K"})},
+      {"tk", "tk"},
+      {"side", json::array({"enum", "BUY", "SELL"})},
+      {"px", "price"},
+      {"qty", "size"},
+      {"ttl", "count"}};
+  std::vector<std::string> errs;
+  validate(schema, q, "$", errs);
+  if (errs.empty() && !inside(q["px"])) errs.push_back("$.px: an order price is strictly between 0 and 1");
+  if (errs.empty() && !(num(q["qty"]) > 0)) errs.push_back("$.qty: must be > 0");
+  if (errs.empty() && (num(q["ttl"]) < 1 || num(q["ttl"]) > 3600)) errs.push_back("$.ttl: 1 to 3600 seconds");
+  return errs;
+}
+
 }  // namespace deskd

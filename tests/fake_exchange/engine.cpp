@@ -556,6 +556,8 @@ void Engine::execute(Market& m, Order& t, Order& mk, Qty q, Op& op) {
                {"ts", op.now / 1000},
                {"ts_ms", op.now}};
   events_.push_back(std::move(e));
+  public_trades_.push_back({trade_id, m.spec.ticker, outcome(t.side), yes_px, q, op.now});
+  if (public_trades_.size() > 50000) public_trades_.pop_front();
   m.last_px = yes_px;
   m.last_size = q;
   m.volume += q;

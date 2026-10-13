@@ -483,6 +483,28 @@ static void test_parsers() {
   CHECK(!parse_orders("{\"orders\":[" + order + "," + bad_row.dump() + "],\"cursor\":\"\"}", &why) &&
         why.find("orders[1].yes_price_dollars") == 0);
 
+  // GET /markets/trades (public prints; the fill model's backfill)
+  auto trades = parse_trades(R"({"trades":[{"trade_id":"t2","ticker":"KXTEST-26OCT06-A","count_fp":"3.00",
+      "yes_price_dollars":"0.4100","no_price_dollars":"0.5900","taker_side":"no","created_time":"2026-10-06T15:30:01Z"},
+      {"trade_id":"t1","ticker":"KXTEST-26OCT06-A","count_fp":"0.50","yes_price_dollars":"0.4200",
+      "no_price_dollars":"0.5800","taker_side":"yes","created_time":"2026-10-06T15:30:00.25Z"}],"cursor":"c2"})", &why);
+  CHECK(trades && trades->rows.size() == 2 && trades->cursor == "c2");
+  if (trades && trades->rows.size() == 2) {
+    CHECK(trades->rows[0].count == 300 && trades->rows[0].yes_price == 4100 && !trades->rows[0].taker_bought_yes &&
+          trades->rows[0].ts_ms == 1791300601000);
+    CHECK(trades->rows[1].count == 50 && trades->rows[1].taker_bought_yes && trades->rows[1].ts_ms == 1791300600250);
+  }
+  CHECK(!parse_trades(R"({"trades":[{"trade_id":"t","ticker":"K","count_fp":"1.00","yes_price_dollars":"0.4100",
+      "taker_side":"maybe","created_time":"2026-10-06T15:30:01Z"}]})", &why) && why.find("taker_side") != std::string::npos);
+  {
+    TradesQuery tq;
+    tq.ticker = "KXTEST-26OCT06-A";
+    tq.min_ts = 1791300000;
+    tq.limit = 1000;
+    const auto r = build_get_trades(tq);
+    CHECK(r.method == "GET" && !r.auth && r.path == "/trade-api/v2/markets/trades" && r.query == "ticker=KXTEST-26OCT06-A&min_ts=1791300000&limit=1000");
+  }
+
   auto fills = parse_fills(R"({"fills":[{"fill_id":"f1","exchange_index":0,"trade_id":"f1","order_id":"o-1",
       "ticker":"KXTEST-26OCT06-A","market_ticker":"KXTEST-26OCT06-A","outcome_side":"yes","book_side":"bid",
       "count_fp":"2.00","yes_price_dollars":"0.4200","no_price_dollars":"0.5800","is_taker":true,
@@ -763,6 +785,12 @@ static void round_trip(const std::string& key_type) {
   auto fills = parse_fills(rt.send(build_get_fills(fq)).res.body, &why);
   CHECK(fills && fills->rows.size() == 1 && fills->rows[0].count == 200 && fills->rows[0].yes_price == 4200 &&
         fills->rows[0].taker && fills->rows[0].fee > 0 && take && fills->rows[0].order_id == take->order_id);
+  // the take is a public print too: GET /markets/trades shows it, its taker bought YES
+  TradesQuery tq;
+  tq.ticker = fx::T;
+  auto prints = parse_trades(rt.send(build_get_trades(tq)).res.body, &why);
+  CHECK(prints && !prints->rows.empty() && prints->rows[0].count == 200 && prints->rows[0].yes_price == 4200 &&
+        prints->rows[0].taker_bought_yes && prints->rows[0].ticker == fx::T);
   // reduce-only IOC ask sells 1 back into the street's 0.40 bid
   CreateOrder flat = order_on(fx::T, 0, BookSide::ASK, 100, 4000, TimeInForce::IOC, "M-rt-flat");
   flat.reduce_only = true;

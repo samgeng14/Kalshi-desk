@@ -1,5 +1,5 @@
 #pragma once
-// JSON in the shapes of ui/desk/js/contract.js (version 1.5.0), the single statement of what
+// JSON in the shapes of ui/desk/js/contract.js (version 1.6.0), the single statement of what
 // deskd serves the screen. "If the backend and this file disagree, this file wins": the tests
 // run contract.js's own validator over what these builders produce (tests/deskd/contract_check.cjs).
 //
@@ -22,7 +22,7 @@
 
 namespace deskd {
 
-constexpr const char* kContractVersion = "1.5.0";
+constexpr const char* kContractVersion = "1.6.0";
 // grev of the empty universe deskd lists until gw has markets (contract 1.5: a short id that
 // changes whenever a group or a count changes; nothing changes while there is nothing)
 constexpr const char* kEmptyUniverseGrev = "0";
@@ -97,5 +97,7 @@ std::vector<std::string> check_request(const std::string& key, const nlohmann::j
 // GET /api/universe's query, as contract.js's parseQuery and validateQuery see it: offset and
 // limit are numbers when they are all digits, every other value a string.
 std::vector<std::string> check_universe_query(const nlohmann::json& q);
+// GET /api/fill's query (contract 1.6), as contract.js validateQuery checks it
+std::vector<std::string> check_fill_query(const nlohmann::json& q);
 
 }  // namespace deskd

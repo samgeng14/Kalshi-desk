@@ -487,6 +487,63 @@ bool State::refresh(Worker* worker) {
   return ready;
 }
 
+void State::request_trades(const std::string& ticker, std::int64_t since_ms) {
+  std::lock_guard<std::mutex> lock(controls_mu_);
+  const auto failed = trades_failed_.find(ticker);
+  if (failed != trades_failed_.end() && mono_ms() - failed->second < 60000) return;
+  auto& at = trades_wanted_[ticker];
+  if (!at || since_ms < at) at = since_ms;
+}
+
+void State::backfill_trades(Worker* worker) {
+  // A backfill never delays the account: a refresh asked for (a private event to reconcile, and
+  // until then Manual and Systematic orders are refused STALE) goes first, and one asked for
+  // while a market's pages are being read stops them; the market is read again from the start.
+  if (refresh_requested_.load()) return;
+  std::string ticker;
+  std::int64_t since = 0;
+  {
+    std::lock_guard<std::mutex> lock(controls_mu_);
+    if (trades_wanted_.empty()) return;
+    ticker = trades_wanted_.begin()->first;
+    since = trades_wanted_.begin()->second;
+    trades_wanted_.erase(trades_wanted_.begin());
+  }
+  std::vector<kalshi::TradeRow> rows;
+  kalshi::TradesQuery q;
+  q.ticker = ticker;
+  q.min_ts = since / 1000;
+  q.limit = 1000;
+  std::string why;
+  for (int page = 0; page < 5; ++page) {
+    if (refresh_requested_.load()) {
+      std::lock_guard<std::mutex> lock(controls_mu_);
+      auto& at = trades_wanted_[ticker];
+      if (!at || since < at) at = since;
+      return;
+    }
+    std::string body;
+    if (!get(kalshi::build_get_trades(q), &body, &why, worker)) break;
+    auto p = kalshi::parse_trades(body, &why);
+    if (!p) break;
+    for (auto& r : p->rows) rows.push_back(std::move(r));
+    if (p->cursor.empty()) {
+      why.clear();
+      if (trades_cb_) trades_cb_(ticker, since, std::move(rows));   // every print since `since`
+      return;
+    }
+    q.cursor = p->cursor;
+  }
+  if (why.empty()) {   // five full pages: the tape is complete from the oldest print read
+    const std::int64_t from = rows.empty() ? since : rows.back().ts_ms;
+    if (trades_cb_) trades_cb_(ticker, from, std::move(rows));
+    return;
+  }
+  DLOG_WARN("rest: trades for %s: %s", ticker.c_str(), why.c_str());
+  std::lock_guard<std::mutex> lock(controls_mu_);
+  trades_failed_[ticker] = mono_ms();
+}
+
 void State::run(Worker& worker) {
   auto next = mono_ms();
   std::int64_t last_attempt = 0;
@@ -498,6 +555,8 @@ void State::run(Worker& worker) {
       last_attempt = now;
       refresh(&worker);
       next = mono_ms() + options_.poll_ms;
+    } else {
+      backfill_trades(&worker);   // between polls, one market at a time
     }
     if (!worker.stopping()) std::this_thread::sleep_for(std::chrono::milliseconds(50));
   }

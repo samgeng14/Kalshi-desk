@@ -58,6 +58,13 @@ bool Deskd::init_venue(std::string* err) {
   if (options_.rest_gap_ms >= 0) ro.request_gap_ms = options_.rest_gap_ms;
   rest_ = std::make_unique<rest::State>(*factory_, *re, signer_.get(),
       [this](std::shared_ptr<const rest::Snapshot> s) { on_rest(std::move(s)); }, ro);
+  // the fill model's last hour of a market's prints, read once its book first arrives
+  rest_->set_trades_callback([this](const std::string& tk, std::int64_t from, std::vector<kalshi::TradeRow> rows) {
+    std::vector<std::pair<std::string, TapePrint>> prints;
+    prints.reserve(rows.size());
+    for (const auto& r : rows) prints.push_back({r.trade_id, TapePrint{r.ts_ms, r.count, r.taker_bought_yes}});
+    fill_model_.backfill(tk, from, prints);
+  });
   private_ = std::make_unique<KalshiPrivate>(*we,*factory_,*signer_,feeds_.KXP,
       [this](const PrivateEvent& e) {
         // gw settles its own orders from the event; positions and cash still come from the
@@ -210,6 +217,11 @@ void Deskd::attach_manual() {
     };
     env.private_up = [this] { const auto v = feeds_.KXP.view(); return v.up && !v.gap; };
     env.post = [this](GwMsg m) { return gw_->post(std::move(m)); };
+    env.fill_p = [this](const std::string& tk, bool buy, Qty ahead, Qty size, int ttl_s) {
+      const auto e = fill_model_.estimate(tk, !buy, ahead, size, ttl_s, now_ms());
+      return e.why.empty() ? e.p_full : 0.0;
+    };
+    env.alert = [this](const std::string& lvl, const std::string& msg) { pub_->alert(lvl, "SYS", msg); };
     auto want = [this](const std::string& lane) {
       return [this, lane](std::set<std::string> markets) {
         bool changed = false;
@@ -482,6 +494,7 @@ std::optional<Px> Deskd::mid(const std::string& ticker) const {
 }
 
 void Deskd::on_trade(const MdTrade& t) {
+  fill_model_.add(t.ticker, t.trade_id, TapePrint{t.ts_ms, t.qty, t.taker_bought_yes});
   auto& tape = tape_[t.ticker];
   if (!t.trade_id.empty()) {
     if (!tape.seen.insert(t.trade_id).second) return;   // already shown
@@ -570,6 +583,11 @@ void Deskd::on_book(const MdBook& b) {
     (*next)[b.ticker] = b;
     std::atomic_store(&books_, std::shared_ptr<const std::map<std::string, MdBook>>(std::move(next)));
   }
+  if (!md_last_.count(b.ticker)) {
+    // a market's first book: the live prints count from now, the hour before comes by REST
+    fill_model_.cover(b.ticker, now_ms());
+    if (rest_ && fill_model_.needs_backfill(b.ticker)) rest_->request_trades(b.ticker, now_ms() - 3600000);
+  }
   md_last_[b.ticker] = b;
   if (markouts_) {
     const bool two = !b.stale && !b.bids.empty() && !b.asks.empty();
@@ -606,6 +624,86 @@ void Deskd::publish_market(const std::string& tk) {
   const auto s = rest_->snapshot();
   const auto it = s->markets.find(tk);
   if (it != s->markets.end()) pub_->post(PubData{"mkt", mkt_row(it->second, s->pins.count(tk), s->live.count(tk))});
+}
+
+json Deskd::fill(const json& q) {
+  const auto tk = q.at("tk").get<std::string>();
+  if (!rest_) return err_body("UNKNOWN_MARKET", tk + ": no venue connected");
+  const auto snap = rest_->snapshot();
+  const auto mit = snap->markets.find(tk);
+  if (mit == snap->markets.end()) return err_body("UNKNOWN_MARKET", tk + " is not listed");
+  const std::int64_t now = now_ms();
+  if (fill_model_.needs_backfill(tk)) rest_->request_trades(tk, now - 3600000);
+  const auto books = std::atomic_load(&books_);
+  const auto bit = books ? books->find(tk) : decltype(books->find(tk)){};
+  if (!books || bit == books->end()) return err_body("STALE", tk + ": no book yet (open its ladder or watch it)");
+  const MdBook& b = bit->second;
+  if (b.stale) return err_body("STALE", tk + ": its book is stale");
+  const bool buy = q.at("side") == "BUY";
+  const auto asked = kalshi::parse_px(q.at("px").get<std::string>());
+  const Qty qty = static_cast<Qty>(std::llround(q.at("qty").get<double>() * kOneContract));
+  const int ttl = q.at("ttl").get<int>();
+  if (!asked || qty <= 0) return err_body("BAD_REQUEST", "px and qty");
+  const auto& grid = mit->second.price_ranges;
+  const auto& own = buy ? b.bids : b.asks;   // the side the order rests on, best first
+  const auto& opp = buy ? b.asks : b.bids;
+  auto better = [buy](Px a, Px c) { return buy ? a > c : a < c; };   // a more aggressive than c
+  auto crosses = [&](Px p) { return !opp.empty() && !better(opp.front().px, p) ; };
+  FillEstimate shown;   // the estimate at the first resting price: its why and windows
+  bool have_shown = false;
+  auto point = [&](Px p) {
+    json j{{"px", price_str(p)}};
+    if (crosses(p)) {   // marketable: fills now up to the depth at or better than p
+      Qty depth = 0;
+      for (const auto& l : opp) if (!better(l.px, p)) depth += l.qty;
+      j["p_full"] = depth >= qty ? 1.0 : 0.0;
+      j["p_any"] = depth > 0 ? 1.0 : 0.0;
+      j["med_s"] = 0.0;
+      j["ahead"] = 0;
+      return j;
+    }
+    Qty ahead = 0;   // price-time priority: everything at p or better on our side is first
+    for (const auto& l : own) if (!better(p, l.px)) ahead += l.qty;
+    const auto e = fill_model_.estimate(tk, !buy, ahead, qty, ttl, now);
+    if (!have_shown) { shown = e; have_shown = true; }
+    auto r3 = [](double x) { return std::round(x * 1000.0) / 1000.0; };
+    j["p_full"] = r3(e.p_full);
+    j["p_any"] = r3(e.p_any);
+    j["med_s"] = e.median_s < 0 ? json(nullptr) : json(std::round(e.median_s * 10.0) / 10.0);
+    j["ahead"] = qty_to_number(ahead);
+    return j;
+  };
+  // the curve, most aggressive first: one tick better than our touch (unless that crosses), the
+  // touch, then up to three ticks behind it
+  std::vector<Px> prices;
+  auto step = [&](Px p, bool toward) -> std::optional<Px> {   // one grid tick more (toward) or less aggressive
+    const bool up = buy == toward;
+    return up ? grid_ceil(p + 1, grid) : grid_floor(p - 1, grid);
+  };
+  std::optional<Px> touch = own.empty() ? std::nullopt : std::optional<Px>(own.front().px);
+  if (touch) {
+    if (auto in = step(*touch, true); in && !crosses(*in)) prices.push_back(*in);
+    prices.push_back(*touch);
+  } else if (!opp.empty()) {
+    if (auto in = step(opp.front().px, false)) prices.push_back(*in);
+  }
+  for (int i = 0; i < 3 && !prices.empty(); ++i)
+    if (auto behind = step(prices.back(), false); behind && *behind > 0 && *behind < kOneDollar) prices.push_back(*behind);
+  json curve = json::array();
+  json p80 = nullptr;
+  for (const Px p : prices) curve.push_back(point(p));
+  const json at = point(*asked);
+  if (have_shown && shown.why.empty())
+    for (auto it = curve.rbegin(); it != curve.rend(); ++it)   // least aggressive first
+      if ((*it)["p_full"].get<double>() >= 0.8) { p80 = (*it)["px"]; break; }
+  const std::int64_t from = fill_model_.covered_from(tk);
+  json take{{"px", opp.empty() ? json(nullptr) : json(price_str(opp.front().px))},
+            {"depth", opp.empty() ? 0.0 : qty_to_number(opp.front().qty)}};
+  return json{{"ok", true},
+              {"fill", {{"tk", tk}, {"side", buy ? "BUY" : "SELL"}, {"ttl", ttl}, {"qty", qty_to_number(qty)},
+                        {"at", at}, {"curve", curve}, {"p80_px", p80}, {"take", take},
+                        {"tape_s", from > 0 && now > from ? (now - from) / 1000 : 0}, {"windows", shown.windows},
+                        {"why", have_shown ? shown.why : std::string()}}}};
 }
 
 json Deskd::watch(const json& request) {

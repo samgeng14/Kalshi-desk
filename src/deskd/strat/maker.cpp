@@ -74,12 +74,14 @@ MakerDecision maker_quote(const MakerInput& in, const MakerParams& p) {
   const Px tick = grid_step(bb, *in.grid);
   const long double micro = (static_cast<long double>(bb) * as + static_cast<long double>(ba) * bs) / (bs + as);
   long double fair = (ba - bb) > p.mid_over_ticks * tick ? (bb + ba) / 2.0L : micro;
-  Px e = p.edge_alone;
+  Px e = p.edge_alone, e_min = p.edge_min;
   if (in.anchor) {
     if (std::fabs(static_cast<double>(*in.anchor - micro)) > p.anchor_gap) return pull("anchor and microprice over 3c apart");
     fair = (fair + *in.anchor) / 2.0L;
     e = p.edge_anchor + in.maker_fee;
+    e_min = p.edge_min + in.maker_fee;
   }
+  if (in.edge_relax > 0) e = std::max(std::min(e, e_min), e - in.edge_relax);   // the fill pace, never below the floor
   d.fair = static_cast<Px>(std::llround(static_cast<double>(fair)));
   const long double skew = static_cast<long double>(p.skew_per_contract) * q / kOneContract;
   const Px bid_cap = static_cast<Px>(std::floor(static_cast<double>(fair - e - skew)));
@@ -219,7 +221,14 @@ void MakerEngine::step(std::int64_t now) {
     const auto pos_it = view->positions.find(lane_ + "|" + tk);
     const Qty pos = pos_it == view->positions.end() ? 0 : pos_it->second;
     // a fill of ours pulls both sides for a second (plan: pull on our fill)
-    if (last_pos_.count(tk) && last_pos_[tk] != pos) { cool_until_[tk] = now + 1000; cool_why_[tk] = "our fill"; }
+    if (last_pos_.count(tk) && last_pos_[tk] != pos) {
+      cool_until_[tk] = now + 1000;
+      cool_why_[tk] = "our fill";
+      last_fill_ms_ = now;
+      fill_times_.push_back(now);
+      if (relax_steps_ && env_.alert) env_.alert("INFO", lane_ + " filled: its edge floor is back to normal");
+      relax_steps_ = 0;
+    }
     last_pos_[tk] = pos;
     MakerDecision d;
     const auto m = snap->markets.find(tk);
@@ -261,6 +270,7 @@ void MakerEngine::step(std::int64_t now) {
       in.close_ms = m->second.close_ms.value_or(now);
       in.private_up = env_.private_up && env_.private_up();
       in.reference_fresh = a.fresh;
+      in.edge_relax = static_cast<Px>(relax_steps_.load()) * p_.edge_step;
       if (a.gated) {
         in.anchor = a.fair ? a.fair : std::optional<Px>(0);
         in.reference_fresh = a.fresh && a.fair.has_value();
@@ -332,6 +342,59 @@ void MakerEngine::step(std::int64_t now) {
       if (idle && d.quotes.empty()) sides_.erase(tk);
     }
   }
+  bool quoting = false;
+  for (const auto& [tk, slots] : sides_)
+    for (const auto& [slot, s] : slots) if (slot != 2 && !s.cid.empty()) quoting = true;
+  pace(now, running, quoting, *view, *snap);
+}
+
+// The fill pace (MakerParams::fill_target_ms): how long the lane has quoted without a fill, the
+// edge floor's steps down, and the expected wait for the next fill from the fill model.
+void MakerEngine::pace(std::int64_t now, bool running, bool quoting, const Gateway::SysView& v, const rest::Snapshot&) {
+  while (!fill_times_.empty() && fill_times_.front() < now - 1800000) fill_times_.pop_front();
+  fills_30m_ = static_cast<int>(fill_times_.size());
+  if (!running) {
+    quoting_since_ms_ = 0;
+    relax_steps_ = 0;
+    std::lock_guard<std::mutex> lk(status_mu_);
+    est_every_s_ = -1;
+    return;
+  }
+  if (!quoting) quoting_since_ms_ = 0;
+  else if (!quoting_since_ms_) quoting_since_ms_ = now;
+  const int max_steps = p_.edge_step > 0 ? static_cast<int>(std::max<Px>(0, p_.edge_alone - p_.edge_min) / p_.edge_step) : 0;
+  if (p_.fill_target_ms > 0 && quoting_since_ms_ && max_steps > 0) {
+    const std::int64_t quiet = now - std::max(last_fill_ms_.load(), quoting_since_ms_);
+    const int want = static_cast<int>(std::min<std::int64_t>(max_steps, quiet / p_.fill_target_ms));
+    if (want > relax_steps_) {
+      relax_steps_ = want;
+      if (env_.alert) {
+        char msg[200];
+        std::snprintf(msg, sizeof msg, "%s: no fill in %lld min of quoting: edge floor down %.2fc%s", lane_.c_str(),
+                      static_cast<long long>(quiet / 60000), relax_steps_.load() * p_.edge_step / 100.0,
+                      relax_steps_.load() == max_steps ? " (at the 0.5c floor: the book may simply be quiet)" : "");
+        env_.alert("WARN", msg);
+      }
+    }
+  }
+  // the expected wait for the next fill: each resting quote fills within its life with the fill
+  // model's probability; their rates add (every 5 s: a model read is a pass over an hour of tape)
+  if (!env_.fill_p || now - pace_checked_ms_ < 5000) return;
+  pace_checked_ms_ = now;
+  double rate = 0;
+  for (const auto& [cid, o] : v.orders) {
+    if (o.lane != lane_ || o.terminal || o.left <= 0 || (o.state != OrdState::WORK && o.state != OrdState::PART)) continue;
+    std::optional<MdBook> b = env_.book ? env_.book(o.ticker) : std::nullopt;
+    if (!b) continue;
+    without_own(*b, v, o.ticker);
+    Qty ahead = 0;
+    for (const auto& l : o.side == Side::BUY ? b->bids : b->asks)
+      if (o.side == Side::BUY ? l.px >= o.price : l.px <= o.price) ahead += l.qty;
+    const int life = std::max(1, p_.ttl_s);
+    rate += env_.fill_p(o.ticker, o.side == Side::BUY, ahead, o.left, life) / life;
+  }
+  std::lock_guard<std::mutex> lk(status_mu_);
+  est_every_s_ = rate > 0 ? 1.0 / rate : -1;
 }
 
 void MakerEngine::set_last(const std::string& tk, const std::string& why) {
@@ -341,12 +404,16 @@ void MakerEngine::set_last(const std::string& tk, const std::string& why) {
 
 json MakerEngine::status() const {
   json markets = json::object();
+  double every = -1;
   {
     std::lock_guard<std::mutex> lk(status_mu_);
     for (const auto& [tk, why] : last_pull_) markets[tk] = why;
+    every = est_every_s_;
   }
   return {{"lane", lane_}, {"places", places_.load()}, {"cancels", cancels_.load()}, {"refusals", refusals_.load()},
-          {"last", markets}};
+          {"last", markets}, {"est_fill_every_s", every < 0 ? json(nullptr) : json(std::round(every))},
+          {"fills_30m", fills_30m_.load()}, {"last_fill_ms", last_fill_ms_.load() ? json(last_fill_ms_.load()) : json(nullptr)},
+          {"edge_relax_c", relax_steps_.load() * p_.edge_step / 100.0}};
 }
 
 }  // namespace deskd

@@ -571,6 +571,8 @@
     live: 'bool'                           // in the live set (its mkt and book are on the stream)
   };
   var UNI_CATS = {}; enums.CAT.forEach(function (c) { UNI_CATS[c] = 'count'; });
+  // GET /api/fill: one price's estimate
+  var FILL_AT = { px: 'price', p_full: 'num', p_any: 'num', med_s: 'num?', ahead: 'size' };
   var UNI_RESP = {
     ok: ['enum', true],
     day: ['enum'].concat(enums.UNI_DAY),
@@ -856,6 +858,20 @@
                  response: { ok: true, day: 'T', date: '2026-10-06', total: 1, offset: 0, rows: [EX.uni], groups: [{ gk: 'WX DEN 10/06', cat: 'WEATHER', n: 1 }],
                              grev: '1x9f2a.1', cats: { SPORTS: 0, WEATHER: 1, FIN: 0, ECON: 0, OTHER: 0 }, ts_ms: T0 } }
     },
+    'GET /api/fill': {
+      doc: 'How likely a resting order is to fill before it expires, from the market\'s own trade tape (the backend keeps the last hour of each live market\'s prints). Query: tk, side=BUY|SELL (YES terms), px, qty, ttl (seconds; the order\'s expiry), v=K (optional; Kalshi only). A resting bid fills from takers who sell, an ask from takers who buy; with `ahead` contracts in front of it in the book now (0 for a price that improves the touch), it fills completely once that side\'s taker volume reaches ahead + qty. p_full and p_any are the share of the tape\'s ttl-long windows (one a second) in which that much (or any) volume came; med_s the median time it took in the windows that filled. at is the asked price; curve the touch improved by one tick, the touch, and up to three ticks behind; p80_px the least aggressive of them estimated to fill completely at least 80% of the time (null: none, so a resting order is unlikely to fill and take is the way); take the opposite touch and its depth (an IOC there fills now up to that). A price at or through the opposite touch crosses: its p_full is 1 if the depth there covers qty. why is empty when the estimate stands, else why it is thin (fewer than two minutes of tape: learning).',
+      query: { 'v?': ['enum', 'K'], tk: 'tk', side: ['enum'].concat(enums.SIDE), px: 'price', qty: 'size', ttl: 'count' },
+      response: { ok: ['enum', true],
+                  fill: { tk: 'tk', side: ['enum'].concat(enums.SIDE), ttl: 'count', qty: 'size', at: FILL_AT, curve: ['arr', FILL_AT],
+                          p80_px: 'price?', take: { px: 'price?', depth: 'size' }, tape_s: 'count', windows: 'count', why: 'str' } },
+      errors: ['BAD_REQUEST', 'UNKNOWN_MARKET', 'STALE', 'FORBIDDEN', 'INTERNAL'],
+      example: { query: { tk: 'KXNATGAS15M-26OCT061930-30', side: 'BUY', px: '0.4400', qty: 10, ttl: 15 },
+                 response: { ok: true, fill: { tk: 'KXNATGAS15M-26OCT061930-30', side: 'BUY', ttl: 15, qty: 10,
+                   at: { px: '0.4400', p_full: 0.31, p_any: 0.47, med_s: 6.2, ahead: 40 },
+                   curve: [{ px: '0.4500', p_full: 0.83, p_any: 0.9, med_s: 3.1, ahead: 0 }, { px: '0.4400', p_full: 0.31, p_any: 0.47, med_s: 6.2, ahead: 40 },
+                           { px: '0.4300', p_full: 0.05, p_any: 0.12, med_s: 11, ahead: 100 }],
+                   p80_px: '0.4500', take: { px: '0.4600', depth: 25 }, tape_s: 3600, windows: 3585, why: '' } } }
+    },
     'POST /api/watch': {
       doc: 'Pin a market to the watchlist (on true) or unpin it (on false). Pinning brings it into the live set: its mkt event (pin true) and its book follow on the stream. Unpinning sends its mkt event with pin false; it stays live while a lane, an open position, a working order or a ladder holds it, and otherwise leaves the live set (its mkt event with live false). A pin on a market that is not OPEN is refused MARKET_CLOSED; an unpin is always accepted. Pins carry over rolls and persist across a backend restart (THE UNIVERSE). Idempotent.',
       request: { v: ['enum'].concat(enums.VENUE), tk: 'tk', on: 'bool' },
@@ -878,7 +894,7 @@
   // cancels and KILL are never rate-limited.
   Object.keys(endpoints).forEach(function (k) {
     var ep = endpoints[k];
-    if (ep.request !== undefined || k === 'GET /api/snapshot' || k === 'GET /api/universe') ep.error = ERR_RESP;
+    if (ep.request !== undefined || k === 'GET /api/snapshot' || k === 'GET /api/universe' || k === 'GET /api/fill') ep.error = ERR_RESP;
     if (k.indexOf('POST ') === 0) {
       ep.errors = ['FORBIDDEN', 'BAD_REQUEST'].concat((ep.errors || []).filter(function (c) { return c !== 'FORBIDDEN' && c !== 'BAD_REQUEST' && c !== 'INTERNAL'; }), ['INTERNAL']);
     }
@@ -969,13 +985,13 @@
     var h = String(host || '').toLowerCase();
     return h === '127.0.0.1:' + port || h === 'localhost:' + port;
   }
-  // GET /api/universe: the query string parsed into typed values ({} on garbage), and checked
+  // GET /api/universe and /api/fill: the query string parsed into typed values ({} on garbage), and checked
   function parseQuery(path) {
     var out = {}, qs = String(path).split('?')[1] || '';
     qs.split('&').forEach(function (kv) {
       if (!kv) return;
       var i = kv.indexOf('='), k = decodeURIComponent(i < 0 ? kv : kv.slice(0, i)), v = i < 0 ? '' : decodeURIComponent(kv.slice(i + 1).replace(/\+/g, ' '));
-      out[k] = (k === 'offset' || k === 'limit') && /^\d+$/.test(v) ? +v : v;
+      out[k] = (k === 'offset' || k === 'limit' || k === 'ttl') && /^\d+$/.test(v) ? +v : (k === 'qty' && /^\d+(\.\d{1,2})?$/.test(v) ? +v : v);
     });
     return out;
   }
@@ -1029,7 +1045,7 @@
   Desk.contract = {
     // 1.3: exp_ms up to the market's close (CLOSE); 1.4: THE UNIVERSE; 1.5: the live set shrinks
     // (mkt.live), mkt.gk, grev, T1 = tomorrow exactly, pins and expiry at the close spelled out
-    version: '1.5.0',
+    version: '1.6.0',
     TOKEN_META: 'desk-token',            // <meta name="desk-token" content="..."> in the served page
     hostOk: hostOk,
     types: types,

@@ -195,6 +195,81 @@ void engine_limits() {
   CHECK(posted.empty());
 }
 
+// The fill pace: quoting a minute with no fill (fill_target_ms 60 s here) lowers the edge floor a
+// step; at the plan's 0.5c floor the bid reaches the price the 1c floor kept it from; a fill puts
+// it back. Book 0.40 x10 / 0.43 x10: fair 0.415. A 1c floor caps the bid at 0.405 (the touch,
+// 0.40); 0.75c at 0.4075 (still 0.40); 0.5c at 0.41 (one tick better than the touch).
+void fill_pace() {
+  const std::string tk = "KXNATGAS15M-26OCT10-A";
+  auto view = std::make_shared<Gateway::SysView>();
+  view->run = RunState::RUN;
+  view->lanes_on = {"M1"};
+  auto snap = std::make_shared<rest::Snapshot>();
+  kalshi::MarketRow m; m.ticker = tk; m.event_ticker = "KXNATGAS15M-26OCT10"; m.status = "active";
+  m.open_ms = OPEN; m.close_ms = OPEN + 3 * 3600000; m.price_ranges = CENT;
+  snap->markets[tk] = m;
+  snap->clock.post_trusted = true;
+  std::vector<GwMsg> posted;
+  std::vector<std::string> alerts;
+  MakerEngine::Env env;
+  env.view = [&] { return std::shared_ptr<const Gateway::SysView>(view); };
+  env.snapshot = [&] { return std::shared_ptr<const rest::Snapshot>(snap); };
+  env.book = [&](const std::string&) { auto b = book(4000, 1000, 4300, 1000); b.ticker = tk; return std::optional<MdBook>(b); };
+  env.private_up = [] { return true; };
+  env.post = [&](GwMsg g) { posted.push_back(std::move(g)); return true; };
+  env.fill_p = [](const std::string&, bool, Qty, Qty, int) { return 0.05; };   // 5% per 15 s quote
+  env.alert = [&](const std::string&, const std::string& msg) { alerts.push_back(msg); };
+  MakerParams p; p.size = 100; p.ttl_s = 15; p.two_sided_ms = 3 * 3600000; p.fill_target_ms = 60000;
+  MakerEngine e("M1", {"KXNATGAS15M"}, env, p);
+  // what gw would show: every placed quote working, every cancelled one gone
+  auto settle = [&] {
+    for (const auto& g : posted) {
+      if (const auto* pi = std::get_if<PlaceIntent>(&g)) {
+        Gateway::SysOrder o; o.cid = pi->cid; o.lane = "M1"; o.ticker = tk; o.side = pi->side; o.price = pi->price;
+        o.count = o.left = pi->count; o.state = OrdState::WORK;
+        view->orders[o.cid] = o;
+      } else if (const auto* ci = std::get_if<CancelIntent>(&g)) {
+        auto it = view->orders.find(ci->cid);
+        if (it != view->orders.end()) { it->second.terminal = true; it->second.left = 0; }
+      }
+    }
+    posted.clear();
+  };
+  auto bid = [&]() -> Px { for (const auto& [cid, o] : view->orders) if (o.side == Side::BUY && !o.terminal) return o.price; return 0; };
+  const std::int64_t t0 = OPEN + 1000;
+  e.step(t0);
+  settle();
+  CHECK(bid() == 4000 && e.status()["edge_relax_c"] == 0.0);
+  e.step(t0 + 61000);
+  settle();
+  // two quotes working at 5% a 15 s life each: one fill expected every 150 s
+  CHECK(e.status()["est_fill_every_s"] == 150);
+  CHECK(alerts.size() == 1 && alerts.back().find("no fill in 1 min") != std::string::npos);
+  CHECK(e.status()["edge_relax_c"] == 0.25 && bid() == 4000);
+  e.step(t0 + 121000);   // the floor reaches 0.5c...
+  settle();
+  CHECK(alerts.size() == 2 && alerts.back().find("0.5c floor") != std::string::npos);
+  e.step(t0 + 122000);   // ...the 0.40 bid is cancelled...
+  settle();
+  e.step(t0 + 123000);   // ...and 0.41 posted
+  settle();
+  CHECK(bid() == 4100 && e.status()["edge_relax_c"] == 0.5);
+  e.step(t0 + 300000);   // never below the floor
+  settle();
+  CHECK(alerts.size() == 2 && e.status()["edge_relax_c"] == 0.5);
+  // a fill: back to the 1c floor, and the bid back to the touch
+  view->positions["M1|" + tk] = 100;
+  e.step(t0 + 301000);
+  settle();
+  CHECK(alerts.size() == 3 && alerts.back().find("back to normal") != std::string::npos);
+  CHECK(e.status()["edge_relax_c"] == 0.0 && e.status()["fills_30m"] == 1);
+  e.step(t0 + 303000);   // after the 1 s pull on our fill
+  settle();
+  e.step(t0 + 304000);
+  settle();
+  CHECK(bid() == 4000);
+}
+
 // The maker-math review (2026-10-10), each with its worked example.
 void review_fixes() {
   // the grid at $0 and $1: the range's own end is not a price, and no lower range wins instead
@@ -304,6 +379,6 @@ void engine_own_quotes() {
 }  // namespace
 
 int main() {
-  grid(); quotes(); anchor_and_pulls(); band(); engine_limits(); review_fixes(); engine_own_quotes();
+  grid(); quotes(); anchor_and_pulls(); band(); engine_limits(); review_fixes(); engine_own_quotes(); fill_pace();
   return finish("deskd-maker");
 }

@@ -97,6 +97,13 @@ class State {
   // previous run's last orders, so their fills can be told apart by client id. Before run().
   void set_orders_since(std::int64_t ms) { orders_since_ms_ = ms; }
   void request_refresh();
+  // The fill model's backfill (strat/fill_model.h): a market's public prints since `since_ms`,
+  // read between polls (at most 5 pages of 1,000) and handed to the callback with the time the
+  // tape is complete from. Any thread; a market asked again within a minute of a failure waits.
+  using TradesCallback = std::function<void(const std::string& ticker, std::int64_t covered_from_ms,
+                                            std::vector<kalshi::TradeRow> rows)>;
+  void set_trades_callback(TradesCallback cb) { trades_cb_ = std::move(cb); }   // before run()
+  void request_trades(const std::string& ticker, std::int64_t since_ms);
   // Set before run(). A private-event generation fences the whole paged read: an event or
   // reconnect during it means those pages cannot be accepted as one reconciled account.
   void set_reconcile_guard(std::function<std::uint64_t()> begin,
@@ -111,6 +118,7 @@ class State {
   bool listing(Snapshot& next, std::string* why, Worker* worker);
   void metadata(Snapshot& next, Worker* worker);
   void publish(Snapshot next);
+  void backfill_trades(Worker* worker);
   void controls(bool pins, std::set<std::string> values);
   net::ConnFactory& factory_;
   net::Endpoint endpoint_;
@@ -122,6 +130,9 @@ class State {
   std::shared_ptr<const Snapshot> published_;
   std::mutex controls_mu_;  // controls/publication only, never held over I/O or callbacks
   std::set<std::string> pins_, live_, held_;
+  TradesCallback trades_cb_;
+  std::map<std::string, std::int64_t> trades_wanted_;   // ticker -> since ms (under controls_mu_)
+  std::map<std::string, std::int64_t> trades_failed_;   // ticker -> mono ms of the last failure
   std::int64_t orders_since_ms_ = 0;
   std::atomic<bool> refresh_requested_{false};
   ClockCheck clock_;

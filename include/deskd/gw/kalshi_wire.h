@@ -173,6 +173,14 @@ struct MarketsQuery {
 };
 WireRequest build_get_markets(const MarketsQuery& q);
 WireRequest build_get_orderbook(const std::string& ticker, int depth = 0);
+// GET /markets/trades (public): a market's prints, newest first, paged by cursor; the fill model's
+// backfill (strat/fill_model.h). min_ts / max_ts in Unix seconds.
+struct TradesQuery {
+  std::string ticker, cursor;
+  std::int64_t min_ts = 0, max_ts = 0;
+  int limit = 0;                  // 1..1000
+};
+WireRequest build_get_trades(const TradesQuery& q);
 WireRequest build_get_exchange_status();
 
 // The bytes to write: request line, Host, the auth headers when given, Accept and Content-Type,
@@ -303,6 +311,14 @@ std::optional<std::vector<BatchCancelRow>> parse_batch_cancel(const std::string&
 std::optional<OrderRow> parse_order(const std::string& body, std::string* why);   // {"order":{...}}
 std::optional<Page<OrderRow>> parse_orders(const std::string& body, std::string* why);
 std::optional<Page<FillRow>> parse_fills(const std::string& body, std::string* why);
+struct TradeRow {               // a public print
+  std::string trade_id, ticker;
+  Px yes_price = 0;
+  Qty count = 0;
+  bool taker_bought_yes = true;   // taker_side "yes": the aggressor bought YES (a print on the ask)
+  std::int64_t ts_ms = 0;
+};
+std::optional<Page<TradeRow>> parse_trades(const std::string& body, std::string* why);
 std::optional<Page<PositionRow>> parse_positions(const std::string& body, std::string* why);
 std::optional<Balance> parse_balance(const std::string& body, std::string* why);
 std::optional<MarketRow> parse_market(const std::string& body, std::string* why);   // {"market":{...}}

@@ -325,6 +325,14 @@ class Engine {
   const Order* order(const std::string& order_id) const;
   const std::vector<const Order*>& user_orders() const { return user_orders_; }
   const std::vector<Fill>& fills() const { return fills_; }
+  // every public print, oldest first (the last 50,000): GET /markets/trades
+  struct PublicTrade {
+    std::string trade_id, ticker, taker_side;   // taker_side "yes" | "no"
+    Px yes_px = 0;
+    Qty qty = 0;
+    std::int64_t ts_ms = 0;
+  };
+  const std::deque<PublicTrade>& public_trades() const { return public_trades_; }
   const std::map<std::pair<int, std::string>, Position>& positions() const { return positions_; }
 
   // ---- order groups
@@ -403,6 +411,7 @@ class Engine {
   std::int64_t cash_updated_ms_ = 0;
   std::map<std::string, Group> groups_;
   std::vector<Event> events_;
+  std::deque<PublicTrade> public_trades_;
   std::int64_t last_cancel_all_ms_ = std::numeric_limits<std::int64_t>::min() / 2;
   bool tape_debts_ = false;
   std::uint64_t transfers_ = 0;

@@ -84,6 +84,7 @@ Deskd::Deskd(DeskdConfig cfg, std::unique_ptr<AccountLock> lock, RuntimeOptions 
     });
   };
   wd.watch = [this](const json& q) { return watch(q); };
+  wd.fill = [this](const json& q) { return fill(q); };
   web_ = std::make_unique<WebServer>(std::move(wd));
 }
 
