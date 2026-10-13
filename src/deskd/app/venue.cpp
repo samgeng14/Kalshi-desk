@@ -178,6 +178,7 @@ void Deskd::attach_manual() {
       if (!j.is_discarded()) pub_->post(PubData{"lane", std::move(j)});
     };
     p.daily_stop = cfg_.daily_stop;
+    p.equity_floor = cfg_.equity_floor;
     p.groups = &groups_;
     p.sys_state_file = cfg_.data_dir + "/systematic.json";
     p.lanes = default_lanes();

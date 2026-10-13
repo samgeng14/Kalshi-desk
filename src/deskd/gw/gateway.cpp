@@ -828,7 +828,7 @@ void Gateway::place_sys(PlaceIntent& p) {
     answer(p.reply, OrderReply{code, msg, ""});
   };
   if (kill_.active()) return refuse("KILLED", "KILL lockout active");
-  if (own_.state == RunState::HALTED) return refuse("HALTED", "Systematic halted by the daily stop");
+  if (own_.state == RunState::HALTED) return refuse("HALTED", "Systematic halted: " + own_.why);
   if (own_.state != RunState::RUN) return refuse("BAD_STATE", "a Systematic order while Systematic is not running");
   const auto* lane = sys_->lane(p.lane);
   if (!lane) return refuse("BAD_REQUEST", "no lane " + p.lane);
@@ -883,6 +883,26 @@ void Gateway::place_sys(PlaceIntent& p) {
   const Micros eff = std::min<Micros>(equity * 7 / 10, used_all + manual_->venue_free());
   if (grows > 0 && used_all + worst > eff)
     return refuse("SYS_CEILING", "past the effective Systematic ceiling " + money_str(eff / 100));
+  // the correlated group (plan section 4, limit 2): every lane's worst case there, held and working
+  if (grows > 0) {
+    auto event_of = [this](const std::string& tk) {
+      const auto it = snapshot_seen_->markets.find(tk);
+      return it == snapshot_seen_->markets.end() ? std::string() : it->second.event_ticker;
+    };
+    const std::string grp = corr_group(p.ticker, m->second.event_ticker);
+    const auto in_grp = [&](const std::string& tk) { return corr_group(tk, event_of(tk)) == grp; };
+    Micros in_group = worst;
+    for (const auto& l : sys_->lanes()) in_group += sys_->open_worst_in(l.id, in_grp);
+    for (const auto& [cid, o] : manual_->ledger().orders())
+      if (o.intent.owner == Owner::SYS && !o.terminal() && in_grp(o.intent.ticker)) in_group += o.reservation();
+    if (in_group > corr_group_cap(grp))
+      return refuse("SYS_CEILING", "group " + grp + " worst case past " + money_str(corr_group_cap(grp) / 100));
+  }
+  // the floor (plan section 4, limit 5): the account's equity under it halts Systematic
+  if (path_->equity_floor > 0 && equity < path_->equity_floor * 100) {
+    halt("equity floor: the account's equity " + money_str(equity / 100) + " is under " + money_str(path_->equity_floor));
+    return refuse("HALTED", "Systematic halted by the equity floor");
+  }
   // the daily loss stop (decision 1): Systematic's day, marked at the mids
   const auto mk = [this](const std::string& tk) { return mark(tk); };
   if (path_->daily_stop > 0 && sys_->day_total(mk) <= -path_->daily_stop * 100) {
@@ -1107,6 +1127,11 @@ void Gateway::sys_tick(std::int64_t now) {
   sync_snapshot();
   const auto mk = [this](const std::string& tk) { return mark(tk); };
   if (own_.state == RunState::RUN && path_->daily_stop > 0 && sys_->day_total(mk) <= -path_->daily_stop * 100) halt("daily stop");
+  if (own_.state == RunState::RUN && path_->equity_floor > 0 && snapshot_seen_ && snapshot_seen_->account_ready) {
+    const Micros equity = (snapshot_seen_->balance.available + snapshot_seen_->balance.portfolio_value.value_or(0)) * 100;
+    if (equity < path_->equity_floor * 100)
+      halt("equity floor: the account's equity " + money_str(equity / 100) + " is under " + money_str(path_->equity_floor));
+  }
   // Order groups: one per lane and shard, created one at a time while Systematic can write;
   // triggered ones are reset once nothing runs (after a Stop or HALT; KILL's at its re-arm).
   const bool can_write = !kill_.active() && (!path_->sys_health || path_->sys_health().manual_sender);

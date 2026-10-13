@@ -60,6 +60,9 @@ struct ManualPath {
   std::function<ManualHealth()> sys_health;
   std::function<void(const std::string&)> publish_lane;
   Money daily_stop = 0;
+  // the floor (plan section 4, limit 5): the account's equity (cash and positions, the venue's
+  // marks) under it halts Systematic; 0 = none
+  Money equity_floor = 0;
   GroupRegistry* groups = nullptr;
   std::vector<LaneSpec> lanes;   // empty: default_lanes()
   // Systematic's book across a restart (its day, positions, trade ids, HALT and the markets

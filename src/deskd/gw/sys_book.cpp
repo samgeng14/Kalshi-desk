@@ -147,6 +147,36 @@ Micros SysBook::unrealized(const std::string& lane, const MarkFn& mark) const {
   return u;
 }
 
+std::string corr_group(const std::string& ticker, const std::string& event_ticker) {
+  const std::string series = ticker.substr(0, ticker.find('-'));
+  static const std::set<std::string> metals = {"KXGOLD15M", "KXSILVER15M", "KXCOPPER15M", "KXPLATINUM15M", "KXPALLADIUM15M"};
+  static const std::set<std::string> fx = {"KXEURUSD15M", "KXGBPUSD15M", "KXUSDJPY15M", "KXAUDUSD15M", "KXUSDCAD15M"};
+  static const std::set<std::string> energy = {"KXNATGAS15M", "KXWTI15M", "KXBRENT15M"};
+  if (metals.count(series)) return "METALS";
+  if (fx.count(series)) return "FX";
+  if (energy.count(series)) return "ENERGY";
+  if (!event_ticker.empty()) return event_ticker;
+  const auto dash = ticker.rfind('-');
+  return dash == std::string::npos ? ticker : ticker.substr(0, dash);
+}
+
+Micros corr_group_cap(const std::string& group) {
+  const bool lip = group == "METALS" || group == "FX" || group == "ENERGY";
+  return (lip ? 25 : 15) * 1000000LL;
+}
+
+Micros SysBook::open_worst_in(const std::string& lane, const std::function<bool(const std::string&)>& in) const {
+  const auto* d = day(lane);
+  if (!d) return 0;
+  Micros w = 0;
+  for (const auto& [tk, inv] : d->inv) {
+    if (!in(tk)) continue;
+    if (inv.pos > 0) w += inv.cost;
+    else if (inv.pos < 0) w += kOneDollar * -inv.pos - inv.cost;
+  }
+  return w;
+}
+
 Micros SysBook::open_worst(const std::string& lane) const {
   const auto* d = day(lane);
   if (!d) return 0;

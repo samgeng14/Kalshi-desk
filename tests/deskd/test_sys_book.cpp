@@ -98,7 +98,25 @@ void settle_and_restore() {
 }
 }  // namespace
 
+// Correlated groups (plan section 4, limit 2) and a lane's worst case within one
+void groups_of_markets() {
+  CHECK(corr_group("KXGOLD15M-26OCT101200-00", "KXGOLD15M-26OCT101200") == "METALS");
+  CHECK(corr_group("KXPLATINUM15M-26OCT101200-00", "") == "METALS");
+  CHECK(corr_group("KXEURUSD15M-26OCT101200-00", "x") == "FX");
+  CHECK(corr_group("KXNATGAS15M-26OCT101200-00", "x") == "ENERGY");
+  CHECK(corr_group("KXHIGHNY-26OCT12-B70", "KXHIGHNY-26OCT12") == "KXHIGHNY-26OCT12");   // one city-day
+  CHECK(corr_group("KXHIGHNY-26OCT12-B70", "") == "KXHIGHNY-26OCT12");                   // by the ticker
+  CHECK(corr_group_cap("METALS") == 25000000 && corr_group_cap("KXHIGHNY-26OCT12") == 15000000);
+  SysBook b;
+  CHECK(b.fill("M2", "SM2-a", "KXHIGHNY-26OCT12-B70", Side::BUY, 500, 9700, 0, 1000, "t1"));   // 5 at 0.97: $4.85
+  CHECK(b.fill("M2", "SM2-b", "KXHIGHCHI-26OCT12-B60", Side::SELL, 500, 300, 0, 1000, "t2"));  // short 5 at 0.03: $4.85
+  auto city = [](const std::string& city) { return [city](const std::string& tk) { return tk.rfind(city, 0) == 0; }; };
+  CHECK(b.open_worst_in("M2", city("KXHIGHNY")) == 4850000);
+  CHECK(b.open_worst_in("M2", city("KXHIGHCHI")) == 4850000);
+  CHECK(b.open_worst("M2") == 9700000 && b.open_worst_in("M1", city("KXHIGHNY")) == 0);
+}
+
 int main() {
-  lanes_and_groups(); lane_day(); settle_and_restore();
+  lanes_and_groups(); lane_day(); settle_and_restore(); groups_of_markets();
   return finish("deskd-sys_book");
 }

@@ -632,7 +632,8 @@ void systematic_group_trigger() {
 //   - a market the lane holds that settles realizes the position, and HALTs a day past the stop
 //   - KILL and its re-arm keep the HALT; so does a restart, with the day and the positions
 void systematic_book() {
-  const std::string W="KXRUNTIME-26OCT10-W", V="KXRUNTIME-26OCT10-V";
+  // three events: the lane's budget is what this test reaches, not one group's $15 cap
+  const std::string W="KXRUNTIME-26OCT11-W", V="KXRUNTIME-26OCT12-V";
   Run r(false,[&](fakex::Engine& e,std::int64_t now) {
     for(const auto& tk:{W,V}) { auto spec=fx::spec(tk,0); spec.close_ms=(now/1000+3600)*1000; e.add_market(spec,now); }
     e.street_add(W,false,6000,5000,now); e.street_add(W,true,3800,5000,now);   // YES 0.60 bid / 0.62 ask
@@ -962,10 +963,23 @@ void fill_estimates() {
     CHECK(std::system(cmd.c_str())==0);
   }
 }
+// The equity floor (plan section 4, limit 5): an account under it halts Systematic, which says why
+void equity_floor() {
+  Run r(false,{},true,[](DeskdConfig& c,RuntimeOptions&) { c.equity_floor=5000*10000; });   // $5,000; the fake holds $2,000
+  CHECK(r.ready());
+  auto lane=r.post("/api/lane/M2",{{"on",true}});
+  CHECK(lane && lane->status==200);
+  std::string why;
+  CHECK(r.until([&]{ return r.d->gw().groups_ready(&why) && why.empty(); },20000));
+  httplib::Result start;
+  CHECK(r.until([&]{ start=r.post("/api/start",json::object()); return start && start->status==200; },10000));
+  CHECK(r.until([&]{ return r.d->status()["run"]["state"]=="HALTED"; },10000));
+  CHECK(r.d->status()["run"]["why"].get<std::string>().find("equity floor")==0);
+}
 }  // namespace
 
 int main() {
   std::signal(SIGPIPE,SIG_IGN);
-  off_by_default(); orders_cancel_kill(); stop_reasons(); financial_fair(); systematic(); systematic_maker(); systematic_band(); systematic_races(); systematic_group_trigger(); systematic_book(); takeover(); shard_preflight(); foreign_cancels(); live_mode(); fill_estimates();
+  off_by_default(); orders_cancel_kill(); stop_reasons(); financial_fair(); systematic(); systematic_maker(); systematic_band(); systematic_races(); systematic_group_trigger(); systematic_book(); takeover(); shard_preflight(); foreign_cancels(); live_mode(); fill_estimates(); equity_floor();
   return finish("deskd-runtime-manual");
 }

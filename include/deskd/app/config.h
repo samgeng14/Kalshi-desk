@@ -35,6 +35,7 @@ struct DeskdConfig {
   int max_streams = 4;               // SSE streams; leaves 12 of the 16 threads for requests
   int heartbeat_window_ms = 5000;    // gw, md-k and priv-k must each move within this
   Money daily_stop = 30 * 10000;     // u; decision 1, the recommended $30
+  Money equity_floor = 150 * 10000;  // u; plan section 4 limit 5: the account under it halts Systematic
   // Manual orders to the (demo) venue. Off by default: gw still admits and answers, but every
   // order is refused RO and the header stays read-only until the operator turns it on.
   bool manual_orders = false;

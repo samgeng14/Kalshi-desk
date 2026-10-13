@@ -56,6 +56,13 @@ struct LaneSpec {
 };
 const std::vector<LaneSpec>& default_lanes();
 
+// Correlated groups (plan section 4, limit 2): Systematic's worst case in one group may not pass
+// $15, $25 in an LIP-15 group. The 15-minute series group by what moves them together: METALS
+// (gold, silver, copper, platinum, palladium), FX (the currency pairs), ENERGY (natural gas, oil);
+// any other market by its event (one city-day of weather, one game, one event's outcomes).
+std::string corr_group(const std::string& ticker, const std::string& event_ticker);
+Micros corr_group_cap(const std::string& group);   // micro-dollars
+
 class SysBook {
  public:
   explicit SysBook(std::vector<LaneSpec> lanes = default_lanes());
@@ -109,6 +116,8 @@ class SysBook {
   using MarkFn = std::function<std::optional<Px>(const std::string&)>;
   Micros unrealized(const std::string& lane, const MarkFn& mark) const;
   Micros open_worst(const std::string& lane) const;
+  // the same, over the lane's markets `in` accepts
+  Micros open_worst_in(const std::string& lane, const std::function<bool(const std::string&)>& in) const;
   // Systematic's day across lanes: real - fees + unrl (the daily stop's measure; no LIP yet)
   Micros day_total(const MarkFn& mark) const;
   std::int64_t day_start_ms() const { return day_start_ms_; }

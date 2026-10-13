@@ -66,7 +66,7 @@ DeskdConfig load_deskd_config(const std::string& path) {
   // "heartbeat_window_ms" would otherwise leave the supervisor's rule unchanged.
   static const std::set<std::string> known = {"data_dir",    "lock_dir",    "ui_dir",
                                               "http_port",   "web_threads", "keepalive_s",
-                                              "max_streams", "heartbeat_window_ms", "daily_stop_dollars",
+                                              "max_streams", "heartbeat_window_ms", "daily_stop_dollars", "equity_floor_dollars",
                                               "manual_orders", "systematic_orders", "lip_series", "band_series",
                                               "peer_url"};
   for (auto kv = d.begin(); kv != d.end(); ++kv) {
@@ -100,6 +100,9 @@ DeskdConfig load_deskd_config(const std::string& path) {
   double stop = -1;
   take(d, "daily_stop_dollars", stop, where);
   if (stop >= 0) c.daily_stop = static_cast<Money>(std::llround(stop * 10000.0));
+  double floor = -1;
+  take(d, "equity_floor_dollars", floor, where);
+  if (floor >= 0) c.equity_floor = static_cast<Money>(std::llround(floor * 10000.0));
   c.data_dir = expand_home(c.data_dir);
   c.lock_dir = expand_home(c.lock_dir);
   // A relative lock dir would be a different file from every other working directory: the bug
