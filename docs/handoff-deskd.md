@@ -1,4 +1,4 @@
-# deskd handoff (2026-10-07, updated 2026-10-12)
+# deskd handoff (2026-10-07, updated 2026-10-13)
 
 The desk is being rebuilt as `deskd`, an event-driven C++17 trading desk, per `docs/impl_plan.md` (the operator-approved plan; read sections 2-4, 8 and 9 first). This file says where everything is and what to do next.
 
@@ -24,6 +24,46 @@ Rules in code:
   re-arm; Systematic lanes M1 and M2 quoting, Start, Stop cancelling.
 
 The work is on GitHub: `samgeng14/kalshi-desk`, branch `claude/pensive-meitner-8k2wae` (draft PR #1).
+
+## 2026-10-13
+
+- **Fill probability** (operator: Manual should fill about 80% of the time; Systematic a fill
+  every 5-10 minutes). `strat/fill_model` measures, from each market's own trade tape (the live
+  trade channel plus a REST backfill of the last hour), the fraction of the last hour's windows in
+  which enough taker volume came to fill an order behind the queue ahead of it. `GET /api/fill`
+  (contract 1.6) gives the curve for a ticket: improve, touch, three behind, and P80, the price
+  that fills 80% of the time. The ticket shows a FILL line and a P80 button. The makers lower
+  their edge floor by 0.25c for each 10 minutes without a fill (never below 0.5c plus the maker
+  fee), and a fill puts it back; `/ops/status` shows `est_fill_every_s` and `fills_30m` per lane.
+- **Risk limits 2 and 5:** correlated groups (METALS, FX, ENERGY $25; any other market by its
+  event, $15) and an equity floor (`deskd.equity_floor_dollars`, default $150) that halts
+  Systematic.
+- **The 4-hour TSan soak:** 3 h 52 m with no ThreadSanitizer report, until the container restarted
+  (no end summary). It found two feed-wide STALE sources, both fixed:
+  - **The account read** fetched every order and fill of the day each poll (13,500 orders by
+    hour 4), so nearly every read overlapped a private event and was discarded; orders went
+    STALE (585 refusals). It now reads the day whole once, then only what is new since the last
+    good read (5-minute overlap, merged by id; an order that left the book is read by its id).
+    A 40-minute soak after: 0 such refusals.
+  - **Market data** reconnected at every watch-list change (each 15-minute roll, a pin), so every
+    book went stale for a moment; and the private feed showed a gap on every event. Watch
+    changes now happen on the live socket (added markets subscribe, removed ones are ignored
+    until the next reconnect), and only an untrusted private event raises the gap.
+- **Write budget:** gw keeps Kalshi's write buckets per shard (create 10 tokens, cancel 2);
+  Systematic is refused RATE past 80% of a bucket, and Manual and cancels are never refused
+  locally (`deskd.write_tier`: "basic", or "advanced" after the upgrade). `/ops/status` has
+  `gw.write_budget`.
+- **Order timelines:** each ended order's timeline (click, web, gw, sent, the wire's three
+  segments, ack, the private feed's first word and fill, the cancel, done) and each fill go to
+  `data/ops.sqlite` through the store thread (tables `orders`, `fills`). Read it with
+  `tools/latency_report.py`.
+- **Demo checks:** `tools/demo_checks` (the probe's `--order-check --group-check --venue-checks
+  --feeds-check`). Venue checks: duplicate cid, shortest expiry, reduce_only on a resting order
+  and on a flat IOC, post-only at the ask, self-trade both ways. Amend and
+  `target_balance_allocation` are not run yet (unverified request shapes).
+- **Still to do from the plan:** the demo proof on the Mac (`tools/demo_checks`, then 50+ demo
+  orders); markouts, the money ledger and LIP windows in ops.sqlite and its nightly copy; the
+  data-release calendar; LIP share and payout; engines for S1, C1 and X1.
 
 ## Where
 

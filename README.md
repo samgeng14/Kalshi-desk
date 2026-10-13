@@ -32,6 +32,19 @@ orders; one command starts both and Ctrl-C stops both. The live config starts wi
 off; set `"systematic_orders": true` in `~/.kalshi/deskd-prod.json` yourself when you want lanes
 there. `python3 tools/desk.py paper` or `live` runs one alone.
 
+```sh
+tools/demo_checks                          # the plan's demo checks on PAPER (play money): order, group,
+                                           # venue shapes (duplicate cid, expiry, reduce_only, post-only
+                                           # cross, self-trade) and the lanes' feeds; replies kept in demo-checks/
+python3 tools/latency_report.py            # where each order's time went (data/ops.sqlite): p50/p90/p99
+                                           # per segment, click to ack; --hours, --own SYS, --json
+```
+
+Each desk writes every ended order's timeline and every fill to `data/ops.sqlite` (read it, never
+write it: deskd's store thread is its only writer). Systematic uses at most 80% of each shard's
+write budget (Kalshi's Basic tier, 100 tokens a second); after the free Advanced upgrade set
+`"write_tier": "advanced"` in the desk's config.
+
 ## Build (macOS)
 
 ```sh
