@@ -1008,6 +1008,31 @@ static void test_probe_binary() {
   CHECK(in("M1  KXNATGAS15M        1 open, 0 with a YES bid, 0 with a strike; next " + fx::G));
   CHECK(in("M2  KXTEST             1 open") && in("M2  KXNONE           none open") && in("M2  1 of 2 series with open markets\n"));
   CHECK(in("subscribed: pyth_value yes, order_group_updates yes"));
+  {   // --venue-checks (plan section 9's demo checks) against the fake's reading of each shape
+    const std::string vc = run(demo_key, "--base " + v.ep().url() + " --handshakes 1 --venue-checks --order-ticker " + fx::T +
+                                             " --dump " + d.path, &rc);
+    CHECK(rc == 0);
+    if (rc != 0) std::fprintf(stderr, "probe output:\n%s\n", vc.c_str());
+    auto line = [&](const std::string& check, const std::string& verdict, const std::string& seen) {
+      const auto at = vc.find("  " + check + " ");
+      return at != std::string::npos && vc.find(verdict, at) < vc.find('\n', at) && vc.find(seen, at) < vc.find('\n', at);
+    };
+    CHECK(line("duplicate_cid", "OK", "again REFUSED duplicate (HTTP 409)"));
+    CHECK(line("shortest_expiry", "SEEN", "now + 1 s accepted"));   // the fake's lead is 0 (K1)
+    CHECK(line("reduce_only_gtc", "SEEN", "REFUSED hard_invalid (HTTP 400)"));
+    CHECK(line("reduce_only_ioc_flat", "OK", "ACK, filled 0.00"));
+    CHECK(line("post_only_cross", "OK", "-> deskd POST_CROSS"));
+    CHECK(line("self_trade_taker_at_cross", "OK", "the resting bid resting"));
+    CHECK(line("self_trade_maker", "OK", "the resting bid canceled"));
+    CHECK(vc.find("this check's orders resting: 0") != std::string::npos && vc.find("NOT OK") == std::string::npos);
+    CHECK(std::filesystem::exists(d.file("kalshi_demo_venue_checks.json")));
+    // nothing of them rests on the fake
+    CHECK(v.f->with_engine([](fakex::Engine& e, std::int64_t) {
+      int n = 0;
+      for (const auto* o : e.user_orders()) if (o->status == fakex::OrdStatus::RESTING) ++n;
+      return n;
+    }) == 0);
+  }
   CHECK(in("pyth_value: 1 underlyings,") && in("Commodities.Index.NATGAS/USD"));
   CHECK(in("KXNATGAS15M      Commodities.Index.NATGAS/USD") && in("KXGOLD15M        not seen"));
   CHECK(in("\nok\n"));

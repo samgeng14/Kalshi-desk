@@ -6,7 +6,7 @@
 // 35-95 ms that a click must never pay, 25-35 ms p50 from write to reply).
 //
 //   kalshi-demo-probe [--key FILE] [--base URL] [--ws URL] [--handshakes N] [--loopback-ca FILE]
-//                     [--order-check] [--group-check] [--order-ticker T] [--dump DIR]
+//                     [--order-check] [--group-check] [--venue-checks] [--order-ticker T] [--dump DIR]
 //                     [--feeds-check [--feeds-seconds N] [--lip-series A,B] [--band-series A,B]]
 //
 //   --key FILE        the key file (default ~/.kalshi/demo.json): {env, key_id, private_key_path,
@@ -29,7 +29,15 @@
 //                     cancelled, and a second bid into the triggered group refused), reset, and
 //                     deleted, with the group's order_group_updates read off the socket: what gw
 //                     relies on for Systematic's lanes. Play money on demo; production is refused.
-//   --order-ticker T  the market for both (default: the most liquid 1c-grid market on the page read)
+//   --venue-checks    plan section 9's demo checks, each OK / NOT OK where deskd's rules rest on the
+//                     answer and SEEN where it is only recorded: a duplicate client_order_id (409
+//                     DUPLICATE), the shortest expiry accepted, reduce_only on a resting order and
+//                     on a flat IOC (Flatten's shape: no fill, nothing that stops a sender), a
+//                     post-only bid at the ask (POST_CROSS, never filled), and self-trade
+//                     prevention both ways with our own bid one tick inside the spread (no self
+//                     fill; taker_at_cross keeps the bid, maker cancels it). Group trigger and reset
+//                     are --group-check's. 1 contract each, cancelled after; play money on demo.
+//   --order-ticker T  the market for all three (default: the most liquid 1c-grid market on the page read)
 //   --feeds-check     what the lanes need from this venue: open markets in M1's LIP-15 series and
 //                     M2's BAND series (deskd's config defaults, or --lip-series / --band-series),
 //                     then --feeds-seconds (default 15) of the socket's pyth_value relay (which
@@ -66,6 +74,7 @@
 #include "deskd/app/log.h"
 #include "deskd/gw/kalshi_sign.h"
 #include "deskd/gw/kalshi_wire.h"
+#include "deskd/gw/manual_book.h"
 #include "deskd/net/conn.h"
 #include "deskd/net/guard.h"
 #include "deskd/net/http.h"
@@ -86,7 +95,7 @@ struct Args {
   int handshakes = 10;
   std::string loopback_ca;
   std::string ws;
-  bool order_check = false, group_check = false, feeds_check = false;
+  bool order_check = false, group_check = false, feeds_check = false, venue_checks = false;
   int feeds_seconds = 15;
   std::vector<std::string> lip_series = DeskdConfig{}.lip_series, band_series = DeskdConfig{}.band_series;
   std::string order_ticker;
@@ -105,7 +114,7 @@ std::vector<std::string> split_list(const std::string& s) {
 int usage() {
   std::fprintf(stderr,
                "usage: kalshi-demo-probe [--key FILE] [--base URL] [--ws URL] [--handshakes N] [--loopback-ca FILE]\n"
-               "                         [--order-check] [--group-check] [--order-ticker T] [--dump DIR]\n"
+               "                         [--order-check] [--group-check] [--venue-checks] [--order-ticker T] [--dump DIR]\n"
                "                         [--feeds-check [--feeds-seconds N] [--lip-series A,B] [--band-series A,B]]\n");
   return 2;
 }
@@ -595,6 +604,216 @@ struct DemoProbe {   // not Probe: bus/msg.h has a message of that name
     return cancelled && ok2xx(x);
   }
 
+  // ---- --venue-checks (plan section 9, "Kalshi demo checks") -----------------------------------
+  // How the venue answers the order shapes deskd's rules rest on. Each check says OK or NOT OK
+  // where deskd depends on the answer, SEEN where it only records it; every order is 1 contract,
+  // post-only at $0.01 with a 15 s expiry unless the check needs another shape, and each check
+  // cancels what it left. The report is printed and, with --dump, kept as JSON.
+  struct Placed {
+    WriteOutcome w;
+    std::optional<CreateAck> ack;
+    std::string order_id;
+  };
+  json checks = json::array();
+  bool checks_ok = true;
+  void verdict(const std::string& name, const char* v, const std::string& seen) {
+    std::printf("  %-22s %-7s %s\n", name.c_str(), v, seen.c_str());
+    checks.push_back({{"check", name}, {"verdict", v}, {"seen", seen}});
+    if (std::string(v) == "NOT OK") checks_ok = false;
+  }
+  // what a refusal is to deskd: its class, and whether that class stops a sender (KILL)
+  static std::string shape(const WriteOutcome& w) {
+    if (w.kind == WriteOutcome::Kind::ACK) return "ACK";
+    if (w.kind != WriteOutcome::Kind::REFUSED) return write_kind_name(w.kind) + std::string(": ") + w.why;
+    return "REFUSED " + std::string(reject_class_name(w.cls)) + " (HTTP " + std::to_string(w.http) + "): " + w.why.substr(0, 120);
+  }
+  static bool stops_desk(const WriteOutcome& w) {
+    return w.kind == WriteOutcome::Kind::REFUSED &&
+           (w.cls == RejectClass::HARD_INVALID || w.cls == RejectClass::AUTH || w.cls == RejectClass::UNKNOWN);
+  }
+  CreateOrder base_order(const MarketRow& m, const std::string& tag) {
+    CreateOrder o;
+    o.ticker = m.ticker;
+    o.exchange_index = m.exchange_index.value_or(0);
+    o.side = BookSide::BID;
+    o.count = kOneContract;
+    o.price = 100;
+    o.tif = TimeInForce::GTC;
+    o.post_only = true;
+    o.expiration_s = wall_s() + 15;
+    o.stp = Stp::MAKER;
+    o.client_order_id = "P-" + tag + "-" + hex16().substr(0, 8);
+    return o;
+  }
+  // patch: the body's JSON changed after the builder (a shape deskd's builder refuses to make)
+  Placed place(const CreateOrder& o, const std::string& label, const std::function<void(json&)>& patch = {}) {
+    Placed p;
+    std::string why;
+    WireRequest r;
+    CreateOrder built = o;
+    if (patch) built.reduce_only = false;   // the builder's own rules; the patch sets what it tests
+    if (!build_create(built, &r, &why)) {
+      p.w.kind = WriteOutcome::Kind::NOT_SENT;
+      p.w.why = "the builder refused it: " + why;
+      return p;
+    }
+    if (patch) {
+      json b = json::parse(r.body, nullptr, false);
+      patch(b);
+      r.body = b.dump();
+    }
+    net::Exchange x = send(r, label);
+    p.w = classify_write(WireOp::CREATE, x);
+    if (p.w.kind == WriteOutcome::Kind::ACK) {
+      p.ack = parse_create_ack(x.res.body, &why);
+      if (p.ack) p.order_id = p.ack->order_id;
+    }
+    return p;
+  }
+  void cancel_quietly(const std::string& order_id, const CreateOrder& o) {
+    if (order_id.empty()) return;
+    std::string why;
+    WireRequest cx;
+    if (build_cancel(order_id, o.exchange_index, o.ticker, -1, &cx, &why)) send(cx, "cancel (cleanup)", false);
+  }
+  std::optional<OrderRow> read_order(const std::string& order_id) {
+    int others = 0;
+    std::string body;
+    return poll_order(order_id, 1500, [](const OrderRow&) { return true; }, &others, &body);
+  }
+
+  bool venue_checks(const std::vector<MarketRow>& rows) {
+    std::printf("\nvenue checks (%s):\n", base.host.c_str());
+    auto m = choose(rows);
+    if (!m) {
+      std::printf("  no market fits (open, a 1c grid at $0.01, an ask above it, two minutes to its close): skipped\n");
+      return false;
+    }
+    std::printf("  on %s shard %d (best bid %s, best ask %s)\n", m->ticker.c_str(), m->exchange_index.value_or(0),
+                m->yes_bid ? price_wire(*m->yes_bid).c_str() : "-", m->yes_ask ? price_wire(*m->yes_ask).c_str() : "-");
+
+    {   // a client_order_id already used: deskd never re-sends one and reconciles a 409 by cid
+      const CreateOrder o = base_order(*m, "dup");
+      const Placed first = place(o, "create (dup cid, first)");
+      const Placed again = place(o, "create (dup cid, again)");
+      const bool ok = first.w.kind == WriteOutcome::Kind::ACK && again.w.kind == WriteOutcome::Kind::REFUSED &&
+                      again.w.cls == RejectClass::DUPLICATE;
+      verdict("duplicate_cid", ok ? "OK" : "NOT OK", "first " + shape(first.w) + "; again " + shape(again.w));
+      cancel_quietly(first.order_id, o);
+      cancel_quietly(again.order_id, o);
+    }
+    {   // the shortest expiration_time accepted, in whole seconds from now (deskd's TTL floor)
+      int accepted = 0;
+      std::string refused;
+      for (const int lead : {1, 2, 3, 5, 10}) {
+        CreateOrder o = base_order(*m, "exp" + std::to_string(lead));
+        o.expiration_s = wall_s() + lead;
+        const Placed p = place(o, "create (expires in " + std::to_string(lead) + " s)");
+        if (p.w.kind == WriteOutcome::Kind::ACK) {
+          accepted = lead;
+          cancel_quietly(p.order_id, o);
+          break;
+        }
+        if (refused.empty()) refused = shape(p.w);
+      }
+      verdict("shortest_expiry", accepted ? "SEEN" : "NOT OK",
+              accepted ? "now + " + std::to_string(accepted) + " s accepted" + (refused.empty() ? "" : "; shorter: " + refused)
+                       : "nothing up to 10 s accepted: " + refused);
+    }
+    {   // reduce_only on a resting order: deskd's builder never sends it (IOC only)
+      const CreateOrder o = base_order(*m, "rogtc");
+      const Placed p = place(o, "create (reduce_only GTC)", [](json& b) { b["reduce_only"] = true; });
+      verdict("reduce_only_gtc", "SEEN", shape(p.w));
+      cancel_quietly(p.order_id, o);
+    }
+    {   // Flatten's shape on a flat market: an IOC reduce_only sell that cannot reduce anything
+      CreateOrder o = base_order(*m, "roioc");
+      o.side = BookSide::ASK;
+      o.tif = TimeInForce::IOC;
+      o.post_only = false;
+      o.expiration_s = 0;
+      o.reduce_only = true;
+      o.price = 9900;   // above any bid: it never trades whatever the venue does with reduce_only
+      const Placed p = place(o, "create (reduce_only IOC, flat)");
+      const bool filled = p.ack && p.ack->fill_count > 0;
+      verdict("reduce_only_ioc_flat", filled || stops_desk(p.w) ? "NOT OK" : "OK",
+              shape(p.w) + (p.ack ? ", filled " + count_wire(p.ack->fill_count) : ""));
+    }
+    if (m->yes_ask && *m->yes_ask > 100) {   // a post-only bid at the ask: cancelled or refused, never filled
+      CreateOrder o = base_order(*m, "pocx");
+      o.price = *m->yes_ask;
+      const Placed p = place(o, "create (post-only at the ask)");
+      std::string seen = shape(p.w);
+      bool ok = !stops_desk(p.w);
+      if (p.w.kind == WriteOutcome::Kind::REFUSED) {
+        KalshiWriteReply r;
+        r.op = WireOp::CREATE;
+        r.outcome = p.w;
+        seen += " -> deskd " + ManualBook::refusal_code(r);
+        ok = ok && ManualBook::refusal_code(r) == "POST_CROSS";
+      } else if (p.ack) {
+        const auto row = read_order(p.order_id);
+        seen += ", filled " + count_wire(p.ack->fill_count) + ", then " + (row ? order_status_name(row->status) : "unread");
+        ok = p.ack->fill_count == 0 && row && row->status != OrderStatus::RESTING;
+        cancel_quietly(p.order_id, o);
+      }
+      verdict("post_only_cross", ok ? "OK" : "NOT OK", seen);
+    }
+    // self-trade: our bid one tick inside the spread, met by our own IOC sell at that price
+    const bool room = m->yes_bid && m->yes_ask && *m->yes_ask - *m->yes_bid >= 200;
+    for (const Stp stp : {Stp::TAKER_AT_CROSS, Stp::MAKER}) {
+      const std::string name = std::string("self_trade_") + stp_name(stp);
+      if (!room) {
+        verdict(name, "SEEN", "skipped: the spread is under 2 ticks, so our bid cannot be the best");
+        continue;
+      }
+      CreateOrder rest = base_order(*m, "stpr");
+      rest.price = *m->yes_bid + 100;
+      const Placed r = place(rest, "create (self-trade: the resting bid)");
+      if (r.w.kind != WriteOutcome::Kind::ACK) {
+        verdict(name, "NOT OK", "the resting bid was not placed: " + shape(r.w));
+        continue;
+      }
+      CreateOrder take = base_order(*m, "stpt");
+      take.side = BookSide::ASK;
+      take.tif = TimeInForce::IOC;
+      take.post_only = false;
+      take.expiration_s = 0;
+      take.price = rest.price;
+      take.stp = stp;
+      const Placed t = place(take, "create (self-trade: our IOC sell)");
+      const auto rested = read_order(r.order_id);
+      const bool self_fill = (t.ack && t.ack->fill_count > 0) || (rested && rested->filled > 0);
+      std::string seen = "taker " + shape(t.w) + (t.ack ? ", filled " + count_wire(t.ack->fill_count) : "") +
+                         "; the resting bid " + (rested ? order_status_name(rested->status) : "unread");
+      // taker_at_cross: the taker stops and the bid rests; maker: the bid goes
+      const bool shape_ok = stp == Stp::TAKER_AT_CROSS ? rested && rested->status == OrderStatus::RESTING
+                                                       : rested && rested->status == OrderStatus::CANCELED;
+      verdict(name, !self_fill && !stops_desk(t.w) && shape_ok ? "OK" : "NOT OK", seen);
+      cancel_quietly(r.order_id, rest);
+    }
+    verdict("amend_expiry", "SEEN", "not run: no amends in the first live weeks (plan section 3); its body is unverified");
+    verdict("target_balance_alloc", "SEEN", "not run: the endpoint's shape is unverified");
+
+    // nothing of this check rests
+    std::string why;
+    ListQuery q;
+    q.status = "resting";
+    q.limit = 200;
+    net::Exchange x = send(build_get_orders(q), "resting orders after the checks");
+    std::size_t left = 0;
+    if (auto page = ok2xx(x) ? parse_orders(x.res.body, &why) : std::nullopt)
+      for (const auto& row : page->rows)
+        if (row.client_order_id.rfind("P-", 0) == 0) {
+          ++left;
+          WireRequest cx;
+          if (build_cancel(row.order_id, row.exchange_index.value_or(0), row.ticker, -1, &cx, &why)) send(cx, "cancel (left over)");
+        }
+    std::printf("  this check's orders resting: %zu\n", left);
+    if (!a.dump.empty()) std::ofstream(a.dump + "/kalshi_demo_venue_checks.json") << checks.dump(1);
+    return checks_ok && left == 0 && ok2xx(x);
+  }
+
   // ---- the socket (--feeds-check, --group-check) ---------------------------------------------
   // One authenticated connection to the venue's socket and the subscriptions asked for. Acks and
   // venue errors are taken in on the way; data frames are handed back whole.
@@ -985,6 +1204,7 @@ int main(int argc, char** argv) {
     else if (s == "--ws" && (v = value())) a.ws = v;
     else if (s == "--order-check") a.order_check = true;
     else if (s == "--group-check") a.group_check = true;
+    else if (s == "--venue-checks") a.venue_checks = true;
     else if (s == "--feeds-check") a.feeds_check = true;
     else if (s == "--feeds-seconds" && (v = value())) a.feeds_seconds = std::max(1, std::atoi(v));
     else if (s == "--lip-series" && (v = value())) a.lip_series = split_list(v);
@@ -1056,6 +1276,7 @@ int main(int argc, char** argv) {
   bool order_ok = true;
   if (a.order_check) order_ok = p.order_check(rows);
   if (a.group_check && !p.group_check(rows)) order_ok = false;
+  if (a.venue_checks && !p.venue_checks(rows)) order_ok = false;
   if (a.feeds_check && !p.feeds_check()) order_ok = false;
   p.summary();
   p.sign_time();
