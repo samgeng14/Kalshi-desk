@@ -87,6 +87,7 @@ struct MakerInput {
   // held (0 flat), since the lane's last fill or IOC here or since it began quoting it, and since
   // its last IOC here (-1 none)
   std::int64_t held_ms = 0, quiet_ms = 0, since_ioc_ms = -1;
+  bool selected = true;                // a lane that picks its markets (Env::select) still picks this one
 };
 
 struct MakerQuote {
@@ -113,8 +114,9 @@ MakerDecision band_quote(const MakerInput& in, const MakerParams& p);
 // not for edge. Flat, it joins the best bid and the best ask with p.size each (post-only, p.ttl_s);
 // after p.probe_every_ms with no fill and no IOC in the market it buys p.size at the ask (an IOC);
 // holding, it offers the position out at the touch (post-only), and once held p.hold_max_ms it
-// leaves by an IOC at the touch (reduce_only), no more often than p.ioc_gap_ms. Pulled on a
-// stale or one-sided book and with the private feed down.
+// leaves by an IOC at the touch (reduce_only), no more often than p.ioc_gap_ms. A market no longer
+// picked, or within 30 min of its close, takes no new risk: flat it is pulled, holding it leaves by
+// that IOC at once. Pulled on a stale or one-sided book and with the private feed down.
 MakerDecision paper_quote(const MakerInput& in, const MakerParams& p);
 // D1's markets: those it holds or already quotes that still trade for 30 min, then up to `want`
 // more by 24 h volume: active, closing over 2 h out, a cent grid, a two-sided listing quote

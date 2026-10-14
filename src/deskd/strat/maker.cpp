@@ -150,6 +150,14 @@ MakerDecision paper_quote(const MakerInput& in, const MakerParams& p) {
   if (bb >= ba) return pull("crossed book");
   d.fair = (bb + ba) / 2;
   const bool ioc_ok = in.since_ioc_ms < 0 || in.since_ioc_ms >= p.ioc_gap_ms;
+  const bool leaving = !in.selected || in.close_ms - in.now_ms < 1800000;
+  if (leaving) {
+    if (in.position == 0) return pull(in.selected ? "closing within 30 min" : "no longer picked");
+    if (!ioc_ok) return pull("leaving: the exit IOC retries in 10 s");
+    const bool lng = in.position > 0;
+    d.quotes.push_back({lng ? Side::SELL : Side::BUY, lng ? bb : ba, lng ? in.position : -in.position, true});
+    return d;
+  }
   if (in.position == 0) {
     d.quotes.push_back({Side::BUY, bb, p.size, false});
     d.quotes.push_back({Side::SELL, ba, p.size, false});
@@ -246,7 +254,7 @@ void MakerEngine::step(std::int64_t now) {
   if (!view || !snap) return;
   const bool running = view->run == RunState::RUN && view->lanes_on.count(lane_);
   // the windows open now in the lane's series
-  std::set<std::string> markets;
+  std::set<std::string> markets, held;
   if (env_.select) {
     // the lane picks its own markets (D1); the ones it holds or quotes stay picked while they trade
     std::set<std::string> keep;
@@ -254,6 +262,8 @@ void MakerEngine::step(std::int64_t now) {
     for (const auto& [key, pos] : view->positions)
       if (pos != 0 && key.compare(0, lane_.size() + 1, lane_ + "|") == 0) keep.insert(key.substr(lane_.size() + 1));
     if (running) markets = env_.select(*snap, now, keep);
+    for (const auto& tk : keep)   // what it holds is worked to the end, picked or not
+      if (view->positions.count(lane_ + "|" + tk) && view->positions.at(lane_ + "|" + tk) != 0) held.insert(tk);
   } else {
     for (const auto& [tk, m] : snap->markets) {
       const bool mine = std::any_of(series_.begin(), series_.end(), [&](const std::string& s) {
@@ -268,6 +278,7 @@ void MakerEngine::step(std::int64_t now) {
   if (env_.want) env_.want(running ? markets : std::set<std::string>{});
   const std::set<std::string> open = markets;
   for (const auto& [tk, s] : sides_) markets.insert(tk);   // finish what is working on a closed one
+  markets.insert(held.begin(), held.end());
   for (const auto& tk : markets) {
     auto& slots = sides_[tk];
     // answers from gw: a refusal backs that side off for 10 s
@@ -346,6 +357,7 @@ void MakerEngine::step(std::int64_t now) {
       in.held_ms = held_since_.count(tk) ? now - held_since_[tk] : 0;
       in.quiet_ms = active_ms_.count(tk) ? now - active_ms_[tk] : 0;
       in.since_ioc_ms = ioc_ms_.count(tk) ? now - ioc_ms_[tk] : -1;
+      in.selected = !env_.select || open.count(tk) > 0;
       if (a.gated) {
         in.anchor = a.fair ? a.fair : std::optional<Px>(0);
         in.reference_fresh = a.fresh && a.fair.has_value();
@@ -412,11 +424,13 @@ void MakerEngine::step(std::int64_t now) {
         if (a.spot > 0 && !quote_spot_.count(tk)) quote_spot_[tk] = a.spot;
       }
     }
-    // a market no longer quoted and with nothing working is forgotten
+    // a market no longer quoted and with nothing working is forgotten, unless the lane holds it
+    // and it still trades (a momentary empty decision must not leave the position to settlement)
     if (!running || !open.count(tk)) {
       bool idle = true;
       for (const auto& [slot, s] : slots) if (!s.cid.empty()) idle = false;
-      if (idle && d.quotes.empty()) {
+      const bool trades = m != snap->markets.end() && m->second.close_ms.value_or(0) > now;
+      if (idle && d.quotes.empty() && (pos == 0 || !trades)) {
         sides_.erase(tk);
         held_since_.erase(tk); active_ms_.erase(tk); ioc_ms_.erase(tk); last_pos_.erase(tk);
       }

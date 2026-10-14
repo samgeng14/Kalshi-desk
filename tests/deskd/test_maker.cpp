@@ -390,6 +390,10 @@ void engine_own_quotes() {
 void paper() {
   MakerParams p; p.size = 100;
   const auto b = book(4000, 500, 4300, 500);
+  // a market a day from its close (input()'s closes in 15 minutes)
+  auto input = [](const MdBook& bk, std::int64_t now = OPEN + 60000, Qty q = 0) {
+    auto x = ::input(bk, now, q); x.close_ms = OPEN + 86400000; return x;
+  };
   auto in = input(b);
   auto d = paper_quote(in, p);
   CHECK(d.pull.empty() && d.quotes.size() == 2 && d.quotes[0].side == Side::BUY && d.quotes[0].price == 4000 &&
@@ -424,6 +428,17 @@ void paper() {
   CHECK(paper_quote(input(stale), p).pull == "book stale");
   in = input(b); in.private_up = false;
   CHECK(paper_quote(in, p).pull == "private feed down");
+  // no longer picked, or within 30 min of the close: no new risk. Flat it is pulled; holding it
+  // leaves by IOC at once (not after 90 s), still one IOC each 10 s
+  in = input(b); in.selected = false;
+  CHECK(paper_quote(in, p).pull == "no longer picked" && paper_quote(in, p).quotes.empty());
+  in = input(b); in.close_ms = in.now_ms + 1799999;
+  CHECK(paper_quote(in, p).pull == "closing within 30 min");
+  in = input(b, OPEN + 60000, 100); in.close_ms = in.now_ms + 1799999; in.held_ms = 1000;
+  d = paper_quote(in, p);
+  CHECK(d.quotes.size() == 1 && d.quotes[0].ioc && d.quotes[0].reduce && d.quotes[0].side == Side::SELL && d.quotes[0].price == 4000);
+  in.since_ioc_ms = 3000;
+  CHECK(paper_quote(in, p).quotes.empty() && !paper_quote(in, p).pull.empty());
 }
 
 void paper_pick() {
@@ -527,8 +542,71 @@ void paper_engine() {
   CHECK(e.status()["lane"] == "D1" && e.status()["places"].get<int>() >= 4);
 }
 
+// D1 at its market's last 30 minutes (review 2026-10-14): the market drops out of the pick, and a
+// position there leaves by IOC at once instead of riding into the close; flat, it is let go.
+void paper_engine_leaving() {
+  const std::string tk = "KXPAPER-2";
+  const std::int64_t close = OPEN + 3 * 3600000;
+  auto view = std::make_shared<Gateway::SysView>();
+  view->run = RunState::RUN;
+  view->lanes_on = {"D1"};
+  auto snap = std::make_shared<rest::Snapshot>();
+  kalshi::MarketRow m; m.ticker = tk; m.event_ticker = "KXPAPER"; m.status = "active"; m.exchange_index = 0;
+  m.open_ms = OPEN; m.close_ms = close; m.price_ranges = CENT; m.yes_bid = 4000; m.yes_ask = 4300; m.volume_24h = 10;
+  snap->markets[tk] = m;
+  snap->clock.post_trusted = true;
+  std::vector<GwMsg> posted;
+  MakerEngine::Env env;
+  env.view = [&] { return std::shared_ptr<const Gateway::SysView>(view); };
+  env.snapshot = [&] { return std::shared_ptr<const rest::Snapshot>(snap); };
+  env.book = [&](const std::string&) { return std::optional<MdBook>(book(4000, 500, 4300, 500)); };
+  env.private_up = [] { return true; };
+  env.post = [&](GwMsg g) { posted.push_back(std::move(g)); return true; };
+  env.select = [](const rest::Snapshot& s, std::int64_t now, const std::set<std::string>& keep) { return paper_markets(s, now, keep); };
+  MakerParams p; p.size = 100; p.fill_target_ms = 0;
+  MakerEngine e("D1", {}, env, p, paper_quote);
+  auto places = [&] {
+    std::vector<PlaceIntent> out;
+    for (const auto& g : posted) if (const auto* pi = std::get_if<PlaceIntent>(&g)) out.push_back(*pi);
+    return out;
+  };
+  e.step(OPEN + 1000);
+  auto pl = places();
+  CHECK(pl.size() == 2);
+  for (auto& pi : pl) {   // both rest
+    Gateway::SysOrder o; o.cid = pi.cid; o.lane = "D1"; o.ticker = tk; o.side = pi.side; o.price = pi.price;
+    o.count = o.left = pi.count; o.state = OrdState::WORK;
+    view->orders[pi.cid] = o;
+  }
+  // the bid filled (long 1), then the market is 29 minutes from its close: out of the pick
+  view->positions["D1|" + tk] = 100;
+  e.step(OPEN + 2000);
+  posted.clear();
+  e.step(close - 29 * 60000);
+  pl = places();
+  int cancels = 0;
+  for (const auto& g : posted) if (std::holds_alternative<CancelIntent>(g)) ++cancels;
+  CHECK(pl.size() == 1 && pl[0].tif == Tif::IOC && pl[0].reduce_only && pl[0].side == Side::SELL && pl[0].price == 4000 &&
+        pl[0].count == 100 && cancels >= 1);
+  // the exit IOC missed: the market is not forgotten while the position is there, and it tries again
+  for (auto& [cid, o] : view->orders) { o.terminal = true; o.state = OrdState::CXL; o.left = 0; }
+  posted.clear();
+  e.step(close - 29 * 60000 + 6000);    // within 10 s of the last IOC: waits
+  CHECK(places().empty() && e.status()["last"][tk] == "leaving: the exit IOC retries in 10 s");
+  e.step(close - 29 * 60000 + 11000);
+  pl = places();
+  CHECK(pl.size() == 1 && pl[0].tif == Tif::IOC && pl[0].reduce_only);
+  // flat: let go, and nothing more is sent there
+  view->positions["D1|" + tk] = 0;
+  posted.clear();
+  e.step(close - 28 * 60000);
+  e.step(close - 27 * 60000);
+  // (its last word is the pause after our fill: it was let go in that step)
+  CHECK(places().empty() && e.status()["last"][tk] == "our fill");
+}
+
 int main() {
   grid(); quotes(); anchor_and_pulls(); band(); engine_limits(); review_fixes(); engine_own_quotes(); fill_pace();
-  paper(); paper_pick(); paper_engine();
+  paper(); paper_pick(); paper_engine(); paper_engine_leaving();
   return finish("deskd-maker");
 }
