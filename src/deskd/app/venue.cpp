@@ -169,6 +169,7 @@ void Deskd::attach_manual() {
     return h;
   };
   p.write_tier = cfg_.write_tier == "advanced" ? WriteBudget::advanced() : WriteBudget::basic();
+  p.live = cfg_.live;
   p.record = [this](const std::string& table, std::string row) { return store_.inbox().push(StoreRecord{table, std::move(row)}); };
   if (cfg_.systematic_orders) {
     p.sys_send = [this](KalshiWriteJob j) { return q_sys_.push(std::move(j)); };
@@ -202,6 +203,7 @@ void Deskd::attach_manual() {
       if (l.id == "M1") l.series = cfg_.lip_series;
       if (l.id == "M2") l.series = cfg_.band_series;
     }
+    if (!cfg_.live && cfg_.paper_lane) p.lanes.push_back(paper_lane());   // D1: the demo account only
   }
   if (cfg_.systematic_orders) {
     // LIP-15 (lane M1): the 15-minute series it trades (deskd.lip_series), quoted by the maker engine
@@ -272,6 +274,24 @@ void Deskd::attach_manual() {
     band_env.markout = [this] { const auto m = markouts_->lane_mean("M2", "60s"); return std::make_pair(m.fills, m.mean); };
     band_env.release = [this](const std::string& tk, std::int64_t now) { return calendar_.active(tk, now); };
     band_ = std::make_unique<MakerEngine>("M2", cfg_.band_series, band_env, band, band_quote);
+    // D1 PAPER (demo only): 1 lot at the touch both sides in two liquid markets it picks, an IOC
+    // buy after 5 quiet minutes, any position out within 90 s, so orders go in and out where the
+    // operator can watch them (2026-10-14: M1's book on demo is empty and M2's markets are not
+    // listed there, so Systematic on PAPER never sent an order)
+    if (!cfg_.live && cfg_.paper_lane) {
+      MakerParams paper;
+      paper.size = kOneContract;
+      paper.fill_target_ms = 0;
+      auto paper_env = env;
+      paper_env.anchor = {};
+      paper_env.release = {};
+      paper_env.want = want("D1");
+      paper_env.markout = [this] { const auto m = markouts_->lane_mean("D1", "60s"); return std::make_pair(m.fills, m.mean); };
+      paper_env.select = [](const rest::Snapshot& s, std::int64_t now, const std::set<std::string>& keep) {
+        return paper_markets(s, now, keep);
+      };
+      paper_ = std::make_unique<MakerEngine>("D1", std::vector<std::string>{}, paper_env, paper, paper_quote);
+    }
   }
   p.send = [this](KalshiWriteJob j) { return q_man_.push(std::move(j)); };
   p.refresh = [this] { rest_->request_refresh(); };

@@ -471,7 +471,7 @@ void systematic() {
   if(snap && snap->status==200) {
     const auto sj=json::parse(snap->body);
     cap["snapshots"].push_back(sj);
-    CHECK(sj["lanes"].size()==5);
+    CHECK(sj["lanes"].size()==6);   // M1 M2 S1 C1 X1, and D1 PAPER on the demo account
   }
   const std::string file=r.dir.path+"/capture-sys.json";
   std::ofstream(file)<<cap.dump();
@@ -597,6 +597,36 @@ void systematic_band() {
   CHECK(stop && stop->status==200);
   CHECK(r.until([&]{ return !quoted(Y,fakex::Side::BID,9700) && !quoted(N,fakex::Side::ASK,200); }));
 }
+// D1 PAPER on the demo account: on from the start, it picks the market that trades for hours with
+// a two-sided book (not the test's own, which closes within 2 h), joins both touches with 1 lot on
+// START, and leaves nothing resting after STOP.
+void systematic_paper() {
+  const std::string P="KXPAPERT-26OCT15-A";
+  Run r(false,[&](fakex::Engine& e,std::int64_t now) {
+    auto spec=fx::spec(P,0); spec.open_ms=now-3600000; spec.close_ms=now+6*3600000; e.add_market(spec,now);
+    e.street_add(P,false,4000,500,now); e.street_add(P,true,5700,500,now);   // YES 0.40 bid / 0.43 ask
+  },true);
+  CHECK(r.ready());
+  std::string why;
+  CHECK(r.until([&]{ return r.d->gw().groups_ready(&why) && why.empty(); },20000));
+  httplib::Result start;
+  CHECK(r.until([&]{ start=r.post("/api/start",json::object()); return start && start->status==200; },10000));
+  auto quoted=[&](fakex::Side side,Px px) {
+    return r.venue.f->with_engine([&](fakex::Engine& e,std::int64_t) {
+      for(const fakex::Order* o:e.user_orders())
+        if(o->status==fakex::OrdStatus::RESTING && o->client_order_id.rfind("SD1-",0)==0 && o->ticker==P &&
+           o->side==side && o->price==px && o->remaining==100 && o->post_only && !o->order_group_id.empty()) return true;
+      return false;
+    });
+  };
+  const bool both=r.until([&]{ return quoted(fakex::Side::BID,4000) && quoted(fakex::Side::ASK,4300); },15000);
+  if(!both) std::fprintf(stderr,"paper: %s\n",r.d->status()["paper"].dump().c_str());
+  CHECK(both);
+  CHECK(r.d->status()["paper"]["last"][P]=="quoting" && !r.d->status()["paper"]["last"].contains(TK));
+  auto stop=r.post("/api/stop",json::object());
+  CHECK(stop && stop->status==200);
+  CHECK(r.until([&]{ return !quoted(fakex::Side::BID,4000) && !quoted(fakex::Side::ASK,4300); }));
+}
 // Systematic's races on the fake (plan section 8): a quote hit before its 201 arrives, a fill
 // during a Systematic cancel, and Stop overtaking a create still on the wire. After each, gw's
 // lane position equals the venue's, the ledger stays healthy and nothing of Systematic rests.
@@ -660,7 +690,8 @@ void systematic_races() {
 // blocks the lane (GROUPS fails, its orders are refused) while Systematic runs, and resets the
 // group once it is stopped.
 void systematic_group_trigger() {
-  Run r(false,{},true);
+  // one lane, so one order group on the venue: no D1 PAPER (deskd.paper_lane false)
+  Run r(false,{},true,[](DeskdConfig& c,RuntimeOptions&) { c.paper_lane=false; });
   CHECK(r.ready());
   auto lane=r.post("/api/lane/M2",{{"on",true}});
   CHECK(lane && lane->status==200);
@@ -963,6 +994,12 @@ void live_mode() {
   }
   auto o=r.order("Mrt-live-1","BUY","0.4200",1,"IOC");
   CHECK(o["status"]==200 && o["ord"]["st"]=="FILL");
+  // no D1 PAPER on the production account: no engine, and no such lane to switch on
+  Run s(false,{},true,[](DeskdConfig& c,RuntimeOptions&) { c.env="prod"; c.live=true; });
+  CHECK(s.ready());
+  CHECK(s.d->status()["paper"].is_null() && s.d->status()["maker"].is_object());
+  auto lane=s.post("/api/lane/D1",{{"on",true}});
+  CHECK(lane && lane->status!=200);
 }
 // The fill model end to end: prints made before deskd started reach it by the REST backfill
 // (/markets/trades), GET /api/fill reads the queue ahead from the live book, and its replies are
@@ -1041,6 +1078,6 @@ void equity_floor() {
 
 int main() {
   std::signal(SIGPIPE,SIG_IGN);
-  off_by_default(); orders_cancel_kill(); stop_reasons(); financial_fair(); systematic(); systematic_maker(); systematic_band(); systematic_races(); systematic_group_trigger(); systematic_book(); takeover(); shard_preflight(); foreign_cancels(); live_mode(); fill_estimates(); equity_floor();
+  off_by_default(); orders_cancel_kill(); stop_reasons(); financial_fair(); systematic(); systematic_maker(); systematic_band(); systematic_paper(); systematic_races(); systematic_group_trigger(); systematic_book(); takeover(); shard_preflight(); foreign_cancels(); live_mode(); fill_estimates(); equity_floor();
   return finish("deskd-runtime-manual");
 }

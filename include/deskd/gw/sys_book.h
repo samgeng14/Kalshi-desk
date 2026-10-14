@@ -53,8 +53,13 @@ struct LaneSpec {
   // false: no engine trades it yet (S1 needs event exclusivity, C1 its model, X1 its backtest), so
   // it cannot be switched on (on, it would only hold order groups that GROUPS waits for)
   bool engine = true;
+  // D1 PAPER: gw refuses its orders on the production account (ManualPath::live), and deskd lists
+  // it only on demo; on at start, so START on PAPER trades at once (other lanes start off)
+  bool paper_only = false, on_at_start = false;
 };
 const std::vector<LaneSpec>& default_lanes();
+// D1 PAPER (strat/maker.h paper_quote): $20, 2 contracts a market, any market; demo only
+LaneSpec paper_lane();
 
 // Correlated groups (plan section 4, limit 2): Systematic's worst case in one group may not pass
 // $15, $25 in an LIP-15 group. The 15-minute series group by what moves them together: METALS

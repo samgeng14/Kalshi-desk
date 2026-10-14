@@ -67,7 +67,7 @@ DeskdConfig load_deskd_config(const std::string& path) {
   static const std::set<std::string> known = {"data_dir",    "lock_dir",    "ui_dir",
                                               "http_port",   "web_threads", "keepalive_s",
                                               "max_streams", "heartbeat_window_ms", "daily_stop_dollars", "equity_floor_dollars",
-                                              "manual_orders", "systematic_orders", "lip_series", "band_series",
+                                              "manual_orders", "systematic_orders", "lip_series", "band_series", "paper_lane",
                                               "peer_url", "write_tier", "calendar"};
   for (auto kv = d.begin(); kv != d.end(); ++kv) {
     if (kv.key() == "live")
@@ -86,6 +86,7 @@ DeskdConfig load_deskd_config(const std::string& path) {
   take(d, "systematic_orders", c.systematic_orders, where);
   take(d, "lip_series", c.lip_series, where);
   take(d, "band_series", c.band_series, where);
+  take(d, "paper_lane", c.paper_lane, where);
   take(d, "peer_url", c.peer_url, where);
   take(d, "write_tier", c.write_tier, where);
   take(d, "calendar", c.calendar, where);

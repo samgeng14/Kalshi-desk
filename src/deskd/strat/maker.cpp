@@ -137,6 +137,63 @@ MakerDecision band_quote(const MakerInput& in, const MakerParams& p) {
   return d;
 }
 
+MakerDecision paper_quote(const MakerInput& in, const MakerParams& p) {
+  MakerDecision d;
+  auto pull = [&](const char* why) { d.quotes.clear(); d.pull = why; return d; };
+  if (!in.book || in.book->stale) return pull("book stale");
+  if (!in.private_up) return pull("private feed down");
+  if (in.close_ms <= in.now_ms) return pull("closed");
+  const auto& bids = in.book->bids;
+  const auto& asks = in.book->asks;
+  if (bids.empty() || asks.empty()) return pull("one-sided book");
+  const Px bb = bids.front().px, ba = asks.front().px;
+  if (bb >= ba) return pull("crossed book");
+  d.fair = (bb + ba) / 2;
+  const bool ioc_ok = in.since_ioc_ms < 0 || in.since_ioc_ms >= p.ioc_gap_ms;
+  if (in.position == 0) {
+    d.quotes.push_back({Side::BUY, bb, p.size, false});
+    d.quotes.push_back({Side::SELL, ba, p.size, false});
+    if (in.quiet_ms >= p.probe_every_ms && ioc_ok) d.quotes.push_back({Side::BUY, ba, p.size, true, false});
+    return d;
+  }
+  // holding: out at the touch, by IOC once held long enough
+  const bool lng = in.position > 0;
+  const Qty q = lng ? in.position : -in.position;
+  const Side out = lng ? Side::SELL : Side::BUY;
+  if (in.held_ms >= p.hold_max_ms && ioc_ok) d.quotes.push_back({out, lng ? bb : ba, q, true});
+  else d.quotes.push_back({out, lng ? ba : bb, q, false});
+  return d;
+}
+
+std::set<std::string> paper_markets(const rest::Snapshot& s, std::int64_t now, const std::set<std::string>& keep,
+                                    std::size_t want) {
+  std::set<std::string> out;
+  auto trading = [&](const kalshi::MarketRow& m, std::int64_t ahead) {
+    return (m.status == "active" || m.status == "open") && (!m.open_ms || *m.open_ms <= now) && m.close_ms &&
+           *m.close_ms > now + ahead;
+  };
+  for (const auto& tk : keep) {
+    const auto it = s.markets.find(tk);
+    if (it != s.markets.end() && trading(it->second, 1800000)) out.insert(tk);
+  }
+  std::vector<std::pair<Qty, std::string>> pick;
+  for (const auto& [tk, m] : s.markets) {
+    if (out.count(tk) || !trading(m, 7200000) || !m.exchange_index || !m.yes_bid || !m.yes_ask) continue;
+    if (m.price_ranges.empty() || std::any_of(m.price_ranges.begin(), m.price_ranges.end(),
+                                              [](const kalshi::PriceRange& r) { return r.step != 100; }))
+      continue;
+    const Px bb = *m.yes_bid, ba = *m.yes_ask;
+    if (bb < 500 || ba > 9500 || ba - bb < 100 || ba - bb > 500) continue;
+    pick.emplace_back(m.volume_24h.value_or(m.volume.value_or(0)), tk);
+  }
+  std::sort(pick.begin(), pick.end(), [](const auto& a, const auto& b) { return a.first != b.first ? a.first > b.first : a.second < b.second; });
+  for (const auto& [v, tk] : pick) {
+    if (out.size() >= want) break;
+    out.insert(tk);
+  }
+  return out;
+}
+
 MakerEngine::MakerEngine(std::string lane, std::vector<std::string> series, Env env, MakerParams params, Decide decide)
     : lane_(std::move(lane)), series_(std::move(series)), env_(std::move(env)), p_(params),
       decide_(decide ? std::move(decide) : Decide(maker_quote)) {}
@@ -190,14 +247,23 @@ void MakerEngine::step(std::int64_t now) {
   const bool running = view->run == RunState::RUN && view->lanes_on.count(lane_);
   // the windows open now in the lane's series
   std::set<std::string> markets;
-  for (const auto& [tk, m] : snap->markets) {
-    const bool mine = std::any_of(series_.begin(), series_.end(), [&](const std::string& s) {
-      return tk.size() > s.size() && tk.compare(0, s.size(), s) == 0 && tk[s.size()] == '-';
-    });
-    // an active market with no open_time has opened (as rest::market_json reads it); one listed
-    // ahead is "initialized"/"unopened", never active
-    if (mine && (!m.open_ms || *m.open_ms <= now) && m.close_ms && *m.close_ms > now && (m.status == "active" || m.status == "open"))
-      markets.insert(tk);
+  if (env_.select) {
+    // the lane picks its own markets (D1); the ones it holds or quotes stay picked while they trade
+    std::set<std::string> keep;
+    for (const auto& [tk, s] : sides_) keep.insert(tk);
+    for (const auto& [key, pos] : view->positions)
+      if (pos != 0 && key.compare(0, lane_.size() + 1, lane_ + "|") == 0) keep.insert(key.substr(lane_.size() + 1));
+    if (running) markets = env_.select(*snap, now, keep);
+  } else {
+    for (const auto& [tk, m] : snap->markets) {
+      const bool mine = std::any_of(series_.begin(), series_.end(), [&](const std::string& s) {
+        return tk.size() > s.size() && tk.compare(0, s.size(), s) == 0 && tk[s.size()] == '-';
+      });
+      // an active market with no open_time has opened (as rest::market_json reads it); one listed
+      // ahead is "initialized"/"unopened", never active
+      if (mine && (!m.open_ms || *m.open_ms <= now) && m.close_ms && *m.close_ms > now && (m.status == "active" || m.status == "open"))
+        markets.insert(tk);
+    }
   }
   if (env_.want) env_.want(running ? markets : std::set<std::string>{});
   const std::set<std::string> open = markets;
@@ -226,9 +292,14 @@ void MakerEngine::step(std::int64_t now) {
       cool_why_[tk] = "our fill";
       last_fill_ms_ = now;
       fill_times_.push_back(now);
+      active_ms_[tk] = now;
       if (relax_steps_ && env_.alert) env_.alert("INFO", lane_ + " filled: its edge floor is back to normal");
       relax_steps_ = 0;
     }
+    if (pos == 0) held_since_.erase(tk);
+    else if (!held_since_.count(tk) || (last_pos_.count(tk) && (last_pos_[tk] > 0) != (pos > 0))) held_since_[tk] = now;
+    if (!running) active_ms_.erase(tk);
+    else if (!active_ms_.count(tk)) active_ms_[tk] = now;
     last_pos_[tk] = pos;
     MakerDecision d;
     const auto m = snap->markets.find(tk);
@@ -272,6 +343,9 @@ void MakerEngine::step(std::int64_t now) {
       in.private_up = env_.private_up && env_.private_up();
       in.reference_fresh = a.fresh;
       in.edge_relax = static_cast<Px>(relax_steps_.load()) * p_.edge_step;
+      in.held_ms = held_since_.count(tk) ? now - held_since_[tk] : 0;
+      in.quiet_ms = active_ms_.count(tk) ? now - active_ms_[tk] : 0;
+      in.since_ioc_ms = ioc_ms_.count(tk) ? now - ioc_ms_[tk] : -1;
       if (a.gated) {
         in.anchor = a.fair ? a.fair : std::optional<Px>(0);
         in.reference_fresh = a.fresh && a.fair.has_value();
@@ -279,7 +353,8 @@ void MakerEngine::step(std::int64_t now) {
       }
       d = decide_(in, p_);
       if (!hold.empty()) {
-        d.quotes.erase(std::remove_if(d.quotes.begin(), d.quotes.end(), [](const MakerQuote& q) { return !q.ioc; }),
+        // a hold stops new risk: what is left is a reducing IOC
+        d.quotes.erase(std::remove_if(d.quotes.begin(), d.quotes.end(), [](const MakerQuote& q) { return !(q.ioc && q.reduce); }),
                        d.quotes.end());
         if (d.quotes.empty()) d.pull = hold;
       }
@@ -319,8 +394,8 @@ void MakerEngine::step(std::int64_t now) {
       pi.count = w->second.size;
       pi.tif = w->second.ioc ? Tif::IOC : Tif::POST;
       pi.ttl_s = w->second.ioc ? 0 : p_.ttl_s;
-      pi.reduce_only = w->second.ioc;
-      pi.override_guard = w->second.ioc;   // the flatten crosses at the touch by design
+      pi.reduce_only = w->second.ioc && w->second.reduce;
+      pi.override_guard = w->second.ioc;   // the flatten (and D1's IOCs) cross at the touch by design
       pi.t_recv_ms = now;
       if (book && !book->bids.empty() && !book->asks.empty())
         pi.touch = pi.side == Side::BUY ? book->bids.front().px : book->asks.front().px;
@@ -333,6 +408,7 @@ void MakerEngine::step(std::int64_t now) {
         s.cid = cid;
         s.acted_ms = now;
         ++places_;
+        if (w->second.ioc) ioc_ms_[tk] = active_ms_[tk] = now;
         if (a.spot > 0 && !quote_spot_.count(tk)) quote_spot_[tk] = a.spot;
       }
     }
@@ -340,7 +416,10 @@ void MakerEngine::step(std::int64_t now) {
     if (!running || !open.count(tk)) {
       bool idle = true;
       for (const auto& [slot, s] : slots) if (!s.cid.empty()) idle = false;
-      if (idle && d.quotes.empty()) sides_.erase(tk);
+      if (idle && d.quotes.empty()) {
+        sides_.erase(tk);
+        held_since_.erase(tk); active_ms_.erase(tk); ioc_ms_.erase(tk); last_pos_.erase(tk);
+      }
     }
   }
   bool quoting = false;

@@ -981,6 +981,7 @@ void Gateway::place_sys(PlaceIntent& p) {
   const auto* lane = sys_->lane(p.lane);
   if (!lane) return refuse("BAD_REQUEST", "no lane " + p.lane);
   if (!sys_->on(p.lane)) return refuse("BAD_STATE", "lane " + p.lane + " is off");
+  if (lane->paper_only && path_->live) return refuse("FORBIDDEN", "lane " + p.lane + " trades only on the demo account");
   if (!sys_restore_error_.empty()) return refuse("RO", sys_restore_error_);
   sync_snapshot();
   if (!snapshot_seen_) return refuse("STALE", "no account read yet");

@@ -16,7 +16,15 @@ const std::vector<LaneSpec>& default_lanes() {
   return L;
 }
 
-SysBook::SysBook(std::vector<LaneSpec> lanes) : lanes_(std::move(lanes)) {}
+LaneSpec paper_lane() {
+  LaneSpec l{"D1", "PAPER", "REST", 20 * 10000, 200, 1000, {}, std::nullopt};
+  l.paper_only = l.on_at_start = true;
+  return l;
+}
+
+SysBook::SysBook(std::vector<LaneSpec> lanes) : lanes_(std::move(lanes)) {
+  for (const auto& l : lanes_) if (l.on_at_start && l.engine) on_.insert(l.id);
+}
 
 const LaneSpec* SysBook::lane(const std::string& id) const {
   for (const auto& l : lanes_) if (l.id == id) return &l;

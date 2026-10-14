@@ -384,7 +384,151 @@ void engine_own_quotes() {
 }
 }  // namespace
 
+// D1 PAPER: flat it joins both touches; quiet 5 min it buys at the ask (an IOC that is new risk,
+// not reduce_only); holding it offers out at the touch, and after 90 s leaves by IOC at the touch,
+// no more than one IOC each 10 s.
+void paper() {
+  MakerParams p; p.size = 100;
+  const auto b = book(4000, 500, 4300, 500);
+  auto in = input(b);
+  auto d = paper_quote(in, p);
+  CHECK(d.pull.empty() && d.quotes.size() == 2 && d.quotes[0].side == Side::BUY && d.quotes[0].price == 4000 &&
+        !d.quotes[0].ioc && d.quotes[1].side == Side::SELL && d.quotes[1].price == 4300 && d.quotes[1].size == 100);
+  in.quiet_ms = 299999;
+  CHECK(paper_quote(in, p).quotes.size() == 2);
+  in.quiet_ms = 300000;
+  d = paper_quote(in, p);
+  CHECK(d.quotes.size() == 3 && d.quotes[2].ioc && !d.quotes[2].reduce && d.quotes[2].side == Side::BUY && d.quotes[2].price == 4300);
+  in.since_ioc_ms = 5000;   // an IOC 5 s ago: not again yet
+  CHECK(paper_quote(in, p).quotes.size() == 2);
+  // long 1: offered at the ask; after 90 s sold at the bid by IOC (reduce_only)
+  in = input(b, OPEN + 60000, 100);
+  in.held_ms = 89999;
+  d = paper_quote(in, p);
+  CHECK(d.quotes.size() == 1 && d.quotes[0].side == Side::SELL && d.quotes[0].price == 4300 && !d.quotes[0].ioc && d.quotes[0].size == 100);
+  in.held_ms = 90000;
+  d = paper_quote(in, p);
+  CHECK(d.quotes.size() == 1 && d.quotes[0].ioc && d.quotes[0].reduce && d.quotes[0].side == Side::SELL && d.quotes[0].price == 4000);
+  in.since_ioc_ms = 9000;   // the last exit IOC missed 9 s ago: rest at the ask meanwhile
+  d = paper_quote(in, p);
+  CHECK(d.quotes.size() == 1 && !d.quotes[0].ioc && d.quotes[0].price == 4300);
+  // short 2: bought back at the ask by IOC
+  in = input(b, OPEN + 60000, -200);
+  in.held_ms = 95000;
+  d = paper_quote(in, p);
+  CHECK(d.quotes.size() == 1 && d.quotes[0].ioc && d.quotes[0].side == Side::BUY && d.quotes[0].price == 4300 && d.quotes[0].size == 200);
+  // pulls
+  auto one = book(4000, 500, 4300, 500); one.asks.clear();
+  CHECK(paper_quote(input(one), p).pull == "one-sided book");
+  auto stale = b; stale.stale = true;
+  CHECK(paper_quote(input(stale), p).pull == "book stale");
+  in = input(b); in.private_up = false;
+  CHECK(paper_quote(in, p).pull == "private feed down");
+}
+
+void paper_pick() {
+  const std::int64_t now = OPEN;
+  rest::Snapshot s;
+  auto add = [&](const std::string& tk, Px bid, Px ask, Qty vol, std::int64_t close_in) {
+    kalshi::MarketRow m; m.ticker = tk; m.status = "active"; m.exchange_index = 0; m.open_ms = now - 1000;
+    m.close_ms = now + close_in; m.price_ranges = CENT; m.yes_bid = bid; m.yes_ask = ask; m.volume_24h = vol;
+    s.markets[tk] = m;
+  };
+  add("A", 4000, 4200, 900, 86400000);
+  add("B", 6000, 6100, 500, 86400000);
+  add("C", 3000, 3300, 2000, 3600000);    // closes within 2 h
+  add("D", 200, 400, 5000, 86400000);     // a long shot
+  add("E", 4000, 4900, 5000, 86400000);   // 9c wide
+  add("F", 5000, 5200, 100, 86400000);
+  add("G", 5000, 5100, 800, 86400000);
+  s.markets["G"].price_ranges = TAPER;    // not a cent grid
+  CHECK((paper_markets(s, now, {}) == std::set<std::string>{"A", "B"}));
+  // kept while it still trades for 30 min, then the best of the rest
+  CHECK((paper_markets(s, now, {"C"}) == std::set<std::string>{"A", "C"}));
+  CHECK((paper_markets(s, now + 3600000 - 1800000, {"C"}) == std::set<std::string>{"A", "B"}));
+  CHECK(paper_markets(s, now, {}, 3).size() == 3 && paper_markets(s, now, {}, 3).count("F"));
+}
+
+// The engine runs D1: it picks its markets, joins both sides, buys at the ask after 5 quiet
+// minutes, and offers a position out at once, by IOC after 90 s.
+void paper_engine() {
+  const std::string tk = "KXPAPER-1";
+  auto view = std::make_shared<Gateway::SysView>();
+  view->run = RunState::RUN;
+  view->lanes_on = {"D1"};
+  auto snap = std::make_shared<rest::Snapshot>();
+  kalshi::MarketRow m; m.ticker = tk; m.event_ticker = "KXPAPER"; m.status = "active"; m.exchange_index = 0;
+  m.open_ms = OPEN; m.close_ms = OPEN + 86400000; m.price_ranges = CENT; m.yes_bid = 4000; m.yes_ask = 4300; m.volume_24h = 10;
+  snap->markets[tk] = m;
+  snap->clock.post_trusted = true;
+  std::vector<GwMsg> posted;
+  std::set<std::string> wanted;
+  MakerEngine::Env env;
+  env.view = [&] { return std::shared_ptr<const Gateway::SysView>(view); };
+  env.snapshot = [&] { return std::shared_ptr<const rest::Snapshot>(snap); };
+  env.book = [&](const std::string&) { return std::optional<MdBook>(book(4000, 500, 4300, 500)); };
+  env.private_up = [] { return true; };
+  env.post = [&](GwMsg g) { posted.push_back(std::move(g)); return true; };
+  env.want = [&](std::set<std::string> w) { wanted = std::move(w); };
+  env.select = [](const rest::Snapshot& s, std::int64_t now, const std::set<std::string>& keep) { return paper_markets(s, now, keep); };
+  MakerParams p; p.size = 100; p.fill_target_ms = 0;
+  MakerEngine e("D1", {}, env, p, paper_quote);
+  auto places = [&] {
+    std::vector<const PlaceIntent*> out;
+    for (const auto& g : posted) if (const auto* pi = std::get_if<PlaceIntent>(&g)) out.push_back(pi);
+    return out;
+  };
+  auto rest_as = [&](const PlaceIntent& pi) {   // gw's view of a working quote
+    Gateway::SysOrder o; o.cid = pi.cid; o.lane = "D1"; o.ticker = pi.ticker; o.side = pi.side; o.price = pi.price;
+    o.count = o.left = pi.count; o.state = OrdState::WORK;
+    view->orders[pi.cid] = o;
+  };
+  std::int64_t t = OPEN + 1000;
+  e.step(t);
+  auto pl = places();
+  CHECK(wanted == std::set<std::string>{tk} && pl.size() == 2);
+  if (pl.size() == 2) {
+    CHECK(pl[0]->lane == "D1" && pl[0]->side == Side::BUY && pl[0]->price == 4000 && pl[0]->tif == Tif::POST &&
+          pl[1]->side == Side::SELL && pl[1]->price == 4300 && pl[1]->count == 100);
+    rest_as(*pl[0]); rest_as(*pl[1]);
+  }
+  // 5 quiet minutes: an IOC buy at the ask, not reduce_only
+  posted.clear();
+  t += 300000;
+  e.step(t);
+  pl = places();
+  CHECK(pl.size() == 1 && pl[0]->tif == Tif::IOC && !pl[0]->reduce_only && pl[0]->side == Side::BUY && pl[0]->price == 4300 &&
+        pl[0]->override_guard);
+  // it filled: long 1. Both quotes go for the second after our fill (plan: pull on our fill)
+  view->positions["D1|" + tk] = 100;
+  posted.clear();
+  t += 1000;
+  e.step(t);
+  int cancels = 0;
+  for (const auto& g : posted) if (std::holds_alternative<CancelIntent>(g)) ++cancels;
+  CHECK(cancels == 2 && places().empty() && e.status()["last"][tk] == "our fill");
+  for (auto& [cid, o] : view->orders) { o.terminal = true; o.state = OrdState::CXL; o.left = 0; }   // gw shows them ended
+  // then the position is offered out at the ask
+  posted.clear();
+  t += 1500;
+  e.step(t);
+  pl = places();
+  CHECK(pl.size() == 1 && pl[0]->tif == Tif::POST && pl[0]->side == Side::SELL && pl[0]->price == 4300 && pl[0]->count == 100);
+  if (pl.size() == 1) rest_as(*pl[0]);
+  // held 90 s: that offer is cancelled, and the position leaves by IOC at the bid, reduce_only
+  posted.clear();
+  t += 90000;
+  e.step(t);
+  pl = places();
+  cancels = 0;
+  for (const auto& g : posted) if (std::holds_alternative<CancelIntent>(g)) ++cancels;
+  CHECK(cancels == 1 && pl.size() == 1 && pl[0]->tif == Tif::IOC && pl[0]->reduce_only && pl[0]->side == Side::SELL &&
+        pl[0]->price == 4000 && pl[0]->count == 100);
+  CHECK(e.status()["lane"] == "D1" && e.status()["places"].get<int>() >= 4);
+}
+
 int main() {
   grid(); quotes(); anchor_and_pulls(); band(); engine_limits(); review_fixes(); engine_own_quotes(); fill_pace();
+  paper(); paper_pick(); paper_engine();
   return finish("deskd-maker");
 }

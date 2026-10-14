@@ -54,6 +54,10 @@ struct DeskdConfig {
   std::vector<std::string> lip_series = {"KXNATGAS15M"};
   // The series lane M2 (BAND 96-99) quotes: the plan's five weather cities first.
   std::vector<std::string> band_series = {"KXHIGHNY", "KXHIGHCHI", "KXHIGHMIA", "KXHIGHAUS", "KXHIGHLAX"};
+  // Lane D1 PAPER (strat/maker.h paper_quote) on the demo account, on from the start: orders in
+  // and out every few minutes so the Systematic path can be watched. Never on the production
+  // account, whatever this says.
+  bool paper_lane = true;
   // The other desk the header's PAPER/LIVE tag switches to: the paper desk (demo account) and
   // the live one (production) are two deskd processes, each with its own account lock, data and
   // port. http://127.0.0.1:PORT/ or http://localhost:PORT/ only; "" = the other default port

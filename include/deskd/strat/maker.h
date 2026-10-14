@@ -66,6 +66,12 @@ struct MakerParams {
   std::int64_t fill_target_ms = 600000;
   Px edge_step = 25;                   // 0.25c
   Px edge_min = 50;                    // 0.5c
+  // D1 PAPER (paper_quote) only: an opening IOC after probe_every_ms with no fill and no IOC in
+  // the market; a position held hold_max_ms leaves by IOC at the touch, at most one IOC each
+  // ioc_gap_ms
+  std::int64_t probe_every_ms = 300000;
+  std::int64_t hold_max_ms = 90000;
+  std::int64_t ioc_gap_ms = 10000;
 };
 
 struct MakerInput {
@@ -77,6 +83,10 @@ struct MakerInput {
   std::int64_t now_ms = 0, open_ms = 0, close_ms = 0;
   bool private_up = false, reference_fresh = true;
   Px edge_relax = 0;                   // how far the fill pace has lowered the edge floor (MakerParams)
+  // the engine's clocks for this market (D1 PAPER reads them): how long the position has been
+  // held (0 flat), since the lane's last fill or IOC here or since it began quoting it, and since
+  // its last IOC here (-1 none)
+  std::int64_t held_ms = 0, quiet_ms = 0, since_ioc_ms = -1;
 };
 
 struct MakerQuote {
@@ -84,6 +94,7 @@ struct MakerQuote {
   Px price = 0;
   Qty size = 0;
   bool ioc = false;                    // the T-60 s flatten
+  bool reduce = true;                  // an IOC is reduce_only; D1's opening IOC is not (new risk)
 };
 struct MakerDecision {
   std::vector<MakerQuote> quotes;      // what should be working
@@ -97,6 +108,19 @@ MakerDecision maker_quote(const MakerInput& in, const MakerParams& p = {});
 // best ask of 0.01-0.04; p.size a market, and no more once that much is held on that side. The
 // position is held to settlement. Pulled on a stale book or the private feed down.
 MakerDecision band_quote(const MakerInput& in, const MakerParams& p);
+
+// D1 PAPER (the demo account only): a lane that trades so the order path can be watched working,
+// not for edge. Flat, it joins the best bid and the best ask with p.size each (post-only, p.ttl_s);
+// after p.probe_every_ms with no fill and no IOC in the market it buys p.size at the ask (an IOC);
+// holding, it offers the position out at the touch (post-only), and once held p.hold_max_ms it
+// leaves by an IOC at the touch (reduce_only), no more often than p.ioc_gap_ms. Pulled on a
+// stale or one-sided book and with the private feed down.
+MakerDecision paper_quote(const MakerInput& in, const MakerParams& p);
+// D1's markets: those it holds or already quotes that still trade for 30 min, then up to `want`
+// more by 24 h volume: active, closing over 2 h out, a cent grid, a two-sided listing quote
+// inside 0.05-0.95 with a 1-5c spread. Sorted, so a re-pick is stable.
+std::set<std::string> paper_markets(const rest::Snapshot& s, std::int64_t now, const std::set<std::string>& keep,
+                                    std::size_t want = 2);
 
 // the grid's own prices: the step at p, and the nearest grid price at or below / at or above
 Px grid_step(Px p, const std::vector<kalshi::PriceRange>& grid);
@@ -136,6 +160,9 @@ class MakerEngine {
     // the data release whose window holds now for this market ("" = none; strat/calendar.h):
     // its resting quotes go, the T-60 s flatten still goes
     std::function<std::string(const std::string& tk, std::int64_t now_ms)> release;
+    // the markets to quote, in place of the series ("" = the series rule); keep: the ones it holds
+    // or quotes now (D1 PAPER: paper_markets)
+    std::function<std::set<std::string>(const rest::Snapshot&, std::int64_t now_ms, const std::set<std::string>& keep)> select;
   };
   using Decide = std::function<MakerDecision(const MakerInput&, const MakerParams&)>;
   MakerEngine(std::string lane, std::vector<std::string> series, Env env, MakerParams params = {},
@@ -159,6 +186,9 @@ class MakerEngine {
   std::map<std::string, std::int64_t> cool_until_;      // after a fill of ours, or a 0.5 sigma move
   std::map<std::string, double> quote_spot_;            // the underlying when the quotes went out
   std::map<std::string, std::string> cool_why_;
+  // per market: when the position went from flat, the last fill or IOC (or the start of quoting),
+  // the last IOC (MakerInput::held_ms, quiet_ms, since_ioc_ms)
+  std::map<std::string, std::int64_t> held_since_, active_ms_, ioc_ms_;
   // what status() shows, written by step() and read from any thread: the per-market reason
   // under status_mu_ (an unguarded map was iterated by /ops/status while step() inserted into
   // it: a TSan race and a possible crash), the counters atomic
