@@ -72,7 +72,9 @@ ManualAdmission admit_manual(const PlaceIntent& input,const ManualContext& c) {
   if(!c.account_ready) return refuse("STALE","the account read (REST) is not current yet");
   if(!c.public_ready) return refuse("STALE","market data is not ready");
   if(!c.private_ready) return refuse("STALE","the private order/fill feed is not up");
-  if(c.unknown_order) return refuse("STALE","an order's outcome on this market is still unknown");
+  if(c.unknown_order)
+    return refuse("STALE","order "+(c.unknown_cid.empty() ? std::string("?") : c.unknown_cid)+
+                  " on this market has an unknown outcome; an account read settles it (an IOC within about 2 minutes)");
   if(!c.book || c.book->ticker!=input.ticker) return refuse("STALE","no book for this market yet");
   if(c.book->stale) return refuse("STALE","this market's book is stale");
   if(c.foreign_order) return refuse("RO","cancel the foreign order on this market first");

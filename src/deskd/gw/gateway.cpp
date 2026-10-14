@@ -168,6 +168,11 @@ void Gateway::run(Worker& self) {
       stats_.handled.fetch_add(1, std::memory_order_relaxed);
     }
     if (sys_) sys_tick(now_ms());
+    // a new account read, even with nothing else happening: it may settle an unknown order
+    if (manual_ && now_ms() - snapshot_polled_ms_ >= 250) {
+      snapshot_polled_ms_ = now_ms();
+      sync_snapshot();
+    }
     if (manual_ && now_ms() - timelines_swept_ms_ >= 1000) {   // timelines whose last stamps never came
       timelines_swept_ms_ = now_ms();
       std::vector<std::string> due;
@@ -525,6 +530,14 @@ void Gateway::manual_reply(const KalshiWriteReply& r) {
   }
   const bool ok = manual_->apply(r);
   if (!ok) DLOG_ERR("reply for order %s contradicts the order book: reconcile before trading", r.cid.c_str());
+  // every create that did not land, with its reason, for desk.py report
+  if (r.outcome.kind == K::UNKNOWN)
+    DLOG_WARN("order %s: outcome unknown (%s); it blocks its market until the private feed or an account read settles it",
+              r.cid.c_str(), r.outcome.why.substr(0, 200).c_str());
+  else if (r.outcome.kind != K::ACK)
+    DLOG_INFO("order %s not placed: %s%s%s", r.cid.c_str(),
+              r.local_code.empty() ? reject_class_name(r.outcome.cls) : r.local_code.c_str(),
+              r.outcome.why.empty() ? "" : ": ", r.outcome.why.substr(0, 200).c_str());
   if (ok && r.outcome.kind == K::ACK && r.create) note_latency(r);
   publish_order(r.cid);
   // A cancel asked for while the write was in flight goes out once the order id is known.
@@ -783,9 +796,59 @@ void Gateway::sync_snapshot() {
   if (snapshot != snapshot_seen_) {
     manual_->set_snapshot(snapshot);
     snapshot_seen_ = std::move(snapshot);
+    if (snapshot_seen_ && snapshot_seen_->account_ready && snapshot_seen_->account_ms != settled_ms_) {
+      settled_ms_ = snapshot_seen_->account_ms;
+      settle_uncertain(*snapshot_seen_);
+    }
     if (sys_ && snapshot_seen_ && snapshot_seen_->account_ready && snapshot_seen_->account_ms != reconciled_ms_) {
       reconciled_ms_ = snapshot_seen_->account_ms;
       sys_reconcile(*snapshot_seen_);
+    }
+  }
+}
+
+// An order whose outcome is unknown (its write timed out, its reply was lost, or its cancel was
+// not confirmed) blocks new orders on its market until something settles it. The private feed
+// usually does; when it missed the update, each account read does: the order's own row settles
+// it, and its absence from a complete read begun well after its deadline proves it never rested
+// (OrderLedger::resolve_absent). Found 2026-10-13 on demo: an order stuck PEND refused every
+// later order on its market as STALE for the rest of the run.
+void Gateway::settle_uncertain(const rest::Snapshot& s) {
+  auto& ledger = manual_->ledger();
+  std::vector<std::string> due;
+  for (const auto& [cid, o] : ledger.orders())
+    if (o.uncertain && !o.terminal()) due.push_back(cid);
+  for (const auto& cid : due) {
+    const auto* o = ledger.find(cid);
+    if (!o) continue;
+    const kalshi::OrderRow* row = nullptr;
+    for (const auto& r : s.orders)
+      if (r.client_order_id == cid || (!o->oid.empty() && r.order_id == o->oid)) { row = &r; break; }
+    if (row) {
+      const bool healthy = ledger.healthy();
+      if (ledger.observed(*row, s.account_ms)) {
+        const auto* after = ledger.find(cid);
+        DLOG_INFO("order %s: the account read shows it %s%s", cid.c_str(), after->json().value("st", "?").c_str(),
+                  after->uncertain ? " (its cancel is not confirmed yet)" : "");
+        publish_order(cid);
+      } else if (healthy && !ledger.healthy()) {
+        DLOG_ERR("account read of order %s contradicts the order book: reconcile before trading", cid.c_str());
+      }
+      continue;
+    }
+    OrderLedger::History h;
+    h.ticker = o->intent.ticker;
+    h.shard = o->shard;
+    h.since_ms = s.orders_from_ms;
+    h.began_ms = s.account_began_ms;
+    h.completed_ms = s.account_ms;
+    h.orders_complete = h.fills_complete = true;   // rest refuses a read it could not page to the end
+    for (const auto& r : s.orders) if (r.ticker == h.ticker) h.orders.push_back(r);
+    for (const auto& f : s.fills) if (f.ticker == h.ticker) h.fills.push_back(f);
+    if (ledger.resolve_absent(cid, h)) {
+      DLOG_INFO("order %s: absent from a complete account read begun after its deadline, so it never rested (%s)",
+                cid.c_str(), ledger.find(cid)->why.c_str());
+      publish_order(cid);
     }
   }
 }

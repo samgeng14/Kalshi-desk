@@ -168,14 +168,65 @@ void unknown_blocks() {
   CHECK(ord["st"]=="PEND" && ord["why"]=="");
   CHECK(d.venue.has_cid("Mgwtest-1"));   // it does rest at the venue: the reservation stays
   r=d.place(d.intent("Mgwtest-2",Side::BUY,4000,100)); CHECK(r.code=="STALE");   // the market is blocked
+  CHECK(r.msg.find("order Mgwtest-1 ")==0);                                        // and says by which order
   // a cancel of the uncertain order is recorded; nothing can be sent without its order id
   auto cx=d.cancel_cid("Mgwtest-1"); CHECK(cx.cids.size()==1);
   CHECK(d.gw->stats().manual_cancels==0);
+}
+
+// The private feed is not wired here, so only the account read can settle an unknown order: its
+// own row (it rested) does at once; its absence from a complete read begun after its deadline
+// (it never reached the book) does then, not before. Either way the market takes orders again
+// (2026-10-13 on demo: an order stuck PEND refused the market's every later order as STALE).
+void unknown_settled_by_account_read() {
+  Desk d;
+  fakex::HttpFault fault; fault.kind=fakex::HttpFault::Kind::DROP_AFTER_ACCEPT; d.venue.f->add_fault(fault);
+  auto r=d.place(d.intent("Mgwset-1",Side::BUY,4000,100,Tif::POST,60));
+  CHECK(r.code=="EXCHANGE");
+  CHECK(d.place(d.intent("Mgwset-2",Side::BUY,4000,100)).code=="STALE");
+  auto row=d.venue.f->with_engine([](fakex::Engine& e, std::int64_t) {
+    kalshi::OrderRow out;
+    for (const fakex::Order* o : e.user_orders())
+      if (o->client_order_id=="Mgwset-1") {
+        out.order_id=o->order_id; out.client_order_id=o->client_order_id; out.ticker=o->ticker;
+        out.yes_price=o->price; out.initial=o->initial; out.filled=o->filled; out.remaining=o->remaining;
+        out.exchange_index=o->exchange_index; out.updated_ms=o->updated_ms;
+      }
+    return out;
+  });
+  CHECK(!row.order_id.empty());
+  auto s=std::make_shared<rest::Snapshot>(*snapshot(now_ms()));
+  s->orders.push_back(row); s->account_ms=now_ms(); ++s->revision;
+  std::atomic_store(&d.snap,std::shared_ptr<const rest::Snapshot>(s));
+  CHECK(d.until([&]{ return d.last_row("Mgwset-1")["st"]=="WORK"; }));
+  CHECK(d.last_row("Mgwset-1")["oid"]==row.order_id);
+  r=d.place(d.intent("Mgwset-3",Side::BUY,4000,100));   // an IOC that does not cross: unblocked
+  CHECK(r.code.empty());
+
+  // never reached the book: an IOC whose request the venue dropped unread
+  fault.kind=fakex::HttpFault::Kind::DROP_BEFORE_REPLY; d.venue.f->add_fault(fault);
+  r=d.place(d.intent("Mgwset-4",Side::BUY,4000,100));
+  CHECK(r.code=="EXCHANGE" && !d.venue.has_cid("Mgwset-4"));
+  const auto t=d.last_row("Mgwset-4")["t"]["sent"];
+  const std::int64_t sent=t.is_number() ? t.get<std::int64_t>() : 0;
+  CHECK(sent>0);
+  // a read that began too soon after it proves nothing
+  s=std::make_shared<rest::Snapshot>(*snapshot(now_ms()));
+  s->orders_from_ms=sent-60000; s->fills_from_ms=sent-60000;
+  s->account_began_ms=sent+1000; s->account_ms=sent+2000; s->revision=10;
+  std::atomic_store(&d.snap,std::shared_ptr<const rest::Snapshot>(s));
+  CHECK(d.place(d.intent("Mgwset-5",Side::BUY,4000,100)).code=="STALE");
+  // one begun after its deadline (an IOC's: two minutes) and complete, without it
+  s=std::make_shared<rest::Snapshot>(*s);
+  s->account_began_ms=sent+121000; s->account_ms=sent+122000; s->revision=11;
+  std::atomic_store(&d.snap,std::shared_ptr<const rest::Snapshot>(s));
+  CHECK(d.until([&]{ return d.last_row("Mgwset-4")["st"]=="CXL"; }));
+  CHECK(d.last_row("Mgwset-4")["why"]=="IOC_REST");
 }
 }  // namespace
 
 int main() {
   std::signal(SIGPIPE, SIG_IGN);   // as deskd's runtime does process-wide (app/runtime.h)
-  fills_and_rests(); refusals(); unknown_blocks();
+  fills_and_rests(); refusals(); unknown_blocks(); unknown_settled_by_account_read();
   return finish("deskd-manual-gw");
 }

@@ -343,7 +343,7 @@ def open_log(path):
 
 
 # what to look at first in a log: a KILL and why, a refusal, a stopped sender, an error
-REPORT_MARKS = ('KILL', 'refused', 'STALE', 'stopped', '[error]', '[warn]', 'not sent', 'contradicts', 'UNKNOWN')
+REPORT_MARKS = ('KILL', 'refused', 'STALE', 'stopped', '[error]', '[warn]', 'not sent', 'not placed', 'outcome unknown', 'account read shows', 'never rested', 'contradicts', 'UNKNOWN')
 
 
 def report(which):

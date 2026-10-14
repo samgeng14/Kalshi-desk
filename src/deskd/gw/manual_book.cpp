@@ -128,7 +128,8 @@ ManualContext ManualBook::context(const PlaceIntent& in, const ManualHealth& h, 
   if (s.exchange.shards.empty()) c.shard_active = c.trading_active;
   for (const auto& row : s.exchange.shards)
     if (row.exchange_index == shard) c.shard_active = row.exchange_active && row.trading_active;
-  c.unknown_order = ledger_.blocks(in.ticker, shard);
+  c.unknown_cid = ledger_.blocking(in.ticker, shard);
+  c.unknown_order = !c.unknown_cid.empty();
   c.free = venue_free();
   c.shard_free = shard_free(shard);
   for (const auto& p : s.positions)

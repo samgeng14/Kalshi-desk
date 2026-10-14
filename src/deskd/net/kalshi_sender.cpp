@@ -25,6 +25,27 @@ WireOp op_of(KalshiWriteJob::Kind k) {
   using JK=KalshiWriteJob::Kind;
   return k==JK::CREATE ? WireOp::CREATE : k==JK::CANCEL ? WireOp::CANCEL : k==JK::TRANSFER ? WireOp::TRANSFER : WireOp::GROUP;
 }
+const char* op_word(WireOp op) {
+  switch(op) {
+    case WireOp::CREATE: return "create";
+    case WireOp::CANCEL: return "cancel";
+    case WireOp::BATCH_CANCEL: return "batch cancel";
+    case WireOp::CANCEL_ALL: return "cancel-all";
+    case WireOp::GROUP: return "order group";
+    case WireOp::TRANSFER: return "transfer";
+    default: return "write";
+  }
+}
+// what a local refusal means, for the operator (the ticket shows it with the code)
+std::string local_why(const std::string& code) {
+  if(code=="STALE") return "not on the wire within its send window (the sender was busy with an earlier write, or no connection was ready)";
+  if(code=="EXPIRY") return "its expiry came too close before it could be sent";
+  if(code=="USER") return "cancelled before it was sent";
+  if(code=="KILLED") return "KILL is active";
+  if(code=="RO") return "the sender is stopped: see its reason in the header";
+  if(code=="STOP") return "deskd is stopping";
+  return code;
+}
 }  // namespace
 std::string KalshiSender::admission(const KalshiWriteJob& j,const Worker& self) const {
   if(self.stopping()) return "STOP";
@@ -62,6 +83,7 @@ std::string KalshiSender::fail_reason() const {
 }
 void KalshiSender::fail_closed(const std::string& why) {
   { std::lock_guard<std::mutex> lk(why_m_); why_=why; }
+  DLOG_ERR("sender stopped: %s", why.c_str());
   // A Manual failure always sends a fresh cancel-all, KILL active or not, so recovery waits on
   // one that went out after it. The cancel sender never re-trips itself: an unconfirmed
   // cancel-all would retry without end; the operator presses KILL again instead.
@@ -84,14 +106,14 @@ KalshiWriteReply KalshiSender::execute(kalshi::WireRequest request,const std::st
   auto refused=[&](const std::string& code,const std::string& why) {
     r.local_code=code; r.outcome.why=why; return r;
   };
-  if(job) { const auto code=admission(*job,self); if(!code.empty()) return refused(code,"sender admission refused"); }
+  if(job) { const auto code=admission(*job,self); if(!code.empty()) return refused(code,local_why(code)); }
   self.beat();
   std::string why;
   auto conn=pool_.take(options_.connect_ms,&r.pool_miss,&why);
   self.beat();
   if(!conn) return refused("EXCHANGE","no guarded venue connection");
   // A cancel, KILL or deadline can overtake the handshake. Re-check before any bytes leave.
-  if(job) { const auto code=admission(*job,self); if(!code.empty()) return refused(code,"permit expired before send"); }
+  if(job) { const auto code=admission(*job,self); if(!code.empty()) return refused(code,local_why(code)+" (before send)"); }
   const auto& ep=pool_.config().endpoint;
   const std::string base=kalshi::kBasePath;
   if(request.path.compare(0,base.size(),base)!=0) return refused("INTERNAL","unexpected write path");
@@ -102,7 +124,7 @@ KalshiWriteReply KalshiSender::execute(kalshi::WireRequest request,const std::st
     return refused("RO","request signing failed");
   }
   const auto bytes=kalshi::request_bytes(request,ep.host_header(),headers);
-  if(job) { const auto code=admission(*job,self); if(!code.empty()) return refused(code,"permit revoked while signing"); }
+  if(job) { const auto code=admission(*job,self); if(!code.empty()) return refused(code,local_why(code)+" (while signing)"); }
   r.sent_ms=now_ms(); ++attempted_;
   r.exchange=net::exchange(*conn,bytes,net::mono_us()+1000LL*options_.reply_ms,false,[&]{self.beat();});
   conn.reset(); // one write per connection, regardless of a keep-alive response
@@ -123,8 +145,14 @@ KalshiWriteReply KalshiSender::execute(kalshi::WireRequest request,const std::st
   }
   // a refused transfer (not enough free cash, transfers paused) is the operator's to read, not a
   // fault in the order path
-  if(r.outcome.kind==kalshi::WriteOutcome::Kind::REFUSED && reject_trips_kill(r.outcome.cls) && request.op!=WireOp::TRANSFER)
-    fail_closed("venue rejected a write as invalid or unauthorized; reconciliation required");
+  if(r.outcome.kind==kalshi::WriteOutcome::Kind::REFUSED && reject_trips_kill(r.outcome.cls) && request.op!=WireOp::TRANSFER) {
+    // the venue's own words, so the KILL says which write and why (2026-10-13: a KILL on demo
+    // could not be told from an operator's click)
+    std::string text=r.outcome.why.substr(0,160);
+    while(!text.empty() && std::isspace(static_cast<unsigned char>(text.back()))) text.pop_back();
+    fail_closed(std::string("venue refused a ")+op_word(request.op)+" ("+cid+") as "+reject_class_name(r.outcome.cls)+
+                ", HTTP "+std::to_string(r.outcome.http)+(text.empty() ? "" : ": "+text)+"; reconciliation required");
+  }
   return r;
 }
 void KalshiSender::take_kill(Worker& self) {
@@ -193,7 +221,7 @@ void KalshiSender::run(Worker& self) {
       r.cid=job->cid; r.entered_ms=now_ms();
       r.op=op_of(job->kind);
       r.outcome.kind=kalshi::WriteOutcome::Kind::NOT_SENT;
-      r.local_code=code.empty() ? "BAD_REQUEST" : code; r.outcome.why=why;
+      r.local_code=code.empty() ? "BAD_REQUEST" : code; r.outcome.why=code.empty() ? why : local_why(code);
     } else r=execute(std::move(request),job->cid,self,&*job);
     r.shard=job->shard;   // gw's write budget bills a 429 to it
     if(job->kind==JK::GROUP) {

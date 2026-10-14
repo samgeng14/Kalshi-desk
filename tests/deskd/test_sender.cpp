@@ -154,7 +154,9 @@ void hard_refusal_recovers() {
   const auto refused=h.wait("Mwrong-1");
   CHECK(refused.outcome.kind==Kind::REFUSED && reject_trips_kill(refused.outcome.cls));
   CHECK(until([&]{return h.kill.active() && !h.manual->healthy();}));
-  CHECK(h.manual->fail_reason().find("invalid or unauthorized")!=std::string::npos && h.cancel->fail_reason().empty());
+  // the KILL names the write and the venue's own words
+  CHECK(h.manual->fail_reason().rfind("venue refused a create (Mwrong-1) as hard_invalid, HTTP 404: not_found",0)==0 &&
+        h.manual->fail_reason().find("; reconciliation required")!=std::string::npos && h.cancel->fail_reason().empty());
   CHECK(h.wait("",WireOp::CANCEL_ALL).outcome.kind==Kind::ACK);
   CHECK(until([&]{return h.kill.confirmed_gen()==h.kill.generation();}));
   CHECK(!h.manual->healthy());   // KILL still active: the operator has not re-armed

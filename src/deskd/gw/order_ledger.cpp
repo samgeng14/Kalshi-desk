@@ -264,9 +264,9 @@ bool OrderLedger::resolve_absent(const std::string& cid, const History& h) {
   o.why=o.intent.exp_ms ? "EXPIRY" : o.intent.tif==Tif::FOK ? "FOK" : "IOC_REST";
   ++o.rev; return true;
 }
-bool OrderLedger::blocks(const std::string& ticker,int shard) const {
-  for(const auto& pair:orders_) if(pair.second.intent.ticker==ticker && pair.second.shard==shard && pair.second.uncertain) return true;
-  return false;
+std::string OrderLedger::blocking(const std::string& ticker,int shard) const {
+  for(const auto& pair:orders_) if(pair.second.intent.ticker==ticker && pair.second.shard==shard && pair.second.uncertain) return pair.first;
+  return {};
 }
 kalshi::Micros OrderLedger::reserved(int shard) const {
   kalshi::Micros result=0;

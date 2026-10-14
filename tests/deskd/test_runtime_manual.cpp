@@ -308,7 +308,8 @@ void stop_reasons() {
   CHECK(r.until([&]{ return !r.d->status()["gw"]["ledger_why"].get<std::string>().empty(); }));
   auto s=r.d->status();
   CHECK(s["senders"]["k1"]["healthy"]==false);
-  CHECK(s["senders"]["k1"]["why"].get<std::string>().find("invalid or unauthorized")!=std::string::npos);
+  CHECK(s["senders"]["k1"]["why"].get<std::string>().rfind("venue refused a create (Mrt-hard-1) as hard_invalid",0)==0);
+  CHECK(s["run"]["state"]=="KILLED" && s["run"]["why"].get<std::string>().rfind("venue refused a create (Mrt-hard-1)",0)==0);
   CHECK(s["gw"]["ledger_healthy"]==false);
   CHECK(s["gw"]["ledger_why"].get<std::string>().rfind("Mrt-hard-1: ",0)==0);
   CHECK(r.until([&]{ return r.d->kill_switch().confirmed_gen()==r.d->kill_switch().generation(); }));

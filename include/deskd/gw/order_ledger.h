@@ -59,7 +59,9 @@ class OrderLedger {
   // absence from an open-orders snapshot, timeout, or local expiry is never sufficient.
   bool resolve_absent(const std::string& cid, const History& history);
   const Order* find(const std::string& cid) const;
-  bool blocks(const std::string& ticker, int shard) const;
+  bool blocks(const std::string& ticker, int shard) const { return !blocking(ticker, shard).empty(); }
+  // the first order on this market and shard whose outcome is unknown, "" when none
+  std::string blocking(const std::string& ticker, int shard) const;
   kalshi::Micros reserved(int shard) const;
   std::vector<std::string> fills_due(std::int64_t now) const;
   bool healthy() const { return healthy_; }
