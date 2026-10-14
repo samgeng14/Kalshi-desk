@@ -184,16 +184,19 @@ void unknown_settled_by_account_read() {
   auto r=d.place(d.intent("Mgwset-1",Side::BUY,4000,100,Tif::POST,60));
   CHECK(r.code=="EXCHANGE");
   CHECK(d.place(d.intent("Mgwset-2",Side::BUY,4000,100)).code=="STALE");
-  auto row=d.venue.f->with_engine([](fakex::Engine& e, std::int64_t) {
-    kalshi::OrderRow out;
-    for (const fakex::Order* o : e.user_orders())
-      if (o->client_order_id=="Mgwset-1") {
-        out.order_id=o->order_id; out.client_order_id=o->client_order_id; out.ticker=o->ticker;
-        out.yes_price=o->price; out.initial=o->initial; out.filled=o->filled; out.remaining=o->remaining;
-        out.exchange_index=o->exchange_index; out.updated_ms=o->updated_ms;
-      }
-    return out;
-  });
+  auto venue_row=[&](const std::string& cid) {   // the order's row as the account read gets it
+    return d.venue.f->with_engine([&](fakex::Engine& e, std::int64_t) {
+      kalshi::OrderRow out;
+      for (const fakex::Order* o : e.user_orders())
+        if (o->client_order_id==cid) {
+          out.order_id=o->order_id; out.client_order_id=o->client_order_id; out.ticker=o->ticker;
+          out.yes_price=o->price; out.initial=o->initial; out.filled=o->filled; out.remaining=o->remaining;
+          out.exchange_index=o->exchange_index; out.updated_ms=o->updated_ms;
+        }
+      return out;
+    });
+  };
+  auto row=venue_row("Mgwset-1");
   CHECK(!row.order_id.empty());
   auto s=std::make_shared<rest::Snapshot>(*snapshot(now_ms()));
   s->orders.push_back(row); s->account_ms=now_ms(); ++s->revision;
@@ -202,6 +205,23 @@ void unknown_settled_by_account_read() {
   CHECK(d.last_row("Mgwset-1")["oid"]==row.order_id);
   r=d.place(d.intent("Mgwset-3",Side::BUY,4000,100));   // an IOC that does not cross: unblocked
   CHECK(r.code.empty());
+
+  // cancelled while its outcome was unknown: the cancel waits for the order id, and goes the
+  // moment the account read binds it (review 2026-10-14: it never went, and the order rested on)
+  d.venue.f->add_fault(fault);
+  r=d.place(d.intent("Mgwset-6",Side::BUY,3900,100,Tif::POST,60));
+  CHECK(r.code=="EXCHANGE");
+  auto cx=d.cancel_cid("Mgwset-6"); CHECK(cx.cids.size()==1);
+  CHECK(d.gw->stats().manual_cancels==0);
+  s=std::make_shared<rest::Snapshot>(*snapshot(now_ms()));
+  s->orders.push_back(venue_row("Mgwset-6")); s->account_ms=now_ms()+1; s->revision=5;
+  std::atomic_store(&d.snap,std::shared_ptr<const rest::Snapshot>(s));
+  CHECK(d.until([&]{ return d.gw->stats().manual_cancels==1; }));
+  CHECK(d.until([&]{ return d.last_row("Mgwset-6")["st"]=="CXL"; }));
+  CHECK(d.until([&]{ return d.venue.f->with_engine([](fakex::Engine& e, std::int64_t) {
+    for (const fakex::Order* o : e.user_orders())
+      if (o->client_order_id=="Mgwset-6") return o->status!=fakex::OrdStatus::RESTING;
+    return false; }); }));
 
   // never reached the book: an IOC whose request the venue dropped unread
   fault.kind=fakex::HttpFault::Kind::DROP_BEFORE_REPLY; d.venue.f->add_fault(fault);

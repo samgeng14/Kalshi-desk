@@ -234,6 +234,7 @@ class Gateway {
   std::int64_t settled_ms_ = 0;               // the account read that last settled unknown orders
   std::int64_t snapshot_polled_ms_ = 0;       // gw's last look for a new account read
   void settle_uncertain(const rest::Snapshot& s);
+  void flush_cancel(const std::string& cid);
   std::set<std::string> man_held_;                                   // gw thread
   std::shared_ptr<const std::set<std::string>> man_view_;           // std::atomic_load / std::atomic_store
   std::map<std::string, std::int64_t> alerted_;                      // "lane|code" -> when last alerted

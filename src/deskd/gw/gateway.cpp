@@ -540,9 +540,7 @@ void Gateway::manual_reply(const KalshiWriteReply& r) {
               r.outcome.why.empty() ? "" : ": ", r.outcome.why.substr(0, 200).c_str());
   if (ok && r.outcome.kind == K::ACK && r.create) note_latency(r);
   publish_order(r.cid);
-  // A cancel asked for while the write was in flight goes out once the order id is known.
-  if (const auto* o = manual_->ledger().find(r.cid))
-    if (o->cancel_requested && !o->terminal() && !o->oid.empty() && !cancel_sent_.count(r.cid)) send_cancel(r.cid);
+  flush_cancel(r.cid);   // a cancel asked for while the write was in flight goes out once the order id is known
   const auto it = pending_.find(r.cid);
   if (it == pending_.end()) return;
   OrderReply out;
@@ -628,9 +626,15 @@ void Gateway::manual_private(const PrivateEvent& e) {
   }
   if (!cid.empty()) {
     publish_order(cid);
-    if (const auto* o = ledger.find(cid))
-      if (o->cancel_requested && !o->terminal() && !o->oid.empty() && !cancel_sent_.count(cid)) send_cancel(cid);
+    flush_cancel(cid);
   }
+}
+
+// A cancel asked for before the order id was known (the create in flight, or its outcome unknown)
+// goes out once something binds it: the create's reply, the private feed, or an account read.
+void Gateway::flush_cancel(const std::string& cid) {
+  if (const auto* o = manual_->ledger().find(cid))
+    if (o->cancel_requested && !o->terminal() && !o->oid.empty() && !cancel_sent_.count(cid)) send_cancel(cid);
 }
 
 std::vector<std::string> Gateway::cancel_manual(const CancelIntent& c) {
@@ -799,6 +803,7 @@ void Gateway::sync_snapshot() {
     if (snapshot_seen_ && snapshot_seen_->account_ready && snapshot_seen_->account_ms != settled_ms_) {
       settled_ms_ = snapshot_seen_->account_ms;
       settle_uncertain(*snapshot_seen_);
+      note_ledger();   // a contradiction it found stops the ledger: /ops/status and the log say so
     }
     if (sys_ && snapshot_seen_ && snapshot_seen_->account_ready && snapshot_seen_->account_ms != reconciled_ms_) {
       reconciled_ms_ = snapshot_seen_->account_ms;
@@ -831,6 +836,7 @@ void Gateway::settle_uncertain(const rest::Snapshot& s) {
         DLOG_INFO("order %s: the account read shows it %s%s", cid.c_str(), after->json().value("st", "?").c_str(),
                   after->uncertain ? " (its cancel is not confirmed yet)" : "");
         publish_order(cid);
+        flush_cancel(cid);   // cancelled while its outcome was unknown: the cancel goes now
       } else if (healthy && !ledger.healthy()) {
         DLOG_ERR("account read of order %s contradicts the order book: reconcile before trading", cid.c_str());
       }
