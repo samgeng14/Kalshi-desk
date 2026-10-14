@@ -1,4 +1,4 @@
-# deskd handoff (2026-10-07, updated 2026-10-13)
+# deskd handoff (2026-10-07, updated 2026-10-14)
 
 The desk is being rebuilt as `deskd`, an event-driven C++17 trading desk, per `docs/impl_plan.md` (the operator-approved plan; read sections 2-4, 8 and 9 first). This file says where everything is and what to do next.
 
@@ -24,6 +24,29 @@ Rules in code:
   re-arm; Systematic lanes M1 and M2 quoting, Start, Stop cancelling.
 
 The work is on GitHub: `samgeng14/kalshi-desk`, branch `claude/pensive-meitner-8k2wae` (draft PR #1).
+
+## 2026-10-14: paper trading on the Mac
+
+The operator's first paper session (2026-10-13): a ticket BUY "just said STALE", a KILL came from
+nowhere, and Systematic sent nothing. Fixed:
+
+- **The ticket sends an IOC by default** (a click takes the touch and fills). A result line under
+  its buttons says why it cannot send now and what clears it (KILLED: RE-ARM in the header after
+  60 s, then CONFIRM), or what became of the last order: sent, resting, filled at, cancelled, or
+  refused with the backend's reason. The top BUY YES / SELL YES toggles are labelled SIDE: they
+  send nothing.
+- **Every stop says why.** A sender's KILL names the write and the venue's words ("venue refused a
+  create (cid) as hard_invalid, HTTP 404: ..."), shown on the header's KILL button and the
+  Systematic strip; local refusals carry a sentence; gw logs every create that did not land.
+  `python3 tools/desk.py report` prints them from the desk's log file.
+- **An unknown order no longer blocks its market for the run.** The STALE names it, and gw settles
+  it from the account read: its own row at once, or its absence from a complete read begun after
+  its deadline (an IOC's: 2 minutes). gw looks for a new account read every 250 ms.
+- **Lane D1 PAPER** (demo only, on from the start): two liquid markets it picks itself, 1 contract
+  at the touch both sides, an IOC buy after 5 quiet minutes, any position out within 90 s (by IOC
+  at the touch). $20, 2 contracts a market. deskd adds it only without `--live`, gw refuses its
+  orders on production, and `deskd.paper_lane: false` leaves it out. M1 has nothing to quote on
+  demo (KXNATGAS15M's book is empty there) and M2's weather markets are not listed there.
 
 ## 2026-10-13
 

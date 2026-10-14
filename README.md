@@ -32,6 +32,13 @@ orders; one command starts both and Ctrl-C stops both. The live config starts wi
 off; set `"systematic_orders": true` in `~/.kalshi/deskd-prod.json` yourself when you want lanes
 there. `python3 tools/desk.py paper` or `live` runs one alone.
 
+Each desk's log also goes to `deskd.log` in its data directory. After anything odd, run
+`python3 tools/desk.py report` (or `report live`): the run state and why, any stopped sender, and
+every KILL, refusal and unsent order from the log. On PAPER, Systematic has lane D1 PAPER, on from
+the start: it quotes 1 contract at the touch in two liquid demo markets, buys 1 at the ask after
+5 quiet minutes and exits any position within 90 s, so START shows orders going in and out. It
+never runs on LIVE; `"paper_lane": false` in the paper config leaves it out.
+
 ```sh
 tools/demo_checks                          # the plan's demo checks on PAPER (play money): order, group,
                                            # venue shapes (duplicate cid, expiry, reduce_only, post-only
