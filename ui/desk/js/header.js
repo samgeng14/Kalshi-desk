@@ -252,6 +252,9 @@
         D.setText(kb, label);
         var kc = k.st === 'ARMED' ? '' : k.st === 'KILLING' ? 'pend' : k.st === 'KILLFAIL' ? 'fail' : k.st === 'LOCKED' ? 'locked' : k.st === 'CONFIRM' ? 'rearm confirm' : 'rearm';
         if (kb.className !== kc) kb.className = kc;
+        var kr = Desk.store.hdr ? Desk.store.hdr.run : null;
+        D.setAttr(kb, 'title', kr && kr.state === 'KILLED' ? 'KILLED ' + F.time(kr.since_ms) + (kr.why ? ': ' + kr.why : '') +
+          (k.st === 'LOCKED' ? '' : '. Click RE-ARM, then CONFIRM') : null);
       }
     }
   }

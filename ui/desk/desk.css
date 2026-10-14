@@ -310,7 +310,7 @@ body[data-tab="manual"] #tab-manual { visibility: visible; z-index: 1; }
 /* MANUAL: 288 | 340 | 340 | 1fr (about 541 px at 1512); right column 176 / 180 / 200 / rest */
 #tab-manual { grid-template-columns: var(--watch-w) var(--lad-w) var(--lad-w) minmax(0, 1fr); grid-template-rows: minmax(0, 1fr); }
 #m-lad-c, #m-lad-d { display: none; }
-.m-right { display: grid; grid-template-rows: 176px 160px 140px 150px minmax(0, 1fr); gap: 1px; min-height: 0; min-width: 0; }
+.m-right { display: grid; grid-template-rows: 194px 160px 140px 150px minmax(0, 1fr); gap: 1px; min-height: 0; min-width: 0; }
 
 /* WIDE (external monitor, >= 1920 px): a third ladder; the right column stops at 600 px and the
    watchlist takes what is left (from 420 px it adds Sprd, Vol and Close) */
@@ -318,7 +318,7 @@ body[data-tab="manual"] #tab-manual { visibility: visible; z-index: 1; }
   :root { --watch-w: 320px; }
   #tab-manual { grid-template-columns: max(var(--watch-w), calc(100% - 3 * var(--lad-w) - 600px - 4px)) var(--lad-w) var(--lad-w) var(--lad-w) minmax(0, 1fr); }
   #m-lad-c { display: flex; }
-  .m-right { grid-template-rows: 176px 200px 200px 240px minmax(0, 1fr); }
+  .m-right { grid-template-rows: 194px 200px 200px 240px minmax(0, 1fr); }
   .s-lower { grid-template-columns: minmax(0, 1fr) 760px; }
   .s-left { grid-template-rows: 280px 240px minmax(0, 1fr); }
   .s-right { grid-template-rows: 400px minmax(0, 1fr); }
@@ -346,7 +346,7 @@ body[data-split="1"] #m-lad-b, body[data-split="1"] #m-lad-c, body[data-split="1
 body[data-split="1"] .s-lower { grid-template-columns: minmax(0, 1fr) 560px; }
 /* short windows */
 @media (max-height: 759px) {
-  .m-right { grid-template-rows: 176px 120px 110px 120px minmax(0, 1fr); }
+  .m-right { grid-template-rows: 194px 120px 110px 120px minmax(0, 1fr); }
   .s-left { grid-template-rows: 170px 140px minmax(0, 1fr); }
   .s-right { grid-template-rows: 280px minmax(0, 1fr); }
 }

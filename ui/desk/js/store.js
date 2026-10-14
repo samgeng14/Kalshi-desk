@@ -318,15 +318,13 @@
       st.orders.forEach(function (o) { if (!any && o.key === key && !o.terminal) any = true; });
       return any;
     },
+    // KILLED first: it is the one an operator must act on, and a feed gap hid it
     canTrade: function (v) {
-      if (st.killPend) return 'KILLED';
+      var h = st.hdr;
+      if (st.killPend || (h && h.run.state === 'KILLED')) return 'KILLED';
       if (st.stale) return st.staleWhy;
       if (v && st.vstale[v]) return st.vstale[v];
-      var h = st.hdr;
-      if (h) {
-        if (h.run.state === 'KILLED') return 'KILLED';
-        if (v && h.cash[v] && h.cash[v].ro) return 'RO';
-      }
+      if (h && v && h.cash[v] && h.cash[v].ro) return 'RO';
       return '';
     },
 
@@ -420,17 +418,23 @@
     //                                      the cid replaces it); the line goes to the status bar
     //   no answer, 5xx, EXCHANGE/INTERNAL   fate unknown: the order stays PEND and a snapshot
     //   with no ord                        decides (the backend may have sent it to the venue)
-    // A refusal the backend reports with its ord also raises its own alert on the stream, so the
-    // page logs only the refusals the backend cannot have logged.
+    // A refusal that carries its ord is logged here too, and its reason kept on the order (msg):
+    // the backend raises no alert for a manual order (2026-10-14: a refusal on demo showed only
+    // REJ STALE on the order, and no reason anywhere).
     reply: function (cid, status, json) {
       var o = st.orders.get(cid), ok = !!(json && json.ok), hasOrd = !!(json && json.ord);
       if (hasOrd) H.ord(json.ord, null, false);
       var e = (json && json.err) || { code: 'INTERNAL', msg: 'HTTP ' + status };
       var what = o ? o.side + ' ' + Desk.fmt.size(o.qty) + ' ' + o.tk + ' @ ' + Desk.fmt.px(o.px) : cid;
+      if (!ok && hasOrd) {
+        var o2 = st.orders.get(cid);
+        if (o2 && e.msg) { o2.msg = e.msg; mark('mord:' + o2.key); }
+        st.localAlert('WARN', 'GW', (o2 && o2.st === 'REJ' ? 'REJ ' : '') + e.code + ' ' + what + ': ' + e.msg);
+      }
       if (!ok && !hasOrd) {
         if (status >= 400 && status < 500 && PRESEND[e.code]) {
           if (o && !o.terminal) {
-            o.st = 'REJ'; o.why = Desk.contract && Desk.contract.enums.WHY.indexOf(e.code) >= 0 ? e.code : 'INTERNAL';
+            o.st = 'REJ'; o.why = Desk.contract && Desk.contract.enums.WHY.indexOf(e.code) >= 0 ? e.code : 'INTERNAL'; o.msg = e.msg || '';
             o.left = 0; o.terminal = true; o.doneAt = nowMs();
             if (o.local) { o.local.pend = false; o.local.prov = true; }
             mark('ord'); mark('ord:' + o.key); mark('mord:' + o.key);
