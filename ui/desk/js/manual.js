@@ -1109,7 +1109,7 @@
       case 'FILL': return { t: o.side + ' ' + q + ' filled' + (o.avg !== null && o.avg !== undefined ? ' @' + F.px(o.avg) : at), cls: 'ok' };
       case 'EXP': return { t: o.side + ' ' + q + at + (done ? ' ' + done + ', the rest expired' : ' expired unfilled'), cls: done ? 'ok' : 'warn' };
       case 'CXL': return { t: o.side + ' ' + q + at + (done ? ' ' + done + ', the rest cancelled' : ' not filled, cancelled') + (why ? ' (' + why + ')' : ''), cls: done ? 'ok' : 'warn' };
-      case 'REJ': return { t: o.side + ' ' + q + at + ' refused: ' + (why || l.err || 'no reason given'), cls: 'crit' };
+      case 'REJ': return { t: o.side + ' ' + q + at + ' refused: ' + (o.msg ? why : (l.err || why || 'no reason given')), cls: 'crit' };
     }
     return { t: '', cls: '' };
   }
@@ -1399,9 +1399,14 @@
       setCls(x[1], armed ? 'confirm' : (x[0] === 'BUY' ? 'buy' : 'sell'));
       setDisabled(x[1], blocked || x[2].px === null);
     });
-    var block = why || qtyReason(m, cfg.tk.qty) || (TK.pxBad ? 'PRICE OFF GRID' : '') || (typeOK(t, m) ? '' : 'EXPIRY NOT IN CONTRACT') ||
-      (o.px === null ? 'NO PRICE: the ' + (side === 'BUY' ? 'ask' : 'bid') + ' side of the book is empty' : '');
+    // what stops both buttons; an empty book side stops only the one that prices from it, so it
+    // shows only while there is no last order to report (and names the side that button reads)
+    var block = why || qtyReason(m, cfg.tk.qty) || (TK.pxBad ? 'PRICE OFF GRID' : '') || (typeOK(t, m) ? '' : 'EXPIRY NOT IN CONTRACT');
     var lt = tkLastText(st, key, block);
+    if (!lt.t && o.px === null) {
+      var reads = (t.tif === 'POST') === (side === 'BUY') ? 'bid' : 'ask';
+      lt = { t: 'cannot send ' + side + ': NO PRICE: the ' + reads + ' side of the book is empty', cls: 'warn' };
+    }
     D.setText(E.last, lt.t); D.setAttr(E.last, 'title', lt.t || null); setCls(E.last, 'n' + (lt.cls ? ' ' + lt.cls : ''));
   }
 

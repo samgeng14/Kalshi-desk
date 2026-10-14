@@ -560,7 +560,10 @@
         filled: d.filled, left: d.left, avg: px(d.avg), tif: d.tif, exp_ms: d.exp_ms, st: d.st, why: d.why, own: d.own,
         lane: d.lane, piq: d.piq, fee: money(d.fee), touch: px(d.touch), edge: money(d.edge),
         t: { click: d.t.click, recv: d.t.recv, sent: d.t.sent, ack: d.t.ack, done: d.t.done }, rev: d.rev,
-        terminal: !!TERM[d.st], doneAt: null, local: old && old.local ? old.local : null
+        terminal: !!TERM[d.st], doneAt: null, local: old && old.local ? old.local : null,
+        // the reason a refusal's HTTP answer gave (reply): the record has none, so its echo or a
+        // snapshot keeps it while the outcome is the same one
+        msg: old && old.msg && !prov && old.st === d.st && old.why === d.why ? old.msg : ''
       };
       // a terminal order never changes again; a late non-terminal echo cannot resurrect it (a
       // provisional REJ made here is not the backend's word and gives way)
