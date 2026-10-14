@@ -7,9 +7,10 @@
 
 namespace deskd {
 
-void run_strat(Worker& self) {
+void run_strat(Worker& self, const std::function<void()>& step) {
   while (!self.stopping()) {
     self.beat();
+    if (step) step();
     std::this_thread::sleep_for(std::chrono::milliseconds(250));
   }
 }

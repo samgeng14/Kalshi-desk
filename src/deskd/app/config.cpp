@@ -1,7 +1,10 @@
 #include "deskd/app/config.h"
+#include <algorithm>
+#include <cctype>
 
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <nlohmann/json.hpp>
 #include <set>
@@ -63,7 +66,9 @@ DeskdConfig load_deskd_config(const std::string& path) {
   // "heartbeat_window_ms" would otherwise leave the supervisor's rule unchanged.
   static const std::set<std::string> known = {"data_dir",    "lock_dir",    "ui_dir",
                                               "http_port",   "web_threads", "keepalive_s",
-                                              "max_streams", "heartbeat_window_ms", "daily_stop_dollars"};
+                                              "max_streams", "heartbeat_window_ms", "daily_stop_dollars", "equity_floor_dollars",
+                                              "manual_orders", "systematic_orders", "lip_series", "band_series", "paper_lane",
+                                              "peer_url", "write_tier", "calendar"};
   for (auto kv = d.begin(); kv != d.end(); ++kv) {
     if (kv.key() == "live")
       throw std::runtime_error(where + ": \"live\" is a command-line flag only (--live), never a file setting");
@@ -77,9 +82,33 @@ DeskdConfig load_deskd_config(const std::string& path) {
   take(d, "keepalive_s", c.keepalive_s, where);
   take(d, "max_streams", c.max_streams, where);
   take(d, "heartbeat_window_ms", c.heartbeat_window_ms, where);
+  take(d, "manual_orders", c.manual_orders, where);
+  take(d, "systematic_orders", c.systematic_orders, where);
+  take(d, "lip_series", c.lip_series, where);
+  take(d, "band_series", c.band_series, where);
+  take(d, "paper_lane", c.paper_lane, where);
+  take(d, "peer_url", c.peer_url, where);
+  take(d, "write_tier", c.write_tier, where);
+  take(d, "calendar", c.calendar, where);
+  c.calendar = expand_home(c.calendar);
+  if (c.write_tier != "basic" && c.write_tier != "advanced")
+    throw std::runtime_error(where + ": write_tier is \"basic\" or \"advanced\", not \"" + c.write_tier.substr(0, 40) + "\"");
+  if (!c.peer_url.empty() && !peer_url_ok(c.peer_url))
+    throw std::runtime_error(where + ": peer_url must be http://127.0.0.1:PORT/ or http://localhost:PORT/, not \"" +
+                             c.peer_url.substr(0, 80) + "\"");
+  for (const auto* list : {&c.lip_series, &c.band_series})
+    for (const auto& s : *list) {
+      const bool ok = !s.empty() && s.size() <= 40 &&
+          std::all_of(s.begin(), s.end(), [](unsigned char ch) { return std::isupper(ch) || std::isdigit(ch); });
+      if (!ok) throw std::runtime_error(where + ": " + (list == &c.lip_series ? "lip_series" : "band_series") +
+                                        " has \"" + s + "\", not a series ticker");
+    }
   double stop = -1;
   take(d, "daily_stop_dollars", stop, where);
   if (stop >= 0) c.daily_stop = static_cast<Money>(std::llround(stop * 10000.0));
+  double floor = -1;
+  take(d, "equity_floor_dollars", floor, where);
+  if (floor >= 0) c.equity_floor = static_cast<Money>(std::llround(floor * 10000.0));
   c.data_dir = expand_home(c.data_dir);
   c.lock_dir = expand_home(c.lock_dir);
   // A relative lock dir would be a different file from every other working directory: the bug
@@ -93,6 +122,23 @@ DeskdConfig load_deskd_config(const std::string& path) {
   if (c.keepalive_s < 1) throw std::runtime_error(where + ": keepalive_s below 1");
   if (c.heartbeat_window_ms < 1000) throw std::runtime_error(where + ": heartbeat_window_ms below 1000");
   return c;
+}
+
+bool peer_url_ok(const std::string& url) {
+  std::string rest;
+  for (const char* prefix : {"http://127.0.0.1:", "http://localhost:"})
+    if (url.compare(0, std::strlen(prefix), prefix) == 0) rest = url.substr(std::strlen(prefix));
+  if (rest.empty()) return false;
+  if (rest.back() == '/') rest.pop_back();
+  if (rest.empty() || rest.size() > 5 || !std::all_of(rest.begin(), rest.end(), [](unsigned char ch) { return std::isdigit(ch); }))
+    return false;
+  const int port = std::stoi(rest);
+  return port >= 1 && port <= 65535;
+}
+
+std::string peer_url_for(const DeskdConfig& cfg) {
+  if (!cfg.peer_url.empty()) return cfg.peer_url.back() == '/' ? cfg.peer_url : cfg.peer_url + "/";
+  return cfg.live ? "http://127.0.0.1:8788/" : "http://127.0.0.1:8789/";
 }
 
 }  // namespace deskd

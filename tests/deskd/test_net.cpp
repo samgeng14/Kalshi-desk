@@ -30,6 +30,19 @@ using namespace fx;
 
 namespace {
 
+// A connection a test goes on to use: the connection is its setup, not what it tests. On a
+// loaded machine an open can lose a race with a server's reset or with its own deadline, so it is
+// tried three times; one that never opens stops the test with the reason, never a write through
+// a null connection (deskd-net SEGFAULTed so under ctest -j 4, 2026-10-10).
+std::unique_ptr<Conn> must_open(ConnFactory& f, const Endpoint& ep, int ms, int line) {
+  std::string why;
+  for (int i = 0; i < 3; ++i)
+    if (auto c = f.open(ep, ms, &why)) return c;
+  std::fprintf(stderr, "FAIL %s:%d: no connection after three tries: %s\n", __FILE__, line, why.c_str());
+  std::exit(1);
+}
+#define MUST_OPEN(f, ep, ms) must_open(f, ep, ms, __LINE__)
+
 std::string get_status_bytes(const Endpoint& ep, bool keep_alive = false) {
   return request_bytes("GET", ep.host_header(), ep.base_path + "/exchange/status", {{"Accept", "application/json"}}, "",
                        keep_alive);
@@ -184,12 +197,12 @@ static void test_one_request_per_connection() {
   ConnFactory f(demo_guard(), trust_test_ca());
   std::string why;
   // a read
-  auto c = f.open(v.ep(), 2000, &why);
+  auto c = MUST_OPEN(f, v.ep(), 2000);
   Exchange x = exchange(*c, get_status_bytes(v.ep(), true), deadline_ms(2000));
   CHECK(x.fate == Exchange::Fate::REPLIED && x.res.status == 200 && x.res.body.find("exchange_active") != std::string::npos);
   CHECK(x.reusable && x.t_written_us > 0 && x.t_first_byte_us >= x.t_written_us && x.t_done_us >= x.t_first_byte_us);
   // a write: Connection: close, so the venue closes it after the reply and nobody can reuse it
-  auto w = f.open(v.ep(), 2000, &why);
+  auto w = MUST_OPEN(f, v.ep(), 2000);
   Exchange cx = exchange(*w, create_bytes(v.ep(), "M-net-1"), deadline_ms(2000));
   CHECK(cx.fate == Exchange::Fate::REPLIED && cx.res.status == 201 && !cx.reusable);
   CHECK(cx.res.body.find("\"order_id\"") != std::string::npos && v.has_cid("M-net-1"));
@@ -270,7 +283,7 @@ static void test_raw_replies() {
     s.start();
     ConnFactory f(demo_guard());
     std::string why;
-    auto c = f.open(s.ep(), 1000, &why);
+    auto c = MUST_OPEN(f, s.ep(), 1000);
     Exchange x = exchange(*c, request_bytes("POST", "127.0.0.1", "/o", {}, "{}", false), deadline_ms(1000));
     CHECK(x.fate == Exchange::Fate::UNKNOWN && x.why.find("refuses") != std::string::npos);
   }
@@ -281,7 +294,7 @@ static void test_raw_replies() {
     s.start();
     ConnFactory f(demo_guard());
     std::string why;
-    auto c = f.open(s.ep(), 1000, &why);
+    auto c = MUST_OPEN(f, s.ep(), 1000);
     Exchange x = exchange(*c, request_bytes("POST", "127.0.0.1", "/o", {}, "{}", false), deadline_ms(1000));
     CHECK(x.fate == Exchange::Fate::UNKNOWN && x.cut == ResponseParser::Cut::NO_BYTES);
   }
@@ -290,7 +303,7 @@ static void test_raw_replies() {
     RawServer s;   // listening, never accepting: the kernel's buffers fill and the write stalls
     ConnFactory f(demo_guard());
     std::string why;
-    auto c = f.open(s.ep(), 1000, &why);
+    auto c = MUST_OPEN(f, s.ep(), 1000);
     CHECK(c != nullptr);
     const std::string big(16 * 1024 * 1024, 'x');
     int idles = 0;
@@ -305,7 +318,7 @@ static void test_raw_replies() {
     s.start();
     ConnFactory f(demo_guard());
     std::string why;
-    auto c = f.open(s.ep(), 1000, &why);
+    auto c = MUST_OPEN(f, s.ep(), 1000);
     Exchange x = exchange(*c, request_bytes("GET", "127.0.0.1", "/", {}, "", true), deadline_ms(1000));
     CHECK(x.fate == Exchange::Fate::REPLIED && x.res.body == "to the end" && !x.reusable);
   }
@@ -320,7 +333,7 @@ static void test_idle_close() {
     Venue v(cfg);
     ConnFactory f(demo_guard(), trust_test_ca());
     std::string why;
-    auto c = f.open(v.ep(), 2000, &why);
+    auto c = MUST_OPEN(f, v.ep(), 2000);
     CHECK(c && c->usable(&why));
     std::this_thread::sleep_for(std::chrono::milliseconds(400));
     CHECK(log_has(*v.f, "http idle-close") && v.f->idle_closes() == 1);
@@ -334,7 +347,7 @@ static void test_idle_close() {
   Venue v;
   ConnFactory f(demo_guard(), trust_test_ca());
   std::string why;
-  auto c = f.open(v.ep(), 2000, &why);
+  auto c = MUST_OPEN(f, v.ep(), 2000);
   std::this_thread::sleep_for(std::chrono::milliseconds(50));
   v.f->drop_http_connections();
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -522,20 +535,27 @@ static void test_pool() {
 // The old desk died of SIGPIPE on a TLS reconnect: with SIGPIPE's default action back, a write
 // into a connection the peer reset must fail, not kill.
 static void test_no_sigpipe() {
+#ifdef SO_NOSIGPIPE
   ::signal(SIGPIPE, SIG_DFL);
+#else
+  // Linux has no per-socket SO_NOSIGPIPE; deskd relies on runtime's process-wide SIG_IGN there,
+  // so only the write-fails-cleanly half of this test applies.
+  ::signal(SIGPIPE, SIG_IGN);
+#endif
   {
     RawServer s;
     s.read_request = false;
     s.reset = true;
     s.start();
     ConnFactory f(demo_guard());
-    std::string why;
-    auto c = f.open(s.ep(), 1000, &why);
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    const std::string data(256 * 1024, 'x');
-    IoResult r1 = c->write_all(data.data(), data.size(), deadline_ms(500));
-    IoResult r2 = c->write_all(data.data(), data.size(), deadline_ms(500));
-    CHECK(r1.status != IoStatus::OK || r2.status != IoStatus::OK);
+    auto c = MUST_OPEN(f, s.ep(), 1000);
+    {
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      const std::string data(256 * 1024, 'x');
+      IoResult r1 = c->write_all(data.data(), data.size(), deadline_ms(500));
+      IoResult r2 = c->write_all(data.data(), data.size(), deadline_ms(500));
+      CHECK(r1.status != IoStatus::OK || r2.status != IoStatus::OK);
+    }
   }
   {
     fakex::FakeConfig cfg;
@@ -543,14 +563,15 @@ static void test_no_sigpipe() {
     cfg.tls_close_notify = false;
     Venue v(cfg);
     ConnFactory f(demo_guard(), trust_test_ca());
-    std::string why;
-    auto c = f.open(v.ep(), 2000, &why);
-    std::this_thread::sleep_for(std::chrono::milliseconds(400));
-    const std::string data(256 * 1024, 'x');
-    IoResult r1 = c->write_all(data.data(), data.size(), deadline_ms(500));
-    IoResult r2 = c->write_all(data.data(), data.size(), deadline_ms(500));
-    CHECK(r1.status != IoStatus::OK || r2.status != IoStatus::OK);
-    c->close(true);   // close_notify into a dead socket: still no signal
+    auto c = MUST_OPEN(f, v.ep(), 2000);
+    {
+      std::this_thread::sleep_for(std::chrono::milliseconds(400));
+      const std::string data(256 * 1024, 'x');
+      IoResult r1 = c->write_all(data.data(), data.size(), deadline_ms(500));
+      IoResult r2 = c->write_all(data.data(), data.size(), deadline_ms(500));
+      CHECK(r1.status != IoStatus::OK || r2.status != IoStatus::OK);
+      c->close(true);   // close_notify into a dead socket: still no signal
+    }
   }
   ::signal(SIGPIPE, SIG_IGN);
   CHECK(true);   // reaching here is the test

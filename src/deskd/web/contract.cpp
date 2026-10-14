@@ -110,6 +110,19 @@ std::string et_date(std::int64_t wall_ms) {
   return ymd(floor_div(utc_s + offset, 86400));
 }
 
+std::int64_t et_midnight_ms(std::int64_t wall_ms) {
+  // The ET day's start: local midnight is never inside a DST change (those happen at 02:00), so
+  // the offset in force at midnight is the one that maps the candidate back to the same date.
+  const std::int64_t utc_s = floor_div(wall_ms, 1000);
+  for (const std::int64_t offset : {-4 * 3600, -5 * 3600}) {
+    const std::int64_t midnight = floor_div(utc_s + offset, 86400) * 86400 - offset;
+    if (midnight <= utc_s && et_date(midnight * 1000) == et_date(wall_ms) &&
+        et_date((midnight - 1) * 1000) != et_date(wall_ms))
+      return midnight * 1000;
+  }
+  return floor_div(utc_s, 86400) * 86400 * 1000;   // unreachable for valid times
+}
+
 std::string et_date_after(const std::string& date) {
   int y = 0;
   unsigned m = 0, d = 0;
@@ -129,8 +142,8 @@ json hdr_json(const HdrInputs& in) {
       {"cash",
        {{"K", {{"total", zero}, {"free", zero}, {"ro", true}, {"shards", json::array()}}},
         {"P", {{"total", zero}, {"free", zero}, {"ro", true}}}}},
-      {"day", {{"total", zero}, {"sys", zero}, {"man", zero}, {"lip", zero}}},
-      {"risk", zero},
+      {"day", {{"total", money_str(in.day_man)}, {"sys", zero}, {"man", money_str(in.day_man)}, {"lip", zero}}},
+      {"risk", money_str(std::max<Money>(0, in.risk))},
       // left = limit + min(0, day.sys): the whole stop while nothing has traded
       {"stop", {{"left", money_str(in.daily_stop)}, {"limit", money_str(in.daily_stop)}, {"hit", false}}},
       {"sys", {{"K", venue_sys}, {"P", venue_sys}}},
@@ -139,6 +152,16 @@ json hdr_json(const HdrInputs& in) {
       {"preflight", preflight_json(in.preflight)},
       {"lat", {{"kx_lag_ms", nullptr}, {"pm_lag_ms", nullptr}, {"gw_ack_ms", nullptr}, {"clk_off_ms", nullptr}}}};
   if (in.cash_k.is_object()) result["cash"]["K"] = in.cash_k;
+  if (in.sys) {
+    // day_man arrives as the account's whole day; Systematic's part is gw's lanes
+    const Money sys = in.sys->day;
+    result["day"] = {{"total", money_str(in.day_man)}, {"sys", money_str(sys)}, {"man", money_str(in.day_man - sys)},
+                     {"lip", zero}};
+    const Money left = in.daily_stop + std::min<Money>(0, sys);
+    result["stop"] = {{"left", money_str(left)}, {"limit", money_str(in.daily_stop)}, {"hit", left <= 0}};
+    result["sys"]["K"] = {{"used", money_str(in.sys->used)}, {"ceiling", money_str(in.sys->ceiling)}, {"eff", money_str(in.sys->eff)}};
+    result["cost"] = {{"used", money_str(in.sys->fees)}, {"budget", money_str(in.sys->budget)}};
+  }
   if (in.kx_lag_ms) result["lat"]["kx_lag_ms"] = *in.kx_lag_ms;
   if (in.clk_off_ms) result["lat"]["clk_off_ms"] = *in.clk_off_ms;
   if (in.gw_ack_ms) result["lat"]["gw_ack_ms"] = *in.gw_ack_ms;
@@ -422,6 +445,22 @@ std::vector<std::string> check_universe_query(const json& q) {
   validate(schema, q, "$", errs);
   if (q.is_object() && q.contains("limit") && q["limit"].is_number() && (num(q["limit"]) < 1 || num(q["limit"]) > 200))
     errs.push_back("$.limit: 1 to 200");
+  return errs;
+}
+
+std::vector<std::string> check_fill_query(const json& q) {
+  static const json schema = {
+      {"v?", json::array({"enum", "K"})},
+      {"tk", "tk"},
+      {"side", json::array({"enum", "BUY", "SELL"})},
+      {"px", "price"},
+      {"qty", "size"},
+      {"ttl", "count"}};
+  std::vector<std::string> errs;
+  validate(schema, q, "$", errs);
+  if (errs.empty() && !inside(q["px"])) errs.push_back("$.px: an order price is strictly between 0 and 1");
+  if (errs.empty() && !(num(q["qty"]) > 0)) errs.push_back("$.qty: must be > 0");
+  if (errs.empty() && (num(q["ttl"]) < 1 || num(q["ttl"]) > 3600)) errs.push_back("$.ttl: 1 to 3600 seconds");
   return errs;
 }
 

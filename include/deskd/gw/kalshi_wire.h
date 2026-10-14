@@ -127,6 +127,24 @@ bool build_batch_cancel(const std::vector<BatchCancelItem>& items, WireRequest* 
 // DELETE /portfolio/events/orders[?subaccount=S]: every resting order (204); KILL's backstop
 WireRequest build_cancel_all(int subaccount = -1);
 
+// Order groups (plan section 3: one per Systematic lane and shard; groups do not span shards).
+// POST /portfolio/order_groups/create {contracts_limit, contracts_limit_fp, exchange_index}: the
+// limit is whole contracts over the venue's rolling 15 s window of fills; going over it cancels
+// every order in the group and refuses new ones until a reset.
+bool build_create_order_group(Qty contracts_limit, int exchange_index, int subaccount, WireRequest* out, std::string* why);
+// PUT /portfolio/order_groups/{id}/{trigger|reset}?exchange_index=N[&subaccount=S]
+bool build_order_group_action(const std::string& id, const std::string& action, int exchange_index, int subaccount,
+                              WireRequest* out, std::string* why);
+// POST /portfolio/intra_exchange_instance_transfer: free cash from one shard to another (the
+// ticket's MOVE). The body is the old desk's, used live (src/client.cpp transfer_between_shards):
+// {source, destination: "event_contract", amount in 1/10,000 $, source_exchange_shard,
+// destination_exchange_shard}; the reply {transfer_id}.
+bool build_transfer(int from_shard, int to_shard, Money amount, WireRequest* out, std::string* why);
+// DELETE /portfolio/order_groups/{id}?exchange_index=N[&subaccount=S]: its orders cancelled, the group gone
+bool build_delete_order_group(const std::string& id, int exchange_index, int subaccount, WireRequest* out,
+                              std::string* why);
+std::optional<std::string> parse_create_order_group(const std::string& body, std::string* why);
+
 struct ListQuery {   // the read routes' shared filters; empty / -1 / 0 = left out
   std::string ticker;             // fills: comma-separated, up to 100
   std::string event_ticker;
@@ -155,6 +173,17 @@ struct MarketsQuery {
 };
 WireRequest build_get_markets(const MarketsQuery& q);
 WireRequest build_get_orderbook(const std::string& ticker, int depth = 0);
+// GET /markets/trades (public): a market's prints, newest first, paged by cursor; the fill model's
+// backfill (strat/fill_model.h). min_ts / max_ts in Unix seconds.
+struct TradesQuery {
+  std::string ticker, cursor;
+  std::int64_t min_ts = 0, max_ts = 0;
+  int limit = 0;                  // 1..1000
+};
+WireRequest build_get_trades(const TradesQuery& q);
+// GET /incentive_programs (public): Kalshi's incentive programs, `limit` a page. The venue ignores
+// its documented `type` filter (scripts/incentive_audit.py), so callers read incentive_type.
+WireRequest build_get_incentive_programs(const std::string& status, const std::string& cursor, int limit);
 WireRequest build_get_exchange_status();
 
 // The bytes to write: request line, Host, the auth headers when given, Accept and Content-Type,
@@ -242,6 +271,13 @@ struct MarketRow {
   std::optional<Qty> yes_bid_size, yes_ask_size, volume, volume_24h, open_interest;
   std::optional<std::int64_t> open_ms, close_ms, expected_expiration_ms, expiration_ms;
   std::vector<PriceRange> price_ranges;
+  // fractional_trading_enabled; absent means whole contracts only (Kalshi enables fractional
+  // order sizes market by market; docs.kalshi.com/getting_started/fixed_point_migration).
+  std::optional<bool> fractional;
+  // What the contract pays on (greater, greater_or_equal, less, less_or_equal, between, ...),
+  // for a terminal-price model; a strike that is absent or not a number is left out, never 0.
+  std::string strike_type;
+  std::optional<double> floor_strike, cap_strike;
   // Enriched only by the public series endpoint, never a guessed market-prefix fee.
   std::string fee_type;
   std::optional<double> fee_multiplier;
@@ -278,6 +314,27 @@ std::optional<std::vector<BatchCancelRow>> parse_batch_cancel(const std::string&
 std::optional<OrderRow> parse_order(const std::string& body, std::string* why);   // {"order":{...}}
 std::optional<Page<OrderRow>> parse_orders(const std::string& body, std::string* why);
 std::optional<Page<FillRow>> parse_fills(const std::string& body, std::string* why);
+struct TradeRow {               // a public print
+  std::string trade_id, ticker;
+  Px yes_price = 0;
+  Qty count = 0;
+  bool taker_bought_yes = true;   // taker_side "yes": the aggressor bought YES (a print on the ask)
+  std::int64_t ts_ms = 0;
+};
+std::optional<Page<TradeRow>> parse_trades(const std::string& body, std::string* why);
+// A liquidity incentive program (LIP) on one market: period_reward (in 1/10,000 $, the venue's
+// centi-cents) is paid over [start, end) on per-second book snapshots; target_size and the
+// discount per cent from the best price decide what scores (strat/lip.h)
+struct IncentiveRow {
+  std::string market_ticker, type;   // type: the row's incentive_type ("liquidity", "volume", ...)
+  std::int64_t period_reward = 0;    // 1/10,000 $
+  Qty target_size = 0;
+  int discount_bps = 0;
+  std::int64_t start_ms = 0, end_ms = 0;
+};
+// Every row's type; only liquidity rows are read whole (one that breaks its shape fails the page:
+// a shape change is loud); the others carry their ticker and type. next_cursor, else cursor.
+std::optional<Page<IncentiveRow>> parse_incentive_programs(const std::string& body, std::string* why);
 std::optional<Page<PositionRow>> parse_positions(const std::string& body, std::string* why);
 std::optional<Balance> parse_balance(const std::string& body, std::string* why);
 std::optional<MarketRow> parse_market(const std::string& body, std::string* why);   // {"market":{...}}

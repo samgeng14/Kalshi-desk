@@ -352,6 +352,33 @@ static void test_guards_and_page(Desk& k) {
   }
   CHECK(cross_site_refusal("Cross-Site", nullptr, 8788).find("cross-site") != std::string::npos);
   CHECK(cross_site_refusal("same-origin", nullptr, 8788).empty());
+  // the PAPER/LIVE switch: the other desk's page (same-site) may open this page by a click, nothing else
+  {
+    const httplib::Headers nav{{"Sec-Fetch-Site", "same-site"}, {"Sec-Fetch-Mode", "navigate"},
+                               {"Sec-Fetch-Dest", "document"}, {"Sec-Fetch-User", "?1"}};
+    auto page = get(port, "/", "", nav);
+    CHECK(page && page->status == 200 && page->body.find("desk-token\" content=\"" + token) != std::string::npos);
+    auto api = get(port, "/api/health", "", nav);
+    CHECK(api && api->status == 403);
+    auto frame = get(port, "/", "", {{"Sec-Fetch-Site", "same-site"}, {"Sec-Fetch-Mode", "navigate"},
+                                     {"Sec-Fetch-Dest", "iframe"}, {"Sec-Fetch-User", "?1"}});
+    CHECK(frame && frame->status == 403);
+    // after the "Switch to LIVE?" confirm (Chrome) or from Safari there is no Sec-Fetch-User
+    auto confirmed = get(port, "/?tab=systematic", "", {{"Sec-Fetch-Site", "same-site"}, {"Sec-Fetch-Mode", "navigate"},
+                                                        {"Sec-Fetch-Dest", "document"}});
+    CHECK(confirmed && confirmed->status == 200);
+    auto script = get(port, "/js/main.js", "", {{"Sec-Fetch-Site", "same-site"}, {"Sec-Fetch-Mode", "no-cors"},
+                                                {"Sec-Fetch-Dest", "script"}});
+    CHECK(script && script->status == 403);
+    auto far = get(port, "/", "", {{"Sec-Fetch-Site", "cross-site"}, {"Sec-Fetch-Mode", "navigate"},
+                                   {"Sec-Fetch-Dest", "document"}, {"Sec-Fetch-User", "?1"}});
+    CHECK(far && far->status == 403);
+    CHECK(peer_navigation("GET", "/index.html", "Same-Site", "navigate", "document", false));
+    CHECK(!peer_navigation("GET", "/", "same-site", "navigate", "document", true));
+    CHECK(!peer_navigation("POST", "/", "same-site", "navigate", "document", false));
+    CHECK(!peer_navigation("GET", "/js/main.js", "same-site", "navigate", "document", false));
+    CHECK(!peer_navigation("GET", "/", "same-site", "no-cors", "document", false));
+  }
 
   // over 64 KiB: Host, origin and token still come first; a good one is BAD_REQUEST
   {
@@ -383,7 +410,9 @@ static void test_guards_and_page(Desk& k) {
   const std::string ord = R"({"cid":"Mk3f9x2-17","v":"K","tk":"KXNATGAS15M-26OCT061930-30","side":"BUY","px":"0.6300",)"
                           R"("qty":10,"tif":"POST","ttl_s":15,"override":false,"touch":"0.6300","t_click_ms":1791307199950})";
   auto o = post(port, "/api/order", ord, token);
-  CHECK(o && o->status == 404 && err_code(o) == "UNKNOWN_MARKET");
+  // gw answers: the Manual path is not attached in this runtime yet, so read-only, nothing sent
+  CHECK(o && o->status == 409 && err_code(o) == "RO" && !json::parse(o->body).contains("ord"));
+  CHECK(k.d->gw().stats().place_refused >= 1);
   capture("POST /api/order", o);
   auto cx = post(port, "/api/cancel", R"({"cids":["Mk3f9x2-17"]})", token);
   CHECK(cx && cx->status == 200);
@@ -851,6 +880,20 @@ static void test_stop_ends_streams() {
   CHECK(a.complete.load() && b.complete.load());
 }
 
+// A second desk on a port already in use is refused, never let in beside the first (httplib's
+// default SO_REUSEPORT bound it and split the page's connections between the two)
+static void test_port_taken() {
+  Desk k;
+  WebDeps deps;
+  deps.ui_dir = std::string(DESKD_SOURCE_DIR) + "/ui/desk";
+  WebServer second(deps);
+  std::string err;
+  CHECK(second.bind(k.port(), &err) == 0);
+  CHECK(err.find("in use") != std::string::npos);
+  auto h = get(k.port(), "/api/health");
+  CHECK(h && h->status == 200 && json::parse(h->body)["epoch"] == k.d->epoch());
+}
+
 // false when node is missing: the conformance check did not run, and ctest must say so (77,
 // SKIP_RETURN_CODE in CMakeLists.txt) rather than report a pass
 static bool test_contract() {
@@ -889,6 +932,7 @@ int main() {
   test_kill_with_cx_full();
   test_control_waits();
   test_stop_ends_streams();
+  test_port_taken();
   const bool node_ran = test_contract();
   const int rc = finish("deskd-web");
   return rc == 0 && !node_ran ? 77 : rc;

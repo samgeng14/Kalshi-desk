@@ -314,6 +314,9 @@ bool parse_scenario(const std::string& text, Tape& out, std::string* err) {
       }
       spec->fee_mult_milli = static_cast<int>(std::lround(o.value("fee_multiplier", 1.0) * 1000));
       spec->close_ms = o.contains("close_in_ms") ? e.t_ms + o["close_in_ms"].get<std::int64_t>() : 0;
+      spec->open_ms = o.contains("open_in_ms") ? e.t_ms + o["open_in_ms"].get<std::int64_t>() : 0;
+      spec->strike_type = o.value("strike_type", std::string());
+      if (o.contains("floor_strike") && o["floor_strike"].is_number()) spec->floor_strike = o["floor_strike"].get<double>();
       e.spec = std::move(spec);
     } else if (j.contains("snapshot")) {
       const json& o = j["snapshot"];
@@ -349,10 +352,17 @@ bool parse_scenario(const std::string& text, Tape& out, std::string* err) {
       e.kind = j.contains("pause") ? TapeEvent::Kind::PAUSE : j.contains("resume") ? TapeEvent::Kind::RESUME
                                                                                   : TapeEvent::Kind::CLOSE;
       e.ticker = ticker_of(j[k]);
+    } else if (j.contains("pyth")) {
+      const json& o = j["pyth"];
+      e.kind = TapeEvent::Kind::PYTH;
+      e.underlying = o.is_object() ? o.value("underlying", std::string()) : std::string();
+      if (e.underlying.empty() || !o.contains("value") || !o["value"].is_number() || o["value"].get<double>() <= 0)
+        return fail("pyth needs an underlying and a positive value");
+      e.value = o["value"].get<double>();
     } else {
       return fail("unknown event");
     }
-    static const char* names[] = {"snapshot", "delta", "trade", "market", "pause", "resume", "close"};
+    static const char* names[] = {"snapshot", "delta", "trade", "market", "pause", "resume", "close", "pyth"};
     ++out.rows;
     ++out.kinds[names[static_cast<int>(e.kind)]];
     out.events.push_back(std::move(e));

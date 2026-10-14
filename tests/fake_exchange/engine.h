@@ -120,6 +120,12 @@ struct MarketSpec {
   FeeType fee_type = FeeType::QUADRATIC;
   int fee_mult_milli = 1000;
   std::int64_t close_ms = 0;    // 0: never closes on its own
+  bool fractional = false;      // fractional_trading_enabled (listed only; the engine does not refuse)
+  std::int64_t open_ms = 0;     // open_time; 0: left out
+  // strike_type, floor_strike, cap_strike as listed ("" / nullopt: left out); the engine never
+  // settles on them
+  std::string strike_type;
+  std::optional<double> floor_strike, cap_strike;
 };
 
 enum class Side { BID, ASK };  // the order's book side, YES terms
@@ -251,6 +257,8 @@ struct Market {
   Micros dollar_volume = 0;
   json last_ticker;             // the last ticker message's fields, to send only on change
   std::map<std::pair<bool, Px>, std::pair<Qty, std::int64_t>> debt;  // (no side?, px) -> (qty, since)
+  bool settled = false;         // settle_market: closed, determined and paid out
+  std::string result;           // "yes" or "no" once settled
 };
 
 struct EngineConfig {
@@ -289,6 +297,10 @@ class Engine {
   void pause(const std::string& ticker, std::int64_t now_ms);  // "" pauses every market
   void resume(const std::string& ticker, std::int64_t now_ms);
   void close(const std::string& ticker, std::int64_t now_ms);
+  // Closes the market (if open) and settles it: each position pays $1 a contract on the winning
+  // side into its shard's cash, realizes against its cost and goes to 0; the market lists as
+  // status "settled" with its result.
+  void settle_market(const std::string& ticker, bool yes, std::int64_t now_ms);
 
   // ---- time: expiries, closes, group windows and tape debts
   void tick(std::int64_t now_ms);
@@ -313,6 +325,24 @@ class Engine {
   const Order* order(const std::string& order_id) const;
   const std::vector<const Order*>& user_orders() const { return user_orders_; }
   const std::vector<Fill>& fills() const { return fills_; }
+  // every public print, oldest first (the last 50,000): GET /markets/trades
+  struct PublicTrade {
+    std::string trade_id, ticker, taker_side;   // taker_side "yes" | "no"
+    Px yes_px = 0;
+    Qty qty = 0;
+    std::int64_t ts_ms = 0;
+  };
+  const std::deque<PublicTrade>& public_trades() const { return public_trades_; }
+  // the incentive programs GET /incentive_programs lists (scripts/incentive_audit.py's fields): a
+  // liquidity program pays `reward` (1/10,000 $) over [start, end) to resting quotes near the best
+  struct Incentive {
+    std::string ticker, type = "liquidity";
+    std::int64_t start_ms = 0, end_ms = 0, reward = 0;
+    Qty target = 0;
+    int discount_bps = 0;
+  };
+  void add_incentive(Incentive i) { incentives_.push_back(std::move(i)); }
+  const std::vector<Incentive>& incentives() const { return incentives_; }
   const std::map<std::pair<int, std::string>, Position>& positions() const { return positions_; }
 
   // ---- order groups
@@ -391,6 +421,8 @@ class Engine {
   std::int64_t cash_updated_ms_ = 0;
   std::map<std::string, Group> groups_;
   std::vector<Event> events_;
+  std::deque<PublicTrade> public_trades_;
+  std::vector<Incentive> incentives_;
   std::int64_t last_cancel_all_ms_ = std::numeric_limits<std::int64_t>::min() / 2;
   bool tape_debts_ = false;
   std::uint64_t transfers_ = 0;

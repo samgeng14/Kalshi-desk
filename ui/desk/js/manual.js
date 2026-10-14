@@ -317,7 +317,10 @@
   function defaults() {
     var lad = {};
     SLOTS.forEach(function (s) { lad[s] = { qty: 1, ttl: 15 }; });
-    return { cap: 1, lad: lad, zoomBy: {}, tk: { qty: 1, type: 'P15', side: 'BUY' },
+    // the ticket's type: IOC, so a BUY or SELL click takes the touch and fills (2026-10-14: the 15 s
+    // post-only default joined the bid on demo and expired unfilled, which read as "nothing goes
+    // through"). tkv 2: a P15 saved before then was that default, not a choice, and reads as IOC.
+    return { cap: 1, lad: lad, zoomBy: {}, tk: { qty: 1, type: 'IOC', side: 'BUY' }, tkv: 2,
              watch: { scope: 'watch', day: 'T', cat: '', v: '', sort: 'close', collapsed: {} } };
   }
   function loadCfg() {
@@ -333,7 +336,7 @@
     if (s.zoomBy && typeof s.zoomBy === 'object') Object.keys(s.zoomBy).slice(-300).forEach(function (k) { if (ZOOMS.indexOf(s.zoomBy[k]) >= 0) c.zoomBy[k] = s.zoomBy[k]; });
     if (s.tk) {
       if (typeof s.tk.qty === 'number' && s.tk.qty >= 0 && s.tk.qty < 1e6) c.tk.qty = s.tk.qty;
-      if (TK_TYPES.some(function (t) { return t.id === s.tk.type; })) c.tk.type = s.tk.type;
+      if (TK_TYPES.some(function (t) { return t.id === s.tk.type; }) && (s.tkv >= 2 || s.tk.type !== 'P15')) c.tk.type = s.tk.type;
       if (s.tk.side === 'BUY' || s.tk.side === 'SELL') c.tk.side = s.tk.side;
     }
     if (s.watch) {
@@ -370,7 +373,9 @@
   // Runtime state
   // ---------------------------------------------------------------------------------------------
   var LAD = {};                      // slot -> ladder runtime
-  var TK = { key: null, px: null, pxBad: false, arm: null, el: {} };
+  // last: the ticket's last click, {key, side, cid, err, at} (the result line under its buttons)
+  var TK = { key: null, px: null, pxBad: false, arm: null, last: null, el: {} };
+  var TK_LAST_MS = 120000;           // the result line shows an order's fate for two minutes
   var W = { cursor: null, cursorI: -1, lastFocus: null, items: [], rowItems: [], q: '', drawnSig: '', drawnRes: null, lastAt: 0, dirty: false, scroll: false, el: {}, pinOf: {}, uni: null, V: null, enterQ: null, lay: {},
             rowAtItem: function () { return null; } };
   var GR = { work: null, fills: null, pos: null, posAt: 0, posDirty: false };
@@ -1046,9 +1051,9 @@
     if (!m) return null;
     var btnEl = side === 'BUY' ? TK.el.buy : TK.el.sell;
     var why = blockReason(m) || qtyReason(m, cfg.tk.qty) || (TK.pxBad ? 'PRICE OFF GRID' : '') || (typeOK(tkType(m), m) ? '' : 'EXPIRY NOT IN CONTRACT');
-    if (why) { refuse(null, btnEl, why); return null; }
+    if (why) { refuse(null, btnEl, why); tkNote(key, side, null, why); return null; }
     var o = tkOrder(side, m, b);
-    if (o.px === null) { refuse(null, btnEl, 'NO PRICE: empty book side'); return null; }
+    if (o.px === null) { refuse(null, btnEl, 'NO PRICE: empty book side'); tkNote(key, side, null, 'NO PRICE: empty book side'); return null; }
     var now = Date.now(), a = TK.arm, here = !!a && a.side === side && a.px === o.px && a.key === key;
     var override = here && confirms(a, ev, now), guard = st.priceGuard(key, side, o.px);
     if (guard && !override) {
@@ -1058,9 +1063,55 @@
     TK.arm = null;
     var px = o.px;
     var cid = send(key, m, side, { tif: o.tif, px: o.px, ttl_s: o.ttl_s, exp_ms: o.exp_ms, touch: o.touch,
-      onReply: function (r) { armOnBand(r, function (t) { TK.arm = { side: side, px: px, key: key, until: t + ARM_MS, at: t }; mark('mtk'); }); } }, cfg.tk.qty, override, ev);
+      onReply: function (r, c) {
+        tkReplied(c, r);
+        armOnBand(r, function (t) { TK.arm = { side: side, px: px, key: key, until: t + ARM_MS, at: t }; mark('mtk'); });
+      } }, cfg.tk.qty, override, ev);
+    tkNote(key, side, cid, cid ? '' : (st.canTrade(m.v) || 'not sent'));
     mark('mtk');
     return cid;
+  }
+  function tkNote(key, side, cid, err) { TK.last = { key: key, side: side, cid: cid, err: err, at: Date.now() }; mark('mtk'); }
+  // deskd's answer to the ticket's last order: a refusal's code and its reason stay on the line
+  function tkReplied(cid, r) {
+    var l = TK.last;
+    if (!l || l.cid !== cid) return;
+    var j = r ? r.json : null, e = j && j.err;
+    if (!r || r.status === 0) l.err = 'no answer from deskd; its state is unknown until the next snapshot';
+    else if (!(j && j.ok) && e && e.code) l.err = e.code + (e.msg && e.msg !== e.code ? ': ' + e.msg : '');
+    mark('mtk');
+  }
+  // what a refusal before sending means, and what clears it
+  function blockHint(why) {
+    if (/^KILLED/.test(why)) return ': KILL is on; press RE-ARM in the header (after its 60 s), then CONFIRM';
+    if (/^SRV DOWN/.test(why)) return ': this page has lost deskd';
+    if (/^(GAP|SYNC)/.test(why)) return ': the page is catching up with deskd';
+    if (/^KX (DOWN|GAP)/.test(why)) return ': the Kalshi feed is down or has a gap';
+    if (/^RO/.test(why)) return ': this account is read-only (see the header)';
+    if (/^QTY 0/.test(why)) return ': set a size';
+    return '';
+  }
+  // the ticket's result line: why its buttons cannot send now, else what became of its last order
+  // (2026-10-14: a refusal was a disabled button or a status-bar line, and a click on demo seemed
+  // to do nothing)
+  function tkLastText(st, key, block) {
+    if (block) return { t: 'cannot send: ' + block + blockHint(block), cls: 'warn' };
+    var l = TK.last;
+    if (!l || l.key !== key || Date.now() - l.at > TK_LAST_MS) return { t: '', cls: '' };
+    var o = l.cid ? st.orders.get(l.cid) : null, F = Desk.fmt;
+    if (!o) return { t: l.side + ' not sent' + (l.err ? ': ' + l.err : ''), cls: 'crit' };
+    var q = F.size(o.qty), at = ' @' + F.px(o.px), done = o.filled ? 'filled ' + F.size(o.filled) + '/' + q : '';
+    var why = o.why ? (o.why + (o.msg ? ': ' + o.msg : '')) : '';
+    switch (o.st) {
+      case 'PEND': return { t: o.side + ' ' + q + at + ' sent, waiting for the venue' + (l.err ? ' (' + l.err + ')' : ''), cls: l.err ? 'warn' : '' };
+      case 'WORK': return { t: o.side + ' ' + q + at + ' resting on the book', cls: 'ok' };
+      case 'PART': return { t: o.side + ' ' + done + at + ', the rest resting', cls: 'ok' };
+      case 'FILL': return { t: o.side + ' ' + q + ' filled' + (o.avg !== null && o.avg !== undefined ? ' @' + F.px(o.avg) : at), cls: 'ok' };
+      case 'EXP': return { t: o.side + ' ' + q + at + (done ? ' ' + done + ', the rest expired' : ' expired unfilled'), cls: done ? 'ok' : 'warn' };
+      case 'CXL': return { t: o.side + ' ' + q + at + (done ? ' ' + done + ', the rest cancelled' : ' not filled, cancelled') + (why ? ' (' + why + ')' : ''), cls: done ? 'ok' : 'warn' };
+      case 'REJ': return { t: o.side + ' ' + q + at + ' refused: ' + (o.msg ? why : (l.err || why || 'no reason given')), cls: 'crit' };
+    }
+    return { t: '', cls: '' };
   }
   function buildTicket() {
     var host = $('m-ticket-body');
@@ -1070,8 +1121,12 @@
     var r1 = el('div', 'tk-r'), r2 = el('div', 'tk-r'), r3 = el('div', 'tk-r'), r4 = el('div', 'tk-r');
     E.vK = btn('KAL', 'tv', { 'data-a': 'venue', 'data-v': 'K' }); E.vP = btn('PM', 'tv', { 'data-a': 'venue', 'data-v': 'P' });
     E.mkt = el('span', 'tk-mkt'); E.blk = el('span', 'tag crit tk-blk');
-    E.sB = btn('BUY YES', 'ts', { 'data-a': 'side', 'data-v': 'BUY' }); E.sS = btn('SELL YES', 'ts', { 'data-a': 'side', 'data-v': 'SELL' });
-    add(r1, E.vK, E.vP, E.mkt, E.blk, E.sB, E.sS);
+    // SIDE picks the side the check lines and Enter work on; it sends nothing (the BUY and SELL
+    // buttons at the bottom send)
+    E.sideL = el('span', 'lb', 'SIDE');
+    E.sB = btn('BUY YES', 'ts', { 'data-a': 'side', 'data-v': 'BUY', title: 'show the check lines for a buy (Enter sends it); the buttons at the bottom send' });
+    E.sS = btn('SELL YES', 'ts', { 'data-a': 'side', 'data-v': 'SELL', title: 'show the check lines for a sell (Enter sends it); the buttons at the bottom send' });
+    add(r1, E.vK, E.vP, E.mkt, E.blk, E.sideL, E.sB, E.sS);
     E.qtyL = el('span', 'lb', 'QTY');
     E.qty = el('input', 'n', null, { type: 'text', inputmode: 'decimal', autocomplete: 'off', spellcheck: 'false' });
     E.q = PRESETS.map(function (q) { return btn(String(q), 'q', { 'data-a': 'q', 'data-v': String(q) }); });
@@ -1081,9 +1136,10 @@
     E.dn = btn(MINUS, 'stp', { 'data-a': 'step', 'data-v': '-1' }); E.up = btn('+', 'stp', { 'data-a': 'step', 'data-v': '1' });
     E.fB = btn('BID', 'fp', { 'data-a': 'fill', 'data-v': 'BID' }); E.fM = btn('MID', 'fp', { 'data-a': 'fill', 'data-v': 'MID' }); E.fA = btn('ASK', 'fp', { 'data-a': 'fill', 'data-v': 'ASK' });
     E.auto = btn('AUTO', 'fp', { 'data-a': 'auto' });
+    E.p80 = btn('P80', 'fp', { 'data-a': 'p80', title: 'the least aggressive price estimated to fill completely 80% of the time before this expiry; IOC when no resting price gets there' });
     E.capL = el('span', 'lb gap', 'CAP');
     E.cap = CAPS.map(function (c) { return btn(String(c), 'cp', { 'data-a': 'cap', 'data-v': String(c) }); });
-    add(r3, E.pxL, E.px, E.dn, E.up, E.fB, E.fM, E.fA, E.auto, E.capL); E.cap.forEach(function (b) { r3.appendChild(b); });
+    add(r3, E.pxL, E.px, E.dn, E.up, E.fB, E.fM, E.fA, E.auto, E.p80, E.capL); E.cap.forEach(function (b) { r3.appendChild(b); });
     E.types = TK_TYPES.map(function (t) { return btn(t.label, 'ty', { 'data-a': 'type', 'data-v': t.id }); });
     E.types.forEach(function (b) { r4.appendChild(b); });
     var l5 = el('div', 'tk-l'), l6 = el('div', 'tk-l');
@@ -1095,10 +1151,17 @@
     E.eML = el('span', 'lb', 'vs model'); E.eM = el('span', 'n fair'); E.eEL = el('span', 'lb', 'vs ESPN'); E.eE = el('span', 'n espn');
     E.eNL = el('span', 'lb', 'net'); E.eN = el('span', 'n v'); E.touch = el('span', 'n dim tch');
     add(l6, E.eML, E.eM, E.eEL, E.eE, E.eNL, E.eN, E.touch);
+    // FILL: how likely this order is to fill completely before it expires (GET /api/fill)
+    var l7 = el('div', 'tk-l');
+    E.fillL = el('span', 'lb', 'fill'); E.fill = el('span', 'n v'); E.fillHint = el('span', 'n dim');
+    add(l7, E.fillL, E.fill, E.fillHint);
     var r7 = el('div', 'tk-b');
     E.buy = btn('BUY', 'buy', { 'data-a': 'send', 'data-v': 'BUY' }); E.sell = btn('SELL', 'sell', { 'data-a': 'send', 'data-v': 'SELL' });
     add(r7, E.buy, E.sell);
-    add(host, r1, r2, r3, r4, l5, l6, r7);
+    var l8 = el('div', 'tk-l tk-last');
+    E.last = el('span', 'n');
+    add(l8, E.last);
+    add(host, r1, r2, r3, r4, l5, l6, l7, r7, l8);
     // the ticket's settings act on pointerdown; BUY / SELL and MOVE (it moves cash) keep the click
     Desk.dom.onPress(host, onTicketClick, function (ev) {
       var b = btnOf(ev), a = b ? b.getAttribute('data-a') : null;
@@ -1137,6 +1200,59 @@
       tp.addEventListener('keydown', function (ev) { if (ev.key === 'Escape' && !ev.shiftKey) tkClear(); });
     }
   }
+  // FILL (contract 1.6, GET /api/fill): the backend's estimate from the market's own trade tape,
+  // fetched when the order changes and every 3 s while it is shown. The in-page demo has no model
+  // (404): the line stays empty there.
+  var FL = { sig: '', at: 0, pend: false, res: null, off: false };
+  function fillPath(m, o, side, t) {
+    if (!m || m.v !== 'K' || o.px === null || !(cfg.tk.qty > 0)) return null;
+    var nowS = Date.now() + (S().srvOffset || 0);
+    var ttl = t.tif !== 'POST' ? 5 : (o.exp_ms ? Math.round((o.exp_ms - nowS) / 1000) : t.ttl);
+    if (!(ttl >= 1)) return null;
+    return '/api/fill?tk=' + encodeURIComponent(m.tk) + '&side=' + side + '&px=' + Desk.num.pxStr(o.px) +
+      '&qty=' + cfg.tk.qty + '&ttl=' + Math.min(3600, ttl);
+  }
+  function fillFetch(path) {
+    var now = Date.now();
+    if (FL.off || FL.pend || (path === FL.sig && now - FL.at < 3000)) return;
+    FL.pend = true; FL.sig = path; FL.at = now;
+    Desk.transport.get(path).then(function (r) {
+      FL.pend = false;
+      if (!r || r.status === 0) { FL.res = null; return; }
+      if (r.status === 404 && r.json && r.json.err && r.json.err.code === 'NOT_FOUND') { FL.off = true; FL.res = null; }
+      else FL.res = { path: path, status: r.status, json: r.json };
+      mark('mtk');
+    }, function () { FL.pend = false; });
+  }
+  function fillLine(E, m, t, path) {
+    var D = Desk.dom, F = Desk.fmt, fr = FL.res && FL.res.path === path ? FL.res : null;
+    var text = '', cls = 'n v', hint = '', can80 = false;
+    if (path && !FL.off) {
+      if (!fr) text = '...';
+      else if (fr.status !== 200) text = fr.json && fr.json.err ? fr.json.err.code : 'HTTP ' + fr.status;
+      else {
+        var f = fr.json.fill, a = f.at;
+        if (t.tif !== 'POST') {   // IOC/FOK: what the opposite touch holds now
+          text = a.p_full >= 1 ? 'fills now' : (a.p_any > 0 ? 'part now' : 'no fill now');
+          cls += a.p_full >= 1 ? ' up' : ' dn';
+        } else if (f.why) {
+          text = 'learning'; hint = f.why;
+        } else {
+          var pct = Math.round(a.p_full * 100);
+          text = pct + '% in ' + (f.ttl < 120 ? f.ttl + 's' : Math.round(f.ttl / 60) + 'm') + (a.med_s !== null && a.p_full > 0 ? ' ~' + Math.round(a.med_s) + 's' : '');
+          cls += a.p_full >= 0.8 ? ' up' : (a.p_full >= 0.4 ? ' warn' : ' dn');
+          hint = f.p80_px ? 'P80 ' + F.pxg(Desk.num.px(f.p80_px), m.g) : 'P80 none: take ' + (f.take.px ? F.pxg(Desk.num.px(f.take.px), m.g) : '-');
+          can80 = true;
+        }
+        D.setAttr(E.fill, 'title', 'complete fill before expiry ' + Math.round(a.p_full * 100) + '%, any fill ' + Math.round(a.p_any * 100) +
+          '%; ' + a.ahead + ' ahead in the queue; from ' + Math.round(f.tape_s / 60) + ' min of this market\'s trades');
+      }
+    }
+    D.setText(E.fill, text); D.setText(E.fillHint, hint);
+    if (E.fill.className !== cls) E.fill.className = cls;
+    D.setClass(E.fillL, 'off', text === '');
+    setDisabled(E.p80, !can80);
+  }
   function tkClear() { TK.px = null; TK.pxBad = false; TK.arm = null; mark('mtk'); }
   function stepTicketPx(n) {
     var st = S(), m = st.market(TK.key); if (!m) return;
@@ -1165,6 +1281,14 @@
       TK.px = p; TK.pxBad = false;
     }
     else if (a === 'auto') { TK.px = null; TK.pxBad = false; }
+    else if (a === 'p80') {
+      // the estimate's P80 price; none: the order takes instead (IOC at the touch plus the cap)
+      var f = FL.res && FL.res.status === 200 && FL.res.json ? FL.res.json.fill : null;
+      if (!m || !f || f.why) return;
+      if (f.p80_px) { TK.px = Desk.num.px(f.p80_px); TK.pxBad = false; }
+      else if (f.take && f.take.px) { cfg.tk.type = 'IOC'; TK.px = null; TK.pxBad = false; }
+      else return;
+    }
     else if (a === 'cap') { cfg.cap = +v; footAll(); }
     else if (a === 'type') cfg.tk.type = v;
     else return;
@@ -1183,7 +1307,7 @@
     var loaded = key !== TK.key;
     if (loaded) tkLoad(key);
     if (!(d.all || loaded || d.has('focus') || d.has('mtk') || d.has('clock') || d.has('hdr') || d.has('stale') || d.has('pos') ||
-          (key && (d.has('book:' + key) || d.has('mkt:' + key))))) return;
+          (key && (d.has('book:' + key) || d.has('mkt:' + key) || d.has('mord:' + key))))) return;
     var E = TK.el, D = Desk.dom, F = Desk.fmt, now = Date.now();
     if (!E.buy) return;
     if (TK.arm && TK.arm.until <= now) TK.arm = null;
@@ -1214,9 +1338,11 @@
     TK.move = null;
     if (!m) {
       D.setClass(E.move, 'off', true);
-      setVal(E.px, ''); [E.cost, E.maxl, E.fee, E.shL, E.sh, E.shOk, E.guard, E.eM, E.eE, E.eN, E.touch].forEach(function (x) { D.setText(x, ''); });
+      setVal(E.px, ''); [E.cost, E.maxl, E.fee, E.shL, E.sh, E.shOk, E.guard, E.eM, E.eE, E.eN, E.touch, E.fill, E.fillHint].forEach(function (x) { D.setText(x, ''); });
+      setDisabled(E.p80, true);
       D.setText(E.buy, 'BUY'); D.setText(E.sell, 'SELL'); setDisabled(E.buy, true); setDisabled(E.sell, true);
       setCls(E.buy, 'buy'); setCls(E.sell, 'sell');
+      D.setText(E.last, 'pick a market: click one in the watchlist or a ladder'); setCls(E.last, 'n');
       return;
     }
     var g = m.g, side = cfg.tk.side;
@@ -1256,6 +1382,9 @@
     D.setText(E.eN, net === null ? '' : F.cents(net) + 'c'); setCls(E.eN, 'n v ' + (net === null ? '' : F.sign(net)));
     D.setText(E.touch, b ? 'bid ' + (b.bb === null ? '-' : F.pxg(b.bb, g)) + ' ask ' + (b.ba === null ? '-' : F.pxg(b.ba, g)) : '');
     [[E.eML, E.eM], [E.eEL, E.eE], [E.eNL, E.eN]].forEach(function (x) { D.setClass(x[0], 'off', x[1].textContent === ''); });
+    var tt0 = tkType(m), fpath = fillPath(m, o, side, tt0);
+    if (fpath) fillFetch(fpath);
+    fillLine(E, m, tt0, fpath);
     // buttons
     var lab = function (sd, x) {
       var q = F.size(cfg.tk.qty);
@@ -1270,6 +1399,15 @@
       setCls(x[1], armed ? 'confirm' : (x[0] === 'BUY' ? 'buy' : 'sell'));
       setDisabled(x[1], blocked || x[2].px === null);
     });
+    // what stops both buttons; an empty book side stops only the one that prices from it, so it
+    // shows only while there is no last order to report (and names the side that button reads)
+    var block = why || qtyReason(m, cfg.tk.qty) || (TK.pxBad ? 'PRICE OFF GRID' : '') || (typeOK(t, m) ? '' : 'EXPIRY NOT IN CONTRACT');
+    var lt = tkLastText(st, key, block);
+    if (!lt.t && o.px === null) {
+      var reads = (t.tif === 'POST') === (side === 'BUY') ? 'bid' : 'ask';
+      lt = { t: 'cannot send ' + side + ': NO PRICE: the ' + reads + ' side of the book is empty', cls: 'warn' };
+    }
+    D.setText(E.last, lt.t); D.setAttr(E.last, 'title', lt.t || null); setCls(E.last, 'n' + (lt.cls ? ' ' + lt.cls : ''));
   }
 
   // ---------------------------------------------------------------------------------------------

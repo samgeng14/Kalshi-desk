@@ -74,8 +74,9 @@ bool KillSwitch::trip(std::int64_t wall_ms, std::int64_t mono_ms, const std::str
   return first;
 }
 
-void KillSwitch::cancel_all_done(std::int64_t wall_ms, std::int64_t mono_ms) {
+void KillSwitch::cancel_all_done(std::int64_t wall_ms, std::int64_t mono_ms, std::uint64_t generation) {
   std::lock_guard<std::mutex> lk(m_);
+  if (generation > confirmed_gen_.load()) confirmed_gen_.store(generation);
   if (since_.load() == 0) return;
   lockout_end_mono_ = std::max(lockout_end_mono_, mono_ms + kLockoutMs);
   rearm_wall_.store(std::max(rearm_wall_.load(), wall_ms + kLockoutMs));

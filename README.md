@@ -14,6 +14,44 @@ whether a model proposed it, you typed it, or a bot fired it.
                        reconcile: balance, positions, orders, fills, settlements ──► eval / gate
 ```
 
+## The desk (deskd): one desk, a PAPER | LIVE toggle
+
+```sh
+python3 tools/desk.py setup            # once: PAPER (the Kalshi demo account) from ~/.kalshi/demo.json
+python3 tools/desk.py setup live       # once: LIVE (real Kalshi) from ~/.kalshi/prod.json (or --key FILE)
+python3 tools/desk.py                  # the desk: PAPER, and LIVE too after you type LIVE; one browser tab
+python3 tools/desk.py sim              # the fake exchange: no network, no key, http://127.0.0.1:8790/
+python3 tools/desk.py status           # both accounts
+python3 tools/desk.py kill paper|live  # KILL, as the screen's button
+```
+
+The header's PAPER | LIVE toggle flips the tab between the two accounts (asking first before
+LIVE), keeping the screen's tab. Underneath each account is its own deskd (its own lock, order
+ledger and venue connections; ports 8788 and 8789), so a fault on one never touches the other's
+orders; one command starts both and Ctrl-C stops both. The live config starts with Systematic
+off; set `"systematic_orders": true` in `~/.kalshi/deskd-prod.json` yourself when you want lanes
+there. `python3 tools/desk.py paper` or `live` runs one alone.
+
+Each desk's log also goes to `deskd.log` in its data directory. After anything odd, run
+`python3 tools/desk.py report` (or `report live`): the run state and why, any stopped sender, and
+every KILL, refusal and unsent order from the log. On PAPER, Systematic has lane D1 PAPER, on from
+the start: it quotes 1 contract at the touch in two liquid demo markets, buys 1 at the ask after
+5 quiet minutes and exits any position within 90 s, so START shows orders going in and out. It
+never runs on LIVE; `"paper_lane": false` in the paper config leaves it out.
+
+```sh
+tools/demo_checks                          # the plan's demo checks on PAPER (play money): order, group,
+                                           # venue shapes (duplicate cid, expiry, reduce_only, post-only
+                                           # cross, self-trade) and the lanes' feeds; replies kept in demo-checks/
+python3 tools/latency_report.py            # where each order's time went (data/ops.sqlite): p50/p90/p99
+                                           # per segment, click to ack; --hours, --own SYS, --json
+```
+
+Each desk writes every ended order's timeline and every fill to `data/ops.sqlite` (read it, never
+write it: deskd's store thread is its only writer). Systematic uses at most 80% of each shard's
+write budget (Kalshi's Basic tier, 100 tokens a second); after the free Advanced upgrade set
+`"write_tier": "advanced"` in the desk's config.
+
 ## Build (macOS)
 
 ```sh

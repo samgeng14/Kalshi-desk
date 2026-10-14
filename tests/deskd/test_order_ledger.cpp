@@ -56,6 +56,20 @@ static void races() {
   CHECK(l.find("Mledger-1")->state==OrdState::CXL && l.find("Mledger-1")->filled==500); record(l);
   CHECK(!l.insert(intent(),0,4200000));
 }
+// gw's reason for a cancel (STOP, HALT, LANE_OFF, TAKEOVER) is the order's why whichever lands
+// first: the private feed's canceled update or the cancel's own reply (a TAKEOVER showed USER)
+static void cancel_reason_either_way() {
+  auto l=ledger();
+  CHECK(l.acknowledged("Mledger-1",ack(),t+2));
+  CHECK(l.request_cancel("Mledger-1","TAKEOVER"));
+  CHECK(l.observed(row(0,0,kalshi::OrderStatus::CANCELED,t+4),t+4));
+  CHECK(l.find("Mledger-1")->state==OrdState::CXL && l.find("Mledger-1")->why=="TAKEOVER"); record(l);
+  CHECK(l.cancelled("Mledger-1",{"oid-1","Mledger-1",1000,t+5},"TAKEOVER",t+5));
+  CHECK(l.find("Mledger-1")->why=="TAKEOVER");
+  auto m=ledger();
+  CHECK(m.acknowledged("Mledger-1",ack(),t+2) && m.request_cancel("Mledger-1"));   // the page's x: USER
+  CHECK(m.observed(row(0,0,kalshi::OrderStatus::CANCELED,t+4),t+4) && m.find("Mledger-1")->why=="USER");
+}
 static void cumulative_is_not_execution() {
   auto l=ledger(Tif::IOC);
   CHECK(l.acknowledged("Mledger-1",ack(250,0),t+2));
@@ -115,15 +129,27 @@ static void unknown_table_and_proof() {
   CHECK(!post.resolve_absent("Mledger-1",h)); ++h.began_ms;
   CHECK(post.resolve_absent("Mledger-1",h)); CHECK(post.find("Mledger-1")->state==OrdState::EXP); record(post);
 }
+static void touch_and_edge() {
+  auto p=intent("Sedge-1"); p.owner=Owner::SYS; p.lane="M1"; p.side=Side::BUY;
+  p.touch=4100; p.fair=4350;
+  OrderLedger l; CHECK(l.insert(p,0,1));
+  const auto j=l.find("Sedge-1")->json();
+  CHECK(j["touch"]=="0.4100" && j["edge"]=="0.0150" && j["own"]=="SYS" && j["lane"]=="M1");   // bid 0.42 under fair 0.435
+  auto s=intent("Sedge-2"); s.side=Side::SELL; s.fair=4350;
+  CHECK(l.insert(s,0,1) && l.find("Sedge-2")->json()["edge"]=="-0.0150" && l.find("Sedge-2")->json()["touch"].is_null());
+  CHECK(!intent().touch && !intent().fair);
+}
 static void bad_evidence() {
   auto l=ledger(); auto f=execution();
-  CHECK(l.fill(f,"",t+1)==OrderLedger::FillResult::UNMAPPED && l.healthy());
+  CHECK(l.fill(f,"",t+1)==OrderLedger::FillResult::UNMAPPED && l.healthy() && l.why_unhealthy().empty());
   CHECK(l.fill(f,"Mledger-1",t+2)==OrderLedger::FillResult::APPLIED);
   f.count=251; CHECK(l.fill(f,"Mledger-1",t+3)==OrderLedger::FillResult::INVALID);
   CHECK(!l.healthy() && l.find("Mledger-1")->executions==250 && l.reserved(0)==3150000);
+  CHECK(l.why_unhealthy().find("fill")!=std::string::npos && l.why_unhealthy().find("arrived twice")!=std::string::npos);
   CHECK(!l.insert(intent("Mnew-1"),0,1));
   auto other=ledger(); auto a=ack(); a.fill_count=1001;
   CHECK(!other.acknowledged("Mledger-1",a,t+2) && !other.healthy()); CHECK(other.reserved(0)==4200000);
+  CHECK(other.why_unhealthy().rfind("Mledger-1: acknowledged filled 1001",0)==0);
   auto reject=ledger(); CHECK(reject.rejected("Mledger-1","SHARD_CASH",t+2));
   CHECK(reject.reserved(0)==0); record(reject);
   CHECK(!reject.acknowledged("Mledger-1",ack(),t+3) && !reject.healthy());
@@ -132,6 +158,10 @@ static void bad_evidence() {
   auto malformed=ledger();
   CHECK(!malformed.observed(row(250,0,kalshi::OrderStatus::EXECUTED),t+3));
   CHECK(!malformed.healthy() && malformed.reserved(0)==4200000);
+  CHECK(malformed.why_unhealthy().find("is executed with")!=std::string::npos);
+  // the first contradiction is the one kept
+  CHECK(!malformed.observed(row(250,0,kalshi::OrderStatus::EXECUTED),t+4));
+  CHECK(malformed.why_unhealthy().find("Mledger-1:")==0);
 }
 static void fractional_and_permutations() {
   auto p=intent(); p.count=3; p.side=Side::SELL;
@@ -168,8 +198,8 @@ static void fractional_and_permutations() {
   } while(std::next_permutation(ops.begin(),ops.end()));
 }
 int main() {
-  races(); cumulative_is_not_execution(); zero_cancel_needs_read(); unknown_table_and_proof();
-  bad_evidence(); fractional_and_permutations();
+  races(); cancel_reason_either_way(); cumulative_is_not_execution(); zero_cancel_needs_read(); unknown_table_and_proof();
+  bad_evidence(); touch_and_edge(); fractional_and_permutations();
   TempDir dir;
   const std::string path=dir.file("order-ledger-contract.json");
   { std::ofstream out(path); out<<capture; }

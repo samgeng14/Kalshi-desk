@@ -209,6 +209,26 @@ void Engine::resume(const std::string& ticker, std::int64_t now_ms) {
     if ((ticker.empty() || t == ticker) && m.state == Market::State::PAUSED) m.state = Market::State::OPEN;
 }
 
+void Engine::settle_market(const std::string& ticker, bool yes, std::int64_t now_ms) {
+  Market* m = market(ticker);
+  if (!m || m->settled) return;
+  close(ticker, now_ms);
+  m->settled = true;
+  m->result = yes ? "yes" : "no";
+  for (auto& [key, p] : positions_) {
+    if (key.second != ticker || !p.pos) continue;
+    const bool wins = (p.pos > 0) == yes;
+    const Micros payout = wins ? notional(kDollar, std::abs(p.pos)) : 0;
+    cash_[{key.first, p.exchange_index}] += payout;
+    p.realized += payout - p.cost;
+    p.cost = 0;
+    p.pos_fees = 0;
+    p.pos = 0;
+    p.updated_ms = now_ms;
+  }
+  cash_updated_ms_ = now_ms;
+}
+
 void Engine::close(const std::string& ticker, std::int64_t now_ms) {
   Market* m = market(ticker);
   if (!m || m->state == Market::State::CLOSED) return;
@@ -514,6 +534,8 @@ void Engine::execute(Market& m, Order& t, Order& mk, Qty q, Op& op) {
   mk.filled += q;
   mk.updated_ms = op.now;
   unrest(m, mk, q, op, t.street ? std::string() : t.client_order_id, t.street ? 0 : t.subaccount);
+  // a resting order filled to the last contract is executed, as the venue reports it
+  if (!mk.street && mk.remaining == 0 && mk.status == OrdStatus::RESTING) mk.status = OrdStatus::EXECUTED;
   if (!mk.street) settle(m, mk, q, yes_px, false, trade_id, op);
   if (!t.street) settle(m, t, q, yes_px, true, trade_id, op);
 
@@ -534,6 +556,8 @@ void Engine::execute(Market& m, Order& t, Order& mk, Qty q, Op& op) {
                {"ts", op.now / 1000},
                {"ts_ms", op.now}};
   events_.push_back(std::move(e));
+  public_trades_.push_back({trade_id, m.spec.ticker, outcome(t.side), yes_px, q, op.now});
+  if (public_trades_.size() > 50000) public_trades_.pop_front();
   m.last_px = yes_px;
   m.last_size = q;
   m.volume += q;
@@ -747,7 +771,9 @@ CreateResult Engine::create(const NewOrder& n, std::int64_t now_ms) {
       return r;
     }
     if (g->triggered) {
-      r.err = refuse(400, "invalid_order", "invalid order", "order group triggered");
+      // what demo answered an order into its triggered group, verbatim (demo checks, 2026-10-13)
+      r.err = refuse(400, "exceeded_order_group_contracts_limit",
+                     "placing this order would exceed your the order group contracts limit");
       return r;
     }
   }

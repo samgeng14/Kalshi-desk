@@ -1,0 +1,12 @@
+{
+  "releases": [
+    {
+      "name": "EIA natural gas storage",
+      "series": ["KXNATGAS"],
+      "weekly": ["Thu 10:30"],
+      "skip": [],
+      "dates": [],
+      "note": "EIA's Weekly Natural Gas Storage Report. A holiday week moves it: add the Thursday to skip and the moved time to dates, from EIA's published schedule."
+    }
+  ]
+}

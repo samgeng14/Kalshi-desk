@@ -47,7 +47,7 @@ json rest_order_json(const kalshi::OrderRow& row, std::int64_t now) {
       {"t",{{"click",nullptr},{"recv",ts},{"sent",nullptr},{"ack",row.updated_ms.value_or(ts)},
              {"done",resting ? json(nullptr) : json(row.updated_ms.value_or(now))}}},{"rev",1}};
 }
-json rest_position_json(const kalshi::PositionRow& row) {
+json rest_position_json(const kalshi::PositionRow& row, std::optional<Px> mark, Money real, Money fees) {
   const Qty n = std::abs(row.position);
   const Money cost = std::max<Money>(0, (row.exposure + 99) / 100);
   const Money payout = n * 100;
@@ -56,14 +56,114 @@ json rest_position_json(const kalshi::PositionRow& row) {
     const Px p = std::clamp<Money>(row.exposure / n, 0, kOneDollar);
     avg = price_str(row.position > 0 ? p : kOneDollar - p);
   }
-  // REST's realized/fees are lifetime aggregates. They cannot be labelled today's P&L.
-  // The execution ledger supplies daily P&L in the gateway; this startup view is cost only.
+  // REST's realized/fees are lifetime aggregates, never labelled today's: real and fees come
+  // from today's fills (day_pnl). unrl is the open position marked at the live mid.
+  Money unrl = 0;
+  if (n && mark && *mark >= 0 && *mark <= kOneDollar) {
+    const kalshi::Micros value = static_cast<kalshi::Micros>(row.position > 0 ? *mark : kOneDollar - *mark) * n;
+    const kalshi::Micros diff = value - row.exposure;
+    unrl = diff >= 0 ? (diff + 50) / 100 : -((-diff + 50) / 100);
+  }
   return {{"v","K"},{"tk",row.ticker},{"pos",qty_to_number(row.position)},
-      {"avg",avg},{"own",n ? json("MAN") : json(nullptr)},{"mark",nullptr},
-      {"unrl","0.0000"},{"real","0.0000"},{"fees","0.0000"},{"maxl",money_str(cost)},
+      {"avg",avg},{"own",n ? json("MAN") : json(nullptr)},{"mark",n && mark ? json(price_str(*mark)) : json(nullptr)},
+      {"unrl",money_str(unrl)},{"real",money_str(real)},{"fees",money_str(fees)},{"maxl",money_str(cost)},
       {"if_yes",money_str((row.position > 0 ? payout : 0) - cost)},
       {"if_no",money_str((row.position < 0 ? payout : 0) - cost)}};
 }
+namespace {
+Money micros_to_money(kalshi::Micros m) { return m >= 0 ? (m + 50) / 100 : -((-m + 50) / 100); }
+int sign(Qty q) { return (q > 0) - (q < 0); }
+}  // namespace
+
+DayPnl day_pnl(const rest::Snapshot& state, std::int64_t day_start_ms, const MidFn& mid) {
+  DayPnl out;
+  std::map<std::string, std::string> cid_of;   // order id -> client order id, where the venue gave one
+  for (const auto& o : state.orders) if (!o.client_order_id.empty()) cid_of[o.order_id] = o.client_order_id;
+  using Key = std::pair<std::string, int>;
+  std::map<Key, std::vector<const kalshi::FillRow*>> by_market;
+  for (const auto& f : state.fills)
+    if (f.ts_ms >= day_start_ms && f.count > 0) by_market[{f.ticker, f.exchange_index}].push_back(&f);
+  std::map<Key, const kalshi::PositionRow*> positions;
+  for (const auto& p : state.positions) positions[{p.ticker, p.exchange_index}] = &p;
+  for (auto& [key, fills] : by_market) {
+    std::sort(fills.begin(), fills.end(), [](const auto* a, const auto* b) {
+      return a->ts_ms != b->ts_ms ? a->ts_ms < b->ts_ms : a->trade_id < b->trade_id;
+    });
+    // Kalshi's position now, as signed YES contracts and signed YES-terms cost (micro-dollars).
+    Qty p_now = 0;
+    kalshi::Micros s_now = 0;
+    if (const auto it = positions.find(key); it != positions.end()) {
+      p_now = it->second->position;
+      const Qty n = std::abs(p_now);
+      s_now = p_now > 0 ? it->second->exposure : -static_cast<kalshi::Micros>(n) * kOneDollar + it->second->exposure;
+    }
+    auto signed_qty = [](const kalshi::FillRow* f) { return f->side == kalshi::BookSide::BID ? f->count : -f->count; };
+    // Backwards: the day's starting cost, if today's fills leave it recoverable.
+    Qty p = p_now;
+    kalshi::Micros s = s_now;
+    bool known = true;
+    for (auto it = fills.rbegin(); it != fills.rend(); ++it) {
+      const Qty q = signed_qty(*it), before = p - q;
+      if (before == 0) { s = 0; known = true; }
+      else if (sign(q) == sign(before)) s -= static_cast<kalshi::Micros>((*it)->yes_price) * q;
+      else if (std::abs(q) <= std::abs(before) && p != 0)
+        s = static_cast<kalshi::Micros>(std::llround(static_cast<long double>(s) * before / p));
+      else known = false;   // went flat or flipped: the earlier cost is not in Kalshi's numbers
+      p = before;
+    }
+    // Forwards: each fill's realized part, net of its fee.
+    Money real_sum = 0, fee_sum = 0;
+    for (const auto* f : fills) {
+      const Qty q = signed_qty(f);
+      const kalshi::Micros px = f->yes_price;
+      kalshi::Micros realized = 0;
+      bool unknown = false;
+      if (p == 0 || sign(q) == sign(p)) {
+        s += px * q;
+        p += q;
+      } else {
+        const Qty r = sign(q) * std::min(std::abs(q), std::abs(p));   // the reducing part
+        if (known) {
+          const long double removed = static_cast<long double>(s) * r / p;   // cost leaving with r
+          realized = static_cast<kalshi::Micros>(std::llround(-static_cast<long double>(r) * px + removed));
+          s = static_cast<kalshi::Micros>(std::llround(static_cast<long double>(s) - removed));
+        } else {
+          unknown = true;
+        }
+        p += r;
+        if (p == 0) { s = 0; known = true; }
+        const Qty rest = q - r;   // a flip opens the remainder at this price
+        if (rest) { s = px * rest; p = rest; known = true; }
+      }
+      if (unknown) ++out.unknown_basis;
+      const Money fee = micros_to_money(f->fee);
+      const Money real = micros_to_money(realized) - fee;
+      real_sum += real;
+      fee_sum += fee;
+      kalshi::OrderRow tmp;
+      tmp.order_id = f->order_id;
+      if (const auto c = cid_of.find(f->order_id); c != cid_of.end()) tmp.client_order_id = c->second;
+      const std::string cid = screen_cid(tmp);
+      const std::string own = !tmp.client_order_id.empty() && cid == tmp.client_order_id && cid[0] == 'M' ? "MAN" :
+                              !tmp.client_order_id.empty() && cid == tmp.client_order_id && cid[0] == 'S' ? "SYS" : "EXT";
+      const auto m = mid ? mid(f->ticker) : std::nullopt;
+      out.fills.push_back({{"fid", f->trade_id.empty() ? f->fill_id : f->trade_id}, {"cid", cid},
+          {"oid", f->order_id.empty() ? json(nullptr) : json(f->order_id)}, {"v", "K"}, {"tk", f->ticker},
+          {"side", f->side == kalshi::BookSide::BID ? "BUY" : "SELL"}, {"px", price_str(f->yes_price)},
+          {"qty", qty_to_number(f->count)}, {"liq", f->taker ? "T" : "M"}, {"fee", money_str(fee)},
+          {"ts_ms", f->ts_ms}, {"own", own},
+          {"lane", own == "SYS" && cid.find('-') != std::string::npos && cid.find('-') > 1 ? json(cid.substr(1, cid.find('-') - 1)) : json(nullptr)},
+          {"mid", m ? json(price_str(*m)) : json(nullptr)},
+          {"fair", nullptr}, {"real", money_str(real)}});
+    }
+    out.real[key] = real_sum;
+    out.fees[key] = fee_sum;
+    out.real_total += real_sum;
+  }
+  std::sort(out.fills.begin(), out.fills.end(), [](const json& a, const json& b) { return a["ts_ms"] < b["ts_ms"]; });
+  return out;
+}
+
 json rest_cash_json(const rest::Snapshot& state, bool read_only) {
   using Key=std::pair<int,std::string>;
   std::map<Key,Qty> yes_room,no_room;

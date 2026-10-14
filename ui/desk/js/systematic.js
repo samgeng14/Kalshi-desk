@@ -732,6 +732,9 @@
     // DISK warns (red tag) but never blocks START: the recorder is not needed to trade (contract)
     preflightRows(h).forEach(function (r) { if (r.ok === false && r.id !== 'DISK') why.push(r.id + (r.why ? ' ' + r.why : '')); });
     if (!why.length && S.vstale.K) why.push(S.vstale.K);
+    // KILLED first, with who killed and how to leave it (2026-10-14: a KILL from a sender's
+    // venue refusal looked the same as the operator's click, and START just sat disabled)
+    if (h.run.state === 'KILLED') why.unshift('KILLED' + (h.run.why ? ' (' + h.run.why + ')' : '') + ': RE-ARM in the header, then CONFIRM');
     if (h.run.state !== 'STOP') return { block: true, why: h.run.state === 'RUN' ? '' : why.join(', ') };
     return { block: why.length > 0, why: why.join(', ') };
   }

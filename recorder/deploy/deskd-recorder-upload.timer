@@ -1,0 +1,12 @@
+# Hourly, a few minutes past the hour (the recorder compacts an hour 5-15 s after it ends);
+# Persistent: an hour missed while the VM was down runs at boot.
+[Unit]
+Description=deskd recorder: upload finished hours to R2, hourly
+
+[Timer]
+OnCalendar=*-*-* *:07:00
+RandomizedDelaySec=300
+Persistent=true
+
+[Install]
+WantedBy=timers.target

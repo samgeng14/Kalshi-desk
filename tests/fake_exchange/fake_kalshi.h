@@ -222,6 +222,11 @@ class FakeKalshi {
     }
   }
 
+  // ---- Kalshi's pyth_value channel: one reference value, to every pyth_value subscription.
+  // The shape is the old desk's reading of the documented channel (src/reference_feed.cpp):
+  // {type: pyth_value, sid, msg: {underlying_ticker, value_usd, source_ts_ms}}, no seq.
+  void pyth(const std::string& underlying, double value_usd, std::int64_t source_ts_ms);
+
   // ---- a tape or scenario, from now at `speed` (2.0 plays twice as fast)
   void play(Tape tape, double speed = 1.0);
   bool tape_done() const;
@@ -318,6 +323,7 @@ class FakeKalshi {
   // still held goes behind them (Held); the returned targets cover what went out now.
   Targets publish_locked(const std::vector<Event>& events);
   Targets publish_now_locked(const std::vector<Event>& events);
+  void pyth_locked(const std::string& underlying, double value_usd, std::int64_t source_ts_ms);
   std::uint64_t hold_locked(std::vector<Event> events, bool ready);  // a new Held batch; its id
   void release_locked(std::uint64_t id);   // that batch is ready: publish what can go
   void sweep_locked(const std::shared_ptr<Session>& s);   // drops overflowed subscriptions

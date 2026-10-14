@@ -3,6 +3,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <nlohmann/json.hpp>
 
 namespace deskd::kalshi {
@@ -243,6 +244,23 @@ FillRow read_fill(Rd& r) {
   return f;
 }
 
+TradeRow read_trade(Rd& r) {
+  TradeRow t;
+  t.trade_id = r.str("trade_id");
+  t.ticker = r.str("ticker");
+  t.count = r.count("count_fp");
+  t.yes_price = r.px("yes_price_dollars");
+  const std::string side = r.str("taker_side");
+  if (r.ok()) {
+    if (side == "yes") t.taker_bought_yes = true;
+    else if (side == "no") t.taker_bought_yes = false;
+    else r.fail("taker_side", "not yes or no");
+  }
+  if (auto ts = r.otime("created_time")) t.ts_ms = *ts;
+  else if (r.ok()) r.fail("created_time", "missing");
+  return t;
+}
+
 PositionRow read_position(Rd& r) {
   PositionRow p;
   p.ticker = r.str("ticker");
@@ -283,6 +301,23 @@ MarketRow read_market(Rd& r) {
   m.open_ms = r.otime("open_time");
   m.expected_expiration_ms = r.otime("expected_expiration_time");
   m.expiration_ms = r.otime("expiration_time");
+  m.fractional = r.obool("fractional_trading_enabled");
+  m.strike_type = r.str_or_empty("strike_type");
+  auto strike = [&r](const char* key) -> std::optional<double> {
+    const json* v = r.at(key);
+    if (!v) return std::nullopt;
+    double d = 0;
+    if (v->is_number()) d = v->get<double>();
+    else if (v->is_string()) {
+      const auto& s = v->get_ref<const std::string&>();
+      char* end = nullptr;
+      d = std::strtod(s.c_str(), &end);
+      if (s.empty() || end != s.c_str() + s.size()) return std::nullopt;
+    } else return std::nullopt;
+    return std::isfinite(d) ? std::optional<double>(d) : std::nullopt;
+  };
+  m.floor_strike = strike("floor_strike");
+  m.cap_strike = strike("cap_strike");
   if (const json* pr = r.at("price_ranges")) {
     if (!pr->is_array()) {
       r.fail("price_ranges", "not an array");
@@ -635,6 +670,108 @@ WireRequest build_cancel_all(int subaccount) {
   return r;
 }
 
+bool build_create_order_group(Qty limit, int exchange_index, int subaccount, WireRequest* out, std::string* why) {
+  if (limit < kOneContract || limit % kOneContract || limit > 1000000 * kOneContract) {
+    if (why) *why = "contracts_limit is whole contracts, 1 to 1,000,000";
+    return false;
+  }
+  if (exchange_index < 0) {
+    if (why) *why = "a group names its shard (exchange_index)";
+    return false;
+  }
+  if (subaccount < -1 || subaccount > 63) {
+    if (why) *why = "subaccount must be 0-63";
+    return false;
+  }
+  json b{{"contracts_limit", limit / kOneContract}, {"contracts_limit_fp", count_wire(limit)},
+         {"exchange_index", exchange_index}};
+  if (subaccount >= 0) b["subaccount"] = subaccount;
+  WireRequest r;
+  r.method = "POST";
+  r.path = std::string(kBasePath) + "/portfolio/order_groups/create";
+  r.body = b.dump();
+  r.write = true;
+  r.op = WireOp::GROUP;
+  *out = std::move(r);
+  return true;
+}
+
+bool build_order_group_action(const std::string& id, const std::string& action, int exchange_index, int subaccount,
+                              WireRequest* out, std::string* why) {
+  if (!id_ok(id)) {
+    if (why) *why = "a bad order_group_id";
+    return false;
+  }
+  if (action != "trigger" && action != "reset") {
+    if (why) *why = "a group action is trigger or reset";
+    return false;
+  }
+  if (exchange_index < 0 || subaccount < -1 || subaccount > 63) {
+    if (why) *why = "a group action names its shard (and subaccount 0-63)";
+    return false;
+  }
+  WireRequest r;
+  r.method = "PUT";
+  r.path = std::string(kBasePath) + "/portfolio/order_groups/" + url_encode(id) + "/" + action;
+  add_q(r.query, "exchange_index", exchange_index, true);
+  add_q(r.query, "subaccount", subaccount, subaccount >= 0);
+  r.body = "{}";
+  r.write = true;
+  r.op = WireOp::GROUP;
+  *out = std::move(r);
+  return true;
+}
+
+bool build_transfer(int from_shard, int to_shard, Money amount, WireRequest* out, std::string* why) {
+  if (from_shard < 0 || to_shard < 0 || from_shard == to_shard) {
+    if (why) *why = "a transfer names two different shards";
+    return false;
+  }
+  if (amount <= 0 || amount > 1000000LL * 10000) {
+    if (why) *why = "a transfer moves $0.0001 to $1,000,000";
+    return false;
+  }
+  WireRequest r;
+  r.method = "POST";
+  r.path = std::string(kBasePath) + "/portfolio/intra_exchange_instance_transfer";
+  r.body = json{{"source", "event_contract"}, {"destination", "event_contract"}, {"amount", amount},
+                {"source_exchange_shard", from_shard}, {"destination_exchange_shard", to_shard}}.dump();
+  r.write = true;
+  r.op = WireOp::TRANSFER;
+  *out = std::move(r);
+  return true;
+}
+
+bool build_delete_order_group(const std::string& id, int exchange_index, int subaccount, WireRequest* out,
+                              std::string* why) {
+  if (!id_ok(id)) {
+    if (why) *why = "a bad order_group_id";
+    return false;
+  }
+  if (exchange_index < 0 || subaccount < -1 || subaccount > 63) {
+    if (why) *why = "a group's delete names its shard (and subaccount 0-63)";
+    return false;
+  }
+  WireRequest r;
+  r.method = "DELETE";
+  r.path = std::string(kBasePath) + "/portfolio/order_groups/" + url_encode(id);
+  add_q(r.query, "exchange_index", exchange_index, true);
+  add_q(r.query, "subaccount", subaccount, subaccount >= 0);
+  r.write = true;
+  r.op = WireOp::GROUP;
+  *out = std::move(r);
+  return true;
+}
+
+std::optional<std::string> parse_create_order_group(const std::string& body, std::string* why) {
+  auto j = parse_object(body, why);
+  if (!j) return std::nullopt;
+  Rd r(*j, "order group");
+  const auto id = r.str("order_group_id");
+  if (r.ok() && !id_ok(id)) r.fail("order_group_id", "not an id");
+  return done(r, id, why);
+}
+
 WireRequest build_get_order(const std::string& order_id) { return get("/portfolio/orders/" + url_encode(order_id)); }
 WireRequest build_get_orders(const ListQuery& q) {
   std::string s;
@@ -678,6 +815,23 @@ WireRequest build_get_orderbook(const std::string& ticker, int depth) {
   return get("/markets/" + url_encode(ticker) + "/orderbook", s, false);
 }
 WireRequest build_get_exchange_status() { return get("/exchange/status", "", false); }
+WireRequest build_get_trades(const TradesQuery& q) {
+  std::string s;
+  add_q(s, "ticker", q.ticker);
+  add_q(s, "min_ts", q.min_ts, q.min_ts > 0);
+  add_q(s, "max_ts", q.max_ts, q.max_ts > 0);
+  add_q(s, "limit", q.limit, q.limit > 0);
+  add_q(s, "cursor", q.cursor);
+  return get("/markets/trades", s, false);
+}
+
+WireRequest build_get_incentive_programs(const std::string& status, const std::string& cursor, int limit) {
+  std::string s;
+  add_q(s, "status", status);
+  add_q(s, "limit", limit, limit > 0);
+  add_q(s, "cursor", cursor);
+  return get("/incentive_programs", s, false);
+}
 
 std::string request_bytes(const WireRequest& r, const std::string& host_header,
                           const std::vector<std::pair<std::string, std::string>>& auth_headers,
@@ -790,6 +944,51 @@ std::optional<Page<OrderRow>> parse_orders(const std::string& body, std::string*
 std::optional<Page<FillRow>> parse_fills(const std::string& body, std::string* why) {
   return read_page<FillRow>(body, "fills", read_fill, why);
 }
+std::optional<Page<TradeRow>> parse_trades(const std::string& body, std::string* why) {
+  return read_page<TradeRow>(body, "trades", read_trade, why);
+}
+std::optional<Page<IncentiveRow>> parse_incentive_programs(const std::string& body, std::string* why) {
+  auto j = parse_object(body, why);
+  if (!j) return std::nullopt;
+  Page<IncentiveRow> page;
+  const auto it = j->find("incentive_programs");
+  if (it != j->end() && !it->is_null()) {
+    if (!it->is_array()) {
+      if (why) *why = "incentive_programs: not an array";
+      return std::nullopt;
+    }
+    for (const auto& row : *it) {
+      Rd r(row, "incentive_programs[" + std::to_string(page.rows.size()) + "]");
+      IncentiveRow p;
+      p.market_ticker = r.str_or_empty("market_ticker");
+      p.type = r.str_or_empty("incentive_type");
+      if (r.ok() && p.type == "liquidity") {
+        p.period_reward = r.integer("period_reward");
+        if (auto t = r.ocount("target_size_fp")) p.target_size = *t;
+        p.discount_bps = static_cast<int>(r.oint("discount_factor_bps").value_or(0));
+        p.start_ms = r.otime("start_date").value_or(0);
+        p.end_ms = r.otime("end_date").value_or(0);
+        if (r.ok() && (p.market_ticker.empty() || !p.start_ms || p.end_ms <= p.start_ms || p.period_reward < 0 ||
+                       p.discount_bps < 0 || p.discount_bps > 10000))
+          r.fail("liquidity", "a program without a market, a period, or a sane reward and discount");
+      }
+      if (!r.ok()) {
+        if (why) *why = r.err;
+        return std::nullopt;
+      }
+      page.rows.push_back(std::move(p));
+    }
+  }
+  for (const char* key : {"next_cursor", "cursor"}) {
+    const auto c = j->find(key);
+    if (c != j->end() && c->is_string() && !c->get<std::string>().empty()) {
+      page.cursor = c->get<std::string>();
+      break;
+    }
+  }
+  return page;
+}
+
 std::optional<Page<PositionRow>> parse_positions(const std::string& body, std::string* why) {
   return read_page<PositionRow>(body, "market_positions", read_position, why);
 }
@@ -962,6 +1161,8 @@ WriteOutcome classify_write(WireOp op, const net::Exchange& x) {
       case WireOp::CANCEL: parsed = st == 200 && parse_cancel_ack(x.res.body, &why).has_value(); break;
       case WireOp::BATCH_CANCEL: parsed = st == 200 && parse_batch_cancel(x.res.body, &why).has_value(); break;
       case WireOp::CANCEL_ALL: parsed = st == 204 || st == 200; break;
+      case WireOp::GROUP: parsed = true; break;
+      case WireOp::TRANSFER: parsed = true; break;
       case WireOp::OTHER: parsed = true; break;
     }
     if (parsed) {

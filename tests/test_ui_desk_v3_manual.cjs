@@ -993,7 +993,8 @@ function manOrders(P, key) { const a = []; P.D.store.orders.forEach(o => { if (o
   // ---- ticket ---------------------------------------------------------------------------------
   const E = MS.ticket.el;
   eq(E.mkt.textContent, nat.short, 'the ticket follows the focused market');
-  eq(MS.cfg.tk.type, 'P15', 'ticket defaults to POST 15 s');
+  eq(MS.cfg.tk.type, 'IOC', 'ticket defaults to IOC: a click takes the touch');
+  MS.cfg.tk.type = 'P15'; D.render.mark('mtk');   // the checks below start from a 15 s post
   P.sim().freeze(natKey, { bids: [[6300, 120], [6200, 85]], asks: [[6400, 80], [6500, 210], [6700, 12]] });
   await run(300);
   check(/^BUY 1 @0\.63 15s$/.test(E.buy.textContent) && /^SELL 1 @0\.64 15s$/.test(E.sell.textContent), 'AUTO price: a post joins its own side', E.buy.textContent + ' | ' + E.sell.textContent);
@@ -1066,7 +1067,11 @@ function manOrders(P, key) { const a = []; P.D.store.orders.forEach(o => { if (o
   click(E.buy);
   o = newest(P, x => x.own === 'MAN');
   check(st.orders.size === n0 + 1 && o.tif === 'IOC' && o.qty === 5 && o.px === 6500, 'BUY sends the IOC', { tif: o.tif, qty: o.qty, px: o.px });
+  P.frame();
+  check(/^BUY 5 @0\.65 sent/.test(E.last.textContent), 'the result line says it went out', E.last.textContent);
   await run(250);
+  check(/^BUY 5 (filled|@0\.65 (filled|not filled))/.test(E.last.textContent) && st.orders.get(o.cid).terminal, 'and then what became of it',
+    [E.last.textContent, st.orders.get(o.cid).st]);
   // fixed price, the guard as a second click
   click(tyBtn('15s'));
   E.px.focus(); E.px.value = '0.70'; fire(E.px, 'input', {}); E.px.blur();
@@ -1246,6 +1251,7 @@ function manOrders(P, key) { const a = []; P.D.store.orders.forEach(o => { if (o
   await run(300);
   check(/^KILLED \d+s$/.test(P.$('kill').textContent), 'KILLED with the lockout once the backend confirms', P.$('kill').textContent);
   check(E.buy.disabled && E.blk.textContent === 'KILLED', 'KILL: the ticket is locked');
+  check(/^cannot send: KILLED: KILL is on; press RE-ARM/.test(E.last.textContent), 'and its result line says how to unlock it', E.last.textContent);
   eq(st.orders.get(cidK).st, 'CXL', 'KILL cancelled the working order');
   n0 = st.orders.size;
   click(ladCell(P, 'A', 6200, 'bq'));
@@ -1735,6 +1741,9 @@ function manOrders(P, key) { const a = []; P.D.store.orders.forEach(o => { if (o
       for (let i = 0; i < 80; i++) { await run(250, 250); seen.add(Math.round(st.hdr.day.total / 100)); }
       check(seen.size >= 2, 'its marks move the day\'s total', seen.size);
       eq(n, 0, 'SUBTLE: DAY does not flash on marks (2026-10-06: 13 flashes in 20 s with the lanes running)');
+      // the flash gap is real time (performance.now(), 1.5 s) and these loops run 20 s of sim time
+      // in about a second of it: wait out the fill's flash first, or FULL may have nothing to show
+      await new Promise(r => setTimeout(r, 1600));
       D.ui.setFlash('full'); n = 0;
       for (let i = 0; i < 80; i++) await run(250, 250);
       check(n > 0, 'FULL: it does', n);

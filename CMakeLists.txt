@@ -229,6 +229,7 @@ if(PYTHON3_EXE)
   # The alpha audit checked against ground truth: pure noise must yield nothing, an injected
   # signal must be found, and the HAC correction must shrink the t-stat overlap inflates.
   add_test(NAME alpha-decay COMMAND ${PYTHON3_EXE} ${CMAKE_SOURCE_DIR}/tests/test_alpha_decay.py)
+  add_test(NAME latency-report COMMAND ${PYTHON3_EXE} ${CMAKE_SOURCE_DIR}/tools/latency_report.py --self-test)
   # The commodity replay's own proof that it cannot see the future: it builds its data in memory,
   # moves the reference after a chosen instant and checks no earlier probability changed.
   add_test(NAME commodity-replay
@@ -273,6 +274,13 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang" AND NOT CMAKE_CXX_COMPILE_OPTIONS
   endif()
 endif()
 
+# The plan's soak runs under ThreadSanitizer (plan section 8): configure a separate build with
+# -DDESKD_TSAN=ON; every target, the fake exchange included, is instrumented.
+option(DESKD_TSAN "build deskd and its tests under ThreadSanitizer" OFF)
+if(DESKD_TSAN)
+  add_compile_options(-fsanitize=thread -g -O1)
+  add_link_options(-fsanitize=thread)
+endif()
 add_library(deskd_flags INTERFACE)
 target_include_directories(deskd_flags INTERFACE include ${CMAKE_BINARY_DIR}/generated)
 target_include_directories(deskd_flags SYSTEM INTERFACE third_party)
@@ -299,6 +307,8 @@ add_library(deskd_core STATIC
   src/deskd/md/kalshi_md.cpp
   src/deskd/rest/state.cpp
   src/deskd/priv/kalshi_private.cpp
+  src/deskd/ref/pyth.cpp
+  src/deskd/ref/espn.cpp
   src/deskd/net/guard.cpp
   src/deskd/net/http.cpp
   src/deskd/net/ws.cpp
@@ -309,11 +319,21 @@ add_library(deskd_core STATIC
   src/deskd/gw/gateway.cpp
   src/deskd/gw/order_ledger.cpp
   src/deskd/gw/manual_admission.cpp
+  src/deskd/gw/manual_book.cpp
+  src/deskd/gw/sys_book.cpp
+  src/deskd/gw/write_budget.cpp
   src/deskd/gw/kill.cpp
   src/deskd/gw/kalshi_sign.cpp
   src/deskd/gw/kalshi_wire.cpp
   src/deskd/gw/reject.cpp
   src/deskd/strat/strat.cpp
+  src/deskd/strat/terminal_price.cpp
+  src/deskd/strat/fair.cpp
+  src/deskd/strat/maker.cpp
+  src/deskd/strat/fill_model.cpp
+  src/deskd/strat/calendar.cpp
+  src/deskd/strat/lip.cpp
+  src/deskd/strat/markouts.cpp
   src/deskd/store/store.cpp
   src/deskd/web/sse.cpp
   src/deskd/web/streams.cpp
@@ -321,7 +341,7 @@ add_library(deskd_core STATIC
   src/deskd/web/pub.cpp
   src/deskd/web/server.cpp)
 # net/ speaks TLS through OpenSSL 3 (Homebrew's openssl@3 on macOS), and gw/ signs with it
-target_link_libraries(deskd_core PUBLIC deskd_flags OpenSSL::SSL OpenSSL::Crypto)
+target_link_libraries(deskd_core PUBLIC deskd_flags OpenSSL::SSL OpenSSL::Crypto ${DESK_SQLITE_TARGET})
 target_precompile_headers(deskd_core PRIVATE
   <nlohmann/json.hpp> <httplib.h>
   <atomic> <chrono> <condition_variable> <deque> <functional> <future> <map> <memory> <mutex>
@@ -437,18 +457,29 @@ add_dependencies(deskd-test-fake-wire fake-kalshi)  # it starts the binary once
 #   wire   the signer (RSA-PSS and Ed25519, verified by the fake), the builders and parsers against
 #          the documented shapes and the fake over TLS, what each write reply means, and the demo
 #          probe binary run against the fake
-foreach(t http pub_data order_ledger manual_admission)
+foreach(t http pub_data order_ledger manual_admission manual_book fair espn sys_book maker markouts fill write_budget calendar lip)
   add_executable(deskd-test-${t} tests/deskd/test_${t}.cpp)
   target_link_libraries(deskd-test-${t} PRIVATE deskd_core)
   target_precompile_headers(deskd-test-${t} REUSE_FROM deskd_core)
   add_test(NAME deskd-${t} COMMAND deskd-test-${t})
 endforeach()
-foreach(t net wire md rest private sender)
+foreach(t net wire md rest private sender manual_gw runtime_manual pyth)
   add_executable(deskd-test-${t} tests/deskd/test_${t}.cpp)
   target_link_libraries(deskd-test-${t} PRIVATE deskd_core fake_kalshi)
   target_precompile_headers(deskd-test-${t} REUSE_FROM deskd_core)
   add_test(NAME deskd-${t} COMMAND deskd-test-${t})
 endforeach()
+# The Systematic soak (tests/deskd/soak.cpp): 60 s under ctest; DESKD_SOAK_SECONDS=14400 for the
+# plan's 4 hours, in a build configured with -DDESKD_TSAN=ON.
+add_executable(deskd-soak tests/deskd/soak.cpp)
+target_link_libraries(deskd-soak PRIVATE deskd_core fake_kalshi)
+target_precompile_headers(deskd-soak REUSE_FROM deskd_core)
+add_test(NAME deskd-soak COMMAND deskd-soak)
+if(DESKD_TSAN)
+  # OpenSSL is not instrumented: tests/deskd/tsan.supp says which of its reports are not races
+  set_tests_properties(deskd-soak PROPERTIES ENVIRONMENT "TSAN_OPTIONS=suppressions=${CMAKE_SOURCE_DIR}/tests/deskd/tsan.supp")
+endif()
+set_tests_properties(deskd-soak PROPERTIES TIMEOUT 300)
 
 # tools/kalshi_demo_probe: signed reads (and, asked for, one tiny post-only order and its cancel)
 # against Kalshi's DEMO exchange through deskd's own net/ and signer, with latency figures. Not a
@@ -463,4 +494,4 @@ add_custom_target(deskd-all DEPENDS deskd deskctl deskd-test-bus deskd-test-ops 
                                     fake-kalshi deskd-test-fake-engine deskd-test-fake-wire
                                     deskd-test-http deskd-test-net deskd-test-wire deskd-test-md
                                     deskd-test-pub_data deskd-test-rest deskd-test-private deskd-test-order_ledger
-                                    deskd-test-sender deskd-test-manual_admission kalshi-demo-probe)
+                                    deskd-test-sender deskd-test-manual_admission deskd-test-manual_book deskd-test-manual_gw deskd-test-runtime_manual kalshi-demo-probe)

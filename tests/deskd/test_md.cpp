@@ -151,11 +151,11 @@ void socket_integration() {
   auto endpoint = net::Endpoint::parse("http://127.0.0.1:" + std::to_string(exchange.port()) + "/trade-api/ws/v2", &why);
   CHECK(endpoint.has_value()); if (!endpoint) return;
   FeedState feed;
-  std::mutex mutex; std::map<std::string, MdBook> latest; int stale = 0;
+  std::mutex mutex; std::map<std::string, MdBook> latest; int stale = 0; std::map<std::string, int> stale_of;
   KalshiMd::Options options; options.markets_per_subscription = 2; options.ping_ms = 80;
   options.pong_timeout_ms = 500; options.backoff_min_ms = 20; options.backoff_max_ms = 100;
   KalshiMd md(*endpoint, factory, *key, feed, [&](const MdBook& book) {
-    std::lock_guard<std::mutex> lock(mutex); latest[book.ticker] = book; if (book.stale) ++stale;
+    std::lock_guard<std::mutex> lock(mutex); latest[book.ticker] = book; if (book.stale) { ++stale; ++stale_of[book.ticker]; }
   }, options);
   CHECK(!md.set_watch({}, &why)); CHECK(!md.set_watch({"BAD\r\n"}, &why));
   CHECK(md.set_watch({"TEST-C", "TEST-B", "TEST-A"}, &why));
@@ -183,6 +183,31 @@ void socket_integration() {
   CHECK(wait_for([&] { return feed.view().up && !feed.view().gap; }));
   exchange.drop_ws_connections();
   CHECK(wait_for([&] { return factory.stats().connects >= 3 && feed.view().up && !feed.view().gap; }));
+  {   // a watch-list change on a live connection: in place, no reconnect; the other books never
+      // go stale and the feed never gaps
+    const auto connects = factory.stats().connects;
+    std::map<std::string, int> was; { std::lock_guard<std::mutex> lock(mutex); was = stale_of; }
+    CHECK(md.set_watch({"TEST-B", "TEST-C"}, &why));
+    CHECK(wait_for([&] { std::lock_guard<std::mutex> lock(mutex); return latest.at("TEST-A").reason == "unwatched"; }));
+    // TEST-A's frames still come on its old subscription and are ignored
+    exchange.with_engine([](fakex::Engine& e, std::int64_t now) { e.street_add("TEST-A", false, 3700, 100, now); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    CHECK(feed.view().up && !feed.view().gap);
+    // watched again: a new subscription and its own snapshot
+    CHECK(md.set_watch({"TEST-A", "TEST-B", "TEST-C"}, &why));
+    CHECK(wait_for([&] { std::lock_guard<std::mutex> lock(mutex); return latest.at("TEST-A").reason.empty() && !latest.at("TEST-A").stale; }));
+    std::size_t levels = 0; { std::lock_guard<std::mutex> lock(mutex); levels = latest.at("TEST-A").bids.size(); }
+    // a delta on it applies once, though both its subscriptions carry it
+    exchange.with_engine([](fakex::Engine& e, std::int64_t now) { e.street_add("TEST-A", false, 3600, 100, now); });
+    CHECK(wait_for([&] { std::lock_guard<std::mutex> lock(mutex); return latest.at("TEST-A").bids.size() == levels + 1; }));
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      CHECK(latest.at("TEST-A").bids.size() == levels + 1 && latest.at("TEST-A").bids.back().qty == 100);
+      CHECK(stale_of["TEST-B"] == was["TEST-B"] && stale_of["TEST-C"] == was["TEST-C"]);
+    }
+    CHECK(factory.stats().connects == connects && feed.view().up && !feed.view().gap);
+  }
   md.clear_watch();
   CHECK(wait_for([&] { std::lock_guard<std::mutex> lock(mutex); return latest.at("TEST-A").reason == "unwatched"; }));
   CHECK(md.set_watch({"TEST-B"}, &why));
@@ -204,8 +229,39 @@ void socket_integration() {
 }
 }  // namespace
 
+// The trade channel: prints in YES terms for subscribed markets only; a gap or a malformed print
+// is counted or skipped, never a reason to drop the books.
+void trades() {
+  std::vector<MdTrade> prints;
+  MdBooks b([](const MdBook&) {}, [&](const MdTrade& t) { prints.push_back(t); });
+  std::string why;
+  b.watch({"A", "B"}, 1);
+  CHECK(b.subscribed(1, {"A", "B"}, &why));
+  CHECK(b.subscribed_trades(2, {"A"}, &why));
+  CHECK(!b.subscribed_trades(2, {"A"}, &why));      // duplicate sid
+  CHECK(!b.subscribed_trades(3, {"Z"}, &why));      // not watched
+  CHECK(b.message(snapshot("A", 1, 1), 10, &why) && b.message(snapshot("B", 1, 2), 11, &why) && b.ready());
+  auto trade = [](const std::string& tk, std::int64_t seq, const char* px, const char* qty, const char* taker) {
+    return json{{"type", "trade"}, {"sid", 2}, {"seq", seq},
+                {"msg", {{"trade_id", "t" + std::to_string(seq)}, {"market_ticker", tk}, {"yes_price_dollars", px},
+                         {"count_fp", qty}, {"taker_side", taker}, {"ts", 1700000001}}}};
+  };
+  CHECK(b.message(trade("A", 1, "0.4200", "2.00", "yes"), 20, &why));
+  CHECK(prints.size() == 1 && prints[0].px == 4200 && prints[0].qty == 200 && prints[0].taker_bought_yes &&
+        prints[0].ts_ms == 1700000001000LL && prints[0].trade_id == "t1");
+  CHECK(b.message(trade("A", 2, "0.4100", "0.50", "no"), 21, &why));
+  CHECK(prints.size() == 2 && !prints[1].taker_bought_yes && prints[1].qty == 50);
+  CHECK(b.message(trade("A", 5, "0.4100", "1.00", "no"), 22, &why) && b.trade_gaps() == 1 && b.ready());   // gap: counted
+  CHECK(b.message(trade("B", 6, "0.4100", "1.00", "no"), 23, &why) && prints.size() == 3);    // not this sid's market
+  CHECK(b.message(trade("A", 7, "1.5", "1.00", "no"), 24, &why) && prints.size() == 3);      // malformed: skipped
+  CHECK(b.message({{"type", "ok"}, {"sid", 2}, {"seq", 8}}, 25, &why) && b.ready());          // other frames on the sid
+  json unnumbered = trade("A", 9, "0.4300", "1.00", "yes"); unnumbered.erase("seq");
+  CHECK(b.message(unnumbered, 26, &why) && prints.size() == 4 && prints[3].px == 4300);       // a print without seq
+  CHECK(b.message(delta("A", 1, 3, "yes", "0.4000", "-0.50"), 27, &why) && b.ready());        // books unaffected
+}
+
 int main() {
   ::signal(SIGPIPE, SIG_IGN);
-  framing(); reducer(); socket_integration();
+  framing(); reducer(); trades(); socket_integration();
   return finish("deskd-md");
 }

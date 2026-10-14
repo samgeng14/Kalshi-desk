@@ -32,7 +32,9 @@ static void basics() {
   OrderLedger ledger; CHECK(ledger.insert(a.intent,2,a.collateral));
   CHECK(ledger.reserved(2)==a.collateral); // fees checked, never represented as working collateral
   f.p.slip_ticks=2; CHECK(f.admit().wire.price==4200); // cap already includes UI slippage
-  f.p.count=1; CHECK(f.admit().wire.count==1); CHECK(f.admit().collateral==4200);
+  f.p.count=1; CHECK(f.admit().code=="BAD_QTY"); // whole contracts unless the market says otherwise
+  f.m.fractional=false; CHECK(f.admit().code=="BAD_QTY");
+  f.m.fractional=true; CHECK(f.admit().wire.count==1); CHECK(f.admit().collateral==4200);
   f.p.side=Side::SELL; f.p.price=4000; CHECK(f.admit().collateral==6000);
   f.p.tif=Tif::FOK; CHECK(f.admit().wire.tif==kalshi::TimeInForce::FOK);
   f.m.status="open"; CHECK(f.admit().ok());
@@ -106,6 +108,10 @@ static void prices() {
   f.m.price_ranges={{0,10000,0}}; CHECK(f.admit().code=="RO");
   f.m.price_ranges={{0,6000,100},{5000,10000,100}}; CHECK(f.admit().code=="RO");
 }
+// A whole-contract market reduces a fractional position in whole contracts only.
+static void r0(Fixture& f,Qty expect) {
+  auto r=f.admit(); CHECK(r.ok()); CHECK(r.intent.count==expect); CHECK(r.wire.count==expect); CHECK(r.collateral==0);
+}
 static void cash_and_reducing() {
   Fixture f; const auto a=f.admit();
   f.c.free=a.required()-1; CHECK(f.admit().code=="NO_CASH"); f.c.free=a.required();
@@ -114,7 +120,9 @@ static void cash_and_reducing() {
   f.c.free=500000000; f.c.shard_free=3550000; f.p.price=5200; f.p.count=1500; f.p.override_guard=true;
   CHECK(f.admit().code=="SHARD_CASH"); // user's example: venue cash can't replace shard collateral
   f.c.shard_free=500000000; f.p.count=1000; f.p.price=4200; f.p.override_guard=false;
-  f.c.position=-350; CHECK(f.admit().collateral==2730000); // exact 3.5 reducing + 6.5 opening
+  f.c.position=-350; CHECK(f.admit().collateral==2730000); // collateral is exact on any market
+  f.p.reduce_only=true; r0(f,300); f.c.reducing_committed=300; CHECK(f.admit().code=="REDUCE");
+  f.c.reducing_committed=0; f.p.reduce_only=false; f.m.fractional=true; CHECK(f.admit().collateral==2730000); // exact 3.5 reducing + 6.5 opening
   f.c.reducing_committed=150; CHECK(f.admit().collateral==3360000);
   f.p.reduce_only=true; auto r=f.admit(); CHECK(r.ok()); CHECK(r.intent.count==200); CHECK(r.collateral==0);
   CHECK(r.wire.reduce_only && r.wire.count==200); CHECK(f.p.count==1000);
@@ -134,7 +142,8 @@ static void fees_and_bad_inputs() {
   f.p.cid="Sfoo-123"; CHECK(f.admit().code=="BAD_REQUEST"); f.p.cid="M12345";
   f.p.owner=Owner::SYS; CHECK(f.admit().code=="BAD_REQUEST"); f.p.owner=Owner::MAN;
   f.p.count=0; CHECK(f.admit().code=="BAD_QTY"); f.p.count=1000000001;
-  CHECK(f.admit().code=="BAD_QTY"); f.p.count=1;
+  CHECK(f.admit().code=="BAD_QTY"); f.p.count=150; CHECK(f.admit().code=="BAD_QTY");
+  f.m.fractional=true; f.p.count=1;
   f.c.position=std::numeric_limits<Qty>::min(); CHECK(f.admit().code=="RO");
   f.c.position=0; f.c.now_ms=std::numeric_limits<std::int64_t>::max(); CHECK(f.admit().code=="BAD_REQUEST");
 }

@@ -5,8 +5,9 @@
 // and parsers; and it measures what the click budget rests on (plan section 2: a handshake of
 // 35-95 ms that a click must never pay, 25-35 ms p50 from write to reply).
 //
-//   kalshi-demo-probe [--key FILE] [--base URL] [--handshakes N] [--loopback-ca FILE]
-//                     [--order-check [--order-ticker T]] [--dump DIR]
+//   kalshi-demo-probe [--key FILE] [--base URL] [--ws URL] [--handshakes N] [--loopback-ca FILE]
+//                     [--order-check] [--group-check] [--venue-checks] [--order-ticker T] [--dump DIR]
+//                     [--feeds-check [--feeds-seconds N] [--lip-series A,B] [--band-series A,B]]
 //
 //   --key FILE        the key file (default ~/.kalshi/demo.json): {env, key_id, private_key_path,
 //                     key_type}, or a deskd config's {env, key_id, pem_path, key_type}. The key is
@@ -23,13 +24,33 @@
 //                     (far below any touch: it rests, costs $0.01 of collateral, and dies on its
 //                     own if the cancel is lost), read back, cancelled, read back again, and the
 //                     resting list checked empty of it. Play money on demo; production is refused.
-//   --order-ticker T  the market for it (default: the most liquid 1c-grid market on the page read)
+//   --group-check     an order group (limit 1 contract) on that market's shard, a post-only bid at
+//                     $0.01 in it (15 s expiry, as above), the group triggered (the bid must be
+//                     cancelled, and a second bid into the triggered group refused), reset, and
+//                     deleted, with the group's order_group_updates read off the socket: what gw
+//                     relies on for Systematic's lanes. Play money on demo; production is refused.
+//   --venue-checks    plan section 9's demo checks, each OK / NOT OK where deskd's rules rest on the
+//                     answer and SEEN where it is only recorded: a duplicate client_order_id (409
+//                     DUPLICATE), the shortest expiry accepted, reduce_only on a resting order and
+//                     on a flat IOC (Flatten's shape: no fill, nothing that stops a sender), a
+//                     post-only bid at the ask (POST_CROSS, never filled), and self-trade
+//                     prevention both ways with our own bid one tick inside the spread (no self
+//                     fill; taker_at_cross keeps the bid, maker cancels it). Group trigger and reset
+//                     are --group-check's. 1 contract each, cancelled after; play money on demo.
+//   --order-ticker T  the market for all three (default: the most liquid 1c-grid market on the page read)
+//   --feeds-check     what the lanes need from this venue: open markets in M1's LIP-15 series and
+//                     M2's BAND series (deskd's config defaults, or --lip-series / --band-series),
+//                     then --feeds-seconds (default 15) of the socket's pyth_value relay (which
+//                     underlyings, how often, and which 15-minute series' reference among them)
+//                     and the order_group_updates subscription. Reads only.
+//   --ws URL          the socket (default: --base with /trade-api/v2 -> /trade-api/ws/v2)
 //   --dump DIR        the raw reply bodies, for tests/deskd/fixtures (look them over for account
 //                     ids before committing one)
 //
 // Exit 0 when every request got a whole 2xx reply (a GET order's 404 right after its 201 is not
-// counted: demo answered 404 for about 0.7 s on 2026-10-07) and the order check, if asked for,
-// left nothing resting; 1 otherwise; 2 on bad arguments, a key that does not load, or a base the
+// counted: demo answered 404 for about 0.7 s on 2026-10-07), the order and group checks, if asked
+// for, behaved and left nothing resting, and the feeds check found markets for both lanes and
+// values on pyth_value; 1 otherwise; 2 on bad arguments, a key that does not load, or a base the
 // guard refuses.
 #include <signal.h>
 
@@ -39,8 +60,12 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <functional>
+#include <map>
 #include <nlohmann/json.hpp>
+#include <optional>
 #include <random>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -49,10 +74,14 @@
 #include "deskd/app/log.h"
 #include "deskd/gw/kalshi_sign.h"
 #include "deskd/gw/kalshi_wire.h"
+#include "deskd/gw/manual_book.h"
 #include "deskd/net/conn.h"
 #include "deskd/net/guard.h"
 #include "deskd/net/http.h"
 #include "deskd/net/pool.h"
+#include "deskd/net/ws.h"
+#include "deskd/ref/pyth.h"
+#include "deskd/strat/fair.h"
 
 using namespace deskd;
 using namespace deskd::kalshi;
@@ -65,15 +94,28 @@ struct Args {
   std::string base = "https://demo-api.kalshi.co/trade-api/v2";
   int handshakes = 10;
   std::string loopback_ca;
-  bool order_check = false;
+  std::string ws;
+  bool order_check = false, group_check = false, feeds_check = false, venue_checks = false;
+  int feeds_seconds = 15;
+  std::vector<std::string> lip_series = DeskdConfig{}.lip_series, band_series = DeskdConfig{}.band_series;
   std::string order_ticker;
   std::string dump;
 };
 
+std::vector<std::string> split_list(const std::string& s) {
+  std::vector<std::string> out;
+  std::stringstream in(s);
+  std::string item;
+  while (std::getline(in, item, ','))
+    if (!item.empty()) out.push_back(item);
+  return out;
+}
+
 int usage() {
   std::fprintf(stderr,
-               "usage: kalshi-demo-probe [--key FILE] [--base URL] [--handshakes N] [--loopback-ca FILE]\n"
-               "                         [--order-check [--order-ticker T]] [--dump DIR]\n");
+               "usage: kalshi-demo-probe [--key FILE] [--base URL] [--ws URL] [--handshakes N] [--loopback-ca FILE]\n"
+               "                         [--order-check] [--group-check] [--venue-checks] [--order-ticker T] [--dump DIR]\n"
+               "                         [--feeds-check [--feeds-seconds N] [--lip-series A,B] [--band-series A,B]]\n");
   return 2;
 }
 
@@ -159,14 +201,15 @@ struct DemoProbe {   // not Probe: bus/msg.h has a message of that name
   Args a;
   SendGuard guard{false, nullptr};   // never live: a production host gets no socket
   net::ConnFactory factory;
-  net::Endpoint base;
+  net::Endpoint base, ws_ep;
   std::unique_ptr<KalshiSigner> signer;
   std::unique_ptr<net::SparePool> pool;
   std::vector<double> ttfb, done, take;
   bool all_ok = true;
 
-  DemoProbe(Args args, net::Endpoint ep, std::unique_ptr<KalshiSigner> s)
-      : a(std::move(args)), factory(guard, options(a, true)), base(std::move(ep)), signer(std::move(s)) {}
+  DemoProbe(Args args, net::Endpoint ep, net::Endpoint ws, std::unique_ptr<KalshiSigner> s)
+      : a(std::move(args)), factory(guard, options(a, true)), base(std::move(ep)), ws_ep(std::move(ws)),
+        signer(std::move(s)) {}
 
   static net::FactoryOptions options(const Args& a, bool resume) {
     net::FactoryOptions o;
@@ -561,6 +604,610 @@ struct DemoProbe {   // not Probe: bus/msg.h has a message of that name
     return cancelled && ok2xx(x);
   }
 
+  // ---- --venue-checks (plan section 9, "Kalshi demo checks") -----------------------------------
+  // How the venue answers the order shapes deskd's rules rest on. Each check says OK or NOT OK
+  // where deskd depends on the answer, SEEN where it only records it; every order is 1 contract,
+  // post-only at $0.01 with a 15 s expiry unless the check needs another shape, and each check
+  // cancels what it left. The report is printed and, with --dump, kept as JSON.
+  struct Placed {
+    WriteOutcome w;
+    std::optional<CreateAck> ack;
+    std::string order_id;
+  };
+  json checks = json::array();
+  bool checks_ok = true;
+  void verdict(const std::string& name, const char* v, const std::string& seen) {
+    std::printf("  %-22s %-7s %s\n", name.c_str(), v, seen.c_str());
+    checks.push_back({{"check", name}, {"verdict", v}, {"seen", seen}});
+    if (std::string(v) == "NOT OK") checks_ok = false;
+  }
+  // what a refusal is to deskd: its class, and whether that class stops a sender (KILL)
+  static std::string shape(const WriteOutcome& w) {
+    if (w.kind == WriteOutcome::Kind::ACK) return "ACK";
+    if (w.kind != WriteOutcome::Kind::REFUSED) return write_kind_name(w.kind) + std::string(": ") + w.why;
+    return "REFUSED " + std::string(reject_class_name(w.cls)) + " (HTTP " + std::to_string(w.http) + "): " + w.why.substr(0, 120);
+  }
+  static bool stops_desk(const WriteOutcome& w) {
+    return w.kind == WriteOutcome::Kind::REFUSED &&
+           (w.cls == RejectClass::HARD_INVALID || w.cls == RejectClass::AUTH || w.cls == RejectClass::UNKNOWN);
+  }
+  CreateOrder base_order(const MarketRow& m, const std::string& tag) {
+    CreateOrder o;
+    o.ticker = m.ticker;
+    o.exchange_index = m.exchange_index.value_or(0);
+    o.side = BookSide::BID;
+    o.count = kOneContract;
+    o.price = 100;
+    o.tif = TimeInForce::GTC;
+    o.post_only = true;
+    o.expiration_s = wall_s() + 15;
+    o.stp = Stp::MAKER;
+    o.client_order_id = "P-" + tag + "-" + hex16().substr(0, 8);
+    return o;
+  }
+  // patch: the body's JSON changed after the builder (a shape deskd's builder refuses to make)
+  Placed place(const CreateOrder& o, const std::string& label, const std::function<void(json&)>& patch = {}) {
+    Placed p;
+    std::string why;
+    WireRequest r;
+    CreateOrder built = o;
+    if (patch) built.reduce_only = false;   // the builder's own rules; the patch sets what it tests
+    if (!build_create(built, &r, &why)) {
+      p.w.kind = WriteOutcome::Kind::NOT_SENT;
+      p.w.why = "the builder refused it: " + why;
+      return p;
+    }
+    if (patch) {
+      json b = json::parse(r.body, nullptr, false);
+      patch(b);
+      r.body = b.dump();
+    }
+    net::Exchange x = send(r, label);
+    p.w = classify_write(WireOp::CREATE, x);
+    if (p.w.kind == WriteOutcome::Kind::ACK) {
+      p.ack = parse_create_ack(x.res.body, &why);
+      if (p.ack) p.order_id = p.ack->order_id;
+    }
+    return p;
+  }
+  void cancel_quietly(const std::string& order_id, const CreateOrder& o) {
+    if (order_id.empty()) return;
+    std::string why;
+    WireRequest cx;
+    if (build_cancel(order_id, o.exchange_index, o.ticker, -1, &cx, &why)) send(cx, "cancel (cleanup)", false);
+  }
+  std::optional<OrderRow> read_order(const std::string& order_id) {
+    int others = 0;
+    std::string body;
+    return poll_order(order_id, 1500, [](const OrderRow&) { return true; }, &others, &body);
+  }
+
+  // the live touch from the market's book (the listing's is too old for the checks that need it)
+  struct Touch {
+    std::optional<Px> bid, ask;
+    Qty bid_qty = 0;
+  };
+  std::optional<Touch> touch(const std::string& tk) {
+    std::string why;
+    net::Exchange x = send(build_get_orderbook(tk, 5), "orderbook", false);
+    auto ob = ok2xx(x) ? parse_orderbook(x.res.body, &why) : std::nullopt;
+    if (!ob) return std::nullopt;
+    Touch t;
+    if (!ob->yes.empty()) {
+      t.bid = ob->yes.back().first;
+      t.bid_qty = ob->yes.back().second;
+    }
+    if (!ob->no.empty()) t.ask = kOneDollar - ob->no.back().first;
+    return t;
+  }
+
+  bool venue_checks(const std::vector<MarketRow>& rows) {
+    std::printf("\nvenue checks (%s):\n", base.host.c_str());
+    auto m = choose(rows);
+    if (!m) {
+      std::printf("  no market fits (open, a 1c grid at $0.01, an ask above it, two minutes to its close): skipped\n");
+      return false;
+    }
+    std::printf("  on %s shard %d (best bid %s, best ask %s)\n", m->ticker.c_str(), m->exchange_index.value_or(0),
+                m->yes_bid ? price_wire(*m->yes_bid).c_str() : "-", m->yes_ask ? price_wire(*m->yes_ask).c_str() : "-");
+
+    {   // a client_order_id already used: deskd never re-sends one and reconciles a 409 by cid
+      const CreateOrder o = base_order(*m, "dup");
+      const Placed first = place(o, "create (dup cid, first)");
+      const Placed again = place(o, "create (dup cid, again)");
+      const bool ok = first.w.kind == WriteOutcome::Kind::ACK && again.w.kind == WriteOutcome::Kind::REFUSED &&
+                      again.w.cls == RejectClass::DUPLICATE;
+      verdict("duplicate_cid", ok ? "OK" : "NOT OK", "first " + shape(first.w) + "; again " + shape(again.w));
+      cancel_quietly(first.order_id, o);
+      cancel_quietly(again.order_id, o);
+    }
+    {   // the shortest expiration_time accepted, in whole seconds from now (deskd's TTL floor)
+      int accepted = 0;
+      std::string refused;
+      for (const int lead : {1, 2, 3, 5, 10}) {
+        CreateOrder o = base_order(*m, "exp" + std::to_string(lead));
+        o.expiration_s = wall_s() + lead;
+        const Placed p = place(o, "create (expires in " + std::to_string(lead) + " s)");
+        if (p.w.kind == WriteOutcome::Kind::ACK) {
+          accepted = lead;
+          cancel_quietly(p.order_id, o);
+          break;
+        }
+        if (refused.empty()) refused = shape(p.w);
+      }
+      verdict("shortest_expiry", accepted ? "SEEN" : "NOT OK",
+              accepted ? "now + " + std::to_string(accepted) + " s accepted" + (refused.empty() ? "" : "; shorter: " + refused)
+                       : "nothing up to 10 s accepted: " + refused);
+    }
+    {   // reduce_only on a resting order: deskd's builder never sends it (IOC only)
+      const CreateOrder o = base_order(*m, "rogtc");
+      const Placed p = place(o, "create (reduce_only GTC)", [](json& b) { b["reduce_only"] = true; });
+      verdict("reduce_only_gtc", "SEEN", shape(p.w));
+      cancel_quietly(p.order_id, o);
+    }
+    {   // Flatten's shape on a flat market: an IOC reduce_only sell that cannot reduce anything
+      CreateOrder o = base_order(*m, "roioc");
+      o.side = BookSide::ASK;
+      o.tif = TimeInForce::IOC;
+      o.post_only = false;
+      o.expiration_s = 0;
+      o.reduce_only = true;
+      o.price = 9900;   // above any bid: it never trades whatever the venue does with reduce_only
+      const Placed p = place(o, "create (reduce_only IOC, flat)");
+      const bool filled = p.ack && p.ack->fill_count > 0;
+      verdict("reduce_only_ioc_flat", filled || stops_desk(p.w) ? "NOT OK" : "OK",
+              shape(p.w) + (p.ack ? ", filled " + count_wire(p.ack->fill_count) : ""));
+    }
+    {   // a post-only bid at the live ask: cancelled or refused, never filled
+      const auto t = touch(m->ticker);
+      if (!t || !t->ask) {
+        verdict("post_only_cross", "SEEN", "skipped: no ask on this market's book to cross");
+      } else {
+        CreateOrder o = base_order(*m, "pocx");
+        o.price = *t->ask;
+        const Placed p = place(o, "create (post-only at the ask)");
+        std::string seen = shape(p.w);
+        bool ok = !stops_desk(p.w) && p.w.kind != WriteOutcome::Kind::NOT_SENT;
+        if (p.w.kind == WriteOutcome::Kind::REFUSED) {
+          KalshiWriteReply r;
+          r.op = WireOp::CREATE;
+          r.outcome = p.w;
+          seen += " -> deskd " + ManualBook::refusal_code(r);
+          ok = ok && ManualBook::refusal_code(r) == "POST_CROSS";
+        } else if (p.ack) {
+          const auto row = read_order(p.order_id);
+          seen += ", filled " + count_wire(p.ack->fill_count) + ", then " + (row ? order_status_name(row->status) : "unread");
+          ok = p.ack->fill_count == 0 && row && row->status != OrderStatus::RESTING;
+          cancel_quietly(p.order_id, o);
+        }
+        verdict("post_only_cross", ok ? "OK" : "NOT OK", seen);
+      }
+    }
+    // self-trade: our bid one tick inside the live spread, the best bid alone, met by our own IOC
+    // sell at that price. The listing's touch is too old for this: on demo a bot bid at or above
+    // ours in between, our sell traded with it, and the check called that a self-trade (2026-10-13).
+    for (const Stp stp : {Stp::TAKER_AT_CROSS, Stp::MAKER}) {
+      const std::string name = std::string("self_trade_") + stp_name(stp);
+      const auto t = touch(m->ticker);
+      if (!t || !t->bid || !t->ask || *t->ask - *t->bid < 200) {
+        verdict(name, "SEEN", "skipped: the live spread is under 2 ticks or one side is empty, so our bid cannot be the best");
+        continue;
+      }
+      CreateOrder rest = base_order(*m, "stpr");
+      rest.price = *t->bid + 100;
+      const Placed r = place(rest, "create (self-trade: the resting bid)");
+      if (r.w.kind != WriteOutcome::Kind::ACK) {
+        verdict(name, "NOT OK", "the resting bid was not placed: " + shape(r.w));
+        continue;
+      }
+      // ours must be the best bid, alone at its price, or the sell meets someone else first
+      const auto now = touch(m->ticker);
+      if (!now || !now->bid || *now->bid != rest.price || now->bid_qty != rest.count) {
+        verdict(name, "SEEN", "skipped: another bid was at or above ours before the sell went (best bid " +
+                                  (now && now->bid ? price_wire(*now->bid) : std::string("-")) + ")");
+        cancel_quietly(r.order_id, rest);
+        continue;
+      }
+      CreateOrder take = base_order(*m, "stpt");
+      take.side = BookSide::ASK;
+      take.tif = TimeInForce::IOC;
+      take.post_only = false;
+      take.expiration_s = 0;
+      take.price = rest.price;
+      take.stp = stp;
+      const Placed tk = place(take, "create (self-trade: our IOC sell)");
+      const auto rested = read_order(r.order_id);
+      const Qty took = tk.ack ? tk.ack->fill_count : 0;
+      std::string seen = "taker " + shape(tk.w) + (tk.ack ? ", filled " + count_wire(took) : "") + "; the resting bid " +
+                         (rested ? order_status_name(rested->status) + std::string(", filled ") + count_wire(rested->filled) : "unread");
+      if (rested && rested->filled > 0) {
+        verdict(name, "NOT OK", "SELF TRADE: our two orders traded with each other; " + seen);
+      } else if (took > 0) {
+        // our bid untouched and the sell filled: it met another bid that came in after the book read
+        verdict(name, "SEEN", "inconclusive: the sell met another participant's bid (this account now holds the " +
+                                  count_wire(took) + " it sold); " + seen);
+      } else {
+        // taker_at_cross: the taker stops and the bid rests; maker: the bid goes
+        const bool shape_ok = stp == Stp::TAKER_AT_CROSS ? rested && rested->status == OrderStatus::RESTING
+                                                         : rested && rested->status == OrderStatus::CANCELED;
+        verdict(name, !stops_desk(tk.w) && shape_ok ? "OK" : "NOT OK", seen);
+      }
+      cancel_quietly(r.order_id, rest);
+    }
+    verdict("amend_expiry", "SEEN", "not run: no amends in the first live weeks (plan section 3); its body is unverified");
+    verdict("target_balance_alloc", "SEEN", "not run: the endpoint's shape is unverified");
+
+    // nothing of this check rests; demo's resting list can show a cancelled order for a moment
+    std::string why;
+    ListQuery q;
+    q.status = "resting";
+    q.limit = 200;
+    std::size_t left = 0;
+    bool listed = false;
+    for (int i = 0; i < 6; ++i) {
+      net::Exchange x = send(build_get_orders(q), "resting orders after the checks", i == 0);
+      auto page = ok2xx(x) ? parse_orders(x.res.body, &why) : std::nullopt;
+      listed = page.has_value();
+      left = 0;
+      if (page)
+        for (const auto& row : page->rows)
+          if (row.client_order_id.rfind("P-", 0) == 0) {
+            ++left;
+            WireRequest cx;
+            if (build_cancel(row.order_id, row.exchange_index.value_or(0), row.ticker, -1, &cx, &why)) send(cx, "cancel (left over)");
+          }
+      if (!left || !listed) break;
+      std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    }
+    std::printf("  this check's orders resting: %zu\n", left);
+    if (!a.dump.empty()) std::ofstream(a.dump + "/kalshi_demo_venue_checks.json") << checks.dump(1);
+    return checks_ok && left == 0 && listed;
+  }
+
+  // ---- the socket (--feeds-check, --group-check) ---------------------------------------------
+  // One authenticated connection to the venue's socket and the subscriptions asked for. Acks and
+  // venue errors are taken in on the way; data frames are handed back whole.
+  struct Socket {
+    net::WsClient ws;
+    std::map<std::int64_t, std::string> channels;   // sid -> channel, from the acks
+    std::vector<std::string> errors;
+    bool has(const std::string& channel) const {
+      for (const auto& [sid, c] : channels)
+        if (c == channel) return true;
+      return false;
+    }
+  };
+  static json subscribe(int id, const json& params) { return json{{"id", id}, {"cmd", "subscribe"}, {"params", params}}; }
+  static std::string str_of(const json& j, const char* k) {
+    const auto it = j.find(k);
+    return it != j.end() && it->is_string() ? it->get<std::string>() : std::string();
+  }
+  bool ws_open(Socket& s, const std::vector<json>& cmds, std::string* why) {
+    const auto auth = signer->headers(now_ms(), "GET", ws_ep.base_path);
+    if (!s.ws.connect(factory, ws_ep, auth, 5000, why)) return false;
+    for (const auto& c : cmds)
+      if (!s.ws.send(net::WsOp::TEXT, c.dump(), 1000, why)) return false;
+    return true;
+  }
+  // The next data frame within ms; nullopt on silence, or once the socket is gone.
+  std::optional<json> ws_next(Socket& s, int ms) {
+    const std::int64_t until = net::mono_us() + static_cast<std::int64_t>(ms) * 1000;
+    std::string why;
+    while (s.ws.connected()) {
+      const std::int64_t left = (until - net::mono_us()) / 1000;
+      if (left <= 0) return std::nullopt;
+      net::WsEvent ev;
+      const auto r = s.ws.read(&ev, static_cast<int>(std::min<std::int64_t>(left, 200)), &why);
+      if (r == net::WsClient::Read::TIMEOUT) continue;
+      if (r != net::WsClient::Read::EVENT) {
+        std::printf("  the socket closed: %s\n", why.empty() ? "by the venue" : why.c_str());
+        s.ws.close();
+        return std::nullopt;
+      }
+      if (ev.op != net::WsOp::TEXT) continue;
+      json j = json::parse(ev.payload, nullptr, false);
+      if (!j.is_object()) continue;
+      const std::string type = str_of(j, "type");
+      const json msg = j.contains("msg") && j["msg"].is_object() ? j["msg"] : json::object();
+      if (type == "subscribed") {
+        if (msg.contains("sid") && msg["sid"].is_number_integer()) s.channels[msg["sid"].get<std::int64_t>()] = str_of(msg, "channel");
+        continue;
+      }
+      if (type == "error") {
+        s.errors.push_back(msg.dump().substr(0, 200));
+        continue;
+      }
+      return j;
+    }
+    return std::nullopt;
+  }
+
+  // ---- --feeds-check -------------------------------------------------------------------------
+  // A lane's series, each with its open markets: how many, how many with a bid and a strike, and
+  // the next to close. true when any of them has an open market.
+  bool series_check(const char* lane, const std::vector<std::string>& series) {
+    int with_markets = 0;
+    const std::int64_t now = now_ms();
+    for (const auto& name : series) {
+      MarketsQuery q;
+      q.limit = 200;
+      q.status = "open";
+      q.series_ticker = name;
+      net::Exchange x = send(build_get_markets(q), "markets " + name, false);
+      std::string why;
+      auto page = ok2xx(x) ? parse_markets(x.res.body, &why) : std::nullopt;
+      if (!page) {
+        if (x.fate == net::Exchange::Fate::REPLIED)
+          std::printf("  %-3s %-16s cannot read it: HTTP %d %s\n", lane, name.c_str(), x.res.status, why.c_str());
+        all_ok = false;
+        continue;
+      }
+      auto rows = page->rows;
+      if (rows.empty()) {
+        std::printf("  %-3s %-16s none open\n", lane, name.c_str());
+        continue;
+      }
+      ++with_markets;
+      std::sort(rows.begin(), rows.end(), [](const MarketRow& l, const MarketRow& r) {
+        return l.close_ms.value_or(INT64_MAX) < r.close_ms.value_or(INT64_MAX);
+      });
+      int with_bid = 0, with_strike = 0;
+      for (const auto& m : rows) {
+        if (m.yes_bid && *m.yes_bid > 0) ++with_bid;
+        if (m.floor_strike || m.cap_strike) ++with_strike;
+      }
+      const MarketRow& m = rows.front();
+      char strike[64] = "no strike";
+      if (m.floor_strike || m.cap_strike)
+        std::snprintf(strike, sizeof strike, "%s %.6g%s", m.strike_type.empty() ? "strike" : m.strike_type.c_str(),
+                      m.floor_strike ? *m.floor_strike : *m.cap_strike, m.floor_strike && m.cap_strike ? " (and a cap)" : "");
+      const std::string closes =
+          m.close_ms ? "closes in " + std::to_string((*m.close_ms - now) / 1000) + " s" : std::string("no close time");
+      std::printf("  %-3s %-16s %3zu%s open, %d with a YES bid, %d with a strike; next %s %s, %s, bid %s ask %s, shard %d\n",
+                  lane, name.c_str(), rows.size(), page->cursor.empty() ? "" : "+", with_bid, with_strike, m.ticker.c_str(),
+                  closes.c_str(), strike,
+                  m.yes_bid ? price_wire(*m.yes_bid).c_str() : "-", m.yes_ask ? price_wire(*m.yes_ask).c_str() : "-",
+                  m.exchange_index.value_or(-1));
+    }
+    std::printf("  %-3s %d of %zu series with open markets%s\n", lane, with_markets, series.size(),
+                with_markets ? "" : ": NOTHING TO QUOTE here; name series that exist in the config");
+    return with_markets > 0;
+  }
+
+  bool feeds_check() {
+    std::printf("\nfeeds check (%s):\n", base.host.c_str());
+    std::printf("lane series, open markets (M1 LIP-15, M2 BAND 96-99):\n");
+    const bool lip = series_check("M1", a.lip_series);
+    const bool band = series_check("M2", a.band_series);
+
+    std::printf("socket %s: pyth_value (every underlying) and order_group_updates for %d s\n", ws_ep.url().c_str(),
+                a.feeds_seconds);
+    Socket s;
+    std::string why;
+    if (!ws_open(s, {subscribe(1, {{"channels", {"pyth_value"}}, {"underlying_tickers", {"all"}}}),
+                     subscribe(2, {{"channels", {"order_group_updates"}}})}, &why)) {
+      std::printf("  cannot open it: %s\n", why.c_str());
+      return false;
+    }
+    PythValues values;
+    int group_msgs = 0, skipped = 0;
+    std::map<std::string, int> others;
+    const std::int64_t until = net::mono_us() + static_cast<std::int64_t>(a.feeds_seconds) * 1000 * 1000;
+    while (s.ws.connected()) {
+      const std::int64_t left = (until - net::mono_us()) / 1000;
+      if (left <= 0) break;
+      auto j = ws_next(s, static_cast<int>(left));
+      if (!j) continue;
+      const std::string type = str_of(*j, "type");
+      if (type == "pyth_value") {
+        std::string bad;
+        if (!j->contains("msg") || !values.value((*j)["msg"], now_ms(), &bad)) ++skipped;
+      } else if (type == "order_group_updates") {
+        ++group_msgs;
+      } else {
+        ++others[type.empty() ? std::string("(no type)") : type];
+      }
+    }
+    s.ws.close();
+    const bool pyth_sub = s.has("pyth_value"), group_sub = s.has("order_group_updates");
+    std::printf("  subscribed: pyth_value %s, order_group_updates %s\n", pyth_sub ? "yes" : "NO", group_sub ? "yes" : "NO");
+    for (const auto& e : s.errors) std::printf("  venue error: %s\n", e.c_str());
+    std::int64_t messages = 0;
+    for (const auto& [sym, series] : values.series()) messages += series.messages;
+    std::printf("  pyth_value: %zu underlyings, %lld values, %d malformed (skipped)\n", values.series().size(),
+                static_cast<long long>(messages), skipped);
+    for (const auto& [sym, series] : values.series()) {
+      const RefTick* t = series.last();
+      std::printf("    %-34s %5lld values (%lld unchanged, %lld repeated, %lld out of order), last %.6g, %s, median gap %lld ms\n",
+                  sym.c_str(), static_cast<long long>(series.messages), static_cast<long long>(series.unchanged),
+                  static_cast<long long>(series.duplicates), static_cast<long long>(series.out_of_order), t ? t->value : 0.0,
+                  t && t->source_ms ? ("source clock " + std::to_string(t->recv_ms - t->source_ms) + " ms behind ours").c_str()
+                                    : "no source time",
+                  static_cast<long long>(series.median_gap_ms()));
+    }
+    // the 15-minute series and the symbol each one's fair reads (deskd matches them the same way)
+    std::printf("  15-minute series and their reference here:\n");
+    for (const auto& u : financial_underlyings()) {
+      const std::string sym = pyth_symbol_for(values, u.patterns);
+      std::printf("    %-16s %s\n", u.series.c_str(), sym.empty() ? "not seen" : sym.c_str());
+    }
+    std::printf("  order_group_updates: %d messages (none expected: no group of this account changed)\n", group_msgs);
+    for (const auto& [type, n] : others) std::printf("  other frames: %s x %d\n", type.c_str(), n);
+    if (values.series().empty())
+      std::printf("  NO pyth_value in %d s: M1's fair has no reference on this venue\n", a.feeds_seconds);
+    return lip && band && pyth_sub && group_sub && !values.series().empty() && s.errors.empty();
+  }
+
+  // ---- --group-check -------------------------------------------------------------------------
+  // What gw does with a Systematic lane's group, once, by hand: create, an order in it, trigger
+  // (its orders cancelled, new ones refused), reset, delete; and the socket's word on each.
+  bool group_check(const std::vector<MarketRow>& rows) {
+    std::printf("\norder group check (%s):\n", base.host.c_str());
+    std::string why;
+    auto m = choose(rows);
+    if (!m) {
+      std::printf("  no market fits (open, a 1c grid at $0.01, an ask above it, two minutes to its close): skipped\n");
+      return false;
+    }
+    const int shard = m->exchange_index.value_or(0);
+    Socket s;
+    if (!ws_open(s, {subscribe(1, {{"channels", {"order_group_updates"}}})}, &why)) {
+      std::printf("  cannot open the socket: %s\n", why.c_str());
+      return false;
+    }
+    // the subscription acknowledged before the group exists, or its "created" can go unseen
+    for (const std::int64_t until = net::mono_us() + 3000000; s.ws.connected() && !s.has("order_group_updates") &&
+                                                              net::mono_us() < until;)
+      ws_next(s, 100);
+    if (!s.has("order_group_updates")) std::printf("  order_group_updates not acknowledged in 3 s; going on\n");
+    std::vector<std::string> events;   // this group's, in order
+    std::string group_id;
+    // the socket's frames for up to ms, until this group's `want` event arrives
+    auto await = [&](const std::string& want, int ms) {
+      const std::int64_t until = net::mono_us() + static_cast<std::int64_t>(ms) * 1000;
+      while (s.ws.connected()) {
+        if (std::find(events.begin(), events.end(), want) != events.end()) return true;
+        const std::int64_t left = (until - net::mono_us()) / 1000;
+        if (left <= 0) return false;
+        auto j = ws_next(s, static_cast<int>(left));
+        if (!j || str_of(*j, "type") != "order_group_updates" || !j->contains("msg") || !(*j)["msg"].is_object()) continue;
+        if (str_of((*j)["msg"], "order_group_id") == group_id) events.push_back(str_of((*j)["msg"], "event_type"));
+      }
+      return std::find(events.begin(), events.end(), want) != events.end();
+    };
+    // a 2xx, or the outcome shown
+    auto write = [&](const WireRequest& r, const std::string& label, WireOp op, net::Exchange* out = nullptr) {
+      net::Exchange x = send(r, label);
+      if (out) *out = x;
+      const WriteOutcome w = classify_write(op, x);
+      if (w.kind == WriteOutcome::Kind::ACK) return true;
+      std::printf("    outcome %s%s: %s\n", write_kind_name(w.kind),
+                  w.kind == WriteOutcome::Kind::REFUSED ? (std::string(" ") + reject_class_name(w.cls)).c_str() : "",
+                  w.why.c_str());
+      return false;
+    };
+    // a post-only bid for 1 at $0.01 in the group, 15 s to live; its order id, or ""
+    std::vector<std::string> cids;
+    auto bid = [&](const std::string& label, WriteOutcome* outcome) {
+      CreateOrder o;
+      o.ticker = m->ticker;
+      o.exchange_index = shard;
+      o.side = BookSide::BID;
+      o.count = kOneContract;
+      o.price = 100;
+      o.tif = TimeInForce::GTC;
+      o.post_only = true;
+      o.cancel_on_pause = true;
+      o.expiration_s = wall_s() + 15;
+      o.stp = Stp::MAKER;
+      o.order_group_id = group_id;
+      o.client_order_id = "P-" + hex16();
+      cids.push_back(o.client_order_id);
+      WireRequest cr;
+      std::string bwhy;
+      if (!build_create(o, &cr, &bwhy)) {
+        std::printf("  the builder refused it: %s\n", bwhy.c_str());
+        return std::string();
+      }
+      net::Exchange x = send(cr, label);
+      *outcome = classify_write(WireOp::CREATE, x);
+      if (outcome->kind != WriteOutcome::Kind::ACK) return std::string();
+      auto ack = parse_create_ack(x.res.body, &bwhy);
+      return ack ? ack->order_id : std::string();
+    };
+
+    WireRequest r;
+    build_create_order_group(kOneContract, shard, -1, &r, &why);
+    net::Exchange x;
+    if (!write(r, "create group (POST)", WireOp::GROUP, &x)) return false;
+    if (auto id = parse_create_order_group(x.res.body, &why)) group_id = *id;
+    if (group_id.empty()) {
+      std::printf("    the reply carries no order_group_id: %s\n", why.c_str());
+      return false;
+    }
+    dump("order_group", x.res.body);
+    std::printf("    group %s on shard %d, contracts_limit 1 (%s %s)\n", group_id.c_str(), shard, m->ticker.c_str(),
+                m->yes_bid ? ("best bid " + price_wire(*m->yes_bid)).c_str() : "no bid");
+    bool ok = true;
+    const bool created = await("created", 2000);
+
+    WriteOutcome w;
+    const std::string first = bid("bid in the group (POST)", &w);
+    if (first.empty()) {
+      std::printf("    outcome %s: %s\n", write_kind_name(w.kind), w.why.c_str());
+      ok = false;
+    } else {
+      int others = 0;
+      std::string body;
+      auto row = poll_order(first, 3000, [](const OrderRow& o) { return o.status == OrderStatus::RESTING; }, &others, &body);
+      std::printf("    %s, order_group_id %s\n", row ? "resting" : "NOT READ BACK RESTING",
+                  row && row->order_group_id == group_id ? "as sent" : "MISSING OR DIFFERENT");
+      if (!row || row->order_group_id != group_id) ok = false;
+    }
+
+    build_order_group_action(group_id, "trigger", shard, -1, &r, &why);
+    const bool triggered_ok = write(r, "trigger group (PUT)", WireOp::GROUP);
+    if (!triggered_ok) ok = false;
+    if (!first.empty()) {
+      int others = 0;
+      std::string body;
+      auto row = poll_order(first, 3000, [](const OrderRow& o) { return o.status != OrderStatus::RESTING; }, &others, &body);
+      std::printf("    the bid after the trigger: %s\n", row ? order_status_name(row->status) : "STILL RESTING 3 s later");
+      if (!row || row->status != OrderStatus::CANCELED) ok = false;
+    }
+    const bool triggered = await("triggered", 3000);
+
+    // a triggered group refuses new orders until a reset (gw's SOFT_GROUP reads the reason)
+    const std::string second = bid("bid into the triggered group", &w);
+    if (second.empty() && w.kind == WriteOutcome::Kind::REFUSED) {
+      std::printf("    outcome REFUSED %s (HTTP %d): %s%s\n", reject_class_name(w.cls), w.http, w.why.c_str(),
+                  w.cls == RejectClass::SOFT_GROUP ? "" : "  <- gw expects soft_group here: its reject table needs this text");
+      if (w.cls != RejectClass::SOFT_GROUP) ok = false;
+    } else {
+      std::printf("    NOT REFUSED (%s): a triggered group took an order%s\n", write_kind_name(w.kind),
+                  second.empty() ? "" : "; cancelling it");
+      ok = false;
+      if (!second.empty()) {
+        WireRequest cx;
+        if (build_cancel(second, shard, m->ticker, -1, &cx, &why)) send(cx, "cancel order (DELETE)");
+      }
+    }
+
+    build_order_group_action(group_id, "reset", shard, -1, &r, &why);
+    if (!write(r, "reset group (PUT)", WireOp::GROUP)) ok = false;
+    const bool reset = await("reset", 3000);
+    build_delete_order_group(group_id, shard, -1, &r, &why);
+    if (!write(r, "delete group (DELETE)", WireOp::GROUP)) ok = false;
+    const bool deleted = await("deleted", 3000);
+    s.ws.close();
+
+    std::string seen;
+    for (const auto& e : events) seen += (seen.empty() ? "" : ", ") + e;
+    std::printf("    order_group_updates for it: %s (subscribed %s)\n", seen.empty() ? "none" : seen.c_str(),
+                s.has("order_group_updates") ? "yes" : "NO");
+    for (const auto& e : s.errors) std::printf("    venue error: %s\n", e.c_str());
+    // gw needs `triggered` (a venue-side trigger stops a lane); the others are shown for the record
+    if (!triggered) {
+      std::printf("    NO triggered event: gw would not learn of a venue-side trigger from the socket\n");
+      ok = false;
+    }
+    (void)created;
+    (void)reset;
+    (void)deleted;
+
+    ListQuery q;
+    q.status = "resting";
+    q.limit = 200;
+    x = send(build_get_orders(q), "resting orders after");
+    expect2xx(x);
+    std::size_t ours = 0;
+    if (auto page = ok2xx(x) ? parse_orders(x.res.body, &why) : std::nullopt)
+      for (const auto& row : page->rows)
+        if (std::find(cids.begin(), cids.end(), row.client_order_id) != cids.end()) ++ours;
+    std::printf("    this check's orders resting: %zu\n", ours);
+    return ok && ours == 0 && ok2xx(x);
+  }
+
   void sign_time() {
     std::vector<double> us;
     for (int i = 0; i < 2000; ++i) {
@@ -604,7 +1251,14 @@ int main(int argc, char** argv) {
     else if (s == "--base" && (v = value())) a.base = v;
     else if (s == "--handshakes" && (v = value())) a.handshakes = std::max(0, std::atoi(v));
     else if (s == "--loopback-ca" && (v = value())) a.loopback_ca = v;
+    else if (s == "--ws" && (v = value())) a.ws = v;
     else if (s == "--order-check") a.order_check = true;
+    else if (s == "--group-check") a.group_check = true;
+    else if (s == "--venue-checks") a.venue_checks = true;
+    else if (s == "--feeds-check") a.feeds_check = true;
+    else if (s == "--feeds-seconds" && (v = value())) a.feeds_seconds = std::max(1, std::atoi(v));
+    else if (s == "--lip-series" && (v = value())) a.lip_series = split_list(v);
+    else if (s == "--band-series" && (v = value())) a.band_series = split_list(v);
     else if (s == "--order-ticker" && (v = value())) a.order_ticker = v;
     else if (s == "--dump" && (v = value())) a.dump = v;
     else return usage();
@@ -620,11 +1274,23 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "kalshi-demo-probe: --base: %s\n", err.c_str());
     return 2;
   }
+  std::string ws_url = a.ws;
+  if (ws_url.empty()) {
+    ws_url = ep->url();
+    const std::string rest = "/trade-api/v2", sock = "/trade-api/ws/v2";
+    if (ws_url.size() >= rest.size() && ws_url.compare(ws_url.size() - rest.size(), rest.size(), rest) == 0)
+      ws_url.replace(ws_url.size() - rest.size(), rest.size(), sock);
+  }
+  auto wep = net::Endpoint::parse(ws_url, &err);
+  if (!wep) {
+    std::fprintf(stderr, "kalshi-demo-probe: --ws: %s\n", err.c_str());
+    return 2;
+  }
   if (!a.dump.empty()) {
     std::error_code ec;
     std::filesystem::create_directories(a.dump, ec);
   }
-  DemoProbe p(a, *ep, std::move(signer));
+  DemoProbe p(a, *ep, *wep, std::move(signer));
   std::printf("key: %s\n", desc.c_str());
   const std::string refused = p.guard.refuse(p.base.host);
   if (!p.factory.ok(&err)) {
@@ -637,6 +1303,10 @@ int main(int argc, char** argv) {
               p.factory.trust_roots());
   if (!refused.empty()) {
     std::fprintf(stderr, "kalshi-demo-probe: refusing to run against %s\n", p.base.host.c_str());
+    return 2;
+  }
+  if (const std::string ws_refused = p.guard.refuse(p.ws_ep.host); !ws_refused.empty()) {
+    std::fprintf(stderr, "kalshi-demo-probe: refusing the socket at %s: %s\n", p.ws_ep.host.c_str(), ws_refused.c_str());
     return 2;
   }
   p.production_check();
@@ -655,6 +1325,9 @@ int main(int argc, char** argv) {
   const std::vector<MarketRow> rows = p.reads();
   bool order_ok = true;
   if (a.order_check) order_ok = p.order_check(rows);
+  if (a.group_check && !p.group_check(rows)) order_ok = false;
+  if (a.venue_checks && !p.venue_checks(rows)) order_ok = false;
+  if (a.feeds_check && !p.feeds_check()) order_ok = false;
   p.summary();
   p.sign_time();
   p.pool->stop();

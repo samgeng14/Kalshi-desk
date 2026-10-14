@@ -6,6 +6,7 @@
 #include <functional>
 #include <future>
 #include <memory>
+#include <optional>
 #include <string>
 #include <variant>
 #include <vector>
@@ -26,6 +27,15 @@ enum class RunState : std::uint8_t { RUN, STOP, KILLED, HALTED };
 
 const char* venue_code(Venue v);   // "K", "P"
 const char* run_code(RunState s);  // "RUN", "STOP", "KILLED", "HALTED"
+
+// gw's answer to one new order, for the web thread that posted it. ord is the order's contract
+// row as JSON text ("" when it never reached gw's book: a check refused it, or nothing was sent).
+struct OrderReply {
+  std::string code;   // "" = accepted by the venue (or ended CXL there: POST_CROSS, STP, USER)
+  std::string msg;
+  std::string ord;
+};
+using OrderPromise = std::shared_ptr<std::promise<OrderReply>>;
 
 // One new order. The cid carries its owner (M... for Manual, S<lane>-... for Systematic) so
 // ownership survives a crash; an unprefixed open order on the account is foreign.
@@ -48,7 +58,10 @@ struct PlaceIntent {
   // than a cancel it already drained, so a click followed at once by Esc never rests.
   std::uint64_t cancel_epoch = 0;
   std::int64_t t_click_ms = 0;      // browser click time (performance.timeOrigin + timeStamp)
+  std::optional<Px> touch;          // the touch crossed or joined, at click or signal time (ord.touch)
+  std::optional<Px> fair;           // the model fair at send; ord.edge is the limit's edge against it
   std::int64_t t_recv_ms = 0;
+  OrderPromise reply;               // MAN from the web: answered once the venue has (or never will)
 };
 
 // Expiry-only amend (plan section 3: no price amends in the first live weeks). gw builds the
@@ -59,6 +72,12 @@ struct AmendIntent {
   std::int64_t expiry_ms = 0;
 };
 
+struct CancelReply {
+  std::string code, msg;
+  std::vector<std::string> cids;   // orders asked to cancel (contract: n = cids.size())
+};
+using CancelPromise = std::shared_ptr<std::promise<CancelReply>>;
+
 struct CancelIntent {
   enum class Scope : std::uint8_t { CID, MARKET, LANE, ALL };
   enum class Own : std::uint8_t { MAN, SYS, ANY };
@@ -68,6 +87,10 @@ struct CancelIntent {
   std::string ticker;       // MARKET
   std::string lane;         // LANE
   Own own = Own::ANY;       // MARKET and ALL
+  bool has_side = false;    // MARKET: one ladder level (right-click on WRK) when side and/or px are set
+  Side side = Side::BUY;
+  Px px = 0;                // 0 = any price
+  CancelPromise reply;
 };
 
 struct RunView {
@@ -137,7 +160,50 @@ struct Probe {
   std::function<void()> fn;
 };
 
-using GwMsg = std::variant<PlaceIntent, AmendIntent, CancelIntent, Start, Stop, SendResult, OrderEvent, Probe>;
+// The Kalshi Manual or cancel sender's answer for one write (net/kalshi_sender.h), back to gw.
+struct KalshiWriteReply;
+struct ManualWrite {
+  std::shared_ptr<const KalshiWriteReply> reply;
+};
+
+// One parsed private-feed event (priv/kalshi_private.h): an order update or a fill.
+struct PrivateEvent;
+struct PrivateMsg {
+  std::shared_ptr<const PrivateEvent> event;
+};
+
+// POST /api/lane/{id}: a Systematic lane on or off. Off cancels that lane's working orders.
+struct LaneReply {
+  std::string code, msg;   // "" = ok
+  std::string lane;        // the lane's row, JSON text
+  int n = 0;               // orders asked to cancel
+};
+using LanePromise = std::shared_ptr<std::promise<LaneReply>>;
+struct LaneSet {
+  std::string id;
+  bool on = false;
+  LanePromise reply;
+};
+
+// POST /api/release: the operator hands a market Manual took over back to Systematic
+struct ReleaseMarket {
+  std::string ticker;
+  std::shared_ptr<std::promise<bool>> reply;   // false: the market was not held
+};
+
+// POST /api/transfer (the ticket's MOVE): free cash between two Kalshi shards
+struct TransferReply {
+  std::string code, msg;   // "" = done
+  std::string shards;      // the shards after it, JSON text ([{id, cash, free}])
+};
+struct TransferIntent {
+  int from = -1, to = -1;
+  Money amount = 0;
+  std::shared_ptr<std::promise<TransferReply>> reply;
+};
+
+using GwMsg = std::variant<PlaceIntent, AmendIntent, CancelIntent, Start, Stop, SendResult, OrderEvent, Probe, ManualWrite,
+                           PrivateMsg, LaneSet, ReleaseMarket, TransferIntent>;
 
 // Stop goes in the control lane, which nothing else fills; cancels and private events go before
 // new orders (plan section 2). Start and amends wait in the normal lane with the orders, so a

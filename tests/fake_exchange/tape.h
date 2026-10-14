@@ -32,6 +32,10 @@
 //   {"t":250,"delta":{"ticker":"...","side":"yes","price":"0.4600","delta":"10.00"}}
 //   {"t":500,"trade":{"ticker":"...","taker_book_side":"ask","price":"0.4500","count":"5.00"}}
 //   {"t":900,"pause":{"ticker":"..."}}   also "resume" and "close"; "#" lines are comments
+//   {"t":950,"pyth":{"underlying":"Commodities.Index.NATGAS/USD","value":3.105}}   a pyth_value
+//     message, its source_ts_ms the time it is played
+// A market may also say "open_in_ms" (listed as unopened until then), "strike_type" and
+// "floor_strike", as a 15-minute window does.
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -44,7 +48,7 @@
 namespace fakex {
 
 struct TapeEvent {
-  enum class Kind : std::uint8_t { SNAPSHOT, DELTA, TRADE, MARKET, PAUSE, RESUME, CLOSE };
+  enum class Kind : std::uint8_t { SNAPSHOT, DELTA, TRADE, MARKET, PAUSE, RESUME, CLOSE, PYTH };
   Kind kind = Kind::DELTA;
   std::int64_t t_ms = 0;
   std::string ticker;
@@ -53,7 +57,9 @@ struct TapeEvent {
   Qty qty = 0;            // DELTA: signed; TRADE: contracts
   Side side = Side::BID;  // TRADE: the taker's book side
   std::vector<std::pair<Px, Qty>> yes, no;  // SNAPSHOT
-  std::shared_ptr<MarketSpec> spec;          // MARKET: close_ms on the tape's clock
+  std::shared_ptr<MarketSpec> spec;          // MARKET: open_ms and close_ms on the tape's clock
+  std::string underlying;                    // PYTH
+  double value = 0;                          // PYTH: value_usd
   std::int64_t seq = 0;   // the archive's, for reading a tape, not used to play it
 };
 

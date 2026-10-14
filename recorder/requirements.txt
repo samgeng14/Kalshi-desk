@@ -1,0 +1,4 @@
+# the versions the tests ran on (recorder/tests); aarch64 wheels exist for each (the Oracle VM)
+websockets==17.2
+cryptography==50.0.2
+pyarrow==26.0.0

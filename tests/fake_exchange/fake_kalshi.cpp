@@ -2,6 +2,8 @@
 
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+
+#include <ctime>
 #include <openssl/bio.h>
 #include <openssl/evp.h>
 #include <openssl/pem.h>
@@ -302,6 +304,7 @@ void FakeKalshi::pump_locked(std::int64_t now) {
       case TapeEvent::Kind::MARKET: {
         MarketSpec s = *e.spec;
         if (s.close_ms) s.close_ms = rebase(s.close_ms);
+        if (s.open_ms) s.open_ms = rebase(s.open_ms);
         engine_.add_market(std::move(s), at);
         break;
       }
@@ -334,6 +337,9 @@ void FakeKalshi::pump_locked(std::int64_t now) {
       case TapeEvent::Kind::CLOSE:
         engine_.close(e.ticker, at);
         break;
+      case TapeEvent::Kind::PYTH:
+        pyth_locked(e.underlying, e.value, at);
+        break;
     }
     ++tape_pos_;
   }
@@ -365,6 +371,17 @@ void FakeKalshi::set_rate_limits(bool on, RateTier tier) {
   read_ = Bucket{tier.read_per_s * tier.read_burst_s, tier.read_per_s, tier.read_per_s * tier.read_burst_s, now};
   write_ = Bucket{tier.write_per_s * tier.write_burst_s, tier.write_per_s, tier.write_per_s * tier.write_burst_s, now};
   write_shard_.clear();
+}
+void FakeKalshi::pyth(const std::string& underlying, double value_usd, std::int64_t source_ts_ms) {
+  std::lock_guard<std::mutex> lk(mu_);
+  pyth_locked(underlying, value_usd, source_ts_ms);
+}
+void FakeKalshi::pyth_locked(const std::string& underlying, double value_usd, std::int64_t source_ts_ms) {
+  Event e;
+  e.channel = "pyth_value";
+  e.type = "pyth_value";
+  e.msg = json{{"underlying_ticker", underlying}, {"value_usd", value_usd}, {"source_ts_ms", source_ts_ms}};
+  publish_now_locked({e});
 }
 void FakeKalshi::drop_ws_connections() {
   std::lock_guard<std::mutex> lk(mu_);
@@ -1075,6 +1092,14 @@ void FakeKalshi::serve(int fd) {
     } else {
       std::vector<std::pair<std::string, std::string>> h;
       if (rep.status != 204) h.emplace_back("Content-Type", "application/json");
+      {   // as Kalshi does: whole seconds, which deskd's clock check reads (rest/state.h)
+        char date[64];
+        const std::time_t t = std::time(nullptr);
+        std::tm g{};
+        gmtime_r(&t, &g);
+        std::strftime(date, sizeof date, "%a, %d %b %Y %H:%M:%S GMT", &g);
+        h.emplace_back("Date", date);
+      }
       if (is(K::CHUNKED))
         h.emplace_back("Transfer-Encoding", "chunked");
       else if (rep.status != 204)
@@ -1093,8 +1118,10 @@ void FakeKalshi::serve(int fd) {
       } else {
         data += rep.body;
       }
-      net::write_all(fd, data);
+      // logged before the write: a client that has its reply (and a test that then clears the
+      // log) never sees the entry arrive late (test_rest's fresh-cache check, 2026-10-10)
       log_wire(label);
+      net::write_all(fd, data);
     }
     if (held) {
       std::lock_guard<std::mutex> lk(mu_);

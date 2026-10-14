@@ -18,6 +18,7 @@
 // production make no socket at all. The old desk's HTTP and WebSocket clients stay out of
 // deskd's link (deskd_core links none of the desk library).
 #include <string>
+#include <vector>
 
 namespace deskd {
 
@@ -31,6 +32,10 @@ HostClass classify_host(const std::string& host);
 class SendGuard {
  public:
   SendGuard(bool live, const AccountLock* lock) : live_(live), lock_(lock) {}
+  // A guard for public read-only data (ESPN's scoreboards): exactly these hosts, any case, and
+  // loopback (tests). Every venue host is refused, demo included, so a data factory can never
+  // reach an account.
+  static SendGuard data_hosts(std::vector<std::string> hosts);
 
   // "" when a connection to host may be opened, else why not
   std::string refuse(const std::string& host) const;
@@ -39,6 +44,8 @@ class SendGuard {
  private:
   bool live_;
   const AccountLock* lock_;
+  bool data_ = false;
+  std::vector<std::string> hosts_;   // data_ only, lower case
 };
 
 }  // namespace deskd

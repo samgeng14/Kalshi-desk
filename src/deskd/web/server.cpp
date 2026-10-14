@@ -3,6 +3,7 @@
 #include <httplib.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <atomic>
 #include <cctype>
 #include <chrono>
@@ -58,11 +59,40 @@ bool token_ok(const std::string& got, const std::string& want) {
   return diff == 0;
 }
 
+bool peer_navigation(const std::string& method, const std::string& path, const std::string& site,
+                     const std::string& mode, const std::string& dest, bool has_origin) {
+  auto lower = [](std::string v) {
+    for (char& c : v) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return v;
+  };
+  return method == "GET" && (path == "/" || path == "/index.html") && lower(site) == "same-site" &&
+         lower(mode) == "navigate" && lower(dest) == "document" && !has_origin;
+}
+
 bool inject_token(const std::string& html, const std::string& token, std::string* out) {
   static const std::string kEmpty = "<meta name=\"desk-token\" content=\"\">";
   const std::size_t at = html.find(kEmpty);
   if (at == std::string::npos) return false;
   *out = html.substr(0, at) + "<meta name=\"desk-token\" content=\"" + token + "\">" + html.substr(at + kEmpty.size());
+  return true;
+}
+
+bool inject_meta(const std::string& html, const std::string& name, const std::string& value, std::string* out) {
+  const std::string empty = "<meta name=\"" + name + "\" content=\"\">";
+  const std::size_t at = html.find(empty);
+  if (at == std::string::npos) return false;
+  std::string v;
+  for (char c : value) {
+    switch (c) {
+      case '&': v += "&amp;"; break;
+      case '<': v += "&lt;"; break;
+      case '>': v += "&gt;"; break;
+      case '"': v += "&quot;"; break;
+      case '\'': v += "&#39;"; break;
+      default: v.push_back(c);
+    }
+  }
+  *out = html.substr(0, at) + "<meta name=\"" + name + "\" content=\"" + v + "\">" + html.substr(at + empty.size());
   return true;
 }
 
@@ -184,6 +214,7 @@ struct WebServer::Impl {
   std::atomic<std::uint64_t> requests{0};
   std::atomic<bool> stopping{false};
   std::atomic<int> waiting{0};   // request threads blocked on gw or pub right now
+  std::atomic<int> order_waiting{0};   // request threads blocked on a Manual order's venue reply
 
   using Handler = std::function<void(const httplib::Request&, httplib::Response&, const json&)>;
 
@@ -201,6 +232,11 @@ struct WebServer::Impl {
       return "Host must be 127.0.0.1:" + std::to_string(p) + " or localhost:" + std::to_string(p);
     if (req.get_header_value_count("Origin") > 1 || req.get_header_value_count("Sec-Fetch-Site") > 1)
       return "one Origin and one Sec-Fetch-Site at most";
+    for (const char* h : {"Sec-Fetch-Mode", "Sec-Fetch-Dest"})
+      if (req.get_header_value_count(h) > 1) return std::string("one ") + h + " at most";
+    if (peer_navigation(req.method, req.path, req.get_header_value("Sec-Fetch-Site"), req.get_header_value("Sec-Fetch-Mode"),
+                        req.get_header_value("Sec-Fetch-Dest"), req.has_header("Origin")))
+      return "";
     const std::string origin = req.get_header_value("Origin");
     return cross_site_refusal(req.get_header_value("Sec-Fetch-Site"), req.has_header("Origin") ? &origin : nullptr, p);
   }
@@ -266,6 +302,84 @@ struct WebServer::Impl {
   }
   static constexpr int kGwWaitMs = 50;
 
+  // A new order: gw admits it in microseconds, then the reply waits for the venue (send-k1's
+  // connect and reply budgets, 1 s + 1.5 s). At most kMaxOrderWaiting request threads wait on
+  // orders, apart from kMaxWaiting. Past the cap or the wait, the answer is a 5xx without ord,
+  // which the contract defines: the page keeps the order PEND and the stream carries its state.
+  static constexpr int kMaxOrderWaiting = 6;
+  static constexpr int kOrderWaitMs = 3000;
+  struct OrderWaiter {
+    std::atomic<int>& n;
+    bool ok;
+    explicit OrderWaiter(std::atomic<int>& c) : n(c), ok(c.fetch_add(1) < kMaxOrderWaiting) {}
+    ~OrderWaiter() { n.fetch_sub(1); }
+  };
+  void order_route(httplib::Response& res, const json& b) {
+    PlaceIntent p;
+    p.cid = b["cid"].get<std::string>();
+    p.owner = Owner::MAN;
+    if (b["v"] != "K") return reply_err(res, "UNKNOWN_MARKET", "P|" + b["tk"].get<std::string>() + ": Polymarket is not connected");
+    p.venue = Venue::K;
+    p.ticker = b["tk"].get<std::string>();
+    p.side = b["side"] == "BUY" ? Side::BUY : Side::SELL;
+    const auto px = parse_price(b["px"].get<std::string>());
+    const auto qty = qty_from_number(b["qty"].get<double>());
+    if (!px) return reply_err(res, "OFF_GRID", "price is not a contract price");
+    if (!qty || *qty <= 0) return reply_err(res, "BAD_QTY", "size must be positive with at most 2 decimals");
+    p.price = *px;
+    p.count = *qty;
+    const std::string tif = b["tif"].get<std::string>();
+    p.tif = tif == "POST" ? Tif::POST : tif == "FOK" ? Tif::FOK : Tif::IOC;
+    if (b.contains("ttl_s") && !b["ttl_s"].is_null()) p.ttl_s = b["ttl_s"].get<int>();
+    if (b.contains("exp_ms") && !b["exp_ms"].is_null()) p.exp_ms = b["exp_ms"].get<std::int64_t>();
+    p.reduce_only = b.contains("reduce_only") && b["reduce_only"].is_boolean() && b["reduce_only"].get<bool>();
+    p.override_guard = b["override"].get<bool>();
+    if (b.contains("t_click_ms") && !b["t_click_ms"].is_null()) p.t_click_ms = b["t_click_ms"].get<std::int64_t>();
+    if (b.contains("touch") && b["touch"].is_string()) p.touch = parse_price(b["touch"].get<std::string>());
+    p.t_recv_ms = now_ms();
+    p.reply = std::make_shared<std::promise<OrderReply>>();
+    auto f = p.reply->get_future();
+    OrderWaiter w(order_waiting);
+    if (!d.gw->post(std::move(p))) return reply_err(res, "RO", "gw inbox full: the order was not queued, nothing was sent");
+    if (!w.ok)
+      return reply_err(res, "INTERNAL", "order queued; " + std::to_string(kMaxOrderWaiting) +
+                                            " orders already wait on the venue: the stream carries its state");
+    if (f.wait_for(std::chrono::milliseconds(kOrderWaitMs)) != std::future_status::ready)
+      return reply_err(res, "INTERNAL", "order queued; no answer within " + std::to_string(kOrderWaitMs) +
+                                            " ms: the stream carries its state");
+    const OrderReply r = f.get();
+    json ord = r.ord.empty() ? json(nullptr) : json::parse(r.ord, nullptr, false);
+    if (ord.is_discarded()) return reply_err(res, "INTERNAL", "gw returned an unreadable order row");
+    if (r.code.empty()) {
+      if (ord.is_null()) return reply_err(res, "INTERNAL", "gw accepted the order without its row");
+      return reply_json(res, 200, json{{"ok", true}, {"ord", ord}});
+    }
+    json body = err_body(r.code, r.msg);
+    if (!ord.is_null()) body["ord"] = ord;
+    reply_json(res, err_http(r.code), body);
+  }
+
+  // Cancels: gw answers at once with the orders it asked to cancel (each then gets its ord).
+  void cancel_route(httplib::Response& res, std::vector<CancelIntent> intents) {
+    std::vector<std::future<CancelReply>> futures;
+    for (auto& c : intents) {
+      c.reply = std::make_shared<std::promise<CancelReply>>();
+      futures.push_back(c.reply->get_future());
+      if (!d.gw->post(std::move(c))) return reply_err(res, "EXCHANGE", "gw inbox full: cancel not queued; use KILL if it must go now");
+    }
+    Waiter w(waiting);
+    if (!w.ok) return reply_err(res, "EXCHANGE", "cancel queued; gw is busy: the stream shows each order's state");
+    json cids = json::array();
+    for (auto& f : futures) {
+      if (f.wait_for(std::chrono::milliseconds(500)) != std::future_status::ready)
+        return reply_err(res, "EXCHANGE", "cancel queued; gw has not answered: the stream shows each order's state");
+      const CancelReply r = f.get();
+      if (!r.code.empty()) return reply_err(res, r.code, r.msg);
+      for (const auto& cid : r.cids) cids.push_back(cid);
+    }
+    reply_json(res, 200, json{{"ok", true}, {"n", cids.size()}, {"cids", cids}});
+  }
+
   // Snapshot and subscribe: the contract's answer is the data itself, so these wait for pub (up
   // to 2 s), but under the same cap.
   PubReply pub_call(PubMsg m, PubPromise p) {
@@ -291,9 +405,17 @@ struct WebServer::Impl {
 
   void serve_page(httplib::Response& res) {
     std::string html, page;
-    if (!read_file(d.ui_dir + "/index.html", &html)) return reply_err(res, "INTERNAL", "cannot read the ui dir's index.html");
+    if (!read_file(d.ui_dir + "/index.html", &html)) {
+      const int e = errno;
+      return reply_err(res, "INTERNAL", "cannot read " + d.ui_dir + "/index.html: " + std::strerror(e));
+    }
     if (!inject_token(html, d.token, &page))
       return reply_err(res, "INTERNAL", "index.html has no empty desk-token meta to write the token into");
+    // the PAPER/LIVE switch's metas: an older page without them still works, the tag just stays put
+    for (const auto& kv : {std::make_pair("desk-peer", d.peer_url), std::make_pair("desk-venue", d.venue)}) {
+      std::string next;
+      if (!kv.second.empty() && inject_meta(page, kv.first, kv.second, &next)) page.swap(next);
+    }
     res.set_header("Cache-Control", "no-store");   // the token changes every start
     res.set_content(page, "text/html; charset=utf-8");
   }
@@ -417,6 +539,27 @@ void WebServer::Impl::routes() {
     reply_json(res, 200, d.universe ? d.universe(q) : universe_json(q, now_ms()));
   });
 
+  // How likely a resting order is to fill (contract 1.6): the ticket's FILL line and P80 price
+  svr.Get("/api/fill", [this](const httplib::Request& req, httplib::Response& res) {
+    json q = json::object();
+    for (const auto& kv : req.params) {   // contract.js parseQuery: ttl a count, qty a size, the rest strings
+      const std::string& v = kv.second;
+      const bool digits = !v.empty() && v.size() < 10 && v.find_first_not_of("0123456789") == std::string::npos;
+      const auto dot = v.find('.');
+      const bool decimal = !v.empty() && v.size() < 14 && v.find_first_not_of("0123456789.") == std::string::npos &&
+                           dot != 0 && v.find('.', dot == std::string::npos ? v.size() : dot + 1) == std::string::npos &&
+                           (dot == std::string::npos || (v.size() - dot - 1 >= 1 && v.size() - dot - 1 <= 2));
+      if (kv.first == "ttl" && digits) q[kv.first] = std::stoll(v);
+      else if (kv.first == "qty" && decimal) q[kv.first] = std::stod(v);
+      else q[kv.first] = v;
+    }
+    const std::vector<std::string> errs = check_fill_query(q);
+    if (!errs.empty()) return reply_err(res, "BAD_REQUEST", errs[0]);
+    if (!d.fill) return reply_err(res, "UNKNOWN_MARKET", "no venue connected: nothing to estimate");
+    const json out = d.fill(q);
+    reply_json(res, out.value("ok", false) ? 200 : err_http(out.at("err").at("code")), out);
+  });
+
   // deskctl status. Outside /api/: not part of the screen's contract, and never the token.
   svr.Get("/ops/status", [this](const httplib::Request&, httplib::Response& res) {
     json s = d.status ? d.status() : json::object();
@@ -493,32 +636,94 @@ void WebServer::Impl::routes() {
   // Week 0 lists no markets and holds no orders, lanes or balances. These are the answers the
   // gateway would give an empty universe, so the page's buttons get contract replies, not 404s;
   // a body that breaks the contract never gets this far (post: BAD_REQUEST).
-  svr.Post("/api/order", post("POST /api/order", [](const httplib::Request&, httplib::Response& res, const json& b) {
-    reply_err(res, "UNKNOWN_MARKET", b["v"].get<std::string>() + "|" + b["tk"].get<std::string>() + ": no markets are listed in this stage");
+  // Manual orders go to gw, which refuses them RO until the Manual path is attached.
+  svr.Post("/api/order", post("POST /api/order", [this](const httplib::Request&, httplib::Response& res, const json& b) {
+    order_route(res, b);
   }));
-  svr.Post("/api/cancel", post("POST /api/cancel", [](const httplib::Request&, httplib::Response& res, const json& b) {
-    if (b.contains("cids")) return reply_json(res, 200, json{{"ok", true}, {"n", 0}, {"cids", json::array()}});   // unknown cids are skipped
-    reply_err(res, "NOT_FOUND", "no such market");
+  svr.Post("/api/cancel", post("POST /api/cancel", [this](const httplib::Request&, httplib::Response& res, const json& b) {
+    std::vector<CancelIntent> intents;
+    if (b.contains("cids")) {   // unknown or finished cids are skipped by gw
+      for (const auto& cid : b["cids"]) {
+        CancelIntent c; c.scope = CancelIntent::Scope::CID; c.cid = cid.get<std::string>();
+        intents.push_back(std::move(c));
+      }
+      if (intents.empty()) return reply_json(res, 200, json{{"ok", true}, {"n", 0}, {"cids", json::array()}});
+    } else {
+      CancelIntent c;
+      c.scope = CancelIntent::Scope::MARKET;
+      c.venue = b["v"] == "K" ? Venue::K : Venue::P;
+      c.ticker = b["tk"].get<std::string>();
+      const std::string own = b["own"].get<std::string>();
+      c.own = own == "MAN" ? CancelIntent::Own::MAN : own == "SYS" ? CancelIntent::Own::SYS : CancelIntent::Own::ANY;
+      if (b.contains("side") && !b["side"].is_null()) { c.has_side = true; c.side = b["side"] == "BUY" ? Side::BUY : Side::SELL; }
+      if (b.contains("px") && !b["px"].is_null()) c.px = parse_price(b["px"].get<std::string>()).value_or(0);
+      intents.push_back(std::move(c));
+    }
+    cancel_route(res, std::move(intents));
   }));
-  svr.Post("/api/cancel_all", post("POST /api/cancel_all", [](const httplib::Request&, httplib::Response& res, const json&) {
-    reply_json(res, 200, json{{"ok", true}, {"n", 0}, {"cids", json::array()}});
+  svr.Post("/api/cancel_all", post("POST /api/cancel_all", [this](const httplib::Request&, httplib::Response& res, const json& b) {
+    if (b.contains("v") && b["v"] == "P") return reply_json(res, 200, json{{"ok", true}, {"n", 0}, {"cids", json::array()}});
+    CancelIntent c;
+    c.scope = CancelIntent::Scope::ALL;
+    const std::string own = b["own"].get<std::string>();
+    c.own = own == "MAN" ? CancelIntent::Own::MAN : own == "SYS" ? CancelIntent::Own::SYS : CancelIntent::Own::ANY;
+    cancel_route(res, {c});
   }));
   svr.Post("/api/amend", post("POST /api/amend", [](const httplib::Request&, httplib::Response& res, const json&) {
     reply_err(res, "NOT_FOUND", "no such order");
   }));
-  svr.Post(R"(/api/lane/([A-Za-z0-9_-]+))", post("POST /api/lane/{id}", [](const httplib::Request& req, httplib::Response& res, const json&) {
-    reply_err(res, "NOT_FOUND", "no lane " + std::string(req.matches[1]));
+  svr.Post(R"(/api/lane/([A-Za-z0-9_-]+))", post("POST /api/lane/{id}", [this](const httplib::Request& req, httplib::Response& res, const json& b) {
+    auto p = std::make_shared<std::promise<LaneReply>>();
+    const bool posted = d.gw->post(LaneSet{std::string(req.matches[1]), b.at("on").get<bool>(), p});
+    if (!posted) return reply_err(res, "INTERNAL", "gw inbox full: lane switch not queued");
+    auto f = p->get_future();
+    Waiter w(waiting);
+    if (!w.ok) return reply_err(res, "INTERNAL", "lane switch queued; the stream's lane row shows the outcome");
+    if (f.wait_for(std::chrono::milliseconds(kGwWaitMs)) != std::future_status::ready)
+      return reply_err(res, "INTERNAL", "lane switch queued; gw has not answered within 50 ms: the stream's lane row shows the outcome");
+    const LaneReply r = f.get();
+    if (!r.code.empty()) return reply_err(res, r.code, r.msg);
+    reply_json(res, 200, json{{"ok", true}, {"lane", json::parse(r.lane)}});
   }));
-  svr.Post("/api/release", post("POST /api/release", [](const httplib::Request&, httplib::Response& res, const json&) {
-    reply_err(res, "UNKNOWN_MARKET", "no markets are listed in this stage");
+  svr.Post("/api/release", post("POST /api/release", [this](const httplib::Request&, httplib::Response& res, const json& b) {
+    const std::string tk = b.at("tk").get<std::string>();
+    if (b.at("v") != "K") return reply_err(res, "UNKNOWN_MARKET", tk + " is not held by Manual");
+    auto p = std::make_shared<std::promise<bool>>();
+    if (!d.gw->post(ReleaseMarket{tk, p})) return reply_err(res, "INTERNAL", "gw inbox full: release not queued");
+    auto f = p->get_future();
+    Waiter w(waiting);
+    if (!w.ok) return reply_err(res, "INTERNAL", "release queued; the stream's mkt row shows the outcome");
+    if (f.wait_for(std::chrono::milliseconds(kGwWaitMs)) != std::future_status::ready)
+      return reply_err(res, "INTERNAL", "release queued; gw has not answered within 50 ms: the stream's mkt row shows the outcome");
+    if (!f.get()) return reply_err(res, "UNKNOWN_MARKET", tk + " is not held by Manual");
+    reply_json(res, 200, json{{"ok", true}});
   }));
   svr.Post("/api/watch", post("POST /api/watch", [this](const httplib::Request&, httplib::Response& res, const json& b) {
     if (!d.watch) return reply_err(res, "UNKNOWN_MARKET", "no markets are listed in this stage");
     const json answer = d.watch(b);
     reply_json(res, answer.value("ok", false) ? 200 : err_http(answer.at("err").at("code")), answer);
   }));
-  svr.Post("/api/transfer", post("POST /api/transfer", [](const httplib::Request&, httplib::Response& res, const json&) {
-    reply_err(res, "NO_CASH", "no shard balances in this stage");
+  svr.Post("/api/transfer", post("POST /api/transfer", [this](const httplib::Request&, httplib::Response& res, const json& b) {
+    // the ticket's MOVE: gw checks the source's free cash, send-k1 writes it, the answer waits for the venue's
+    auto shard = [](const std::string& id) {
+      if (id.size() < 2 || id.size() > 3 || id[0] != 'S' || !std::all_of(id.begin() + 1, id.end(), ::isdigit)) return -1;
+      return std::stoi(id.substr(1));
+    };
+    TransferIntent t;
+    t.from = shard(b.at("from").get<std::string>());
+    t.to = shard(b.at("to").get<std::string>());
+    t.amount = parse_money(b.at("amt").get<std::string>()).value_or(0);
+    if (t.from < 0 || t.to < 0) return reply_err(res, "BAD_REQUEST", "from and to are Kalshi shards (S0, S1, ...)");
+    t.reply = std::make_shared<std::promise<TransferReply>>();
+    auto f = t.reply->get_future();
+    if (!d.gw->post(std::move(t))) return reply_err(res, "INTERNAL", "gw inbox full: transfer not queued");
+    OrderWaiter w(order_waiting);
+    if (!w.ok) return reply_err(res, "INTERNAL", "transfer queued; the header's shard cash shows the outcome");
+    if (f.wait_for(std::chrono::milliseconds(kOrderWaitMs)) != std::future_status::ready)
+      return reply_err(res, "EXCHANGE", "transfer queued; no answer within 3000 ms: the header's shard cash shows the outcome");
+    const TransferReply r = f.get();
+    if (!r.code.empty()) return reply_err(res, r.code, r.msg);
+    reply_json(res, 200, json{{"ok", true}, {"shards", json::parse(r.shards)}});
   }));
   // Any other POST: the token first, like every POST, then 404 (until 2026-10-06 an unknown
   // path answered 404 before the token was looked at)
@@ -544,6 +749,13 @@ WebServer::WebServer(WebDeps deps) : impl_(new Impl(std::move(deps))) { impl_->r
 WebServer::~WebServer() { stop(); }
 
 int WebServer::bind(int port, std::string* err) {
+  // SO_REUSEADDR alone, never httplib's default SO_REUSEPORT: with it a second deskd on the same
+  // port bound without an error and the kernel shared the page's connections between the two
+  // (a paper and a live desk on one port: each click to either). Now the second one is refused.
+  impl_->svr.set_socket_options([](socket_t s) {
+    int one = 1;
+    ::setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+  });
   int bound = 0;
   if (port == 0) {
     bound = impl_->svr.bind_to_any_port("127.0.0.1");
@@ -568,10 +780,12 @@ void WebServer::stop() {
   // chunk. svr.stop() at once cut them off mid-response instead (httplib's chunked loop leaves on
   // is_shutting_down() before the provider's sink.done()): the browser logged
   // ERR_INCOMPLETE_CHUNKED_ENCODING on every SIGTERM. Wait up to 300 ms for them.
-  impl_->d.pub->streams().close_all();
-  const std::int64_t end = mono_ms() + 300;
-  while (impl_->d.pub->streams().open_count() > 0 && mono_ms() < end)
-    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  if (impl_->d.pub) {
+    impl_->d.pub->streams().close_all();
+    const std::int64_t end = mono_ms() + 300;
+    while (impl_->d.pub->streams().open_count() > 0 && mono_ms() < end)
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
   impl_->svr.stop();
 }
 
