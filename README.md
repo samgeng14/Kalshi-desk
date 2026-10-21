@@ -43,6 +43,9 @@ one-liner that makes it are in the script's docstring; `docs/wcbb_model.md` is t
 With that file present, deskd shows the model's fair on those ladders while a game is on, from
 the pregame Kalshi price it saw before tip. Without it there is no fair, and the log says so.
 
+Research reads `ops-research.sqlite`, the copy the desk writes beside `ops.sqlite` after each ET
+midnight, never the live file. `/ops/status` shows the live file's size; past 1 GB the desk alerts.
+
 Each desk's log also goes to `deskd.log` in its data directory. After anything odd, run
 `python3 tools/desk.py report` (or `report live`): the run state and why, any stopped sender, and
 every KILL, refusal and unsent order from the log. On PAPER, Systematic has lane D1 PAPER, on from

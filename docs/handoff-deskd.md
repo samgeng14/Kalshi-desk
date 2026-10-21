@@ -64,7 +64,27 @@ partial, 141 missing) set this round's order: what protects money before LIVE fi
   the Mac from the WCBB panel; `deskd-wcbb` checks the C++ side against a synthetic file the
   trainer wrote. Systematic use waits for the plan's gate (150+ settled games, held-out Brier at
   least the mid's, positive overlay markouts).
-- **Still open, deliberately:** Stop by batch cancel (per-order cancels work); adopting the last
+- **More safety and hygiene (later the same day):**
+  - The equity floor's HALT (plan section 4, limit 5) lasts until a Start with the account's
+    equity back over the floor, across days and restarts; the daily stop's still ends at ET
+    midnight, and Start's refusal names the HALT it is.
+  - LIP-15's 0.5 sigma pull works on every window it quotes (it needed a strike-checked window
+    before); the 50-window replication counts are kept in `data_dir/replication.json`, so a
+    restart no longer sends the anchor gate back to 0.
+  - A foreign order blocks its market for Systematic too (tested: lanes go through the same
+    admission as a click).
+  - `ops.sqlite`: its size is in `/ops/status` (store.size_bytes) with a CRIT past 1 GB, and after
+    each ET midnight the store writes `ops-research.sqlite` beside it (VACUUM INTO, then a rename):
+    research reads that copy, never the live file.
+  - The screen: a stream silent 3 s is reopened and resynced (was 5 s; it already greyed at 3 s),
+    every tab redraws when Safari shows the page again, and the watchlist's ESPN number greys once
+    its play is over 30 s old.
+  - The recorder review's six findings are fixed with tests (restart backfill of markets that
+    closed while it was down, the restart window from the socket's last frame, the control pick
+    hour, a torn spool line in the gaps report, base.sh's package checks and chrony order).
+- **Still open, deliberately:** Manual order groups (KILL's cancel-all and the batch sweep cover
+  what they would add); exit 75 and the supervisor (the plan returns the LaunchAgent only once
+  deskd is the production binary: your call); Stop by batch cancel (per-order cancels work); adopting the last
   run's own resting orders at start (short expiries; cash accounting risk); `cancel_epoch` (needs
   a browser-side sequence to be correct); the money ledger (settlements endpoint unverified); S1
   arbitrage (week 4; the plan's own evidence puts it at about $0); Polymarket (needs the account);
