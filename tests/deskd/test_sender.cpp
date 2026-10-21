@@ -113,7 +113,8 @@ void permits_and_kill() {
   const auto cancelled=h.wait("",WireOp::CANCEL_ALL);
   CHECK(cancelled.outcome.kind==Kind::ACK && h.cancel->kill_seen()==h.kill.generation());
   CHECK(h.kill.rearm_ms()>=tripped && h.kill.rearm_ms()>=cancelled.ack_ms+59000);
-  CHECK(h.venue.orders()==0 && h.venue.f->http_requests()==1);
+  // no create reached the venue: the cancel-all and the sweep's read are all it saw
+  CHECK(h.venue.orders()==0 && until([&]{return h.venue.f->http_requests()==2;}));
   release.set_value(); wg.request_stop(); wg.join();
 
   Harness fresh;
@@ -137,11 +138,29 @@ void lost_result_and_unconfirmed_kill() {
   cx.kill.trip(now_ms(),mono_ms(),"test");
   CHECK(cx.wait("",WireOp::CANCEL_ALL).outcome.kind==Kind::UNKNOWN);
   CHECK(!cx.cancel->healthy() && cx.kill.active());
-  CHECK(cx.venue.f->http_requests()==1);
+  // the cancel-all, then the sweep's read of what still rests (nothing); no second cancel-all
+  CHECK(until([&]{return cx.venue.f->http_requests()==2;}));
   // A second explicit KILL sends again; no automatic retry hides an uncertain operation.
   cx.kill.trip(now_ms(),mono_ms(),"test again");
   CHECK(cx.wait("",WireOp::CANCEL_ALL,1).outcome.kind==Kind::ACK);
-  CHECK(cx.venue.f->http_requests()==2);
+  CHECK(until([&]{return cx.venue.f->http_requests()==4;}));
+}
+// KILL's sweep (plan section 3: "batch cancel of anything still listed"): a cancel-all the venue
+// dropped unread leaves two orders resting; the sweep reads them and batch-cancels both, and the
+// cancel sender still says its cancel-all is unconfirmed (press KILL again).
+void kill_sweeps_leftovers() {
+  Harness h; h.start();
+  CHECK(h.qm.push(h.order("Mleft-1"))); CHECK(h.qm.push(h.order("Mleft-2")));
+  CHECK(h.wait("Mleft-1").outcome.kind==Kind::ACK && h.wait("Mleft-2").outcome.kind==Kind::ACK);
+  auto resting=[&]{ return h.venue.f->with_engine([](fakex::Engine& e,std::int64_t) {
+    int n=0; for(const fakex::Order* o:e.user_orders()) if(o->status==fakex::OrdStatus::RESTING) ++n; return n; }); };
+  CHECK(resting()==2);
+  fakex::HttpFault fault; fault.kind=fakex::HttpFault::Kind::DROP_BEFORE_REPLY;
+  fault.method="DELETE"; fault.path="/portfolio/events/orders"; h.venue.f->add_fault(fault);
+  h.kill.trip(now_ms(),mono_ms(),"test");
+  CHECK(h.wait("",WireOp::CANCEL_ALL).outcome.kind!=Kind::ACK);
+  CHECK(until([&]{return resting()==0;}));
+  CHECK(!h.cancel->healthy());
 }
 // A refusal that says the desk is wrong trips KILL and stops send-k1 (RO), with the reason kept.
 // It comes back only after a cancel-all sent after the failure is confirmed and KILL is re-armed;
@@ -171,7 +190,8 @@ void hard_refusal_recovers() {
   CHECK(rl.qm.push(rl.order("Mrest-1"))); CHECK(rl.wait("Mrest-1").outcome.kind==Kind::ACK);
   rl.kill.trip(now_ms(),mono_ms(),"operator");
   CHECK(rl.wait("",WireOp::CANCEL_ALL).outcome.kind==Kind::ACK);
-  CHECK(rl.venue.f->http_requests()==3 && rl.cancel->healthy() && rl.cancel->fail_reason().empty());
+  // the create, the 429, the cancel-all again, then the sweep's read
+  CHECK(until([&]{return rl.venue.f->http_requests()==4;}) && rl.cancel->healthy() && rl.cancel->fail_reason().empty());
   CHECK(rl.kill.confirmed_gen()==rl.kill.generation());
   CHECK(rl.venue.f->with_engine([](fakex::Engine& e,std::int64_t) {return e.reserved(0,0);})==0);
 
@@ -261,6 +281,6 @@ void kill_overtakes_inflight_create() {
 }
 int main() {
   std::signal(SIGPIPE,SIG_IGN);
-  writes_and_faults(); permits_and_kill(); lost_result_and_unconfirmed_kill(); hard_refusal_recovers(); systematic_role(); kill_overtakes_inflight_create();
+  writes_and_faults(); permits_and_kill(); lost_result_and_unconfirmed_kill(); hard_refusal_recovers(); systematic_role(); kill_overtakes_inflight_create(); kill_sweeps_leftovers();
   return finish("deskd-sender");
 }

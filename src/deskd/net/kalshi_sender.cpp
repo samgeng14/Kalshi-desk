@@ -100,7 +100,7 @@ void KalshiSender::deliver(KalshiWriteReply reply) {
   if(!queued) fail_closed("sender result queue lost an order update; reconcile before trading");
 }
 KalshiWriteReply KalshiSender::execute(kalshi::WireRequest request,const std::string& cid,
-                                      Worker& self,const KalshiWriteJob* job) {
+                                      Worker& self,const KalshiWriteJob* job,bool trip) {
   KalshiWriteReply r; r.cid=cid; r.op=request.op; r.entered_ms=now_ms();
   r.outcome.kind=kalshi::WriteOutcome::Kind::NOT_SENT;
   auto refused=[&](const std::string& code,const std::string& why) {
@@ -145,7 +145,7 @@ KalshiWriteReply KalshiSender::execute(kalshi::WireRequest request,const std::st
   }
   // a refused transfer (not enough free cash, transfers paused) is the operator's to read, not a
   // fault in the order path
-  if(r.outcome.kind==kalshi::WriteOutcome::Kind::REFUSED && reject_trips_kill(r.outcome.cls) && request.op!=WireOp::TRANSFER) {
+  if(trip && r.outcome.kind==kalshi::WriteOutcome::Kind::REFUSED && reject_trips_kill(r.outcome.cls) && request.op!=WireOp::TRANSFER) {
     // the venue's own words, so the KILL says which write and why (2026-10-13: a KILL on demo
     // could not be told from an operator's click)
     std::string text=r.outcome.why.substr(0,160);
@@ -198,6 +198,71 @@ void KalshiSender::take_kill(Worker& self) {
       DLOG_WARN("KILL: order group %s on shard %d not triggered: %s",id.c_str(),shard,g.outcome.why.c_str());
     deliver(std::move(g));
   }
+  sweep_resting(self,generation);
+}
+bool KalshiSender::read(kalshi::WireRequest request,Worker& self,std::string* body,std::string* why) {
+  bool miss=false;
+  auto conn=pool_.take(options_.connect_ms,&miss,why);
+  self.beat();
+  if(!conn) { if(why->empty()) *why="no guarded venue connection"; return false; }
+  const auto& ep=pool_.config().endpoint;
+  const std::string base=kalshi::kBasePath;
+  if(request.path.compare(0,base.size(),base)!=0) { *why="unexpected read path"; return false; }
+  request.path.replace(0,base.size(),ep.base_path);
+  const auto headers=signer_.headers(now_ms(),request.method,request.path);
+  if(headers.size()!=3) { *why="request signing failed"; return false; }
+  const auto x=net::exchange(*conn,kalshi::request_bytes(request,ep.host_header(),headers),
+                             net::mono_us()+1000LL*options_.reply_ms,false,[&]{self.beat();});
+  conn.reset();
+  if(x.fate!=net::Exchange::Fate::REPLIED) { *why=x.why.empty() ? "no reply" : x.why; return false; }
+  if(x.res.status!=200) { *why="HTTP "+std::to_string(x.res.status); return false; }
+  *body=x.res.body;
+  return true;
+}
+// KILL's last step (plan section 3: "batch cancel of anything still listed"): the account's
+// resting orders as the venue lists them now, cancelled 20 at a time per shard. The cancel-all
+// has normally taken them all, so this finds nothing unless one slipped past it (a create still
+// on the wire, a cancel-all that went unconfirmed). A failed read or batch is logged: KILL's
+// cancel-all and group triggers have already gone.
+void KalshiSender::sweep_resting(Worker& self,std::uint64_t generation) {
+  std::vector<kalshi::OrderRow> rows;
+  std::string why;
+  kalshi::ListQuery q; q.status="resting"; q.limit=1000;
+  for(int page=0;;++page) {
+    if(page==10) { DLOG_WARN("KILL: more than 10 pages of resting orders; batch-cancelling the first 10"); break; }
+    std::string body;
+    if(!read(kalshi::build_get_orders(q),self,&body,&why)) {
+      DLOG_WARN("KILL: resting orders not read after the cancel-all (%s); press KILL again if any remain",why.c_str());
+      return;
+    }
+    auto p=kalshi::parse_orders(body,&why);
+    if(!p) { DLOG_WARN("KILL: resting orders unreadable (%s)",why.c_str()); return; }
+    rows.insert(rows.end(),p->rows.begin(),p->rows.end());
+    if(p->cursor.empty()) break;
+    q.cursor=p->cursor;
+  }
+  std::map<int,std::vector<kalshi::BatchCancelItem>> by_shard;
+  for(const auto& r:rows)
+    if(r.status==kalshi::OrderStatus::RESTING && r.remaining>0 && !r.order_id.empty()) {
+      const int shard=r.exchange_index.value_or(0);
+      by_shard[shard].push_back(kalshi::BatchCancelItem{r.order_id,shard,r.ticker,-1});
+    }
+  std::size_t listed=0,cancelled=0;
+  for(const auto& [shard,items]:by_shard) {
+    listed+=items.size();
+    for(std::size_t i=0;i<items.size();i+=kalshi::kBatchCancelMax) {
+      if(kill_.generation()!=generation || self.stopping()) return;   // a newer KILL sweeps again
+      const std::vector<kalshi::BatchCancelItem> chunk(items.begin()+static_cast<std::ptrdiff_t>(i),
+          items.begin()+static_cast<std::ptrdiff_t>(std::min(items.size(),i+kalshi::kBatchCancelMax)));
+      kalshi::WireRequest request;
+      if(!kalshi::build_batch_cancel(chunk,&request,&why)) { DLOG_WARN("KILL: batch cancel not built: %s",why.c_str()); continue; }
+      const auto r=execute(std::move(request),"",self,nullptr,false);
+      if(r.outcome.kind==kalshi::WriteOutcome::Kind::ACK) cancelled+=chunk.size();
+      else DLOG_WARN("KILL: batch cancel of %zu order(s) on shard %d: %s",chunk.size(),shard,
+                     (r.outcome.why.empty() ? r.local_code : r.outcome.why).substr(0,160).c_str());
+    }
+  }
+  if(listed) DLOG_WARN("KILL: %zu order(s) still listed resting after the cancel-all; %zu batch-cancelled",listed,cancelled);
 }
 void KalshiSender::run(Worker& self) {
   while(!self.stopping()) {

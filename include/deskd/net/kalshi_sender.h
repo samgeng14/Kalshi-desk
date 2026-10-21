@@ -101,10 +101,15 @@ class KalshiSender {
   GroupRegistry* groups_ = nullptr;
   std::atomic<std::uint64_t> kill_seen_{0}, attempted_{0};
   std::string admission(const KalshiWriteJob& job, const Worker& self) const;
+  // trip: a hard refusal stops this sender (fail_closed); KILL's sweep passes false, so a batch
+  // cancel the venue refuses is logged, never a second stop
   KalshiWriteReply execute(kalshi::WireRequest request, const std::string& cid,
-                          Worker& self, const KalshiWriteJob* job);
+                          Worker& self, const KalshiWriteJob* job, bool trip = true);
+  // a signed GET on this sender's connections: the body of a 200, else false and why
+  bool read(kalshi::WireRequest request, Worker& self, std::string* body, std::string* why);
   void deliver(KalshiWriteReply reply);
   void take_kill(Worker& self);
+  void sweep_resting(Worker& self, std::uint64_t generation);
   void fail_closed(const std::string& why);
 };
 }
