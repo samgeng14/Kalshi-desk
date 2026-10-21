@@ -27,7 +27,7 @@ LaneSpec paper_lane() {
 }
 
 SysBook::SysBook(std::vector<LaneSpec> lanes) : lanes_(std::move(lanes)) {
-  for (const auto& l : lanes_) if (l.on_at_start && l.engine) on_.insert(l.id);
+  for (const auto& l : lanes_) if (l.on_at_start && l.engine && l.gate_why.empty()) on_.insert(l.id);
 }
 
 const LaneSpec* SysBook::lane(const std::string& id) const {
@@ -74,10 +74,16 @@ bool SysBook::fill(const std::string& lane, const std::string& cid, const std::s
   if (count <= 0) return false;
   if (!trade_id.empty() && !trades_.insert(trade_id).second) return false;
   auto& d = days_[lane];
+  auto& life = lives_[lane];
   ++d.fills;
   d.hit.insert(cid);
+  if (life.hit.add(cid)) {
+    ++life.trades;
+    if (!life.first_ms) life.first_ms = at;
+  }
   d.ctrs += count;
   d.fees += fee;
+  life.fees += fee;
   d.last_ms = at;
   auto& inv = d.inv[ticker];
   Qty left = count;
@@ -87,7 +93,9 @@ bool SysBook::fill(const std::string& lane, const std::string& cid, const std::s
     const Qty c = std::min(left, open);
     const Micros avg_part = inv.cost / open * c + (inv.cost % open) * c / open;   // cost of the closed part
     const Micros at_px = px * c;
-    d.real += side == Side::SELL ? at_px - avg_part : avg_part - at_px;
+    const Micros real = side == Side::SELL ? at_px - avg_part : avg_part - at_px;
+    d.real += real;
+    life.real += real;
     inv.cost -= avg_part;
     inv.pos += side == Side::BUY ? c : -c;
     left -= c;
@@ -109,6 +117,7 @@ Micros SysBook::settle(const std::string& lane, const std::string& ticker, Px va
   const Micros worth = value * std::abs(inv.pos);
   const Micros pnl = inv.pos > 0 ? worth - inv.cost : inv.cost - worth;
   dit->second.real += pnl;
+  lives_[lane].real += pnl;
   dit->second.last_ms = at;
   dit->second.inv.erase(it);
   return pnl;
@@ -206,6 +215,67 @@ Micros SysBook::day_total(const MarkFn& mark) const {
   return t;
 }
 
+bool SysBook::Ids::add(const std::string& id) {
+  if (!in.insert(id).second) return false;
+  order.push_back(id);
+  while (order.size() > kLifeIds) {
+    in.erase(order.front());
+    order.pop_front();
+  }
+  return true;
+}
+
+const SysBook::Life* SysBook::life(const std::string& lane) const {
+  const auto it = lives_.find(lane);
+  return it == lives_.end() ? nullptr : &it->second;
+}
+
+bool SysBook::markout(const std::string& lane, const std::string& fid, const std::string& h, Money mo_net, Qty qty) {
+  const auto* l = this->lane(lane);
+  if (!l || l->retire_h.empty() || h != l->retire_h || qty <= 0) return false;
+  auto& life = lives_[lane];
+  if (!life.mo_fids.add(fid)) return false;
+  ++life.mo_n;
+  life.mo_ctrs += qty;
+  life.mo_sum += mo_net * qty;
+  return true;
+}
+
+std::string SysBook::retire_due(const LaneSpec& l, const MarkFn& mark) const {
+  const auto* f = life(l.id);
+  if (f && f->retired) return "";
+  // the loss rule, at any count: realized less fees over its life, its open positions at the mark
+  if (l.retire_loss > 0) {
+    const Micros pnl = (f ? f->real - f->fees : 0) + unrealized(l.id, mark);
+    if (pnl <= -l.retire_loss)
+      return "down $" + money_str(-pnl / 100) + " over its life, its limit $" + money_str(l.retire_loss / 100);
+  }
+  if (!f || l.retire_trades <= 0 || f->trades < l.retire_trades) return "";
+  if (l.retire_rule == LaneSpec::RetireRule::CAP)
+    return "its cap of " + std::to_string(l.retire_trades) + " trades";
+  if (l.retire_rule == LaneSpec::RetireRule::MARKOUT && f->mo_n >= kRetireMarked && f->mo_sum <= 0)
+    return std::to_string(f->trades) + " trades, mean net " + l.retire_h + " markout " + money_str(f->mo_sum / f->mo_ctrs) +
+           " over " + std::to_string(f->mo_n) + " marked";
+  return "";
+}
+
+bool SysBook::retire(const std::string& lane, std::int64_t at, const std::string& why) {
+  if (!this->lane(lane)) return false;
+  auto& life = lives_[lane];
+  if (life.retired) return false;
+  life.retired = true;
+  life.retired_ms = at;
+  life.retired_why = why;
+  on_.erase(lane);
+  return true;
+}
+
+bool SysBook::reset_life(const std::string& lane) {
+  if (!this->lane(lane)) return false;
+  lives_.erase(lane);
+  return true;
+}
+
 json SysBook::to_json(const Halt& halt, std::int64_t saved_ms) const {
   json lanes = json::object();
   for (const auto& [lane, d] : days_) {
@@ -214,8 +284,13 @@ json SysBook::to_json(const Halt& halt, std::int64_t saved_ms) const {
     lanes[lane] = {{"sent", d.sent}, {"fills", d.fills}, {"hit", d.hit}, {"ctrs", d.ctrs}, {"fees", d.fees},
                    {"real", d.real}, {"last_ms", d.last_ms}, {"inv", inv}};
   }
+  json lives = json::object();
+  for (const auto& [lane, f] : lives_)
+    lives[lane] = {{"trades", f.trades}, {"real", f.real}, {"fees", f.fees}, {"hit", f.hit.order}, {"first_ms", f.first_ms},
+                   {"mo_n", f.mo_n}, {"mo_ctrs", f.mo_ctrs}, {"mo_sum", f.mo_sum}, {"mo_fids", f.mo_fids.order},
+                   {"retired", f.retired}, {"retired_ms", f.retired_ms}, {"retired_why", f.retired_why}};
   return {{"v", 1}, {"saved_ms", saved_ms}, {"day_start_ms", day_start_ms_}, {"trades", trades_}, {"lanes", lanes},
-          {"halt", halt.on ? json{{"ms", halt.ms}, {"why", halt.why}} : json(nullptr)}};
+          {"life", lives}, {"halt", halt.on ? json{{"ms", halt.ms}, {"why", halt.why}} : json(nullptr)}};
 }
 
 bool SysBook::restore(const json& j, std::int64_t day_start_ms, Halt* halt, std::string* why) {
@@ -242,6 +317,31 @@ bool SysBook::restore(const json& j, std::int64_t day_start_ms, Halt* halt, std:
       }
       days[lane] = std::move(d);
     }
+    // lives, on any day; none in a book saved before they were kept, and each lane starts afresh
+    std::map<std::string, Life> lives;
+    if (j.contains("life")) {
+      if (!j.at("life").is_object()) {
+        if (why) *why = "malformed: its life is not an object";
+        return false;
+      }
+      for (const auto& [lane, x] : j.at("life").items()) {
+        if (!this->lane(lane)) continue;
+        Life f;
+        f.trades = x.at("trades").get<int>();
+        f.real = x.at("real").get<Micros>();
+        f.fees = x.at("fees").get<Micros>();
+        for (const auto& id : x.at("hit").get<std::vector<std::string>>()) f.hit.add(id);
+        f.first_ms = x.at("first_ms").get<std::int64_t>();
+        f.mo_n = x.at("mo_n").get<std::int64_t>();
+        f.mo_ctrs = x.at("mo_ctrs").get<Qty>();
+        f.mo_sum = x.at("mo_sum").get<std::int64_t>();
+        for (const auto& id : x.at("mo_fids").get<std::vector<std::string>>()) f.mo_fids.add(id);
+        f.retired = x.at("retired").get<bool>();
+        f.retired_ms = x.at("retired_ms").get<std::int64_t>();
+        f.retired_why = x.at("retired_why").get<std::string>();
+        lives[lane] = std::move(f);
+      }
+    }
     std::set<std::string> trades;
     if (today) trades = j.at("trades").get<std::set<std::string>>();
     Halt h;
@@ -250,6 +350,8 @@ bool SysBook::restore(const json& j, std::int64_t day_start_ms, Halt* halt, std:
       if (today || saved.floor()) h = saved;   // a floor HALT outlives the day
     }
     days_ = std::move(days);
+    lives_ = std::move(lives);
+    for (const auto& [lane, f] : lives_) if (f.retired) on_.erase(lane);
     trades_ = std::move(trades);
     day_start_ms_ = day_start_ms;
     if (halt) *halt = h;
@@ -269,8 +371,16 @@ json SysBook::lane_json(const LaneSpec& l, RunState run, Micros reserved, int wo
   const Micros cap_left = std::max<Micros>(0, std::min(budget - used, eff_left));
   std::string state = "ON", why;
   const bool is_on = on(l.id);
-  if (!is_on) state = "OFF";
-  else if (run != RunState::RUN) {
+  const auto* f = life(l.id);
+  if (f && f->retired) {
+    state = "OFF";
+    why = "retired: " + f->retired_why;
+  } else if (!l.gate_why.empty()) {
+    state = "OFF";
+    why = l.gate_why;
+  } else if (!is_on) {
+    state = "OFF";
+  } else if (run != RunState::RUN) {
     state = "OFF";
     why = run == RunState::KILLED ? "KILLED" : run == RunState::HALTED ? "HALTED" : "STOP";
   } else if (!blocked.empty()) {
@@ -281,7 +391,7 @@ json SysBook::lane_json(const LaneSpec& l, RunState run, Micros reserved, int wo
     why = "budget used";
   }
   auto money = [](Micros m) { return money_str(m / 100); };
-  return {{"id", l.id}, {"name", l.name}, {"venue", "K"}, {"state", state}, {"on", is_on}, {"style", l.style},
+  return {{"id", l.id}, {"name", l.name}, {"venue", l.venue}, {"state", state}, {"on", is_on}, {"style", l.style},
           {"budget", money(budget)}, {"used", money(used)}, {"open", money(open)}, {"wrk", working},
           {"sent", d ? d->sent : 0}, {"hit", d ? static_cast<int>(d->hit.size()) : 0}, {"fills", d ? d->fills : 0},
           {"ctrs", qty_to_number(d ? d->ctrs : 0)}, {"fees", money(fees)}, {"real", money(real)}, {"unrl", money(unrl)},

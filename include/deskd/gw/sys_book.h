@@ -27,7 +27,14 @@
 // Fills arrive twice, from the private feed and from each REST read, and each counts once by its
 // trade id. A settlement (the market's result, from REST) realizes the position at $1 or $0.
 // to_json / restore carry the book across a restart: the day, the positions and HALT.
+//
+// A lane's life (plan 5(d) and 5(e)'s kill rules): its trades, realized P&L and fees since it
+// was first traded or last reset, never rolled at midnight, and its net markouts at the horizon
+// its retire rule reads. A lane whose rule fires is retired: off, and kept off across restarts
+// until deskctl lane-reset clears its life (decisions 9). Lanes without a rule never retire.
+#include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <map>
 #include <optional>
@@ -56,6 +63,20 @@ struct LaneSpec {
   // D1 PAPER: gw refuses its orders on the production account (ManualPath::live), and deskd lists
   // it only on demo; on at start, so START on PAPER trades at once (other lanes start off)
   bool paper_only = false, on_at_start = false;
+  // the venue it trades (contract LANE_VENUE: K, P, or KP for both), and its budget family: the
+  // lanes of one family ("ARB": S1 and W1) share a cap besides their own budgets; "" = none
+  std::string venue = "K", family = "";
+  Micros event_cap = 0;   // a cap on its worst case in one event (one game), besides the group's; 0 = none
+  std::string gate_why = "";   // why its evidence gate keeps it off; "" = open
+  // Retirement (SysBook::retire_due): CAP after retire_trades trades; MARKOUT at retire_trades
+  // trades or more once SysBook::kRetireMarked fills are marked at retire_h ("300s") and their mean
+  // net markout is <= 0; and under any rule, NONE too, once its life's P&L (real - fees +
+  // unrealized at the mark) is down retire_loss, at any count. 0 = no such rule.
+  enum class RetireRule { NONE, CAP, MARKOUT };
+  int retire_trades = 0;
+  RetireRule retire_rule = RetireRule::NONE;
+  Micros retire_loss = 0;
+  std::string retire_h = "";
 };
 const std::vector<LaneSpec>& default_lanes();
 // D1 PAPER (strat/maker.h paper_quote): $20, 2 contracts a market, any market; demo only
@@ -130,6 +151,41 @@ class SysBook {
   Micros day_total(const MarkFn& mark) const;
   std::int64_t day_start_ms() const { return day_start_ms_; }
 
+  // ---- a lane's life
+  // the newest kLifeIds ids, to count each once: a cid's fills and a fill's markout come within
+  // minutes, so one this old does not come again; oldest first
+  static constexpr std::size_t kLifeIds = 500;
+  struct Ids {
+    std::deque<std::string> order;
+    std::set<std::string> in;
+    bool add(const std::string& id);   // false: already there
+  };
+  static constexpr int kRetireMarked = 50;   // MARKOUT reads the mean once this many are marked
+  struct Life {
+    int trades = 0;                     // orders (cids) with any fill
+    Micros real = 0, fees = 0;          // as Day's, never rolled
+    Ids hit;                            // the cids counted
+    std::int64_t first_ms = 0;          // its first trade; 0 = none yet
+    std::int64_t mo_n = 0;              // fills marked at the lane's retire_h
+    Qty mo_ctrs = 0;                    // their contracts
+    std::int64_t mo_sum = 0;            // their net markout, Money x Qty (the mean: mo_sum / mo_ctrs)
+    Ids mo_fids;                        // the fills marked
+    bool retired = false;
+    std::int64_t retired_ms = 0;
+    std::string retired_why;
+  };
+  const Life* life(const std::string& lane) const;
+  // a fill's net markout (per contract, + in our favour) at horizon h: counted when h is the
+  // lane's retire_h; false: not counted (no such lane, another horizon, the fid already counted)
+  bool markout(const std::string& lane, const std::string& fid, const std::string& h, Money mo_net, Qty qty);
+  // why l's retire rule fires now; "" when it does not, or the lane is already retired
+  std::string retire_due(const LaneSpec& l, const MarkFn& mark) const;
+  // retired from `at` for `why`, and off; false: no such lane, or already retired (the first
+  // retirement stays)
+  bool retire(const std::string& lane, std::int64_t at, const std::string& why);
+  // a fresh life: no trades, markouts or retirement (deskctl lane-reset); false: no such lane
+  bool reset_life(const std::string& lane);
+
   // ---- across a restart
   struct Halt {
     bool on = false;
@@ -141,11 +197,12 @@ class SysBook {
     static constexpr const char* kFloorWhy = "equity floor";
   };
   nlohmann::json to_json(const Halt& halt, std::int64_t saved_ms) const;
-  // A saved book: positions always; the day's counters, trade ids and a daily-stop HALT only when
+  // A saved book: positions and lives always (a retired lane stays off; a book saved before lives
+  // were kept starts each afresh); the day's counters, trade ids and a daily-stop HALT only when
   // it was saved on the ET day that began at day_start_ms (a floor HALT on any day). false (and
   // nothing changed) on a malformed one.
   bool restore(const nlohmann::json& j, std::int64_t day_start_ms, Halt* halt, std::string* why);
-  // the contract's lane row
+  // the contract's lane row; a retired or gated lane is OFF with why it is
   // lip: the lane's LIP estimate today (strat/lip.h), its own line: never in "day" or the stop
   nlohmann::json lane_json(const LaneSpec& l, RunState run, Micros reserved, int working, Micros eff_left,
                            const MarkFn& mark, const std::string& blocked, Micros lip = 0) const;
@@ -155,6 +212,7 @@ class SysBook {
   std::set<std::string> on_;
   std::map<std::pair<std::string, int>, Group> groups_;
   std::map<std::string, Day> days_;
+  std::map<std::string, Life> lives_;
   std::set<std::string> trades_;   // today's counted trade ids, every lane
   std::int64_t day_start_ms_ = 0;
 };
