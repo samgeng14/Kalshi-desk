@@ -36,6 +36,7 @@ struct ManualPath;
 struct KalshiWriteReply;
 struct PrivateEvent;
 namespace rest { struct Snapshot; }
+namespace kalshi { struct FillRow; }
 
 class Gateway {
  public:
@@ -235,6 +236,9 @@ class Gateway {
   std::int64_t snapshot_polled_ms_ = 0;       // gw's last look for a new account read
   void settle_uncertain(const rest::Snapshot& s);
   void flush_cancel(const std::string& cid);
+  void fill_applied(const kalshi::FillRow& f, std::string cid, std::int64_t at, bool live);
+  void reconcile_working(const rest::Snapshot& s);
+  std::int64_t fills_asked_ms_ = 0;   // the last account read asked for missing fills
   static constexpr std::int64_t kExpiryBackupMs = 1500;   // plan section 3: TTL + 1.5 s
   std::set<std::string> expiry_asked_;                     // backup cancels already asked
   void expiry_sweep(std::int64_t now);

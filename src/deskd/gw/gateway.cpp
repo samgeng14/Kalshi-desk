@@ -593,39 +593,46 @@ void Gateway::manual_private(const PrivateEvent& e) {
       return;
     }
     if (r != OrderLedger::FillResult::APPLIED) return;
-    cid = e.cid;
-    if (sys_) {
-      const OrderLedger::Order* o = cid.empty() ? nullptr : ledger.find(cid);
-      if (!o) for (const auto& [c, x] : ledger.orders()) if (x.oid == e.fill.order_id) o = &x;
-      if (o && o->intent.owner == Owner::SYS) {
-        if (sys_->fill(o->intent.lane, o->intent.cid, e.fill.ticker,
-                       e.fill.side == kalshi::BookSide::BID ? Side::BUY : Side::SELL, e.fill.count, e.fill.yes_price,
-                       e.fill.fee, at, fill_key(e.fill)))
-          sys_save_due_ = true;
-        lanes_dirty_.insert(o->intent.lane);
-      }
-    }
+    stats_.private_applied.fetch_add(1);
+    fill_applied(e.fill, e.cid, at, true);
+    return;
   }
   stats_.private_applied.fetch_add(1);
-  if (cid.empty()) {
-    for (const auto& [c, o] : ledger.orders())
-      if (o.oid == (e.kind == PrivateEvent::Kind::ORDER ? e.order.order_id : e.fill.order_id)) cid = c;
+  if (cid.empty())
+    for (const auto& [c, o] : ledger.orders()) if (o.oid == e.order.order_id) cid = c;
+  if (const auto st = cid.empty() ? stamps_.end() : stamps_.find(cid); st != stamps_.end() && !st->second.priv)
+    st->second.priv = at;
+  if (!cid.empty()) {
+    publish_order(cid);
+    flush_cancel(cid);
+  }
+}
+
+// What follows a fill the ledger took (from the private feed, or from an account read when the
+// feed lost it): Systematic's lane position, the order's timeline, the fills table, the page.
+void Gateway::fill_applied(const kalshi::FillRow& f, std::string cid, std::int64_t at, bool live) {
+  auto& ledger = manual_->ledger();
+  const OrderLedger::Order* o = cid.empty() ? nullptr : ledger.find(cid);
+  if (!o) for (const auto& [c, x] : ledger.orders()) if (x.oid == f.order_id) o = &x;
+  if (o) cid = o->intent.cid;
+  if (sys_ && o && o->intent.owner == Owner::SYS) {
+    if (sys_->fill(o->intent.lane, o->intent.cid, f.ticker, f.side == kalshi::BookSide::BID ? Side::BUY : Side::SELL,
+                   f.count, f.yes_price, f.fee, at, fill_key(f)))
+      sys_save_due_ = true;
+    lanes_dirty_.insert(o->intent.lane);
   }
   if (const auto st = cid.empty() ? stamps_.end() : stamps_.find(cid); st != stamps_.end()) {
-    if (!st->second.priv) st->second.priv = at;
-    if (e.kind == PrivateEvent::Kind::FILL && !st->second.fill) st->second.fill = at;
+    if (live && !st->second.priv) st->second.priv = at;
+    if (!st->second.fill) st->second.fill = at;
   }
-  if (e.kind == PrivateEvent::Kind::FILL) {
-    const auto* o = cid.empty() ? nullptr : ledger.find(cid);
-    const auto& f = e.fill;
-    record("fills", nlohmann::json{{"fid", fill_key(f)}, {"cid", cid}, {"oid", f.order_id}, {"tk", f.ticker},
-                                   {"side", f.side == kalshi::BookSide::BID ? "BUY" : "SELL"}, {"qty", qty_to_number(f.count)},
-                                   {"px", price_str(f.yes_price)}, {"fee", money_str(f.fee / 100)}, {"taker", f.taker},
-                                   {"ts_ms", f.ts_ms}, {"recv_ms", at}, {"shard", f.exchange_index},
-                                   {"own", o ? (o->intent.owner == Owner::SYS ? "SYS" : "MAN") : "EXT"},
-                                   {"lane", o && !o->intent.lane.empty() ? nlohmann::json(o->intent.lane) : nlohmann::json(nullptr)}}
-                        .dump());
-  }
+  record("fills", nlohmann::json{{"fid", fill_key(f)}, {"cid", cid}, {"oid", f.order_id}, {"tk", f.ticker},
+                                 {"side", f.side == kalshi::BookSide::BID ? "BUY" : "SELL"}, {"qty", qty_to_number(f.count)},
+                                 {"px", price_str(f.yes_price)}, {"fee", money_str(f.fee / 100)}, {"taker", f.taker},
+                                 {"ts_ms", f.ts_ms}, {"recv_ms", at}, {"shard", f.exchange_index},
+                                 {"own", o ? (o->intent.owner == Owner::SYS ? "SYS" : "MAN") : "EXT"},
+                                 {"lane", o && !o->intent.lane.empty() ? nlohmann::json(o->intent.lane) : nlohmann::json(nullptr)},
+                                 {"src", live ? "ws" : "rest"}}
+                      .dump());
   if (!cid.empty()) {
     publish_order(cid);
     flush_cancel(cid);
@@ -886,6 +893,64 @@ void Gateway::settle_uncertain(const rest::Snapshot& s) {
                 cid.c_str(), ledger.find(cid)->why.c_str());
       publish_order(cid);
     }
+  }
+  reconcile_working(s);
+}
+
+// The private feed can drop an update (a socket gap, a reconnect): an order that filled or was
+// cancelled meanwhile would stay WORK, holding its reservation, until a later event that may never
+// come. So each account read begun after an order was sent settles it from the order's own row
+// when that row says more (ended, or more filled); observed() never resurrects an ended order or
+// lets an older row undo a newer update. And plan section 3's rule: an order whose cumulative
+// filled has run ahead of its fills for 5 s takes the account read's fills for it (deduplicated
+// by trade id); while none are there yet, rest is asked to read again.
+void Gateway::reconcile_working(const rest::Snapshot& s) {
+  auto& ledger = manual_->ledger();
+  std::map<std::string, const kalshi::OrderRow*> by_oid;
+  for (const auto& r : s.orders) by_oid[r.order_id] = &r;
+  std::vector<std::pair<std::string, const kalshi::OrderRow*>> moved;
+  for (const auto& [cid, o] : ledger.orders()) {
+    if (o.terminal() || o.uncertain || o.oid.empty() || !o.sent_ms || s.account_began_ms <= o.sent_ms + 1000) continue;
+    const auto it = by_oid.find(o.oid);
+    if (it == by_oid.end()) continue;
+    const auto& r = *it->second;
+    if (r.status != kalshi::OrderStatus::RESTING || r.filled > o.filled) moved.emplace_back(cid, &r);
+  }
+  for (const auto& [cid, row] : moved) {
+    const bool healthy = ledger.healthy();
+    if (ledger.observed(*row, s.account_ms)) {
+      const auto* after = ledger.find(cid);
+      DLOG_INFO("order %s: the private feed missed an update; the account read shows it %s", cid.c_str(),
+                after->json().value("st", "?").c_str());
+      publish_order(cid);
+      flush_cancel(cid);
+    } else if (healthy && !ledger.healthy()) {
+      DLOG_ERR("account read of order %s contradicts the order book: reconcile before trading", cid.c_str());
+    }
+  }
+  const auto due = ledger.fills_due(now_ms());
+  bool missing = false;
+  for (const auto& cid : due) {
+    const auto* o = ledger.find(cid);
+    if (!o || o->oid.empty()) continue;
+    const std::string oid = o->oid;
+    int applied = 0;
+    for (const auto& f : s.fills) {
+      if (f.order_id != oid) continue;
+      const auto r = ledger.fill(f, cid, s.account_ms, true);
+      if (r == OrderLedger::FillResult::APPLIED) { ++applied; fill_applied(f, cid, s.account_ms, false); }
+      else if (r == OrderLedger::FillResult::INVALID) {
+        DLOG_ERR("account read's fill %s contradicts the order book: reconcile before trading", f.trade_id.c_str());
+        return;
+      }
+    }
+    if (applied) DLOG_WARN("order %s: %d fill(s) the private feed did not deliver, taken from the account read", cid.c_str(), applied);
+    const auto* after = ledger.find(cid);
+    if (after && after->filled > after->executions) missing = true;
+  }
+  if (missing && path_->refresh && now_ms() - fills_asked_ms_ >= 5000) {
+    fills_asked_ms_ = now_ms();
+    path_->refresh();
   }
 }
 

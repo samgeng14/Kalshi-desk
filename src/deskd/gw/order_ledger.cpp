@@ -181,7 +181,7 @@ bool OrderLedger::observed(const kalshi::OrderRow& row, std::int64_t at) {
   o.left = std::min(o.left,o.intent.count-o.filled);
   missing(o,at); ++o.rev; return true;
 }
-OrderLedger::FillResult OrderLedger::fill(const kalshi::FillRow& row, const std::string& cid, std::int64_t at) {
+OrderLedger::FillResult OrderLedger::fill(const kalshi::FillRow& row, const std::string& cid, std::int64_t at, bool rest) {
   auto bad = [&](const Order* o, const std::string& why) {
     if (healthy_) why_unhealthy_ = (o ? o->intent.cid + ": " : std::string()) + "fill " + row.trade_id + " " + why;
     healthy_ = false; return FillResult::INVALID;
@@ -190,8 +190,13 @@ OrderLedger::FillResult OrderLedger::fill(const kalshi::FillRow& row, const std:
       row.yes_price < 0 || row.yes_price > kOneDollar || row.fee < -kMaxReserve || row.fee > kMaxReserve)
     return bad(nullptr,"is malformed");
   const auto dup = fills_.find(row.trade_id);
-  if (dup != fills_.end())
-    return same_fill(dup->second,row) ? FillResult::DUPLICATE : bad(nullptr,"arrived twice with different fields");
+  if (dup != fills_.end()) {
+    const auto& a = dup->second;
+    const bool core = a.order_id == row.order_id && a.ticker == row.ticker && a.side == row.side &&
+                      a.count == row.count && a.yes_price == row.yes_price;
+    const bool same = (rest || rest_fills_.count(row.trade_id)) ? core : same_fill(a,row);
+    return same ? FillResult::DUPLICATE : bad(nullptr,"arrived twice with different fields");
+  }
   auto it = orders_.find(cid);
   if (it == orders_.end()) {
     const auto id = by_oid_.find(row.order_id);
@@ -211,7 +216,8 @@ OrderLedger::FillResult OrderLedger::fill(const kalshi::FillRow& row, const std:
   if ((row.fee > 0 && o.fees > std::numeric_limits<kalshi::Micros>::max()-row.fee) ||
       (row.fee < 0 && o.fees < std::numeric_limits<kalshi::Micros>::min()-row.fee)) return bad(&o,"overflows the fee total");
   if (!bind(o,row.order_id)) return FillResult::INVALID;
-  fills_.emplace(row.trade_id,row); o.executions += row.count; o.fees += row.fee;
+  fills_.emplace(row.trade_id,row); if (rest) rest_fills_.insert(row.trade_id);
+  o.executions += row.count; o.fees += row.fee;
   o.execution_cost += row.yes_price * row.count;
   o.filled = std::max(o.filled,o.executions); o.uncertain=o.cancel_unverified; if(!o.ack_ms) o.ack_ms=at;
   o.left = o.terminal() ? 0 : std::min(o.left,o.intent.count-o.filled);

@@ -270,10 +270,61 @@ void expiry_backup() {
   std::this_thread::sleep_for(std::chrono::milliseconds(600));
   CHECK(d.gw->stats().manual_cancels==1);   // once
 }
+// The private feed lost an update (it is not wired here at all): a resting post is taken in full
+// by the street. The account read shows the order executed, so gw ends it FILL and frees its
+// reservation; its fill is still missing 5 s on, so the next read's fill row is taken (avg price),
+// once, and a third read changes nothing.
+void missed_fill_from_account_read() {
+  Desk d;
+  auto r=d.place(d.intent("Mgwmiss-1",Side::BUY,4100,100,Tif::POST,60));   // the best bid, inside 0.40/0.42
+  CHECK(r.code.empty());
+  CHECK(d.last_row("Mgwmiss-1")["st"]=="WORK");
+  const auto took=d.venue.f->with_engine([](fakex::Engine& e,std::int64_t now) { return e.street_take(fx::T,fakex::Side::ASK,4100,100,now); });
+  CHECK(took==100);
+  auto rows=[&] {
+    return d.venue.f->with_engine([](fakex::Engine& e,std::int64_t) {
+      std::pair<kalshi::OrderRow,std::vector<kalshi::FillRow>> out;
+      for (const fakex::Order* o : e.user_orders())
+        if (o->client_order_id=="Mgwmiss-1") {
+          auto& x=out.first;
+          x.order_id=o->order_id; x.client_order_id=o->client_order_id; x.ticker=o->ticker; x.yes_price=o->price;
+          x.initial=o->initial; x.filled=o->filled; x.remaining=o->remaining; x.exchange_index=o->exchange_index;
+          x.updated_ms=o->updated_ms;
+          x.status=o->remaining==0 ? kalshi::OrderStatus::EXECUTED : kalshi::OrderStatus::RESTING;
+        }
+      for (const auto& f : e.fills())
+        if (f.client_order_id=="Mgwmiss-1") {
+          kalshi::FillRow y; y.fill_id=f.fill_id; y.trade_id=f.trade_id; y.order_id=f.order_id; y.ticker=f.ticker;
+          y.side=kalshi::BookSide::BID; y.count=f.count; y.yes_price=f.yes_px; y.taker=f.taker; y.fee=f.fee;
+          y.ts_ms=f.ts_ms; y.exchange_index=f.exchange_index;
+          out.second.push_back(y);
+        }
+      return out;
+    });
+  };
+  const auto [row,fills]=rows();
+  CHECK(row.status==kalshi::OrderStatus::EXECUTED && fills.size()==1);
+  auto publish=[&](std::int64_t rev) {   // an account read begun now, after the order was sent
+    auto s=std::make_shared<rest::Snapshot>(*snapshot(now_ms()));
+    s->orders.push_back(row); s->fills=fills; s->account_began_ms=now_ms(); s->account_ms=now_ms()+1; s->revision=rev;
+    std::atomic_store(&d.snap,std::shared_ptr<const rest::Snapshot>(s));
+  };
+  std::this_thread::sleep_for(std::chrono::milliseconds(1100));   // the read must begin past the send
+  publish(20);
+  CHECK(d.until([&]{ return d.last_row("Mgwmiss-1")["st"]=="FILL"; }));
+  CHECK(d.last_row("Mgwmiss-1")["avg"].is_null());   // its fill is not in the ledger yet
+  std::this_thread::sleep_for(std::chrono::milliseconds(5200));
+  publish(21);
+  CHECK(d.until([&]{ return d.last_row("Mgwmiss-1")["avg"]=="0.4100"; }));
+  const auto rev=d.last_row("Mgwmiss-1")["rev"];
+  publish(22);
+  std::this_thread::sleep_for(std::chrono::milliseconds(400));
+  CHECK(d.last_row("Mgwmiss-1")["rev"]==rev);   // the same fill again is a duplicate: nothing moves
+}
 }  // namespace
 
 int main() {
   std::signal(SIGPIPE, SIG_IGN);   // as deskd's runtime does process-wide (app/runtime.h)
-  fills_and_rests(); refusals(); unknown_blocks(); unknown_settled_by_account_read(); expiry_backup();
+  fills_and_rests(); refusals(); unknown_blocks(); unknown_settled_by_account_read(); expiry_backup(); missed_fill_from_account_read();
   return finish("deskd-manual-gw");
 }

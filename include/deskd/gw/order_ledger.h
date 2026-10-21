@@ -3,6 +3,7 @@
 // execution/position ledger are separate: cumulative venue counts never move a position.
 #include <map>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 #include <nlohmann/json.hpp>
@@ -49,7 +50,10 @@ class OrderLedger {
   bool observed(const kalshi::OrderRow& row, std::int64_t at);
   // APPLIED is the ONLY outcome that permits the caller to book this execution in positions.
   // An orphan waits for mapping/reconciliation. Conflicting duplicate executions fail closed.
-  FillResult fill(const kalshi::FillRow& row, const std::string& cid, std::int64_t at);
+  // rest: the row came from the account read. REST and the private feed report one trade with
+  // fields that may differ in form (fee rounding, the taker flag, the shard), so a duplicate where
+  // either side is REST's is compared on what defines the trade only.
+  FillResult fill(const kalshi::FillRow& row, const std::string& cid, std::int64_t at, bool rest = false);
   // why: the order's why if the cancel ends it, whichever of the cancel's reply and the private
   // feed's update arrives first
   bool request_cancel(const std::string& cid, const std::string& why = "USER");
@@ -74,6 +78,7 @@ class OrderLedger {
   std::map<std::string, Order> orders_;
   std::map<std::string, std::string> by_oid_;
   std::map<std::string, kalshi::FillRow> fills_;
+  std::set<std::string> rest_fills_;   // trade ids first seen in an account read
   std::map<std::string, std::int64_t> missing_since_;
   bool healthy_ = true;
   std::string why_unhealthy_;

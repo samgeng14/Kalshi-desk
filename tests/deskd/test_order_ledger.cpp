@@ -35,6 +35,25 @@ static void record(const OrderLedger& l,const std::string& cid="Mledger-1") {
 static OrderLedger ledger(Tif tif=Tif::POST) {
   OrderLedger l; CHECK(l.insert(intent("Mledger-1",tif),0,4200000)); CHECK(l.sent("Mledger-1",t+1)); return l;
 }
+// A trade the account read reported first (the private feed lost it) and the feed reports later,
+// or the other way round, counts once even where the two differ in form (fee rounding, the taker
+// flag); a feed-only duplicate still has to match exactly, and either way a different size or
+// price is a contradiction.
+static void rest_fill_duplicates() {
+  auto l=ledger();
+  CHECK(l.fill(execution(),"Mledger-1",t+2,true)==OrderLedger::FillResult::APPLIED);
+  auto ws=execution(); ws.fill_id="WS-id"; ws.fee=17100; ws.taker=true;
+  CHECK(l.fill(ws,"Mledger-1",t+3)==OrderLedger::FillResult::DUPLICATE && l.healthy());
+  CHECK(l.find("Mledger-1")->executions==250 && l.find("Mledger-1")->fees==17000);
+  CHECK(l.fill(execution("trade-2"),"Mledger-1",t+4)==OrderLedger::FillResult::APPLIED);
+  auto rest=execution("trade-2"); rest.fee=16900;
+  CHECK(l.fill(rest,"Mledger-1",t+5,true)==OrderLedger::FillResult::DUPLICATE && l.healthy());
+  auto feed=execution("trade-2"); feed.fee=16900;
+  CHECK(l.fill(feed,"Mledger-1",t+6)==OrderLedger::FillResult::INVALID && !l.healthy());
+  auto m=ledger();
+  CHECK(m.fill(execution(),"Mledger-1",t+2,true)==OrderLedger::FillResult::APPLIED);
+  CHECK(m.fill(execution("trade-1",300),"Mledger-1",t+3)==OrderLedger::FillResult::INVALID);
+}
 static void races() {
   auto l=ledger(); record(l);
   CHECK(l.fill(execution(),"Mledger-1",t+2)==OrderLedger::FillResult::APPLIED);
@@ -198,7 +217,7 @@ static void fractional_and_permutations() {
   } while(std::next_permutation(ops.begin(),ops.end()));
 }
 int main() {
-  races(); cancel_reason_either_way(); cumulative_is_not_execution(); zero_cancel_needs_read(); unknown_table_and_proof();
+  races(); rest_fill_duplicates(); cancel_reason_either_way(); cumulative_is_not_execution(); zero_cancel_needs_read(); unknown_table_and_proof();
   bad_evidence(); touch_and_edge(); fractional_and_permutations();
   TempDir dir;
   const std::string path=dir.file("order-ledger-contract.json");
