@@ -956,6 +956,37 @@ void foreign_cancels() {
   // and a manual order on the market goes now that nothing foreign rests there
   CHECK(r.until([&]{ return r.order("Mforeign-1","BUY","0.3900",1.0,"POST",60)["status"]==200; },10000));
 }
+// A foreign order blocks its market for Systematic too (plan section 2): a lane's order goes
+// through the same admission as a click, so it is refused RO there until the order is cancelled
+void systematic_foreign() {
+  Run r(false,[](fakex::Engine& e,std::int64_t now) {
+    fakex::NewOrder o; o.ticker=TK; o.side=fakex::Side::BID; o.count=100; o.price=3400;   // the web site's: no cid
+    e.create(o,now);
+  },true);
+  CHECK(r.ready());
+  CHECK(r.until([&]{ return r.resting()==1; }));
+  auto lane=r.post("/api/lane/M2",{{"on",true}});
+  CHECK(lane && lane->status==200);
+  std::string why;
+  CHECK(r.until([&]{ return r.d->gw().groups_ready(&why) && why.empty(); },20000));
+  httplib::Result start;
+  CHECK(r.until([&]{ start=r.post("/api/start",json::object()); return start && start->status==200; },10000));
+  auto sys=[&](const std::string& cid) {
+    PlaceIntent p; p.cid=cid; p.owner=Owner::SYS; p.lane="M2"; p.ticker=TK; p.side=Side::BUY; p.price=3900; p.count=100;
+    p.tif=Tif::POST; p.ttl_s=30; p.reply=std::make_shared<std::promise<OrderReply>>();
+    auto f=p.reply->get_future();
+    CHECK(r.d->gw().post(std::move(p)));
+    if(f.wait_for(std::chrono::seconds(5))!=std::future_status::ready) return OrderReply{"TIMEOUT","",""};
+    return f.get();
+  };
+  OrderReply a;
+  CHECK(r.until([&]{ a=sys("SM2-fx-1"); return a.code!="STALE"; },10000));
+  CHECK(a.code=="RO" && a.msg.find("cancel the foreign order")!=std::string::npos);
+  auto all=r.post("/api/cancel_all",{{"v","K"},{"own","ANY"}});
+  CHECK(all && all->status==200);
+  CHECK(r.until([&]{ return r.resting()==0; }));
+  CHECK(r.until([&]{ a=sys("SM2-fx-"+std::to_string(now_ms())); return a.code.empty(); },10000));
+}
 // Paper and live: a demo credential runs without --live, a production one only with it, each on
 // its own account's hosts; any mismatch never starts (and dials nothing). A live desk against the
 // fake on loopback then trades as the paper one does: the production hosts are never dialled here.
@@ -1097,6 +1128,6 @@ void equity_floor() {
 
 int main() {
   std::signal(SIGPIPE,SIG_IGN);
-  off_by_default(); orders_cancel_kill(); stop_reasons(); financial_fair(); systematic(); systematic_maker(); systematic_band(); systematic_paper(); systematic_races(); systematic_group_trigger(); systematic_book(); takeover(); shard_preflight(); foreign_cancels(); live_mode(); fill_estimates(); equity_floor();
+  off_by_default(); orders_cancel_kill(); stop_reasons(); financial_fair(); systematic(); systematic_maker(); systematic_band(); systematic_paper(); systematic_races(); systematic_group_trigger(); systematic_book(); takeover(); shard_preflight(); foreign_cancels(); systematic_foreign(); live_mode(); fill_estimates(); equity_floor();
   return finish("deskd-runtime-manual");
 }
