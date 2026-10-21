@@ -128,6 +128,25 @@ void nba_file() {
   CHECK(other && other->sha256 != m->sha256 && !parse_lane_gate(gate, "N1", other->sha256, {"thr"}, &why));
 }
 
+// A file the Python trainer wrote (tools/train_bball.py --write-synthetic: a seeded NBA panel with
+// overtime rows): the C++ features reproduce its golden rows to 1e-6, overtime included, so the
+// trainer and deskd agree on the NBA's clock and the ot feature
+void trainer_file() {
+  const std::string path = fixture("nba_trained.json");
+  std::string why;
+  const auto m = load_bball_model(path, "nba", &why);
+  CHECK(m.has_value());
+  if (!m) { std::fprintf(stderr, "  %s\n", why.c_str()); return; }
+  CHECK(m->league == "nba" && m->regulation_s == 2880 && m->sha256 == sha256_hex(read(path)));
+  const auto j = json::parse(read(path));
+  bool ot = false;
+  for (const auto& g : j["golden"]) ot = ot || g["in"].value("ot", false);
+  CHECK(ot);
+  auto bad = j;
+  bad["coef"][0] = bad["coef"][0].get<double>() + 1e-4;
+  CHECK(!parse_bball_model(bad.dump(), "nba", &why) && has(why, "golden row"));
+}
+
 // The league a file says it is must be its model's, and a caller gets only the league it asked for
 void refusals() {
   const auto j = json::parse(read(fixture("nba_synthetic.json")));
@@ -212,6 +231,7 @@ int main() {
   game_clock();
   features();
   nba_file();
+  trainer_file();
   refusals();
   wcbb_file();
   live();
