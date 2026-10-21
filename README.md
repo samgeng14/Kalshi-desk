@@ -43,6 +43,10 @@ one-liner that makes it are in the script's docstring; `docs/wcbb_model.md` is t
 With that file present, deskd shows the model's fair on those ladders while a game is on, from
 the pregame Kalshi price it saw before tip. Without it there is no fair, and the log says so.
 
+Before LIVE: `ctest --test-dir build-deskd -L invariants --output-on-failure` runs every test that
+`docs/invariants.md` names for the plan's rules. `python3 tools/replication.py --data DIR` (the
+recorder's data) counts the 15-minute windows whose strike pyth_value reproduced, LIP-15's anchor gate.
+
 Research reads `ops-research.sqlite`, the copy the desk writes beside `ops.sqlite` after each ET
 midnight, never the live file. `/ops/status` shows the live file's size; past 1 GB the desk alerts.
 

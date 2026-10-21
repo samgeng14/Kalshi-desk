@@ -82,6 +82,21 @@ partial, 141 missing) set this round's order: what protects money before LIVE fi
   - The recorder review's six findings are fixed with tests (restart backfill of markets that
     closed while it was down, the restart window from the socket's last frame, the control pick
     hour, a torn spool line in the gaps report, base.sh's package checks and chrony order).
+- **Plan section 8 (tests before LIVE):**
+  - `docs/invariants.md` maps every rule of plan sections 2-3 (85, plus the old lessons) to the
+    test that asserts it: 50 tested, 17 partly, 8 missing (each with its reason), 10 n/a here.
+    `ctest --test-dir build-deskd -L invariants` runs the 24 suites that hold them.
+  - Races: a duplicate fill message counts once (Manual and Systematic); 5,000 orders through
+    the UNKNOWN table settle in under 2 s, and gw now settles an account read in one indexed
+    pass (it was quadratic in unknown orders). gw checks the ledger's bounds after every message
+    in every runtime test and the soak (gw.invariant_violations must stay 0).
+  - Sanitizers: `-DDESKD_ASAN=ON` (AddressSanitizer and UBSan). The first run passed 30 of 33
+    deskd suites; the 3 failures were the tests' own (a dangling temporary twice, a wall-clock
+    bound), now fixed. Configure it in build-deskd, then back (one build directory).
+- **`tools/replication.py --data DIR`**: the anchor gate over the recorder's data (pyth_value
+  against each 15-minute window's strike, deskd's own rules), and `--write-replication` to seed
+  deskd's `replication.json` from it once the recorder has run (never over an existing file
+  without `--force`).
 - **Still open, deliberately:** Manual order groups (KILL's cancel-all and the batch sweep cover
   what they would add); exit 75 and the supervisor (the plan returns the LaunchAgent only once
   deskd is the production binary: your call); Stop by batch cancel (per-order cancels work); adopting the last
