@@ -4,6 +4,7 @@
 
 #include <sys/stat.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -39,6 +40,22 @@ CREATE TABLE IF NOT EXISTS lip_windows(
   PRIMARY KEY(tk, start_ms));
 CREATE TABLE IF NOT EXISTS markouts(
   fid TEXT NOT NULL, h TEXT NOT NULL, mo REAL, mid REAL, json TEXT NOT NULL, PRIMARY KEY(fid, h));
+CREATE TABLE IF NOT EXISTS signals(
+  id TEXT PRIMARY KEY, lane TEXT, mode TEXT, shadow INTEGER, ts_ms INTEGER, tk TEXT, ev TEXT, side TEXT,
+  px REAL, qty REAL, fair REAL, edge REAL, score TEXT, src TEXT, age_ms INTEGER, first_seen_ms INTEGER,
+  touch_since_ms INTEGER, action TEXT, why TEXT, cid TEXT, mo10 REAL, mo60 REAL, mo300 REAL, json TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS signals_lane ON signals(lane, ts_ms);
+CREATE TABLE IF NOT EXISTS scores(
+  src TEXT NOT NULL, league TEXT NOT NULL, game_id TEXT NOT NULL, state TEXT, period INTEGER, clock TEXT,
+  home TEXT, away TEXT, home_score INTEGER, away_score INTEGER, lines TEXT, first_seen_ms INTEGER NOT NULL,
+  prev_poll_ms INTEGER, json TEXT NOT NULL, PRIMARY KEY(src, league, game_id, first_seen_ms));
+CREATE TABLE IF NOT EXISTS arb_scans(
+  ts_ms INTEGER NOT NULL, event TEXT NOT NULL, kind TEXT, mode TEXT, legs TEXT, qty REAL, edge REAL, cost REAL,
+  payout_min REAL, fired INTEGER, why TEXT, json TEXT NOT NULL, PRIMARY KEY(event, ts_ms));
+CREATE INDEX IF NOT EXISTS arb_scans_ts ON arb_scans(ts_ms);
+CREATE TABLE IF NOT EXISTS baskets(
+  id TEXT PRIMARY KEY, event TEXT, kind TEXT, state TEXT, legs TEXT, qty REAL, edge_plan REAL, edge_real REAL,
+  legging REAL, t0_ms INTEGER, t_end_ms INTEGER, json TEXT NOT NULL);
 )SQL";
 
 const char* kOrder =
@@ -52,9 +69,26 @@ const char* kMarkout = "INSERT OR IGNORE INTO markouts(fid,h,mo,mid,json) VALUES
 const char* kFill =
     "INSERT OR IGNORE INTO fills(fid,cid,oid,tk,side,qty,px,fee,taker,ts_ms,recv_ms,shard,own,lane,json) "
     "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
+// a signal's row is sent again once its markouts are in: the later row replaces it
+const char* kSignal =
+    "INSERT OR REPLACE INTO signals(id,lane,mode,shadow,ts_ms,tk,ev,side,px,qty,fair,edge,score,src,age_ms,"
+    "first_seen_ms,touch_since_ms,action,why,cid,mo10,mo60,mo300,json) "
+    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
+// a score state is kept as first seen
+const char* kScore =
+    "INSERT OR IGNORE INTO scores(src,league,game_id,state,period,clock,home,away,home_score,away_score,lines,"
+    "first_seen_ms,prev_poll_ms,json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
+const char* kArbScan =
+    "INSERT OR REPLACE INTO arb_scans(ts_ms,event,kind,mode,legs,qty,edge,cost,payout_min,fired,why,json) "
+    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)";
+// a basket's row is sent again on each change of state: the later row replaces it
+const char* kBasket =
+    "INSERT OR REPLACE INTO baskets(id,event,kind,state,legs,qty,edge_plan,edge_real,legging,t0_ms,t_end_ms,json) "
+    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)";
 
-// binds j[key] as what it holds: a string, a number, a bool, or NULL; a decimal string ("0.4200")
-// in a REAL column binds as its number
+// binds j[key] as what it holds: a string, a number, a bool, an array or object as its JSON text
+// (the whole row, for each table's json column), or NULL; a decimal string ("0.4200") in a REAL
+// column binds as its number
 void bind(sqlite3_stmt* st, int i, const json& j, bool real = false) {
   if (j.is_string()) {
     const auto& s = j.get_ref<const std::string&>();
@@ -70,6 +104,9 @@ void bind(sqlite3_stmt* st, int i, const json& j, bool real = false) {
     sqlite3_bind_int64(st, i, j.get<std::int64_t>());
   } else if (j.is_number()) {
     sqlite3_bind_double(st, i, j.get<double>());
+  } else if (j.is_structured()) {
+    const auto text = j.dump();
+    sqlite3_bind_text(st, i, text.c_str(), static_cast<int>(text.size()), SQLITE_TRANSIENT);
   } else {
     sqlite3_bind_null(st, i);
   }
@@ -80,14 +117,107 @@ const json& at(const json& j, const char* k) {
   return it == j.end() ? null : *it;
 }
 
+void write_order(sqlite3_stmt* st, const json& j) {
+  const auto& t = at(j, "t");
+  const auto& w = at(j, "wire");
+  int i = 0;
+  for (const char* k : {"cid", "own", "lane", "tk", "side", "tif"}) bind(st, ++i, at(j, k));
+  bind(st, ++i, at(j, "px"), true);
+  bind(st, ++i, at(j, "qty"));
+  bind(st, ++i, at(j, "filled"));
+  bind(st, ++i, at(j, "st"));
+  bind(st, ++i, at(j, "why"));
+  bind(st, ++i, at(j, "shard"));
+  for (const char* k : {"click", "recv", "gw", "sent", "ack", "priv", "fill", "cx", "cx_ack", "done"}) bind(st, ++i, at(t, k));
+  for (const char* k : {"w_ms", "fb_ms", "rd_ms"}) bind(st, ++i, at(w, k));
+  bind(st, ++i, j);
+}
+
+void write_fill(sqlite3_stmt* st, const json& j) {
+  int i = 0;
+  for (const char* k : {"fid", "cid", "oid", "tk", "side"}) bind(st, ++i, at(j, k));
+  bind(st, ++i, at(j, "qty"));
+  bind(st, ++i, at(j, "px"), true);
+  bind(st, ++i, at(j, "fee"), true);
+  for (const char* k : {"taker", "ts_ms", "recv_ms", "shard", "own", "lane"}) bind(st, ++i, at(j, k));
+  bind(st, ++i, j);
+}
+
+void write_markout(sqlite3_stmt* st, const json& j) {
+  int i = 0;
+  bind(st, ++i, at(j, "fid"));
+  bind(st, ++i, at(j, "h"));
+  bind(st, ++i, at(j, "mo"), true);
+  bind(st, ++i, at(j, "mid"), true);
+  bind(st, ++i, j);
+}
+
+void write_lip(sqlite3_stmt* st, const json& j) {
+  int i = 0;
+  for (const char* k : {"tk", "start_ms", "end_ms", "seconds", "scored_s", "quoted_s", "mean_share"}) bind(st, ++i, at(j, k));
+  bind(st, ++i, at(j, "est"), true);
+  bind(st, ++i, at(j, "reward"), true);
+  bind(st, ++i, at(j, "target"));
+  bind(st, ++i, at(j, "discount_bps"));
+  bind(st, ++i, j);
+}
+
+void write_signal(sqlite3_stmt* st, const json& j) {
+  int i = 0;
+  for (const char* k : {"id", "lane", "mode", "shadow", "ts_ms", "tk", "ev", "side"}) bind(st, ++i, at(j, k));
+  for (const char* k : {"px", "qty", "fair", "edge"}) bind(st, ++i, at(j, k), true);
+  for (const char* k : {"score", "src", "age_ms", "first_seen_ms", "touch_since_ms", "action", "why", "cid"}) bind(st, ++i, at(j, k));
+  for (const char* k : {"mo10", "mo60", "mo300"}) bind(st, ++i, at(j, k), true);
+  bind(st, ++i, j);
+}
+
+void write_score(sqlite3_stmt* st, const json& j) {
+  int i = 0;
+  for (const char* k : {"src", "league", "game_id", "state", "period", "clock", "home", "away", "home_score", "away_score",
+                        "lines", "first_seen_ms", "prev_poll_ms"})
+    bind(st, ++i, at(j, k));
+  bind(st, ++i, j);
+}
+
+void write_arb_scan(sqlite3_stmt* st, const json& j) {
+  int i = 0;
+  for (const char* k : {"ts_ms", "event", "kind", "mode", "legs"}) bind(st, ++i, at(j, k));
+  for (const char* k : {"qty", "edge", "cost", "payout_min"}) bind(st, ++i, at(j, k), true);
+  for (const char* k : {"fired", "why"}) bind(st, ++i, at(j, k));
+  bind(st, ++i, j);
+}
+
+void write_basket(sqlite3_stmt* st, const json& j) {
+  int i = 0;
+  for (const char* k : {"id", "event", "kind", "state", "legs"}) bind(st, ++i, at(j, k));
+  for (const char* k : {"qty", "edge_plan", "edge_real", "legging"}) bind(st, ++i, at(j, k), true);
+  for (const char* k : {"t0_ms", "t_end_ms"}) bind(st, ++i, at(j, k));
+  bind(st, ++i, j);
+}
+
+// the tables a StoreRecord may name: each one's statement, and how a row's json binds to it
+struct Table {
+  const char* name;
+  const char* sql;
+  void (*write)(sqlite3_stmt*, const json&);
+};
+const Table kTables[] = {
+    {"orders", kOrder, write_order},
+    {"fills", kFill, write_fill},
+    {"markouts", kMarkout, write_markout},
+    {"lip_windows", kLip, write_lip},
+    {"signals", kSignal, write_signal},
+    {"scores", kScore, write_score},
+    {"arb_scans", kArbScan, write_arb_scan},
+    {"baskets", kBasket, write_basket},
+};
+constexpr std::size_t kNTables = sizeof kTables / sizeof kTables[0];
+
 struct Db {
   sqlite3* db = nullptr;
-  sqlite3_stmt *order = nullptr, *fill = nullptr, *markout = nullptr, *lip = nullptr;
+  sqlite3_stmt* st[kNTables] = {};   // kTables' statements, in its order
   ~Db() {
-    sqlite3_finalize(lip);
-    sqlite3_finalize(order);
-    sqlite3_finalize(fill);
-    sqlite3_finalize(markout);
+    for (auto* s : st) sqlite3_finalize(s);
     if (db) sqlite3_close(db);
   }
   std::string err() const { return db ? sqlite3_errmsg(db) : "no database"; }
@@ -106,63 +236,12 @@ bool open(Db& d, const std::string& path, std::string* why) {
     sqlite3_free(msg);
     return false;
   }
-  if (sqlite3_prepare_v2(d.db, kOrder, -1, &d.order, nullptr) != SQLITE_OK ||
-      sqlite3_prepare_v2(d.db, kFill, -1, &d.fill, nullptr) != SQLITE_OK ||
-      sqlite3_prepare_v2(d.db, kMarkout, -1, &d.markout, nullptr) != SQLITE_OK ||
-      sqlite3_prepare_v2(d.db, kLip, -1, &d.lip, nullptr) != SQLITE_OK) {
-    *why = path + ": " + d.err();
-    return false;
-  }
+  for (std::size_t i = 0; i < kNTables; ++i)
+    if (sqlite3_prepare_v2(d.db, kTables[i].sql, -1, &d.st[i], nullptr) != SQLITE_OK) {
+      *why = path + ": " + d.err();
+      return false;
+    }
   return true;
-}
-
-void write_order(sqlite3_stmt* st, const json& j) {
-  const auto& t = at(j, "t");
-  const auto& w = at(j, "wire");
-  int i = 0;
-  for (const char* k : {"cid", "own", "lane", "tk", "side", "tif"}) bind(st, ++i, at(j, k));
-  bind(st, ++i, at(j, "px"), true);
-  bind(st, ++i, at(j, "qty"));
-  bind(st, ++i, at(j, "filled"));
-  bind(st, ++i, at(j, "st"));
-  bind(st, ++i, at(j, "why"));
-  bind(st, ++i, at(j, "shard"));
-  for (const char* k : {"click", "recv", "gw", "sent", "ack", "priv", "fill", "cx", "cx_ack", "done"}) bind(st, ++i, at(t, k));
-  for (const char* k : {"w_ms", "fb_ms", "rd_ms"}) bind(st, ++i, at(w, k));
-  const auto text = j.dump();
-  sqlite3_bind_text(st, ++i, text.c_str(), static_cast<int>(text.size()), SQLITE_TRANSIENT);
-}
-
-void write_fill(sqlite3_stmt* st, const json& j) {
-  int i = 0;
-  for (const char* k : {"fid", "cid", "oid", "tk", "side"}) bind(st, ++i, at(j, k));
-  bind(st, ++i, at(j, "qty"));
-  bind(st, ++i, at(j, "px"), true);
-  bind(st, ++i, at(j, "fee"), true);
-  for (const char* k : {"taker", "ts_ms", "recv_ms", "shard", "own", "lane"}) bind(st, ++i, at(j, k));
-  const auto text = j.dump();
-  sqlite3_bind_text(st, ++i, text.c_str(), static_cast<int>(text.size()), SQLITE_TRANSIENT);
-}
-
-void write_markout(sqlite3_stmt* st, const json& j) {
-  int i = 0;
-  bind(st, ++i, at(j, "fid"));
-  bind(st, ++i, at(j, "h"));
-  bind(st, ++i, at(j, "mo"), true);
-  bind(st, ++i, at(j, "mid"), true);
-  const auto text = j.dump();
-  sqlite3_bind_text(st, ++i, text.c_str(), static_cast<int>(text.size()), SQLITE_TRANSIENT);
-}
-
-void write_lip(sqlite3_stmt* st, const json& j) {
-  int i = 0;
-  for (const char* k : {"tk", "start_ms", "end_ms", "seconds", "scored_s", "quoted_s", "mean_share"}) bind(st, ++i, at(j, k));
-  bind(st, ++i, at(j, "est"), true);
-  bind(st, ++i, at(j, "reward"), true);
-  bind(st, ++i, at(j, "target"));
-  bind(st, ++i, at(j, "discount_bps"));
-  const auto text = j.dump();
-  sqlite3_bind_text(st, ++i, text.c_str(), static_cast<int>(text.size()), SQLITE_TRANSIENT);
 }
 
 std::int64_t file_bytes(const std::string& path) {
@@ -253,15 +332,12 @@ void StoreWorker::run(Worker& self) {
     sqlite3_exec(d.db, "BEGIN", nullptr, nullptr, nullptr);
     for (const auto& r : batch) {
       const auto j = json::parse(r.json, nullptr, false);
-      sqlite3_stmt* st = r.table == "orders" ? d.order : r.table == "fills" ? d.fill : r.table == "markouts" ? d.markout
-                       : r.table == "lip_windows" ? d.lip : nullptr;
-      if (!st || !j.is_object()) { ++bad; continue; }
+      const auto t = std::find_if(std::begin(kTables), std::end(kTables), [&](const Table& x) { return r.table == x.name; });
+      if (t == std::end(kTables) || !j.is_object()) { ++bad; continue; }
+      sqlite3_stmt* st = d.st[t - kTables];
       sqlite3_reset(st);
       sqlite3_clear_bindings(st);
-      if (r.table == "orders") write_order(st, j);
-      else if (r.table == "fills") write_fill(st, j);
-      else if (r.table == "markouts") write_markout(st, j);
-      else write_lip(st, j);
+      t->write(st, j);
       if (sqlite3_step(st) == SQLITE_DONE) ++done;
       else { ++bad; fail("writing " + r.table + ": " + d.err()); }
     }

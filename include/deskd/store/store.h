@@ -3,7 +3,22 @@
 // "orders" (an order's whole timeline once it ends: click, web, gw, the wire, the venue's ack,
 // the private feed, fills, the cancel, the end), "fills" (each fill once, by trade id) and, from
 // strat, "markouts" (each fill's 1/10/60/300 s markout against the mid, per contract) and
-// "lip_windows" (each LIP program window's estimated share and dollars, strat/lip.h). It
+// "lip_windows" (each LIP program window's estimated share and dollars, strat/lip.h). The lanes'
+// research rows come the same way:
+//   "signals"    one table for every IOC lane (C1, X1, N1, N2; the lane column says which): each
+//                signal, taken, pulled or in shadow, keyed by its id. id, lane, mode, shadow,
+//                ts_ms, tk, ev, side, px, qty, fair, edge, score, src, age_ms, first_seen_ms,
+//                touch_since_ms, action, why, cid, mo10, mo60, mo300. The row is sent again once
+//                its markouts are in, and the later row replaces it.
+//   "scores"     each score state as first seen, by source (ESPN, NCAA): src, league, game_id,
+//                state, period, clock, home, away, home_score, away_score, lines, first_seen_ms,
+//                prev_poll_ms. A state sent twice keeps its first row.
+//   "arb_scans"  S1's finder, one row per event scanned: ts_ms, event, kind, mode, legs, qty,
+//                edge, cost, payout_min, fired, why; keyed by event and ts_ms.
+//   "baskets"    S1's baskets, keyed by id, sent again on each change of state: id, event, kind,
+//                state, legs, qty, edge_plan, edge_real, legging, t0_ms, t_end_ms.
+// Every table also keeps the whole row as json. Prices and dollars come as decimal strings
+// ("0.4200") and are stored as numbers; an array (legs, lines) is stored as its JSON text. It
 // writes them in one transaction every quarter second, in WAL mode, so a reader (research,
 // tools/latency_report.py) never blocks it. A full inbox loses the row and gw counts it; a
 // database that cannot be opened or written says why in /ops/status and the desk trades on.
@@ -26,7 +41,7 @@ namespace deskd {
 class Worker;
 
 struct StoreRecord {
-  std::string table;   // "orders", "fills", "markouts" or "lip_windows"
+  std::string table;   // "orders", "fills", "markouts", "lip_windows", "signals", "scores", "arb_scans" or "baskets"
   std::string json;
 };
 
