@@ -2,10 +2,13 @@
 // worked by hand; a file whose golden rows reproduce loads, one whose rows do not (a trainer with
 // other features), an unknown feature, mismatched lengths or too few golden rows are refused.
 #include <cmath>
+#include <fstream>
+#include <sstream>
 
 #include <nlohmann/json.hpp>
 
 #include "check.h"
+#include "deskd/build_paths.h"
 #include "deskd/strat/wcbb_model.h"
 
 using namespace deskd;
@@ -90,6 +93,24 @@ void files() {
   CHECK(!load_wcbb_model("/nonexistent/wcbb.json", &why) && why.find("cannot read") != std::string::npos);
 }
 
+// A file the Python trainer wrote (tools/train_wcbb.py on a generated panel, every feature): the
+// C++ features reproduce its 10 golden rows to 1e-6, and the same file with one coefficient moved
+// by 1e-4 is refused.
+void trainer() {
+  const std::string path = std::string(DESKD_SOURCE_DIR) + "/tests/deskd/fixtures/wcbb_synthetic.json";
+  std::string why;
+  const auto m = load_wcbb_model(path, &why);
+  CHECK(m.has_value());
+  if (!m) { std::fprintf(stderr, "  %s\n", why.c_str()); return; }
+  CHECK(m->features.size() == 7 && m->path == path && m->n_games == 2400 && m->brier_model > 0);
+  std::ifstream f(path);
+  std::stringstream s;
+  s << f.rdbuf();
+  auto j = json::parse(s.str());
+  j["coef"][2] = j["coef"][2].get<double>() + 1e-4;
+  CHECK(!parse_wcbb_model(j.dump(), &why) && why.find("golden row") != std::string::npos);
+}
+
 // ESPN's game state to the model's: four 10-minute quarters, then overtime at 0
 void live() {
   CHECK(wcbb_t_left(1, 600) == 2400.0 && wcbb_t_left(3, 252) == 852.0 && wcbb_t_left(4, 0) == 0.0);
@@ -114,5 +135,6 @@ int main() {
   features();
   files();
   live();
+  trainer();
   return finish("deskd-wcbb");
 }
