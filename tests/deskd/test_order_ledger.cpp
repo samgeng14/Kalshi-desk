@@ -160,7 +160,7 @@ static void unknown_table_and_proof() {
     }
   }
   const auto ms=std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-t0).count();
-  CHECK(ms<2000);
+  CHECK(ms<2000*kSlowdown);
   for(int s=0;s<4;++s) CHECK(l.reserved(s)==0);
   int open=0, blocked=0;
   for(const auto& [cid,o]:l.orders()) if(!o.terminal() || o.uncertain) ++open;

@@ -112,7 +112,8 @@ void band() {
   CHECK(band_quote(input(book(4000, 500, 4600, 500)), p).pull == "no favourite at 96-99c");
   CHECK(band_quote(input(book(9500, 500, 9700, 500)), p).pull == "no favourite at 96-99c");
   CHECK(band_quote(input(book(9950, 500, 9990, 500)), p).pull == "no favourite at 96-99c");
-  auto in = input(book(9700, 500, 9900, 500));
+  const auto held = book(9700, 500, 9900, 500);   // MakerInput points at its book: keep it alive (ASan)
+  auto in = input(held);
   in.private_up = false;
   CHECK(band_quote(in, p).pull == "private feed down");
 }

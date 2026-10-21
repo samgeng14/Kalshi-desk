@@ -984,7 +984,7 @@ void test_many_orders() {
   const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_start).count();
   std::printf("  5,000 resting orders placed in %.0f ms\n", ms);
   CHECK(ok == 5000);
-  CHECK(ms < 3000);
+  CHECK(ms < 3000 * kSlowdown);   // a sanitizer build runs several times slower
   CHECK(e.reserved(0, 0) > 0);
   CHECK(e.cancel_all(std::nullopt, T0 + 6000) == 5000);
   CHECK(e.reserved(0, 0) == 0 && e.user_orders().size() == 5000);

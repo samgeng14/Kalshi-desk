@@ -128,7 +128,8 @@ static void books_and_subscriptions() {
   CHECK(full.at("books").size() == 1);
   CHECK(full.at("books")[0].at("depth") == "FULL");
   CHECK(full.at("books")[0].at("bids").size() == 2);
-  for (const auto& b : h.snapshot("top").body.at("books")) {
+  const auto top = h.snapshot("top").body;   // held: a range-for over a member of a temporary dangles (ASan)
+  for (const auto& b : top.at("books")) {
     CHECK(b.at("depth") == "TOP"); CHECK(b.at("asks").size() == 1);
   }
   auto first_events = drain(h.full);
