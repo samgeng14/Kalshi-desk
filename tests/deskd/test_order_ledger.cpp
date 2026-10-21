@@ -30,6 +30,7 @@ static void record(const OrderLedger& l,const std::string& cid="Mledger-1") {
   CHECK(o->left>=0 && o->left<=o->intent.count-o->filled);
   CHECK(!o->terminal() || o->left==0);
   CHECK(o->reservation()>=0 && o->reservation()<=o->original_reserve);
+  CHECK(l.check().empty());   // the same bounds, as gw checks them after every message
   capture["responses"].push_back({{"key","POST /api/order"},{"status",200},{"json",{{"ok",true},{"ord",o->json()}}}});
 }
 static OrderLedger ledger(Tif tif=Tif::POST) {

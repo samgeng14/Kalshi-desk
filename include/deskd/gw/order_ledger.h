@@ -69,6 +69,10 @@ class OrderLedger {
   kalshi::Micros reserved(int shard) const;
   std::vector<std::string> fills_due(std::int64_t now) const;
   bool healthy() const { return healthy_; }
+  // The first order whose counts break the ledger's own bounds (plan section 8's per-message check):
+  // 0 <= executions <= filled <= count, 0 <= left <= count - filled, nothing left once it ended,
+  // and the reservation within what it reserved at admission; "" when none does.
+  std::string check() const;
   // The first contradiction that made the ledger unhealthy, with the order it names ("" while healthy).
   const std::string& why_unhealthy() const { return why_unhealthy_; }
   const std::map<std::string, Order>& orders() const { return orders_; }

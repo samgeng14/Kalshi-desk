@@ -105,6 +105,7 @@ struct Run {
     o.rest_url=base+"/trade-api/v2"; o.ws_url=base+"/trade-api/ws/v2"; o.factory=fx::trust_test_ca();
     o.rest_poll_ms=700; o.rest_gap_ms=0;   // reconciles (and clock samples at varied sub-second phases) come quickly
     o.fair_watch_since_ms=now_ms()-600000;   // a window opening now is one the fair can check
+    o.check_each_message=true;               // plan section 8: the ledger's bounds after every gw message
     if(tune) tune(c,o);
     launch();
   }
@@ -115,7 +116,13 @@ struct Run {
     if(!d->start(&err)) { std::fprintf(stderr,"deskd did not start: %s\n",err.c_str()); std::exit(2); }
   }
   // a new deskd process on the same data directory and venue
-  void restart() { d->stop(); d.reset(); launch(); }
+  void restart() { invariants_held(); d->stop(); d.reset(); launch(); }
+  // every run: no gw message left the ledger outside its bounds
+  void invariants_held() {
+    const auto gw=d->status()["gw"];
+    if(gw["invariant_violations"]!=0) std::fprintf(stderr,"invariant: %s\n",gw["invariant_why"].get<std::string>().c_str());
+    CHECK(gw["invariant_violations"]==0);
+  }
   // the venue's pyth_value relay for one underlying, every 200 ms (LIP-15 quotes only while its
   // underlying's reference is fresh)
   std::atomic<bool> relaying{false};
@@ -129,6 +136,7 @@ struct Run {
   ~Run() {
     relaying=false;
     if(relay.joinable()) relay.join();
+    invariants_held();
     d->stop();
   }
   httplib::Result post(const std::string& path,const json& body) {

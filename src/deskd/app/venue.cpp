@@ -182,6 +182,7 @@ void Deskd::attach_manual() {
   };
   p.write_tier = cfg_.write_tier == "advanced" ? WriteBudget::advanced() : WriteBudget::basic();
   p.live = cfg_.live;
+  p.check_each_message = options_.check_each_message;
   p.record = [this](const std::string& table, std::string row) { return store_.inbox().push(StoreRecord{table, std::move(row)}); };
   if (cfg_.systematic_orders) {
     p.sys_send = [this](KalshiWriteJob j) { return q_sys_.push(std::move(j)); };

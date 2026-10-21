@@ -172,6 +172,15 @@ void Gateway::run(Worker& self) {
     if (m) {
       handle(*m);
       stats_.handled.fetch_add(1, std::memory_order_relaxed);
+      // plan section 8: the ledger's bounds after every message (tests and the soak turn it on)
+      if (manual_ && path_->check_each_message) {
+        if (auto why = manual_->ledger().check(); !why.empty()) {
+          if (stats_.invariant_violations.fetch_add(1) == 0) {
+            DLOG_ERR("invariant broken after a gw message: %s", why.c_str());
+            std::atomic_store(&invariant_why_, std::make_shared<const std::string>(std::move(why)));
+          }
+        }
+      }
     }
     if (sys_) sys_tick(now_ms());
     // a new account read, even with nothing else happening: it may settle an unknown order; and

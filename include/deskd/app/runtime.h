@@ -81,6 +81,8 @@ struct RuntimeOptions {
   std::int64_t fair_watch_since_ms = 0;
   // ESPN's public scoreboards for the watched game markets (ref/espn.h); "" = off.
   std::string espn_url = "https://site.api.espn.com";
+  // gw checks the ledger's bounds after every message (plan section 8); tests and the soak
+  bool check_each_message = false;
 };
 
 class Deskd {

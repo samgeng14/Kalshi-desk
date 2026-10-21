@@ -274,6 +274,20 @@ std::string OrderLedger::blocking(const std::string& ticker,int shard) const {
   for(const auto& pair:orders_) if(pair.second.intent.ticker==ticker && pair.second.shard==shard && pair.second.uncertain) return pair.first;
   return {};
 }
+std::string OrderLedger::check() const {
+  for(const auto& [cid,o]:orders_) {
+    const Qty n=o.intent.count;
+    auto bad=[&](const char* what) { return cid+": "+what+" (count "+std::to_string(n)+", filled "+std::to_string(o.filled)+
+                                            ", executions "+std::to_string(o.executions)+", left "+std::to_string(o.left)+")"; };
+    if(o.filled<0 || o.filled>n) return bad("filled outside 0..count");
+    if(o.executions<0 || o.executions>o.filled) return bad("executions outside 0..filled");
+    if(o.left<0 || o.left>n-o.filled) return bad("left outside 0..count-filled");
+    if(o.terminal() && o.left!=0) return bad("ended with some left");
+    const auto r=o.reservation();
+    if(r<0 || r>o.original_reserve) return bad("reservation outside 0..its admission reserve");
+  }
+  return "";
+}
 kalshi::Micros OrderLedger::reserved(int shard) const {
   kalshi::Micros result=0;
   for(const auto& pair:orders_) if(pair.second.shard==shard) {

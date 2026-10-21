@@ -56,6 +56,10 @@ class Gateway {
   // REVISIONS: the page keeps the highest rev), so the REST publisher leaves them out.
   std::shared_ptr<const std::set<std::string>> manual_cids() const { return std::atomic_load(&owned_); }
   // Why the Manual order ledger stopped ("" while healthy): any thread, for /ops/status.
+  std::string invariant_why() const {   // the first violation check_each_message found
+    const auto why = std::atomic_load(&invariant_why_);
+    return why ? *why : std::string();
+  }
   std::string ledger_why() const {
     const auto why = std::atomic_load(&ledger_why_);
     return why ? *why : std::string();
@@ -132,6 +136,7 @@ class Gateway {
     std::atomic<std::uint64_t> erased_by_kill{0};     // queued new orders and Starts a KILL deleted
     std::atomic<std::uint64_t> kills_seen{0};         // KILL generations gw has applied
     std::atomic<std::uint64_t> group_reset_fallbacks{0};   // resets taken on their 200 (no socket word)
+    std::atomic<std::uint64_t> invariant_violations{0};    // check_each_message: messages after which a check failed
     std::atomic<std::uint64_t> manual_sent{0};        // Manual orders handed to send-k1
     std::atomic<std::uint64_t> manual_cancels{0};     // Manual cancels handed to the cancel sender
     std::atomic<std::uint64_t> private_applied{0};    // private order updates and fills applied to Manual orders
@@ -187,6 +192,7 @@ class Gateway {
   std::map<std::string, std::string> cancel_why_;   // a cancel gw itself asked for: STOP, LANE_OFF, HALT
   std::shared_ptr<const std::set<std::string>> owned_;   // std::atomic_load / std::atomic_store
   std::shared_ptr<const std::string> ledger_why_;        // std::atomic_load / std::atomic_store
+  std::shared_ptr<const std::string> invariant_why_;     // the same
   WriteBudget budget_;                                    // gw thread only
   std::shared_ptr<const std::map<int, double>> write_view_;   // std::atomic_load / std::atomic_store
   std::atomic<double> write_cap_{0};

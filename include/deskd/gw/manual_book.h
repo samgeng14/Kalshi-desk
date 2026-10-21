@@ -70,6 +70,7 @@ struct ManualPath {
   GroupRegistry* groups = nullptr;
   std::vector<LaneSpec> lanes;   // empty: default_lanes()
   bool live = false;             // the production account: a paper_only lane's orders are refused
+  bool check_each_message = false;   // tests and the soak: OrderLedger::check after every gw message
   // Systematic's book across a restart (its day, positions, trade ids, HALT and the markets
   // Manual holds); "" keeps none
   std::string sys_state_file;

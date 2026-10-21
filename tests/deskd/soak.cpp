@@ -41,6 +41,7 @@ struct Soak {
   std::map<std::string, Px> mid;
   std::int64_t next_open=0;
   int violations=0, takes=0;
+  bool invariant_seen=false;
   std::int64_t max_resting=0;
 
   void add_window(fakex::Engine& e,std::int64_t now) {
@@ -75,6 +76,7 @@ struct Soak {
     const std::string base="https://127.0.0.1:"+std::to_string(venue.port());
     o.rest_url=base+"/trade-api/v2"; o.ws_url=base+"/trade-api/ws/v2"; o.factory=fx::trust_test_ca();
     o.rest_poll_ms=700; o.rest_gap_ms=0; o.espn_url="";
+    o.check_each_message=true;   // plan section 8: the ledger's bounds after every gw message
     std::string err;
     auto lock=AccountLock::acquire(dir.path,"demo","deskd-soak",false,&err);
     d=std::make_unique<Deskd>(c,std::move(lock),o);
@@ -146,6 +148,10 @@ int main() {
     last_check=now;
     const auto st=s.d->status();
     if(st["gw"]["ledger_healthy"]!=true) s.violation("ledger: "+st["gw"]["ledger_why"].get<std::string>());
+    if(st["gw"]["invariant_violations"]!=0 && !s.invariant_seen) {   // counted by gw; reported once here
+      s.invariant_seen=true;
+      s.violation("after a gw message: "+st["gw"]["invariant_why"].get<std::string>());
+    }
     if(st["senders"]["k2"]["healthy"]!=true) s.violation("send-k2: "+st["senders"]["k2"]["why"].get<std::string>());
     if(st["senders"]["cx"]["healthy"]!=true) s.violation("send-cx: "+st["senders"]["cx"]["why"].get<std::string>());
     if(s.d->kill_switch().active()) s.violation("KILL tripped: "+s.d->kill_switch().why());
