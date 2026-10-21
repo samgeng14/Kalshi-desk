@@ -19,6 +19,11 @@ import os
 import time
 from datetime import datetime, timezone
 
+SCORE_COLUMNS = [('recv_us', 'int64'), ('prev_us', 'int64'), ('league', 'string'), ('game_id', 'string'),
+                 ('start_time', 'string'), ('state', 'string'), ('status', 'string'), ('period', 'string'),
+                 ('clock', 'string'), ('home', 'string'), ('away', 'string'), ('home_score', 'int32'),
+                 ('away_score', 'int32'), ('detail', 'string'), ('raw', 'string')]
+
 SCHEMAS = {
     # every frame of the market socket, raw: no parse decision is baked in at write time
     'kalshi_ws': [('recv_us', 'int64'), ('mono_us', 'int64'), ('conn', 'int32'), ('type', 'string'),
@@ -28,9 +33,47 @@ SCHEMAS = {
                        ('open_time', 'string'), ('close_time', 'string'), ('strike_type', 'string'),
                        ('floor_strike', 'float64'), ('cap_strike', 'float64'), ('result', 'string'),
                        ('expiration_value', 'string'), ('raw', 'string')],
-    # every disconnect, sequence gap, refused subscription, failed discovery, torn spool line, clock step
+    # every disconnect, sequence gap, refused subscription, failed discovery or poll, torn spool
+    # line, clock step and restart; source names the feed, from_us/to_us the stretch when known
     'gaps': [('recv_us', 'int64'), ('source', 'string'), ('kind', 'string'), ('detail', 'string'),
              ('from_us', 'int64'), ('to_us', 'int64')],
+    # a market's book by public REST (plan 5(d), and the fallback while the socket cannot
+    # subscribe), written only when it differs from the last one recorded for it: recv_us is when
+    # this book was first seen, sent_us when that poll left (the book held at some instant
+    # between the two), prev_us the poll before it (the change came after that), polls how many
+    # polls had seen the previous book. kind: top (GET /markets?tickers=, best prices and sizes)
+    # or depth (GET /markets/{t}/orderbook, every level in raw). mode: college or fallback.
+    'kalshi_rest_books': [('recv_us', 'int64'), ('sent_us', 'int64'), ('prev_us', 'int64'), ('polls', 'int32'),
+                          ('kind', 'string'), ('mode', 'string'), ('ticker', 'string'),
+                          ('yes_bid', 'float64'), ('yes_bid_size', 'float64'), ('yes_ask', 'float64'),
+                          ('yes_ask_size', 'float64'), ('last_price', 'float64'), ('volume', 'float64'),
+                          ('raw', 'string')],
+    # public prints by REST over a window the socket may have missed (a disconnect, a sequence
+    # gap on trades) and every hour; each trade_id once. reason: why its window was read
+    'kalshi_trades_rest': [('recv_us', 'int64'), ('trade_id', 'string'), ('ticker', 'string'),
+                           ('created_time', 'string'), ('created_us', 'int64'), ('yes_price', 'float64'),
+                           ('no_price', 'float64'), ('count', 'float64'), ('taker_side', 'string'),
+                           ('reason', 'string'), ('raw', 'string')],
+    # GET /incentive_programs every hour, all pages, the types kept chosen here (the venue ignores
+    # its own filter); sweep_us groups one sweep's rows
+    'kalshi_incentives': [('recv_us', 'int64'), ('sweep_us', 'int64'), ('market_ticker', 'string'),
+                          ('incentive_type', 'string'), ('period_reward', 'float64'), ('target_size', 'float64'),
+                          ('discount_factor_bps', 'float64'), ('start_date', 'string'), ('end_date', 'string'),
+                          ('paid_out', 'bool_'), ('raw', 'string')],
+    # every open market once a day (GET /markets, all pages); raw without the rules text
+    'kalshi_markets_daily': [('recv_us', 'int64'), ('sweep_us', 'int64'), ('ticker', 'string'),
+                             ('event_ticker', 'string'), ('status', 'string'), ('open_time', 'string'),
+                             ('close_time', 'string'), ('volume', 'float64'), ('open_interest', 'float64'),
+                             ('yes_bid', 'float64'), ('yes_ask', 'float64'), ('raw', 'string')],
+    # a scoreboard's game each time its state or score changed (recorder/scores.py): recv_us the
+    # poll that first showed it, prev_us the poll before (the change came after that)
+    'espn_scores': SCORE_COLUMNS,
+    'ncaa_scores': SCORE_COLUMNS,
+    # the control decile (plan 5(d)): every game of the control series on its date, ranked by
+    # pregame volume when the pick was made, the picked ones flagged
+    'college_control': [('recv_us', 'int64'), ('series', 'string'), ('game_date', 'string'),
+                        ('event_ticker', 'string'), ('volume', 'float64'), ('rank', 'int32'), ('events', 'int32'),
+                        ('picked', 'bool_')],
 }
 
 GRACE_US = 5_000_000      # a bucket is compacted this long after it ends
@@ -189,6 +232,106 @@ class Store:
                                                     os.path.relpath(final, self.root) if rows else 'nothing'))
         return {'path': final if rows else None, 'rows': len(rows), 'torn': torn, 'spool': os.path.basename(spool),
                 'from_us': start_us, 'to_us': start_us + self.bucket_us}
+
+    # ---- reading back ------------------------------------------------------------------------
+    def last_recv_us(self):
+        """The newest row on disk, any table: the last complete line of each spool (only its
+        tail is read; a spool holds an hour of frames) and the manifest's newest file. None on
+        a new data directory. A restart reads this before writing anything, to log how long
+        the recorder was down."""
+        last = None
+        for path in glob.glob(os.path.join(self.root, 'spool', '*', '*.jsonl')):
+            t = _last_recv(path)
+            if t is not None and (last is None or t > last):
+                last = t
+        for e in read_manifest(self.root):
+            t = e.get('t_max_us')
+            if isinstance(t, int) and (last is None or t > last):
+                last = t
+        return last
+
+    def read_recent(self, table, since_us):
+        """A table's rows received since since_us: its spools, and its Parquet files when pyarrow
+        is there (without it the Parquet part is skipped, as compaction is)."""
+        for path in sorted(glob.glob(os.path.join(self.root, 'spool', table, '*.jsonl'))):
+            try:
+                start = self._bucket_start(os.path.basename(path)[:-len('.jsonl')])
+            except ValueError:
+                continue
+            if start + self.bucket_us < since_us:
+                continue
+            with open(path, 'r', encoding='utf-8', errors='replace') as f:
+                for line in f:
+                    try:
+                        r = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(r, dict) and r.get('recv_us', 0) >= since_us:
+                        yield r
+        try:
+            import pyarrow.parquet as pq
+        except ImportError:
+            return
+        for e in read_manifest(self.root):
+            if e.get('table') != table or e.get('t_max_us', 0) < since_us:
+                continue
+            path = os.path.join(self.root, e['path'])
+            if not os.path.exists(path):
+                continue
+            for r in pq.read_table(path).to_pylist():
+                if r.get('recv_us', 0) >= since_us:
+                    yield r
+
+
+def _last_recv(path, tail=65536):
+    try:
+        with open(path, 'rb') as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - tail))
+            lines = f.read().split(b'\n')
+    except OSError:
+        return None
+    for line in reversed(lines):
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue   # the torn last line of a crash, or the cut first line of the tail
+        if isinstance(r, dict) and isinstance(r.get('recv_us'), int):
+            return r['recv_us']
+    return None
+
+
+class State:
+    """A few facts that must survive a restart (the day's control picks, the day the daily sweep
+    ran), in <data>/state/recorder.json, replaced atomically. Losing it costs a repeat sweep or a
+    re-pick, never data."""
+
+    def __init__(self, root, log=print):
+        self.path = os.path.join(root, 'state', 'recorder.json')
+        self.log = log
+        self.data = {}
+        try:
+            with open(self.path, encoding='utf-8') as f:
+                d = json.load(f)
+            self.data = d if isinstance(d, dict) else {}
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError) as e:
+            log('state: %s unreadable, starting empty: %s' % (self.path, e))
+
+    def get(self, key, default=None):
+        return self.data.get(key, default)
+
+    def set(self, key, value):
+        self.data[key] = value
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        tmp = self.path + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(self.data, f, separators=(',', ':'), sort_keys=True)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, self.path)
 
 
 def read_manifest(root):

@@ -103,6 +103,68 @@ class StoreTest(unittest.TestCase):
         with self.assertRaises(KeyError):
             self.store().write('nope', {'recv_us': T0})
 
+    def test_new_tables_to_parquet(self):
+        import pyarrow.parquet as pq
+        s = self.store()
+        s.write('kalshi_rest_books', {'recv_us': T0, 'sent_us': T0 - 5, 'prev_us': None, 'polls': 0, 'kind': 'top',
+                                      'mode': 'college', 'ticker': 'TK', 'yes_bid': 0.41, 'yes_bid_size': 12.0,
+                                      'yes_ask': None, 'yes_ask_size': None, 'last_price': None, 'volume': 3.0,
+                                      'raw': '{}'})
+        s.write('kalshi_incentives', {'recv_us': T0, 'sweep_us': T0, 'market_ticker': 'TK', 'incentive_type': 'liquidity',
+                                      'period_reward': 1.0, 'target_size': None, 'discount_factor_bps': None,
+                                      'start_date': None, 'end_date': None, 'paid_out': True, 'raw': '{}'})
+        s.write('espn_scores', {'recv_us': T0, 'prev_us': None, 'league': 'l', 'game_id': '1', 'start_time': None,
+                                'state': 'in', 'status': 'S', 'period': '2', 'clock': '1:00', 'home': 'H', 'away': 'A',
+                                'home_score': 3, 'away_score': None, 'detail': None, 'raw': '{}'})
+        s.flush(fsync=True)
+        self.assertEqual(len(s.roll(T0 + 3600 * 1_000_000 + 6_000_000)), 3)
+        m = {e['table']: e for e in read_manifest(self.root)}
+        t = pq.read_table(os.path.join(self.root, m['kalshi_incentives']['path']))
+        self.assertEqual(str(t.schema.field('paid_out').type), 'bool')
+        self.assertIsNone(pq.read_table(os.path.join(self.root, m['kalshi_rest_books']['path'])).column('yes_ask')[0].as_py())
+        self.assertEqual(pq.read_table(os.path.join(self.root, m['espn_scores']['path'])).column('home_score').to_pylist(), [3])
+        # read back (spool and Parquet), for the trade backfill's seed
+        s.write('kalshi_rest_books', {'recv_us': T0 + 3600 * 1_000_000 + 7_000_000, 'ticker': 'TK2'})
+        s.flush()
+        got = sorted(r['ticker'] for r in s.read_recent('kalshi_rest_books', T0))
+        self.assertEqual(got, ['TK', 'TK2'])
+        self.assertEqual([r['ticker'] for r in s.read_recent('kalshi_rest_books', T0 + 1)], ['TK2'])
+        self.assertEqual(s.last_recv_us(), T0 + 3600 * 1_000_000 + 7_000_000)
+        s.close()
+
+
+class ReadBackTest(unittest.TestCase):
+    """What a restart reads before it writes: no pyarrow needed (spools are JSON lines)."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.root = self.dir.name
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def test_last_recv_and_state(self):
+        from recorder.store import State
+        s = Store(self.root, 3600, lambda m: None)
+        self.assertIsNone(s.last_recv_us())                 # a new data directory
+        s.write('kalshi_ws', row(T0 + 10, 1))
+        s.write('gaps', {'recv_us': T0 + 20, 'source': 'x', 'kind': 'y', 'detail': '', 'from_us': None, 'to_us': None})
+        s.write('kalshi_ws', row(T0 + 15, 2))
+        s.close()
+        with open(s.spool_path('gaps', T0), 'a') as f:
+            f.write('{"recv_us": 99999999999999999')        # killed mid-line: the line before counts
+        self.assertEqual(Store(self.root, 3600, lambda m: None).last_recv_us(), T0 + 20)
+        self.assertEqual([r['seq'] for r in s.read_recent('kalshi_ws', T0 + 12)], [2])
+        st = State(self.root)
+        self.assertIsNone(st.get('x'))
+        st.set('x', {'a': [1]})
+        self.assertEqual(State(self.root).get('x'), {'a': [1]})
+        with open(st.path, 'w') as f:
+            f.write('{torn')
+        logs = []
+        self.assertEqual(State(self.root, logs.append).get('x'), None)   # unreadable: start empty, say so
+        self.assertTrue(logs)
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -5,10 +5,14 @@ import os
 import tempfile
 import unittest
 
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import ed25519, padding, rsa
-
 from recorder import config, kalshi
+from recorder.tests.util import HAVE_CRYPTO
+
+if HAVE_CRYPTO:
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ed25519, padding, rsa
+
+NEEDS_CRYPTO = unittest.skipUnless(HAVE_CRYPTO, 'cryptography is not installed (pip install -r recorder/requirements.txt)')
 
 
 def pem(key):
@@ -16,6 +20,7 @@ def pem(key):
                              serialization.NoEncryption())
 
 
+@NEEDS_CRYPTO
 class SignerTest(unittest.TestCase):
     def test_ed25519_and_rsa(self):
         e = ed25519.Ed25519PrivateKey.generate()
@@ -55,6 +60,7 @@ class CommandTest(unittest.TestCase):
         self.assertEqual([m for m in dir(kalshi.Rest) if not m.startswith('_')], ['get', 'markets'])
 
 
+@NEEDS_CRYPTO
 class ConfigTest(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.TemporaryDirectory()
