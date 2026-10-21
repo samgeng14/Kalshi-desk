@@ -237,6 +237,11 @@ class Gateway {
   void settle_uncertain(const rest::Snapshot& s);
   void flush_cancel(const std::string& cid);
   void fill_applied(const kalshi::FillRow& f, std::string cid, std::int64_t at, bool live);
+  // private fills that beat their order's 201, kept up to kOrphanWaitMs
+  struct Orphan;
+  std::vector<Orphan> orphans_;
+  static constexpr std::int64_t kOrphanWaitMs = 5000;
+  void retry_orphans();
   void reconcile_working(const rest::Snapshot& s);
   std::int64_t fills_asked_ms_ = 0;   // the last account read asked for missing fills
   static constexpr std::int64_t kExpiryBackupMs = 1500;   // plan section 3: TTL + 1.5 s

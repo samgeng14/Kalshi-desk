@@ -12,6 +12,7 @@
 #include "deskd/gw/kill.h"
 #include "deskd/gw/manual_book.h"
 #include "deskd/net/kalshi_sender.h"
+#include "deskd/priv/kalshi_private.h"
 #include "deskd/rest/state.h"
 #include "net_fixture.h"
 using namespace deskd;
@@ -321,10 +322,37 @@ void missed_fill_from_account_read() {
   std::this_thread::sleep_for(std::chrono::milliseconds(400));
   CHECK(d.last_row("Mgwmiss-1")["rev"]==rev);   // the same fill again is a duplicate: nothing moves
 }
+// Plan section 3: "private events that beat the 201 wait up to 5 s". The venue holds its reply
+// 300 ms; meanwhile the street takes the post and its fill reaches gw without a client id, before
+// gw knows the order id (UNMAPPED). It waits, and the 201 that names the order lets it in.
+void fill_before_201() {
+  Desk d;
+  fakex::HttpFault fault; fault.kind=fakex::HttpFault::Kind::STALL_AFTER; fault.stall_ms=300; d.venue.f->add_fault(fault);
+  auto p=d.intent("Mgwearly-1",Side::BUY,4100,100,Tif::POST,60);
+  p.reply=std::make_shared<std::promise<OrderReply>>(); auto f=p.reply->get_future();
+  CHECK(d.gw->post(std::move(p)));
+  CHECK(d.until([&]{ return d.venue.has_cid("Mgwearly-1"); }));
+  d.venue.f->with_engine([](fakex::Engine& e,std::int64_t now) { e.street_take(fx::T,fakex::Side::ASK,4100,100,now); });
+  auto fill=d.venue.f->with_engine([](fakex::Engine& e,std::int64_t) {
+    kalshi::FillRow y;
+    for (const auto& x : e.fills())
+      if (x.client_order_id=="Mgwearly-1") {
+        y.fill_id=x.fill_id; y.trade_id=x.trade_id; y.order_id=x.order_id; y.ticker=x.ticker; y.side=kalshi::BookSide::BID;
+        y.count=x.count; y.yes_price=x.yes_px; y.taker=x.taker; y.fee=x.fee; y.ts_ms=x.ts_ms; y.exchange_index=x.exchange_index;
+      }
+    return y;
+  });
+  CHECK(!fill.trade_id.empty());
+  auto ev=std::make_shared<PrivateEvent>(); ev->kind=PrivateEvent::Kind::FILL; ev->fill=fill; ev->received_ms=now_ms();
+  CHECK(d.gw->post(PrivateMsg{ev}));
+  CHECK(f.wait_for(std::chrono::seconds(3))==std::future_status::ready);
+  CHECK(d.until([&]{ return d.last_row("Mgwearly-1")["avg"]=="0.4100"; }));   // no account read needed
+  CHECK(d.last_row("Mgwearly-1")["st"]=="FILL");
+}
 }  // namespace
 
 int main() {
   std::signal(SIGPIPE, SIG_IGN);   // as deskd's runtime does process-wide (app/runtime.h)
-  fills_and_rests(); refusals(); unknown_blocks(); unknown_settled_by_account_read(); expiry_backup(); missed_fill_from_account_read();
+  fills_and_rests(); refusals(); unknown_blocks(); unknown_settled_by_account_read(); expiry_backup(); missed_fill_from_account_read(); fill_before_201();
   return finish("deskd-manual-gw");
 }

@@ -18,6 +18,12 @@
 
 namespace deskd {
 
+struct Gateway::Orphan {
+  kalshi::FillRow fill;
+  std::string cid;
+  std::int64_t at = 0;
+};
+
 Gateway::Gateway(KillSwitch& kill, PreflightFn preflight, std::size_t normal_cap, std::size_t priority_cap)
     : kill_(kill), preflight_(std::move(preflight)), inbox_(normal_cap, priority_cap) {
   own_.state = RunState::STOP;
@@ -174,6 +180,7 @@ void Gateway::run(Worker& self) {
       snapshot_polled_ms_ = now_ms();
       sync_snapshot();
       expiry_sweep(snapshot_polled_ms_);
+      retry_orphans();   // and an early fill whose 5 s ran out goes
     }
     if (manual_ && now_ms() - timelines_swept_ms_ >= 1000) {   // timelines whose last stamps never came
       timelines_swept_ms_ = now_ms();
@@ -543,6 +550,7 @@ void Gateway::manual_reply(const KalshiWriteReply& r) {
   if (ok && r.outcome.kind == K::ACK && r.create) note_latency(r);
   publish_order(r.cid);
   flush_cancel(r.cid);   // a cancel asked for while the write was in flight goes out once the order id is known
+  retry_orphans();
   const auto it = pending_.find(r.cid);
   if (it == pending_.end()) return;
   OrderReply out;
@@ -592,6 +600,9 @@ void Gateway::manual_private(const PrivateEvent& e) {
       DLOG_ERR("private fill %s contradicts the order book: reconcile before trading", e.fill.trade_id.c_str());
       return;
     }
+    // plan section 3: a fill that beats its order's 201 (no order id known yet) waits up to 5 s
+    // for the reply that binds it (retry_orphans); a foreign order's fill simply ages out
+    if (r == OrderLedger::FillResult::UNMAPPED) { orphans_.push_back({e.fill, e.cid, at}); return; }
     if (r != OrderLedger::FillResult::APPLIED) return;
     stats_.private_applied.fetch_add(1);
     fill_applied(e.fill, e.cid, at, true);
@@ -606,6 +617,26 @@ void Gateway::manual_private(const PrivateEvent& e) {
     publish_order(cid);
     flush_cancel(cid);
   }
+}
+
+void Gateway::retry_orphans() {
+  if (orphans_.empty()) return;
+  auto& ledger = manual_->ledger();
+  const auto now = now_ms();
+  std::vector<Orphan> keep;
+  for (auto& x : orphans_) {
+    const auto r = ledger.fill(x.fill, x.cid, x.at);
+    if (r == OrderLedger::FillResult::APPLIED) {
+      DLOG_INFO("fill %s arrived before its order's 201: applied once the 201 named the order", x.fill.trade_id.c_str());
+      stats_.private_applied.fetch_add(1);
+      fill_applied(x.fill, x.cid, x.at, true);
+    } else if (r == OrderLedger::FillResult::INVALID) {
+      DLOG_ERR("private fill %s contradicts the order book: reconcile before trading", x.fill.trade_id.c_str());
+    } else if (r == OrderLedger::FillResult::UNMAPPED && now - x.at < kOrphanWaitMs) {
+      keep.push_back(std::move(x));
+    }
+  }
+  orphans_ = std::move(keep);
 }
 
 // What follows a fill the ledger took (from the private feed, or from an account read when the
