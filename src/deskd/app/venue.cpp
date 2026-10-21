@@ -264,6 +264,7 @@ void Deskd::attach_manual() {
     lip.mo_after = 200;   // plan section 5: "Rule after 200 fills" retires LIP-15 below -1.5c
     lip.mo_floor = 150;
     lip.ttl_s = 15;       // plan section 2: maker orders rest 5-15 s (late fills are the toxic ones)
+    lip.pull_touch_ticks = 2;   // plan section 5(a): a 2-tick touch move pulls both sides
     lip_ = std::make_unique<MakerEngine>("M1", cfg_.lip_series, env, lip);
     // BAND 96-99 (lane M2): the weather highs first (deskd.band_series); no anchor; 5 a market,
     // $15 an event (a city's day), and it stops quoting once its day is down $20 (plan section 5)

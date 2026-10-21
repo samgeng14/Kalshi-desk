@@ -66,6 +66,12 @@ struct MakerParams {
   std::int64_t fill_target_ms = 600000;
   Px edge_step = 25;                   // 0.25c
   Px edge_min = 50;                    // 0.5c
+  // plan section 5(a): pull both sides when either touch (everyone else's) moves this many grid
+  // ticks from where it was when the quotes went out; 0 = off (LIP-15 sets 2)
+  int pull_touch_ticks = 0;
+  // plan section 3: never join the back of a 1-tick queue deeper than this many times our size
+  // unless fair clears the price by the full edge floor (the fill pace's relaxation aside)
+  int deep_join_x = 3;
   // D1 PAPER (paper_quote) only: an opening IOC after probe_every_ms with no fill and no IOC in
   // the market; a position held hold_max_ms leaves by IOC at the touch, at most one IOC each
   // ioc_gap_ms
@@ -187,6 +193,7 @@ class MakerEngine {
   std::map<std::string, Qty> last_pos_;
   std::map<std::string, std::int64_t> cool_until_;      // after a fill of ours, or a 0.5 sigma move
   std::map<std::string, double> quote_spot_;            // the underlying when the quotes went out
+  std::map<std::string, std::pair<Px, Px>> quote_touch_; // everyone else's touch then (bid, ask)
   std::map<std::string, std::string> cool_why_;
   // per market: when the position went from flat, the last fill or IOC (or the start of quoting),
   // the last IOC (MakerInput::held_ms, quiet_ms, since_ioc_ms)

@@ -605,8 +605,81 @@ void paper_engine_leaving() {
   CHECK(places().empty() && e.status()["last"][tk] == "our fill");
 }
 
+// Plan section 3: never join the back of a 1-tick queue deeper than 3x our size unless fair
+// clears the price by the full edge floor. 0.40 x50 / 0.41 x50, 10 a side, the fill pace's floor
+// down 0.5c: without the rule both sides would join (cap at the touch); a shallow queue may still
+// be joined, and an anchor that puts fair a full floor off the price lets it through.
+void deep_join() {
+  MakerParams p;   // size 10, e 1c alone
+  auto deep = book(4000, 5000, 4100, 5000);
+  auto in = input(deep);
+  in.edge_relax = 50;
+  auto d = maker_quote(in, p);
+  CHECK(d.quotes.empty());
+  p.deep_join_x = 0;   // the rule off: both sides join the touch
+  d = maker_quote(in, p);
+  CHECK(d.quotes.size() == 2 && d.quotes[0].price == 4000 && d.quotes[1].price == 4100);
+  p.deep_join_x = 3;
+  auto shallow = book(4000, 3000, 4100, 3000);   // 3x our size: not deeper than 3x
+  in = input(shallow); in.edge_relax = 50;
+  d = maker_quote(in, p);
+  CHECK(d.quotes.size() == 2);
+  // an anchor at 0.40: fair (0.405 + 0.40) / 2 = 0.4025, so the ask at 0.41 clears 0.75c, over
+  // the anchor floor (0.5c, no maker fee); the bid at 0.40 does not
+  in = input(deep); in.edge_relax = 50; in.anchor = Px{4000};
+  d = maker_quote(in, p);
+  CHECK(d.quotes.size() == 1 && d.quotes[0].side == Side::SELL && d.quotes[0].price == 4100);
+}
+
+// Plan section 5(a): a 2-tick move of everyone else's touch pulls both sides (LIP-15 sets 2);
+// a 1-tick move does not.
+void touch_pull() {
+  const std::string tk = "KXNATGAS15M-26OCT101500-00";
+  auto view = std::make_shared<Gateway::SysView>();
+  view->run = RunState::RUN;
+  view->lanes_on = {"M1"};
+  auto snap = std::make_shared<rest::Snapshot>();
+  kalshi::MarketRow m; m.ticker = tk; m.event_ticker = "KXNATGAS15M-26OCT101500"; m.status = "active";
+  m.open_ms = OPEN; m.close_ms = CLOSE; m.price_ranges = CENT;
+  snap->markets[tk] = m;
+  snap->clock.post_trusted = true;
+  MdBook shown = book(4000, 500, 4600, 500);
+  std::vector<GwMsg> posted;
+  MakerEngine::Env env;
+  env.view = [&] { return std::shared_ptr<const Gateway::SysView>(view); };
+  env.snapshot = [&] { return std::shared_ptr<const rest::Snapshot>(snap); };
+  env.book = [&](const std::string&) { return std::optional<MdBook>(shown); };
+  env.private_up = [] { return true; };
+  env.post = [&](GwMsg g) { posted.push_back(std::move(g)); return true; };
+  MakerParams p; p.pull_touch_ticks = 2;
+  MakerEngine e("M1", {"KXNATGAS15M"}, env, p);
+  e.step(OPEN + 60000);
+  CHECK(posted.size() == 2);
+  for (const auto& g : posted)
+    if (const auto* pi = std::get_if<PlaceIntent>(&g)) {
+      Gateway::SysOrder o; o.cid = pi->cid; o.lane = "M1"; o.ticker = tk; o.side = pi->side; o.price = pi->price;
+      o.count = o.left = pi->count; o.state = OrdState::WORK;
+      view->orders[o.cid] = o;
+    }
+  // ours rest at 0.41 / 0.45 (inside); everyone else's bid moves 0.40 -> 0.39: one tick, no pull
+  shown.bids = {{4100, 1000}, {3900, 500}};
+  shown.asks = {{4500, 1000}, {4600, 500}};
+  posted.clear();
+  e.step(OPEN + 61000);
+  int cancels = 0;
+  for (const auto& g : posted) if (std::holds_alternative<CancelIntent>(g)) ++cancels;
+  CHECK(e.status()["last"][tk] != "the touch moved 2 ticks");
+  // then to 0.38: two ticks from 0.40, both go
+  shown.bids = {{4100, 1000}, {3800, 500}};
+  posted.clear();
+  e.step(OPEN + 62000);
+  cancels = 0;
+  for (const auto& g : posted) if (std::holds_alternative<CancelIntent>(g)) ++cancels;
+  CHECK(cancels == 2 && e.status()["last"][tk] == "the touch moved 2 ticks");
+}
+
 int main() {
-  grid(); quotes(); anchor_and_pulls(); band(); engine_limits(); review_fixes(); engine_own_quotes(); fill_pace();
+  grid(); quotes(); deep_join(); touch_pull(); anchor_and_pulls(); band(); engine_limits(); review_fixes(); engine_own_quotes(); fill_pace();
   paper(); paper_pick(); paper_engine(); paper_engine_leaving();
   return finish("deskd-maker");
 }

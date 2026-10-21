@@ -81,6 +81,7 @@ MakerDecision maker_quote(const MakerInput& in, const MakerParams& p) {
     e = p.edge_anchor + in.maker_fee;
     e_min = p.edge_min + in.maker_fee;
   }
+  const Px e_full = e;   // before the fill pace: the floor a deep 1-tick queue must clear
   if (in.edge_relax > 0) e = std::max(std::min(e, e_min), e - in.edge_relax);   // the fill pace, never below the floor
   d.fair = static_cast<Px>(std::llround(static_cast<double>(fair)));
   const long double skew = static_cast<long double>(p.skew_per_contract) * q / kOneContract;
@@ -88,6 +89,14 @@ MakerDecision maker_quote(const MakerInput& in, const MakerParams& p) {
   const Px ask_floor = static_cast<Px>(std::ceil(static_cast<double>(fair + e - skew)));
   const bool two_sided = in.now_ms - in.open_ms < p.two_sided_ms;
   auto whole = [](Qty x) { return x / kOneContract * kOneContract; };
+  // plan section 3: the back of a 1-tick queue deeper than deep_join_x times our size is joined
+  // only where fair clears the price by the full edge floor (the fill-sim's -2.15c case)
+  const bool one_tick = grid_ceil(bb + 1, *in.grid) == std::optional<Px>(ba);
+  auto deep_join = [&](bool bid, Px px, Qty size) {
+    if (!one_tick || p.deep_join_x <= 0 || px != (bid ? bb : ba)) return false;
+    if ((bid ? bs : as) <= static_cast<Qty>(p.deep_join_x) * size) return false;
+    return bid ? fair - px < e_full : px - fair < e_full;
+  };
   // The bid: one tick better than the best bid, or the best bid itself when that would reach the
   // ask (a 1-tick book), never above fair - e - skew. The cap is held under the ask before it is
   // rounded to the grid, so a cap at or through the ask joins the touch instead of dropping the
@@ -97,7 +106,7 @@ MakerDecision maker_quote(const MakerInput& in, const MakerParams& p) {
     if (cap) {
       const Px px = better ? std::min(*better, *cap) : *cap;
       const Qty size = two_sided ? p.size : std::min(p.size, whole(-q));
-      if (px >= bb && px < ba && size > 0) d.quotes.push_back({Side::BUY, px, size, false});
+      if (px >= bb && px < ba && size > 0 && !deep_join(true, px, size)) d.quotes.push_back({Side::BUY, px, size, false});
     }
   }
   if (two_sided || q > 0) {
@@ -105,7 +114,7 @@ MakerDecision maker_quote(const MakerInput& in, const MakerParams& p) {
     if (floor) {
       const Px px = better ? std::max(*better, *floor) : *floor;
       const Qty size = two_sided ? p.size : std::min(p.size, whole(q));
-      if (px <= ba && px > bb && size > 0) d.quotes.push_back({Side::SELL, px, size, false});
+      if (px <= ba && px > bb && size > 0 && !deep_join(false, px, size)) d.quotes.push_back({Side::SELL, px, size, false});
     }
   }
   if (d.quotes.empty()) d.pull = two_sided ? "fair too close to the touch" : q ? "nothing to reduce at fair" : "past minute 10, flat";
@@ -320,6 +329,20 @@ void MakerEngine::step(std::int64_t now) {
     // the underlying moved 0.5 sigma (of its move to the close) since the quotes went out: both go
     bool resting = false;
     for (const auto& [slot, s] : slots) if (!s.cid.empty()) resting = true;
+    if (!resting) quote_touch_.erase(tk);
+    else if (p_.pull_touch_ticks > 0 && book && !book->bids.empty() && !book->asks.empty() && quote_touch_.count(tk) &&
+             m != snap->markets.end()) {
+      // everyone else's touch moved pull_touch_ticks from where it was when the quotes went out
+      const auto [b0, a0] = quote_touch_[tk];
+      const Px b1 = book->bids.front().px, a1 = book->asks.front().px;
+      const auto& g = m->second.price_ranges;
+      const Px tb = grid_step(std::min(b0, b1), g), ta = grid_step(std::min(a0, a1), g);
+      if (std::abs(b1 - b0) >= p_.pull_touch_ticks * tb || std::abs(a1 - a0) >= p_.pull_touch_ticks * ta) {
+        cool_until_[tk] = now + 1000;
+        cool_why_[tk] = "the touch moved " + std::to_string(p_.pull_touch_ticks) + " ticks";
+        quote_touch_.erase(tk);
+      }
+    }
     if (!resting) quote_spot_.erase(tk);
     else if (a.spot > 0 && a.sd_log > 0 && quote_spot_.count(tk) &&
              std::fabs(std::log(a.spot / quote_spot_[tk])) > 0.5 * a.sd_log) {
@@ -422,6 +445,8 @@ void MakerEngine::step(std::int64_t now) {
         ++places_;
         if (w->second.ioc) ioc_ms_[tk] = active_ms_[tk] = now;
         if (a.spot > 0 && !quote_spot_.count(tk)) quote_spot_[tk] = a.spot;
+        if (book && !book->bids.empty() && !book->asks.empty() && !quote_touch_.count(tk))
+          quote_touch_[tk] = {book->bids.front().px, book->asks.front().px};
       }
     }
     // a market no longer quoted and with nothing working is forgotten, unless the lane holds it
