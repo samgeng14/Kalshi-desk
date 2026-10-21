@@ -20,12 +20,16 @@ parse_px and parse_count: a price in whole 1/10,000 $, a count to 1/100).
   - a malformed or impossible frame (a delta below zero, a crossed book) drops that market's
     book until its next snapshot, as deskd does, and is counted as bad.
 
-The sample (the rule chosen): once a minute, at each whole UTC minute, the book as of then (every
-frame received at or before it). A market is sampled inside its own recorded LIP program's window
-(kalshi_incentives start_date to end_date, liquidity programs only), else from its open_time to
-its close_time (kalshi_markets); a market with neither is not sampled. A minute of that window
-with no live book (before the first snapshot, after a gap or a disconnect until the next one) is
-not a sample: it is counted as missing. Minutes outside the recorded data are neither.
+The sample (the rule chosen): once a minute, at 30 s past each whole UTC minute, the book as of
+then (every frame received at or before it). Mid-minute keeps the samples off the windows' edges:
+a 15-minute window keeps its 15, none at its open, when the book is often still empty (the
+recorder subscribes before the open, and the first quotes come a moment after it), so the open
+weighs no more than any other moment. A market is sampled inside its own recorded LIP program's
+window (kalshi_incentives start_date to end_date, liquidity programs only), else from its
+open_time to its close_time (kalshi_markets); a market with neither is not sampled. A sample
+instant in that window with no live book (before the first snapshot, after a gap or a disconnect
+until the next one) is not a sample: it is counted as missing. Instants outside the recorded data
+are neither.
 
 A side holds the target (the rule chosen, deskd's own LIP rule, strat/lip.h): its resting size,
 summed from its best price outward over every level the book holds, is at least the target. The
@@ -67,6 +71,7 @@ UNIT = 10000      # prices in 1/10,000 $ (deskd's Px): $1
 CENT = 100        # one cent in those units
 CT = 100          # counts in 1/100 contract (deskd's Qty): one contract
 MINUTE_US = 60_000_000
+SAMPLE_AT_US = 30_000_000   # past each whole minute: off the windows' edges
 
 
 # ---- the venue's numbers, as deskd parses them ------------------------------------------------
@@ -373,9 +378,9 @@ class Replay:
             self.drop(tk)
 
 
-def drive(data, rp, period_us, on_period, downs=(), timers=None):
+def drive(data, rp, period_us, on_period, downs=(), timers=None, offset_us=0):
     """Feed every kalshi_ws row to rp in the order received. Before each row, in time order:
-    on_period(t) at each whole multiple of period_us, each timer (a heap of (t_us, n, fn)) and
+    on_period(t) at offset_us past each whole multiple of period_us, each timer (a heap of (t_us, n, fn)) and
     each down instant (every book dropped) strictly before it; at a tie, the period, then the
     timer, then the drop. Frames received at an instant count as before it. The data's span:
     the first and last row's recv_us (None, None when there is none)."""
@@ -410,7 +415,7 @@ def drive(data, rp, period_us, on_period, downs=(), timers=None):
             continue
         if first is None:
             first = t
-            nxt = -(-t // period_us) * period_us
+            nxt = -(-(t - offset_us) // period_us) * period_us + offset_us
             while di < len(downs) and downs[di] < t:
                 di += 1
         advance(t)
@@ -489,7 +494,7 @@ def analyse(data, series=None, target=None, touch=False):
             s['both'] += b and a_
 
     downs = down_instants(data)
-    first, last = drive(data, rp, MINUTE_US, on_minute, downs)
+    first, last = drive(data, rp, MINUTE_US, on_minute, downs, offset_us=SAMPLE_AT_US)
     out = {}
     for ser in sorted(stats):
         s = stats[ser]
@@ -628,22 +633,22 @@ def self_test():
         sp.snapshot(t0 - 10 * s, 1, 1, 1, A, [(0.40, 200), (0.39, 150)], [(0.58, 400)])
         sp.snapshot(t0 - 9 * s, 1, 1, 2, B, [(0.30, 300)], [(0.68, 300)])
         sp.snapshot(t0 - 8 * s, 1, 3, 1, C, [(0.50, 900)], [(0.49, 900)])   # no window recorded for C
-        sp.delta(t0 + 30 * s, 1, 1, 3, B, 'yes', 0.30, -1)                  # B's bid 299 from here
+        sp.delta(t0 + 40 * s, 1, 1, 3, B, 'yes', 0.30, -1)                  # B's bid 299 from here
         sp.trade(t0 + 45 * s, 1, 2, 1, A, 0.40, 5, 'no')
         sp.trade(t0 + 50 * s, 1, 2, 3, A, 0.40, 5, 'no')                    # a trade gap: drops no book
-        sp.delta(t0 + 90 * s, 1, 1, 4, A, 'yes', 0.40, -100)                # A's bid 250 from here
-        sp.delta(t0 + 150 * s, 1, 1, 6, A, 'yes', 0.40, 500)                # seq 6 after 4: a gap, not applied
+        sp.delta(t0 + 100 * s, 1, 1, 4, A, 'yes', 0.40, -100)               # A's bid 250 from here
+        sp.delta(t0 + 160 * s, 1, 1, 6, A, 'yes', 0.40, 500)                # seq 6 after 4: a gap, not applied
         sp.delta(t0 + 165 * s, 1, 1, 7, A, 'yes', 0.39, 1)                  # no snapshot yet: ignored
-        sp.snapshot(t0 + 210 * s, 1, 1, 8, A, [(0.40, 200), (0.39, 150)], [(0.58, 400)])
-        sp.snapshot(t0 + 211 * s, 1, 1, 9, B, [(0.30, 300)], [(0.68, 300)])
-        sp.delta(t0 + 250 * s, 1, 1, 10, B, 'no', 0.68, 10)
-        sp.write('gaps', {'recv_us': t0 + 320 * s, 'source': 'kalshi_ws', 'kind': 'disconnect', 'detail': 'test',
-                          'from_us': t0 + 250 * s, 'to_us': None})
-        sp.snapshot(t0 + 330 * s, 2, 1, 1, A, [(0.40, 900)], [(0.58, 900)])  # connection 2, after the last sample
+        sp.snapshot(t0 + 240 * s, 1, 1, 8, A, [(0.40, 200), (0.39, 150)], [(0.58, 400)])
+        sp.snapshot(t0 + 241 * s, 1, 1, 9, B, [(0.30, 300)], [(0.68, 300)])
+        sp.delta(t0 + 280 * s, 1, 1, 10, B, 'no', 0.68, 10)
+        sp.write('gaps', {'recv_us': t0 + 340 * s, 'source': 'kalshi_ws', 'kind': 'disconnect', 'detail': 'test',
+                          'from_us': t0 + 280 * s, 'to_us': None})
+        sp.snapshot(t0 + 350 * s, 2, 1, 1, A, [(0.40, 900)], [(0.58, 900)])  # connection 2, after the last sample
         sp.write('kalshi_ws', {'recv_us': t0 + 100 * s, 'type': 'orderbook_delta'}, torn=True)
-        # Minutes t0+0..5 inside both windows. A: 350/400, 350/400, 250/400, (the gap), 350/400,
-        # (the disconnect): the bid holds 300 in 3 of 4 samples, the ask in 4. B: 300/300,
-        # 299/300, 299/300, (gap), 300/300, (disconnect).
+        # Samples at t0 + 30, 90, ... 330 s inside both windows. A: 350/400, 350/400, 250/400, (the
+        # gap), 350/400, (the disconnect): the bid holds 300 in 3 of 4 samples, the ask in 4. B:
+        # 300/300, 299/300, 299/300, (gap), 300/300, (disconnect).
         r = analyse(d)
         a, b = r['series'].get('KXNATGAS15M', {}), r['series'].get('KXPLATINUM15M', {})
         check('A: 4 samples, 2 missing (the gap, the disconnect), 1 market', (a.get('samples'), a.get('missing'),
@@ -694,6 +699,22 @@ def self_test():
     check('a number at or below the last is a new subscription, not a gap', rp.gaps == 0 and 'X' in rp.books)
     rp.row(row(6, 2, 'ok', 1, 1, {}))
     check('a frame on a new connection drops the old books', 'X' not in rp.books)
+
+    # A window whose book is empty at its open (subscribed 20 minutes before, as the recorder
+    # does) and holds 300 a side from 2 s after it: every sample, mid-minute, holds the target
+    t1 = int(datetime(2026, 10, 20, 15, 0, tzinfo=timezone.utc).timestamp()) * 1_000_000
+    D = 'KXCOPPER15M-26OCT201515-15'
+    with tempfile.TemporaryDirectory() as d:
+        sp = Spool(d)
+        sp.market(t1 - 1300 * s, 'KXCOPPER15M', D, t1, t1 + 900 * s)
+        sp.program(t1 - 1300 * s, D, 'liquidity', t1, t1 + 900 * s, 300)
+        sp.frame(t1 - 1200 * s, 1, 'orderbook_snapshot', 1, 1, {'market_ticker': D, 'market_id': 'id-' + D})
+        sp.delta(t1 + 2 * s, 1, 1, 2, D, 'yes', 0.40, 300)
+        sp.delta(t1 + 2 * s + 1000, 1, 1, 3, D, 'no', 0.58, 300)
+        sp.delta(t1 + 899 * s, 1, 1, 4, D, 'yes', 0.39, 1)
+        e = analyse(d)['series'].get('KXCOPPER15M', {})
+        check('an empty book at the open, full from 2 s after: 15 samples, both sides in all of them',
+              (e.get('samples'), e.get('missing'), e.get('both'), e.get('verdict')) == (15, 0, 1.0, 'JOIN'), e)
     print('lip_join self-test: %s' % ('ok' if not fails else 'FAILED (%d)' % len(fails)))
     return 1 if fails else 0
 
