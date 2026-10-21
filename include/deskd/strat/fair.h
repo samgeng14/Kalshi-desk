@@ -12,7 +12,11 @@
 // volatility estimate is warm, and this window's published strike is the candle close this feed
 // computed at the open, so the number is about the settlement feed. A window that opened before
 // deskd was watching cannot be checked and gets no fair. Replication counts every checked window;
-// the plan's trading gate is 50 consecutive matches (LIP-15 uses the anchor only after that).
+// the plan's trading gate is 50 consecutive matches (LIP-15 uses the anchor only after that), and
+// with persist() the counts outlive a restart.
+//
+// move_sd() is every listed window's sd of the log move to its close, checked or not: the makers'
+// 0.5 sigma pull is a risk rule, so it applies to every window they quote.
 //
 // Threading: step() runs on strat; board() and status() are read from any thread.
 #include <cstdint>
@@ -66,6 +70,12 @@ class FinancialFair {
   FinancialFair(SymbolFn symbol, ViewFn view, std::int64_t watching_since_ms);
   void step(const rest::Snapshot& snapshot, std::int64_t now_ms);
   std::shared_ptr<const FairBoard> board() const;
+  // by market ticker: sigma x sqrt(seconds to the close), in log terms, where the feed is fresh
+  // and its volatility warm
+  std::shared_ptr<const std::map<std::string, double>> move_sd() const;
+  // Keep the replication counts in this file: read now (absent: none yet; unreadable: said in
+  // status and started from none), rewritten whenever a window is checked.
+  void persist(const std::string& path);
   // the plan's anchor gate: 50 windows in a row whose strike this feed reproduced
   bool gated(const std::string& underlying) const;
   nlohmann::json status() const;
@@ -81,6 +91,9 @@ class FinancialFair {
   VolSettings vol_;
   mutable std::mutex m_;   // board_, replication_, checked_, why_
   std::shared_ptr<const FairBoard> board_;
+  std::shared_ptr<const std::map<std::string, double>> move_sd_;
+  std::string state_path_, state_error_;
+  void save_locked() const;
   std::map<std::string, Replication> replication_;   // by underlying key
   std::map<std::string, bool> checked_;              // market ticker -> its strike matched our close
   std::map<std::string, std::string> why_;           // market ticker -> why it has no fair

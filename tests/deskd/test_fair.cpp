@@ -1,6 +1,7 @@
 // The 15-minute financial fair (strat/fair.h): the strike check, the probability, and when a fair
 // is shown at all.
 #include <cmath>
+#include <fstream>
 #include "check.h"
 #include "deskd/rest/state.h"
 #include "deskd/strat/fair.h"
@@ -85,9 +86,13 @@ void replication_gate() {
     return c;
   };
   std::int64_t now = T0 + 3599000;
+  TempDir td;
+  const std::string dir = td.path;
+  const std::string file = dir + "/replication.json";
   FinancialFair fair([](const std::vector<std::string>& p) { return p.front() == NG ? NG : ""; },
                      [&](const std::string&, std::int64_t since, std::int64_t at) { return std::optional<RefView>(view_of(ticks, since, at)); },
                      T0);
+  fair.persist(file);   // none yet
   rest::Snapshot s;
   const std::int64_t w0 = T0 + 30000, w1 = T0 + 2100000, w2 = T0 + 3000000;
   s.markets["KXNATGAS15M-26OCT100000-00"] = window("KXNATGAS15M-26OCT100000-00", w0, close_at(w0));   // before we watched
@@ -107,6 +112,31 @@ void replication_gate() {
   CHECK(st["markets"]["KXGOLD15M-26OCT100050-50"]["why"].get<std::string>().find("no pyth_value symbol") == 0);
   CHECK(!st["markets"].contains("KXHIGHNY-26OCT10-B70"));
   CHECK(st["markets"]["KXNATGAS15M-26OCT100035-35"]["fair"].is_string());
+  // the move to the close is there for every listed window with a fresh, warm feed, its strike
+  // checked or not (the makers' 0.5 sigma pull); none for a closed one or one without a symbol
+  const auto mv = fair.move_sd();
+  CHECK(mv->count("KXNATGAS15M-26OCT100035-35") && mv->count("KXNATGAS15M-26OCT100050-50"));
+  CHECK(!mv->count("KXNATGAS15M-26OCT100000-00") && !mv->count("KXGOLD15M-26OCT100050-50"));
+  if (mv->count("KXNATGAS15M-26OCT100035-35")) {
+    const auto& f = b->at("KXNATGAS15M-26OCT100035-35");
+    CHECK(std::fabs(mv->at("KXNATGAS15M-26OCT100035-35") - f.sigma * std::sqrt(f.tau_s)) < 1e-12);
+  }
+  // the counts outlive a restart: a new fair on the same file starts from them
+  {
+    FinancialFair again([](const std::vector<std::string>&) { return std::string(); },
+                        [](const std::string&, std::int64_t, std::int64_t) { return std::optional<RefView>(); }, now);
+    again.persist(file);
+    const auto r = again.status()["replication"]["natgas"];
+    CHECK(r["checked"] == 2 && r["matched"] == 1 && r["consecutive"] == 0 && r["last_ok"] == false);
+    CHECK(!again.status().contains("replication_file_error"));
+  }
+  {   // an unreadable file starts from none, and says so
+    { std::ofstream(dir + "/bad.json") << "{\"v\":1,\"replication\":{\"natgas\":{\"checked\":\"x\"}}}"; }
+    FinancialFair bad([](const std::vector<std::string>&) { return std::string(); },
+                      [](const std::string&, std::int64_t, std::int64_t) { return std::optional<RefView>(); }, now);
+    bad.persist(dir + "/bad.json");
+    CHECK(bad.status()["replication"].empty() && bad.status()["replication_file_error"].is_string());
+  }
   // a window is checked once: a second step counts nothing new
   fair.step(s, now + 1000);
   CHECK(fair.status()["replication"]["natgas"]["checked"] == 2);

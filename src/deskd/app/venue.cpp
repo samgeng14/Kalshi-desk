@@ -79,6 +79,7 @@ bool Deskd::init_venue(std::string* err) {
       [this](const std::vector<std::string>& patterns) { return pyth_->symbol_for(patterns); },
       [this](const std::string& symbol, std::int64_t since, std::int64_t now) { return pyth_->view(symbol, since, now); },
       options_.fair_watch_since_ms ? options_.fair_watch_since_ms : now_ms());
+  fair_->persist(cfg_.data_dir + "/replication.json");   // the 50-window gate outlives a restart
   md_->set_idle_callback([this] { republish_refs(); });
   markouts_ = std::make_unique<Markouts>();
   // the data releases that pull the makers' quotes: a bad file refuses the start (the operator
@@ -244,7 +245,9 @@ void Deskd::attach_manual() {
       const auto board = fair_->board();
       const auto f = board->find(tk);
       if (ref) a.spot = ref->value;
-      if (f != board->end() && f->second.sigma > 0 && f->second.tau_s > 0) a.sd_log = f->second.sigma * std::sqrt(f->second.tau_s);
+      // the 0.5 sigma pull's yardstick, on every window (checked strike or not)
+      const auto move = fair_->move_sd();
+      if (const auto sd = move->find(tk); sd != move->end()) a.sd_log = sd->second;
       if (!fair_->gated(u->key)) return a;
       a.gated = true;
       if (f != board->end()) a.fair = f->second.fair;
