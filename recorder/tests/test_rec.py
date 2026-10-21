@@ -6,9 +6,12 @@ import json
 import os
 import tempfile
 import time
+import types
 import unittest
+from datetime import datetime, timezone
+from unittest import mock
 
-from recorder import config, polls
+from recorder import config, polls, rec
 from recorder.rec import Recorder, Seqs, apply_lifecycle, frame_row, market_row, wanted
 from recorder.store import Store
 from recorder.tests.util import HAVE_CRYPTO, fake_venue, fixture_lines, spooled
@@ -331,6 +334,69 @@ class RecorderListsTest(unittest.TestCase):
         asyncio.run(self.r.discover_once())
         since = [p['min_close_ts'] for _, p in self.r.venue.rest.calls if 'min_close_ts' in p]
         self.assertTrue(since and all(s >= self.now - 6 * 3600 - 5 for s in since), since)
+
+
+@unittest.skipUnless(HAVE_CRYPTO, 'cryptography is not installed (pip install -r recorder/requirements.txt)')
+class ControlPickHourTest(unittest.TestCase):
+    """The control decile is picked in the first discovery round at or after the pick hour, not
+    at the control series' next hourly listing (the wall clock is the test's)."""
+
+    def setUp(self):
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric import ed25519
+        self.dir = tempfile.TemporaryDirectory()
+        pem = ed25519.Ed25519PrivateKey.generate().private_bytes(
+            serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption())
+        self.s = config.Settings(rest_url='https://127.0.0.1:9/trade-api/v2', ws_url='wss://127.0.0.1:9/trade-api/ws/v2',
+                                 data_dir=self.dir.name, book_series=['KXNATGAS15M'], college_series=[],
+                                 control_series=['KXNCAAMBGAME'], key_id='k', key_pem=pem, control_pick_h=15)
+        self.r = Recorder(self.s, Store(self.dir.name, 3600, lambda m: None))
+        self.r.changed = asyncio.Event()
+        self.clock = [0.0]
+        self.fail = set()   # the times the control listing fails
+        self.listed = []
+
+        def handler(route, p):
+            self.listed.append(p['series_ticker'])
+            if p['series_ticker'] == 'KXNCAAMBGAME' and self.clock[0] in self.fail:
+                raise OSError('503')
+            if p['series_ticker'] != 'KXNCAAMBGAME' or p['status'] != 'open':
+                return {'markets': [], 'cursor': ''}
+            return {'markets': [{'ticker': 'KXNCAAMBGAME-26NOV%02d%s-A' % (d, g),
+                                 'event_ticker': 'KXNCAAMBGAME-26NOV%02d%s' % (d, g), 'status': 'active',
+                                 'volume_fp': v, 'close_time': iso(self.clock[0] + 86400)}
+                                for d in (5, 6) for g, v in (('THIN', '1.00'), ('BIG', '900.00'))], 'cursor': ''}
+        self.r.venue, _ = fake_venue(handler)
+
+    def tearDown(self):
+        self.r.store.close()
+        self.dir.cleanup()
+
+    def round_at(self, day, h, m, s=0):
+        """One discovery round at that UTC time: whether it listed the control series."""
+        self.clock[0] = datetime(2026, 11, day, h, m, s, tzinfo=timezone.utc).timestamp()
+        self.listed.clear()
+        with mock.patch.object(rec, 'time', types.SimpleNamespace(time=lambda: self.clock[0],
+                                                                    monotonic=time.monotonic)):
+            asyncio.run(self.r.discover_once())
+        return 'KXNCAAMBGAME' in self.listed
+
+    def test_picked_at_the_pick_hour(self):
+        self.assertTrue(self.round_at(5, 14, 59))                     # the hourly listing, a minute early
+        self.assertFalse(self.r.control.picked('KXNCAAMBGAME-26NOV05THIN'))
+        self.assertTrue(self.round_at(5, 15, 0, 30))                  # listed again: the pick is due
+        self.assertTrue(self.r.control.picked('KXNCAAMBGAME-26NOV05THIN'))
+        self.assertIn('KXNCAAMBGAME-26NOV05THIN-A', self.r.desired)
+        self.assertNotIn('KXNCAAMBGAME-26NOV05BIG-A', self.r.desired)
+        self.assertFalse(self.round_at(5, 15, 1))                     # picked: hourly again
+        # a failed listing at the pick hour is tried again COLLEGE_RETRY_S later, not every round
+        self.assertTrue(self.round_at(6, 14, 59))
+        self.fail.add(datetime(2026, 11, 6, 15, 0, 30, tzinfo=timezone.utc).timestamp())
+        self.assertTrue(self.round_at(6, 15, 0, 30))
+        self.assertFalse(self.r.control.picked('KXNCAAMBGAME-26NOV06THIN'))
+        self.assertFalse(self.round_at(6, 15, 1))
+        self.assertTrue(self.round_at(6, 15, 5, 30))
+        self.assertTrue(self.r.control.picked('KXNCAAMBGAME-26NOV06THIN'))
 
 
 if __name__ == '__main__':

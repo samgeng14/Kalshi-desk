@@ -241,6 +241,7 @@ class Recorder:
         self.college = set()       # the desired markets of college and control games: books by REST too
         self.recorded = {}         # ticker -> when it was last on the desired list (us), for backfill
         self.next_college = {}     # series -> epoch s its next listing is due
+        self.college_failed = set()  # the college and control series whose last listing failed
         self.reach_back = {}       # series -> epoch s: its next closed/settled listing reaches back here (a restart)
         self.control = college.ControlPicks(settings.control_frac, settings.control_pick_h, self.state)
         self.conn = 0
@@ -295,9 +296,14 @@ class Recorder:
         return out
 
     def due_series(self, now):
-        """This round's listings: every book series; a college or control series once an hour."""
+        """This round's listings: every book series; a college or control series once an hour. A
+        control series also as soon as the day's pick is due, so the pick is made in the first
+        round at or after pick_h, not at its next hourly listing (up to an hour later, or never
+        with a daily one), unless its last listing failed (then COLLEGE_RETRY_S after that)."""
+        pick = self.control.due(now) is not None
         out = [(x, 'book') for x in self.s.book_series]
-        out += [(x, g) for x, g in self.groups.items() if g != 'book' and self.next_college.get(x, 0) <= now]
+        out += [(x, g) for x, g in self.groups.items() if g != 'book' and (
+            self.next_college.get(x, 0) <= now or (g == 'control' and pick and x not in self.college_failed))]
         return out
 
     async def discover_once(self):
@@ -328,6 +334,10 @@ class Recorder:
                 ok = ok and series_ok
             else:
                 self.next_college[series] = now + (self.s.college_discover_s if series_ok else COLLEGE_RETRY_S)
+                if series_ok:
+                    self.college_failed.discard(series)
+                else:
+                    self.college_failed.add(series)
             if group == 'control':
                 control_listed = series_ok if control_listed is None else control_listed and series_ok
         if settled_due:
