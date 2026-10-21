@@ -113,6 +113,7 @@ body.browse #m-browse { display: flex; }
 #tab-manual table.watch td.dim { color: var(--tx2); }
 #tab-manual table.watch td.fair { color: var(--fair); }
 #tab-manual table.watch td.espn { color: var(--espn); }
+#tab-manual table.watch td.espn.dim { color: var(--tx2); }   /* an old ESPN number (after td.espn, so it wins) */
 #tab-manual table.watch td.warn { color: var(--warn); }
 #tab-manual table.watch tr.grp { cursor: pointer; }
 #tab-manual table.watch tr.closed > td { color: var(--tx2); }

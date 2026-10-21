@@ -282,6 +282,7 @@ EspnRef espn_ref(const EspnLeague& lg, const EspnGame& g, bool yes_home, const s
   r.fetched_ms = g.fetched_ms;
   r.score = std::to_string(g.away_score) + "-" + std::to_string(g.home_score);
   r.state = g.state;
+  r.start_ms = g.start_ms;
   r.period = g.period;
   r.yes_score = yes_home ? g.home_score : g.away_score;
   r.opp_score = yes_home ? g.away_score : g.home_score;

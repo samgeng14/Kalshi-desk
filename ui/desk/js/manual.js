@@ -1687,8 +1687,9 @@
       { t: px(bid), cls: 'n bid', fl: 'd', flv: 'full' },
       { t: px(ask), cls: 'n ask', fl: 'd', flv: 'full' },
       { t: fair !== null && fair !== undefined ? logic.fmtRef(fair, null) : '', cls: 'n ' + (amber ? 'warn' : 'fair'), title: fairTitle },
-      // ESPN's number greys once its play is over 30 s old (its age is in the title)
-      { t: ref && ref.espn !== null ? logic.fmtRef(ref.espn, null) : '', cls: 'n espn' + (ref && ref.espn !== null && ref.espn_ts_ms && nowS - ref.espn_ts_ms > 30000 ? ' dim' : ''), title: ref && ref.espn !== null ? logic.fmtRef(ref.espn, g) + (ref.espn_ts_ms ? ' ' + F.age(nowS - ref.espn_ts_ms) : '') : null },
+      // ESPN's number greys once its play is over 2 minutes old: ESPN itself runs about 40 s
+      // behind and deskd reads it every 30 s, so younger is normal (its age is in the title)
+      { t: ref && ref.espn !== null ? logic.fmtRef(ref.espn, null) : '', cls: 'n espn' + (ref && ref.espn !== null && ref.espn_ts_ms && nowS - ref.espn_ts_ms > 120000 ? ' dim' : ''), title: ref && ref.espn !== null ? logic.fmtRef(ref.espn, g) + (ref.espn_ts_ms ? ' ' + F.age(nowS - ref.espn_ts_ms) : '') : null },
       { t: P && P.pos ? logic.posShort(P.pos) : '', cls: 'n', title: P && P.pos ? F.ssize(P.pos) : null },
       { t: T, cls: Tc }
     ];

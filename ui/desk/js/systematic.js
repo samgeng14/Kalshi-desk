@@ -735,7 +735,10 @@
     // KILLED first, with who killed and how to leave it (2026-10-14: a KILL from a sender's
     // venue refusal looked the same as the operator's click, and START just sat disabled)
     if (h.run.state === 'KILLED') why.unshift('KILLED' + (h.run.why ? ' (' + h.run.why + ')' : '') + ': RE-ARM in the header, then CONFIRM');
-    if (h.run.state !== 'STOP') return { block: true, why: h.run.state === 'RUN' ? '' : why.join(', ') };
+    // an equity-floor HALT ends only with a Start once the equity is back over (gw decides, and
+    // refuses with the floor's sentence while it is not); the daily stop's ends at ET midnight
+    var floorHalt = h.run.state === 'HALTED' && /^equity floor/.test(h.run.why || '');
+    if (h.run.state !== 'STOP' && !floorHalt) return { block: true, why: h.run.state === 'RUN' ? '' : why.join(', ') };
     return { block: why.length > 0, why: why.join(', ') };
   }
   function setDis(btn, dis) { if (btn && btn.disabled !== !!dis) btn.disabled = !!dis; }

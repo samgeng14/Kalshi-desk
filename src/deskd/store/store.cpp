@@ -173,7 +173,7 @@ std::int64_t file_bytes(const std::string& path) {
 std::int64_t file_mtime_ms(const std::string& path) {
   struct stat s {};
   if (::stat(path.c_str(), &s) != 0) return 0;
-  return static_cast<std::int64_t>(s.st_mtim.tv_sec) * 1000 + s.st_mtim.tv_nsec / 1000000;
+  return static_cast<std::int64_t>(s.st_mtime) * 1000;   // whole seconds: st_mtim is Linux-only (macOS: st_mtimespec)
 }
 
 }  // namespace

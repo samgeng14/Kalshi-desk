@@ -343,7 +343,7 @@
     NO_CASH: { http: 409, doc: 'not enough free cash on the venue (the check: the order\'s reservation, $0 when it reduces a position, plus its fee as a taker)' },
     SHARD_CASH: { http: 409, doc: 'not enough free cash on the market\'s Kalshi shard (the same check)' },
     SYS_CEILING: { http: 409, doc: 'Systematic order would exceed its 70% ceiling (lanes only)' },
-    HALTED: { http: 409, doc: 'Systematic halted by the daily stop (start refused)' },
+    HALTED: { http: 409, doc: 'Systematic halted: by the daily stop (until ET midnight) or by the equity floor (until a Start with the equity back over it, across days and restarts); start refused meanwhile' },
     PREFLIGHT: { http: 409, doc: 'start refused: a preflight check fails (see preflight in the reply)' },
     BAD_STATE: { http: 409, doc: 'the action does not apply now (e.g. rearm before rearm_ms)' },
     RATE: { http: 429, doc: 'write token bucket empty; retry after the stated ms (orders, transfers; never cancels or KILL)' },
@@ -814,7 +814,7 @@
       example: { request: { on: false }, response: { ok: true, lane: EX.lane } }
     },
     'POST /api/start': {
-      doc: 'Start Systematic. Refused with PREFLIGHT (and the preflight rows) while any check but DISK fails, KILLED during the lockout, HALTED after the daily stop. Starting while running is ok (n 0).',
+      doc: 'Start Systematic. Refused with PREFLIGHT (and the preflight rows) while any check but DISK fails, KILLED during the lockout, HALTED after the daily stop (until ET midnight) and under the equity floor (a Start with the equity back over it ends the floor HALT). Starting while running is ok (n 0).',
       request: {},
       response: RUN_RESP,
       errors: ['PREFLIGHT', 'KILLED', 'HALTED', 'BAD_STATE'],

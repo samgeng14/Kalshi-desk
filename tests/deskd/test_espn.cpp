@@ -88,6 +88,7 @@ void parsing() {
   CHECK(espn_ref(*nba, ot, true, std::nullopt).per == "OT" && !espn_ref(*nba, ot, true, std::nullopt).espn);
   const auto pre = espn_ref(*nba, games[1], true, std::nullopt);
   CHECK(pre.per == "PRE" && pre.clock == "20:00");   // 00:00Z is 8 pm Eastern (EDT)
+  CHECK(pre.state == "pre" && pre.start_ms == games[1].start_ms && pre.start_ms > 0);   // the WCBB p0's cutoff
   auto post = g; post.state = "post";
   CHECK(espn_ref(*nba, post, true, std::nullopt).per == "FINAL");
   const auto* ncaam = espn_league_for("KXNCAAMBGAME-26NOV05DUKEUNC-DUKE");

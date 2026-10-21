@@ -85,6 +85,7 @@ struct EspnRef {
   std::string state;
   int period = 0, yes_score = 0, opp_score = 0;
   double clock_s = -1;
+  std::int64_t start_ms = 0;   // ESPN's scheduled tip (0: not given)
 };
 using EspnBoard = std::map<std::string, EspnRef>;   // by market ticker
 // The contract's per and clock for a game ("PRE" with the ET start, "Q3", "OT", "FINAL").

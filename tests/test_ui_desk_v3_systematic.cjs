@@ -298,6 +298,15 @@ function bootPage(opts) {
     const priv = T.preflightRows(old).find(r => r.id === 'PRIV');
     check(priv.ok === false && priv.why === 'KXP down', 'PRIV derives from the private feed when the backend sends no PRIV row', priv);
     eq(T.preflightRows(st.hdr).find(r => r.id === 'PRIV').ok, true, 'a backend PRIV row wins over the derived one');
+    {   // START and a HALT: the equity floor's ends with a Start (gw checks the equity), the daily stop's does not
+      const keep = [st.stale, st.staleWhy, st.vstale.K];
+      st.stale = false; st.staleWhy = ''; st.vstale.K = '';
+      const halted = why => Object.assign({}, st.hdr, { run: Object.assign({}, st.hdr.run, { state: 'HALTED', why }) });
+      check(!T.startGate(halted("equity floor: the account's equity $120.00 is under $150.00 (Start again once it is back over)")).block,
+        'a floor HALT leaves START live: gw decides whether the equity is back over the floor');
+      check(T.startGate(halted('daily stop')).block, 'a daily-stop HALT keeps START off until ET midnight');
+      [st.stale, st.staleWhy, st.vstale.K] = keep;
+    }
     // St text of finished orders
     eq(T.stText({ terminal: true, st: 'CXL', tif: 'IOC', why: 'IOC_REST', filled: 0, qty: 10 }), 'IOC 0/10', 'an IOC whose rest was killed reads IOC 0/10');
     eq(T.stText({ terminal: true, st: 'REJ', tif: 'IOC', why: 'PRICE_BAND', filled: 0, qty: 1 }), 'REJ PRICE_BAND', 'a reject carries its reason');

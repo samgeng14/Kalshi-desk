@@ -657,13 +657,16 @@ void Deskd::republish_refs() {
 }
 
 void Deskd::on_book(const MdBook& b) {
-  // a women's college game's pregame YES price: the mid of a 15c-or-tighter book while ESPN says
-  // the game has not started (plan section 5(f): "the pregame Kalshi price"); kept once it starts
+  // a women's college game's pregame YES price: the mid of a 15c-or-tighter book before its
+  // scheduled tip, as the model was trained (docs/wcbb_model.md: "the Kalshi mid at the scheduled
+  // tip"); kept once it passes. ESPN says "in" 40-60 s after the real tip, so "pre" alone would
+  // let in-play mids in and count the opening run twice (in p0 and in the margin); a ladder first
+  // opened after the tip gets no p0 and so no fair.
   if (wcbb_ && espn_ && b.ticker.rfind("KXNCAAWBGAME-", 0) == 0 && !b.stale && !b.bids.empty() && !b.asks.empty() &&
       b.asks.front().px - b.bids.front().px <= 1500) {
     const auto board = espn_->board();
     const auto e = board->find(b.ticker);
-    if (e != board->end() && e->second.state == "pre")
+    if (e != board->end() && e->second.state == "pre" && e->second.start_ms > 0 && now_ms() < e->second.start_ms)
       wcbb_p0_[b.ticker] = (b.bids.front().px + b.asks.front().px) / 2.0 / kOneDollar;
   }
   // gw reads the latest book of each market, stale ones included, so a gap blocks orders.
