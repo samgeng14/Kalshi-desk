@@ -3,9 +3,12 @@
 # unpacked release that deploy.sh copied over:
 #
 #   ./setup.sh                 plan: say what it would do, change nothing (the default)
-#   ./setup.sh --apply         do it: user, dirs, release, venv, units (never replacing your files)
+#   ./setup.sh --apply         do it: base system, user, dirs, release, venv, units (never replacing your files)
 #   ./setup.sh --apply --start also enable and start the recorder and the upload timer
 #   ./setup.sh --apply --replace-units   replace changed systemd units (the old ones kept as .bak)
+#
+# The base system first, in the same mode: base.sh (chrony with timesyncd off, a swap file, the
+# journal capped at 1 GB, security-only unattended upgrades without automatic reboots).
 #
 # Safety rules:
 #   - nothing is deleted: every release stays under /opt/deskd-recorder/releases/, the venv and
@@ -45,6 +48,9 @@ act() {   # act "what" cmd...: run it with --apply, else say it
 SUDO=sudo; [ "$(id -u)" = 0 ] && SUDO=
 
 log "setup mode: $MODE, release $REL_ID from $SRC"
+
+# 0. the base system, in this mode (base.sh says what it does and keeps every changed file)
+if [ "$MODE" = apply ]; then bash "$SRC/recorder/deploy/base.sh" --apply; else bash "$SRC/recorder/deploy/base.sh"; fi
 
 # 1. packages: python3-venv only (pip comes with the venv). confold: existing configs are kept.
 if ! dpkg -s python3-venv >/dev/null 2>&1; then
