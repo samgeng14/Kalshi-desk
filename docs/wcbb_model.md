@@ -1,11 +1,25 @@
-# The women's college basketball model (plan section 5(f))
+# The basketball models: women's college and NBA (plan section 5(f))
 
-The model's fair for a KXNCAAWBGAME market: the probability that the market's YES team wins, from
-the game state and the pregame Kalshi price. `tools/train_wcbb.py` fits it and writes
-`models/wcbb_logit_vN.json`; deskd (`strat/wcbb_model.h`) loads that file, refuses it unless its
-golden rows reproduce to 1e-6, and shows the fair on the Manual ladders (book.ref.fair) from the
-first listed game. Systematic use waits for the plan's gate: 150+ settled games, a held-out Brier
-score at least the Kalshi mid's, and positive markouts on overlay clicks.
+The model's fair for a game market (KXNCAAWBGAME, KXNBAGAME): the probability that the market's
+YES team wins, from the game state and the pregame Kalshi price. `tools/train_bball.py --league
+wcbb|nba` fits it and writes `models/wcbb_logit_vN.json` or `models/nba_logit_vN.json`
+(`tools/train_wcbb.py` is `--league wcbb` under its old name); deskd (`strat/wcbb_model.h`, and
+`strat/bball_model.h` for both leagues) loads that file, refuses it unless its golden rows
+reproduce to 1e-6, and shows the fair on the Manual ladders (book.ref.fair) from the first listed
+game. Systematic use waits for the plan's gate: 150+ settled games, a held-out Brier score at
+least the Kalshi mid's, and positive markouts on overlay clicks.
+
+## Leagues
+
+| league | model | regulation | in overtime |
+|---|---|---|---|
+| `wcbb` | `wcbb_logit` | 4 x 600 s = 2400 s | `t_left_s` 0 (the overtime clock is not used) |
+| `nba` | `nba_logit` | 4 x 720 s = 2880 s | `t_left_s` is the overtime clock, 0 to 300 s |
+
+From ESPN's period and the period's clock: periods 1 to 4 with a clock of at most one period give
+(4 - period) x period length + clock, `ot` false; a later period is overtime, `ot` true, with
+`t_left_s` the clock (NBA, clock at most 300 s) or 0 (wcbb, clock at most 600 s). Period 0 or a
+clock past those limits is no state, and no fair.
 
 The NBA's model (KXNBAGAME, the N1 lane) is the same regression in the same file format, with
 model `nba_logit`. deskd reads both leagues through one loader, `strat/bball_model.h`
@@ -50,6 +64,8 @@ With `tau = max(t_left_s, 0) / R` (R the league's regulation: 2400 wcbb, 2880 nb
 | `tau` | tau |
 | `ot` | 1 in overtime, else 0 |
 
+In NBA overtime tau is the overtime clock over 2880 (at most 300/2880); in wcbb overtime it is 0.
+
 ## The file
 
 ```json
@@ -61,8 +77,8 @@ With `tau = max(t_left_s, 0) / R` (R the league's regulation: 2400 wcbb, 2880 nb
   "trained": "2026-11-01",
   "seasons": ["2024-25", "2025-26"],
   "n_games": 1234,
-  "brier": {"model": 0.123, "kalshi_mid": 0.125, "stern": 0.130, "held_out": "2025-26"},
-  "features": ["logit_p0", "margin_over_sd", "logit_p0_x_tau", "possession"],
+  "brier": {"model": 0.123, "kalshi_mid": 0.125, "espn": 0.127, "stern": 0.130, "stern_ot": 0.129, "held_out": "2025-26"},
+  "features": ["logit_p0", "margin_over_sd", "logit_p0_x_tau", "ot"],
   "mean": [0.0, 0.0, 0.0, 0.0],
   "scale": [1.0, 1.0, 1.0, 1.0],
   "coef": [1.0, 0.5, -0.3, 0.1],
@@ -77,4 +93,12 @@ any by more than 1e-6 refuses the file and says which row. `model` is `wcbb_logi
 `league` and `regulation_s`, when present, must be that model's league's (a file without them,
 written before the NBA's, takes them from `model`). A golden row's `ot` is a boolean, false when
 absent. deskd keeps the sha256 of the file's bytes, which is how a gate file
-(`gates_dir/<lane>.json`) names the model it measured.
+(`gates_dir/<lane>.json`) names the model it measured. An NBA file's golden rows include an
+overtime row (3:00 left in overtime); a wcbb file's include one (t_left_s 0) when it uses `ot`.
+
+`model` names the league; `league` must agree with it and `regulation_s` must be that league's (a
+loader refuses `nba_logit` with `regulation_s` 2400, naming both). A file written before these
+keys existed (wcbb, no `league`, no `regulation_s`, golden rows without `ot`) reads as
+`wcbb`, 2400, `ot` false. In `brier`, `kalshi_mid` and `espn` are null when the panel had none;
+`stern_ot` is Stern's model with a tie at the horn going to overtime (train_bball.py's docstring).
+A gate names a model by the file's sha256 (`sha256sum`, the trainer prints it).
