@@ -104,7 +104,9 @@
     });
   }
 
-  var SILENT_MS = 5000, PROBE_MS = 5000;
+  // a stream silent 3 s (no heartbeat: the backend sends one each second) is reopened, and the
+  // reopen resyncs from /api/snapshot (plan section 6); the store greys the screen at the same 3 s
+  var SILENT_MS = 3000, PROBE_MS = 5000;
   function Live(sid) {
     this.sid = sid; this.es = null; this.opened = false; this.retry = null; this.epoch = null;
     this.lastMsg = 0; this.wd = null; this.probing = false; this.lastProbe = 0; this.reopens = 0;

@@ -1687,7 +1687,8 @@
       { t: px(bid), cls: 'n bid', fl: 'd', flv: 'full' },
       { t: px(ask), cls: 'n ask', fl: 'd', flv: 'full' },
       { t: fair !== null && fair !== undefined ? logic.fmtRef(fair, null) : '', cls: 'n ' + (amber ? 'warn' : 'fair'), title: fairTitle },
-      { t: ref && ref.espn !== null ? logic.fmtRef(ref.espn, null) : '', cls: 'n espn', title: ref && ref.espn !== null ? logic.fmtRef(ref.espn, g) + (ref.espn_ts_ms ? ' ' + F.age(nowS - ref.espn_ts_ms) : '') : null },
+      // ESPN's number greys once its play is over 30 s old (its age is in the title)
+      { t: ref && ref.espn !== null ? logic.fmtRef(ref.espn, null) : '', cls: 'n espn' + (ref && ref.espn !== null && ref.espn_ts_ms && nowS - ref.espn_ts_ms > 30000 ? ' dim' : ''), title: ref && ref.espn !== null ? logic.fmtRef(ref.espn, g) + (ref.espn_ts_ms ? ' ' + F.age(nowS - ref.espn_ts_ms) : '') : null },
       { t: P && P.pos ? logic.posShort(P.pos) : '', cls: 'n', title: P && P.pos ? F.ssize(P.pos) : null },
       { t: T, cls: Tc }
     ];
@@ -2010,8 +2011,9 @@
     R.add({ id: 'm-fills', tab: 'manual', fn: renderFills });
     R.add({ id: 'm-pos', tab: 'manual', fn: renderPos });
     if (root.addEventListener) root.addEventListener('resize', function () { dirtyAllLads(); mark('layout'); });
-    // Safari slows hidden tabs: redraw in full when the page shows again
-    document.addEventListener('visibilitychange', function () { if (!document.hidden) R.force('manual'); });
+    // Safari slows hidden tabs: redraw every tab in full when the page shows again (SYSTEMATIC and
+    // SPLIT too, not only this one)
+    document.addEventListener('visibilitychange', function () { if (!document.hidden) R.force(null); });
   }
 
   Desk.manual = {
