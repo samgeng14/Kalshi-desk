@@ -243,10 +243,37 @@ void unknown_settled_by_account_read() {
   CHECK(d.until([&]{ return d.last_row("Mgwset-4")["st"]=="CXL"; }));
   CHECK(d.last_row("Mgwset-4")["why"]=="IOC_REST");
 }
+// Plan section 3: a client cancel at the expiry + 1.5 s backs up the exchange's own ("nothing
+// lives 2 s past expiry"). A venue whose expiry runs a minute late leaves a 5 s post working; gw
+// cancels it, once, about 1.5 s after the expiry, and it ends EXP (why EXPIRY).
+void expiry_backup() {
+  Desk d;
+  d.venue.f->with_engine([](fakex::Engine& e, std::int64_t) { e.config().expiry_delay_ms = 60000; });
+  auto r=d.place(d.intent("Mgwexp-1",Side::BUY,3900,100,Tif::POST,5));
+  CHECK(r.code.empty());
+  auto ord=json::parse(r.ord.empty() ? "{}" : r.ord);
+  CHECK(ord["st"]=="WORK" && ord["exp_ms"].is_number());
+  const std::int64_t exp=ord["exp_ms"].is_number() ? ord["exp_ms"].get<std::int64_t>() : 0;
+  const auto end=mono_ms()+10000;
+  auto ended=[&]{ const auto st=d.last_row("Mgwexp-1")["st"]; return st=="EXP" || st=="CXL"; };
+  while(mono_ms()<end && !ended()) std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  const auto row=d.last_row("Mgwexp-1");
+  // ended by our cancel at its expiry: EXP, why EXPIRY (the contract's word for it)
+  CHECK(row["st"]=="EXP" && row["why"]=="EXPIRY");
+  const std::int64_t done=row["t"]["done"].is_number() ? row["t"]["done"].get<std::int64_t>() : 0;
+  CHECK(done>=exp+1500 && done<exp+2000);   // nothing lives 2 s past its expiry
+  CHECK(d.gw->stats().manual_cancels==1);
+  CHECK(!d.venue.f->with_engine([](fakex::Engine& e, std::int64_t) {
+    for (const fakex::Order* o : e.user_orders())
+      if (o->client_order_id=="Mgwexp-1" && o->status==fakex::OrdStatus::RESTING) return true;
+    return false; }));
+  std::this_thread::sleep_for(std::chrono::milliseconds(600));
+  CHECK(d.gw->stats().manual_cancels==1);   // once
+}
 }  // namespace
 
 int main() {
   std::signal(SIGPIPE, SIG_IGN);   // as deskd's runtime does process-wide (app/runtime.h)
-  fills_and_rests(); refusals(); unknown_blocks(); unknown_settled_by_account_read();
+  fills_and_rests(); refusals(); unknown_blocks(); unknown_settled_by_account_read(); expiry_backup();
   return finish("deskd-manual-gw");
 }

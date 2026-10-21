@@ -168,10 +168,12 @@ void Gateway::run(Worker& self) {
       stats_.handled.fetch_add(1, std::memory_order_relaxed);
     }
     if (sys_) sys_tick(now_ms());
-    // a new account read, even with nothing else happening: it may settle an unknown order
+    // a new account read, even with nothing else happening: it may settle an unknown order; and
+    // the backup cancel of anything working past its expiry
     if (manual_ && now_ms() - snapshot_polled_ms_ >= 250) {
       snapshot_polled_ms_ = now_ms();
       sync_snapshot();
+      expiry_sweep(snapshot_polled_ms_);
     }
     if (manual_ && now_ms() - timelines_swept_ms_ >= 1000) {   // timelines whose last stamps never came
       timelines_swept_ms_ = now_ms();
@@ -627,6 +629,34 @@ void Gateway::manual_private(const PrivateEvent& e) {
   if (!cid.empty()) {
     publish_order(cid);
     flush_cancel(cid);
+  }
+}
+
+// Plan section 3: every post carries an exchange-side expiry, and a client cancel at the expiry
+// plus 1.5 s backs it up ("nothing lives 2 s past expiry"). An order still working then is
+// cancelled with why EXPIRY, once; one whose id is not known yet goes when it is (flush_cancel).
+// One the venue did expire answers 404 (GONE), which is harmless.
+void Gateway::expiry_sweep(std::int64_t now) {
+  for (auto it = expiry_asked_.begin(); it != expiry_asked_.end();) {
+    const auto* o = manual_->ledger().find(*it);
+    it = !o || o->terminal() ? expiry_asked_.erase(it) : std::next(it);
+  }
+  std::vector<std::string> due;
+  for (const auto& [cid, o] : manual_->ledger().orders())
+    if (!o.terminal() && o.intent.tif == Tif::POST && o.intent.exp_ms && now >= o.intent.exp_ms + kExpiryBackupMs &&
+        !cancel_sent_.count(cid) && !expiry_asked_.count(cid))
+      due.push_back(cid);
+  for (const auto& cid : due) {
+    expiry_asked_.insert(cid);
+    const auto* o = manual_->ledger().find(cid);
+    DLOG_WARN("order %s still working %lld ms past its expiry: cancelling it (the backup to the exchange's expiry)",
+              cid.c_str(), static_cast<long long>(now - o->intent.exp_ms));
+    if (!o->cancel_requested) {
+      cancel_why_[cid] = "EXPIRY";
+      manual_->ledger().request_cancel(cid, "EXPIRY");
+    }
+    send_cancel(cid);
+    publish_order(cid);
   }
 }
 
