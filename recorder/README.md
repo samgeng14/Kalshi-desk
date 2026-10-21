@@ -128,13 +128,14 @@ recorder/deploy/deploy.sh --apply            # installs: base system, user, dirs
 ```
 
 `setup.sh` first runs `base.sh` in the same mode: chrony (systemd-timesyncd off, only once chrony
-runs; apt may remove only timesyncd's package to install it, anything more is refused), a 2 GB
-`/swapfile` by a swap unit when the VM has no swap, journald capped at 1 GB, and
-unattended-upgrades for security updates only with no automatic reboot. A package removed but not
-purged counts as not installed. Neither script replaces an existing `recorder.env`,
-credential, changed unit or changed config file (a changed one gets ours beside it as `.new`;
-`--replace-units` switches units, keeping `.bak`), and neither deletes a release. Then put the
-credentials on the VM, root-owned, 0400, in `/etc/deskd-recorder/credentials/`:
+runs; apt may remove only timesyncd's package to install it, anything more is refused, as is a
+failed apt simulation, with apt's error), a 2 GB `/swapfile` by a swap unit when the VM has no
+swap, journald capped at 1 GB, and unattended-upgrades for security updates only with no
+automatic reboot. A package removed but not purged counts as not installed. Neither script
+replaces an existing `recorder.env`, credential, changed unit or changed config file (a changed
+one gets ours beside it as `.new`; `--replace-units` switches units, keeping `.bak`), and neither
+deletes a release. Then put the credentials on the VM, root-owned, 0400, in
+`/etc/deskd-recorder/credentials/`:
 
 | File | What | Needed |
 |---|---|---|

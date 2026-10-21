@@ -8,8 +8,8 @@
 # What it sees to:
 #   - chrony keeps the clock (the recorder stamps first-seen times, so the offset matters), and
 #     systemd-timesyncd is off: two NTP clients fight. Ubuntu's chrony package conflicts with
-#     timesyncd's, so apt removes that one package; if apt would remove anything else, the
-#     install is refused. timesyncd is turned off only once chrony is installed and running.
+#     timesyncd's, so apt removes that one; if apt would remove more, or its simulation fails,
+#     the install is refused. timesyncd is turned off only once chrony is installed and running.
 #   - swap: a SWAP_MB (2048) MB /swapfile, enabled by a systemd swap unit (fstab is not edited),
 #     and only when the VM has no swap at all
 #   - the journal capped at 1 GB (SystemMaxUse=1G), in a journald drop-in
@@ -82,14 +82,22 @@ if installed chrony; then
   CHRONY=1
 else
   apt_update
-  removes=$(apt-get -s install chrony 2>/dev/null | awk '/^Remv /{print $2}' | sort -u | tr '\n' ' ')
-  others=$(printf '%s\n' $removes | grep -vx 'systemd-timesyncd' || true)
-  if [ -n "$others" ]; then
-    log "REFUSED: installing chrony would also remove: $others; install it by hand (timesyncd left on)"
+  # the simulation on its own, not in a pipeline (pipefail and set -e would end the run with no
+  # word): when it fails (package lists without chrony, held or broken packages), say why
+  if ! sim=$(apt-get -s install chrony 2>&1); then
+    log "REFUSED: apt-get -s install chrony failed; install it by hand (timesyncd left on): $(
+      printf '%s\n' "$sim" | grep -v '^[[:space:]]*$' | tail -3 | paste -sd ' ' - || true)"
+    if [ "$MODE" = plan ]; then log "note: plan mode does not run apt-get update; stale package lists can cause this"; fi
   else
-    act "apt-get install chrony${removes:+ (apt removes ${removes% }: it conflicts with chrony)}" \
-      $SUDO $APT install chrony
-    CHRONY=1
+    removes=$(printf '%s\n' "$sim" | awk '/^Remv /{print $2}' | sort -u | tr '\n' ' ')
+    others=$(printf '%s\n' $removes | grep -vx 'systemd-timesyncd' || true)
+    if [ -n "$others" ]; then
+      log "REFUSED: installing chrony would also remove: $others; install it by hand (timesyncd left on)"
+    else
+      act "apt-get install chrony${removes:+ (apt removes ${removes% }: it conflicts with chrony)}" \
+        $SUDO $APT install chrony
+      CHRONY=1
+    fi
   fi
 fi
 if [ "$CHRONY" = 1 ]; then

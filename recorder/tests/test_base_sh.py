@@ -1,9 +1,9 @@
 """deploy/base.sh (chrony, swap, the journald cap, security-only upgrades) run under a temporary
 root with every system command stubbed: plan mode changes nothing, --apply does each thing once,
 a second --apply does nothing, a file you changed is kept (ours goes beside it as .new), and chrony
-is not installed if apt would remove more than timesyncd (which then stays on). A package removed
-but not purged is not installed; timesyncd goes off only once chrony runs. setup.sh's own package
-check, in plan mode."""
+is not installed if apt would remove more than timesyncd or its simulation fails (timesyncd then
+stays on). A package removed but not purged is not installed; timesyncd goes off only once chrony
+runs. setup.sh's own package check, in plan mode."""
 import os
 import shutil
 import subprocess
@@ -26,7 +26,10 @@ STUBS = {
     'dpkg-query': 'for a in "$@"; do p=$a; done\n'
                   '[ -e "$STUB_STATE/pkg-$p" ] || { echo "dpkg-query: no packages found matching $p" >&2; exit 1; }\n'
                   'cat "$STUB_STATE/pkg-$p"\n',
-    'apt-get': 'for a in "$@"; do [ "$a" = -s ] && { cat "$STUB_STATE/apt-sim" 2>/dev/null; exit 0; }; done\n'
+    # apt-get -s prints $STUB_STATE/apt-sim, or fails as apt does when apt-sim-fail exists
+    'apt-get': 'for a in "$@"; do [ "$a" = -s ] && {\n'
+               '  [ -e "$STUB_STATE/apt-sim-fail" ] && { cat "$STUB_STATE/apt-sim-fail" >&2; exit 100; }\n'
+               '  cat "$STUB_STATE/apt-sim" 2>/dev/null; exit 0; }; done\n'
                'last=; for a in "$@"; do last=$a; done\n'
                'case " $* " in *" install "*) echo installed > "$STUB_STATE/pkg-$last"; rm -f "$STUB_STATE/broken-$last";;\n'
                'esac\nexit 0\n',
@@ -208,6 +211,21 @@ class BaseShTest(unittest.TestCase):
         self.write_state('dead-chrony', '')              # enabled, but it does not come up
         out, calls = self.run_base('--apply')
         self.assertIn('REFUSED: chrony is not running; systemd-timesyncd left on', out)
+        self.check_timesyncd_kept(out, calls)
+
+    def test_failed_simulation_is_refused(self):
+        self.write_state('apt-sim-fail', 'Reading package lists...\nBuilding dependency tree...\n'
+                                         'E: Unable to locate package chrony\n')
+        out, _ = self.run_base()
+        self.assertIn('REFUSED: apt-get -s install chrony failed', out)
+        self.assertIn('E: Unable to locate package chrony', out)
+        self.assertIn('note: plan mode does not run apt-get update', out)
+        self.assertIn('would: apt-get install unattended-upgrades', out)   # the rest of the plan is shown
+        self.assertIn('base done (plan)', out)
+        out, calls = self.run_base('--apply')
+        self.assertIn('REFUSED: apt-get -s install chrony failed', out)
+        self.assertNotIn('note: plan mode', out)
+        self.assertNotIn('install chrony', '\n'.join(calls).replace('-s install chrony', ''))
         self.check_timesyncd_kept(out, calls)
 
     def test_setup_python3_venv_check(self):
