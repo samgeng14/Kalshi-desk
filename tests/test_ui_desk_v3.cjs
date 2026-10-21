@@ -194,6 +194,7 @@ const flushMicro = () => new Promise(r => setImmediate(r));
     check(vr({ px: '0.0000' }).length > 0 && vr({ px: '1.0000' }).length > 0, 'an order price is strictly between 0 and 1');
     check(vr({ ttl_s: null, exp_ms: 1791306015500 }).length > 0, 'exp_ms is a whole second');
     check(C.enums.WHY.indexOf('LANE_OFF') >= 0 && C.enums.WHY.indexOf('FORBIDDEN') >= 0 && C.enums.WHY.indexOf('BAD_STATE') >= 0, 'WHY names a lane switched off, FORBIDDEN and BAD_STATE');
+    check(C.enums.WHY.indexOf('RETIRED') >= 0 && C.why.RETIRED, 'WHY names a lane retired by its kill rule (decisions 12), and says what it means');
     check(Object.keys(C.endpoints).filter(k => k.indexOf('POST ') === 0).every(k => ['FORBIDDEN', 'BAD_REQUEST', 'INTERNAL'].every(c => C.endpoints[k].errors.indexOf(c) >= 0)),
       'every POST lists FORBIDDEN, BAD_REQUEST and INTERNAL');
     check(C.endpoints['POST /api/kill'].errors.indexOf('RATE') < 0 && C.endpoints['POST /api/cancel'].errors.indexOf('RATE') < 0, 'KILL and cancels are never rate-limited');

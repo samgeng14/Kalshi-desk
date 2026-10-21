@@ -301,7 +301,7 @@
     WHY: ['', 'USER', 'KILL', 'STOP', 'HALT', 'PULL', 'IOC_REST', 'FOK', 'POST_CROSS', 'STP', 'TAKEOVER',
           'MARKET_CLOSED', 'EXPIRY', 'BAD_REQUEST', 'OFF_GRID', 'BAD_QTY', 'UNKNOWN_MARKET',
           'DUP_CID', 'PRICE_BAND', 'REDUCE', 'KILLED', 'STALE', 'RO', 'NO_CASH', 'SHARD_CASH', 'SYS_CEILING',
-          'HALTED', 'RATE', 'EXCHANGE', 'INTERNAL', 'LANE_OFF', 'FORBIDDEN', 'BAD_STATE']
+          'HALTED', 'RATE', 'EXCHANGE', 'INTERNAL', 'LANE_OFF', 'RETIRED', 'FORBIDDEN', 'BAD_STATE']
   };
   var WHY_DOC = {
     '': 'live order, or fully filled',
@@ -309,6 +309,7 @@
     KILL: 'cancelled by KILL',
     STOP: 'cancelled because Systematic was stopped',
     LANE_OFF: 'cancelled because its lane was switched off (POST /api/lane/{id} with on false, or a lane KILL)',
+    RETIRED: 'cancelled because its lane retired: its kill rule fired, and it stays off until reset with deskd stopped',
     HALT: 'cancelled because the daily stop halted Systematic',
     PULL: 'a lane pulled its own quote (repricing, inventory, news, window end)',
     IOC_REST: 'IOC remainder killed after matching (filled may be > 0)',

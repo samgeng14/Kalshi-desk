@@ -466,7 +466,7 @@
   function cxlable(o) { return !(o.local && o.local.cxlPend); }
   // a lane's routine ending: a requote's pull, an expiry, a fill (FILLS has it), a window closing.
   // These leave WORKING at once; a reject, a killed IOC or a cancel the operator or a limit caused
-  // (KILL, STOP, HALT, LANE_OFF, TAKEOVER, USER, STP, POST_CROSS) stays its 3 s.
+  // (KILL, STOP, HALT, LANE_OFF, RETIRED, TAKEOVER, USER, STP, POST_CROSS) stays its 3 s.
   function routineEnd(o) { return o.st === 'FILL' || o.st === 'EXP' || (o.st === 'CXL' && (o.why === 'PULL' || o.why === 'MARKET_CLOSED')); }
   function renderWorking(now) {
     var S = Desk.store, g = grids.work; g.ensure();
