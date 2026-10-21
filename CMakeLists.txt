@@ -334,6 +334,7 @@ add_library(deskd_core STATIC
   src/deskd/strat/fill_model.cpp
   src/deskd/strat/calendar.cpp
   src/deskd/strat/lip.cpp
+  src/deskd/strat/wcbb_model.cpp
   src/deskd/strat/markouts.cpp
   src/deskd/store/store.cpp
   src/deskd/web/sse.cpp
@@ -470,7 +471,7 @@ add_dependencies(deskd-test-fake-wire fake-kalshi)  # it starts the binary once
 #   wire   the signer (RSA-PSS and Ed25519, verified by the fake), the builders and parsers against
 #          the documented shapes and the fake over TLS, what each write reply means, and the demo
 #          probe binary run against the fake
-foreach(t http pub_data order_ledger manual_admission manual_book fair espn sys_book maker markouts fill write_budget calendar lip)
+foreach(t http pub_data order_ledger manual_admission manual_book fair espn sys_book maker markouts fill write_budget calendar lip wcbb)
   add_executable(deskd-test-${t} tests/deskd/test_${t}.cpp)
   target_link_libraries(deskd-test-${t} PRIVATE deskd_core)
   target_precompile_headers(deskd-test-${t} REUSE_FROM deskd_core)
