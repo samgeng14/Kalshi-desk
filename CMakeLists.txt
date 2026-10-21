@@ -424,6 +424,18 @@ add_executable(fake-kalshi tests/fake_exchange/main.cpp)
 target_link_libraries(fake-kalshi PRIVATE fake_kalshi)
 target_precompile_headers(fake-kalshi REUSE_FROM deskd_core)
 
+# The VM recorder's own tests (recorder/tests; tests/test_recorder.py is the old perps recorder's):
+# Kalshi, ESPN and NCAA replies parsed from fixtures, the REST pollers on a fake REST, the control
+# picks, the gaps report, deploy/base.sh with every system command stubbed, and the recorder run
+# against fake-kalshi with loopback scoreboards. No network. A test that needs pyarrow,
+# cryptography, websockets or duckdb skips when this python3 has none (recorder/requirements.txt).
+if(PYTHON3_EXE)
+  add_test(NAME recorder-unit
+           COMMAND ${PYTHON3_EXE} -m unittest discover -s recorder/tests -t .
+           WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+  set_tests_properties(recorder-unit PROPERTIES ENVIRONMENT "FAKE_KALSHI=$<TARGET_FILE:fake-kalshi>")
+endif()
+
 # The fake's own tests:
 #   fake-engine  no sockets: units, grids and fees (the venue's worked rounding example), matching
 #                (price-time, IOC, FOK, post-only, expiry, reduce-only, self-trade, pause, close),
