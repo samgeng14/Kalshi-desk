@@ -57,7 +57,8 @@ class CommandTest(unittest.TestCase):
         self.assertEqual(json.loads(kalshi.pyth_cmd(5))['params'], {'channels': ['pyth_value'], 'underlying_tickers': ['all']})
 
     def test_rest_has_only_get(self):
-        self.assertEqual([m for m in dir(kalshi.Rest) if not m.startswith('_')], ['get', 'markets'])
+        # paging lives in polls.Venue, under the rate limit; Rest stays one GET
+        self.assertEqual([m for m in dir(kalshi.Rest) if not m.startswith('_')], ['get'])
 
 
 @NEEDS_CRYPTO
@@ -110,6 +111,43 @@ class ConfigTest(unittest.TestCase):
             f.write(pem(ed25519.Ed25519PrivateKey.generate()))
         env['CREDENTIALS_DIRECTORY'] = d
         self.assertEqual(config.load(env).key_id, 'from-systemd')
+
+    def test_college_and_sources(self):
+        s = config.load(dict(self.env))
+        self.assertIn('KXNCAAWBGAME', s.college_series)
+        self.assertEqual(s.control_series, ['KXNCAAMBGAME'])
+        self.assertEqual((s.control_frac, s.control_pick_h, s.college_discover_s), (0.1, 15, 3600))
+        self.assertEqual((s.rest_book_s, s.rest_fallback_s, s.rest_rps + s.rest_book_rps), (4.0, 300, 10))
+        self.assertEqual(s.incentive_types, ['liquidity', 'volume'])
+        self.assertTrue(s.espn_url.startswith('https://site.api.espn.com/'))
+        self.assertIn('basketball/womens-college-basketball:50', s.espn_leagues)
+        self.assertTrue(s.ncaa_sports and s.lifecycle)
+        env = dict(self.env, REC_COLLEGE_SERIES='off', REC_CONTROL_SERIES='none', REC_ESPN_LEAGUES='off',
+                   REC_NCAA_SPORTS='OFF', REC_INCENTIVE_TYPES='off', REC_LIFECYCLE='0')
+        s = config.load(env)
+        # 'off' is no entries: never "every series", never "every league"
+        self.assertEqual((s.college_series, s.control_series, s.espn_leagues, s.ncaa_sports, s.incentive_types),
+                         ([], [], [], [], []))
+        self.assertFalse(s.lifecycle)
+        s = config.load(dict(self.env, REC_COLLEGE_SERIES='KXA, KXB', REC_ESPN_URL='http://127.0.0.1:9/x/'))
+        self.assertEqual((s.college_series, s.espn_url), (['KXA', 'KXB'], 'http://127.0.0.1:9/x'))
+        # systemd leaves a comment after a value in the value: it is cut, not a crash at start
+        s = config.load(dict(self.env, REC_LEAD_S='600      # subscribe a window this long before it opens',
+                             REC_REST_BOOK_S='3\t# the top of book', REC_COLLEGE_SERIES='KXA,KXB  # two'))
+        self.assertEqual((s.lead_s, s.rest_book_s, s.college_series), (600, 3.0, ['KXA', 'KXB']))
+
+    def test_college_guards(self):
+        for bad in [{'REC_COLLEGE_SERIES': 'kxlower'},                          # not a series ticker
+                    {'REC_COLLEGE_SERIES': 'KXA', 'REC_CONTROL_SERIES': 'KXA'},  # in two lists
+                    {'REC_COLLEGE_SERIES': 'KXNATGAS15M'},                       # a book series too
+                    {'REC_ESPN_URL': 'http://site.api.espn.com/apis'},           # plain http off loopback
+                    {'REC_NCAA_URL': 'ftp://x/'},
+                    {'REC_REST_BOOK_S': '0.5'}, {'REC_REST_RPS': '50'}, {'REC_SCORES_S': '1'},
+                    {'REC_CONTROL_FRAC': '0'}]:
+            env = dict(self.env)
+            env.update(bad)
+            with self.assertRaises(ValueError, msg=str(bad)):
+                config.load(env)
 
 
 if __name__ == '__main__':

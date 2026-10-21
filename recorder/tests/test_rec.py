@@ -1,8 +1,17 @@
-"""The recorder's pure parts: which markets to record, frame rows, sequence gaps."""
+"""The recorder's pure parts: which markets to record, frame rows, sequence gaps; and the Recorder's
+lists and switches driven by hand (no socket, a fake REST): the college and control games, the
+lifecycle list, the REST fallback, restart gaps."""
+import asyncio
 import json
+import os
+import tempfile
+import time
 import unittest
 
-from recorder.rec import Seqs, frame_row, market_row, wanted
+from recorder import config, polls
+from recorder.rec import Recorder, Seqs, apply_lifecycle, frame_row, market_row, wanted
+from recorder.store import Store
+from recorder.tests.util import HAVE_CRYPTO, fake_venue, fixture_lines, spooled
 
 NOW = 1791648000.0   # 2026-10-10T16:00:00Z
 
@@ -53,6 +62,172 @@ class SeqTest(unittest.TestCase):
         self.assertEqual(s.see(1, 4), (3, 4))
         self.assertIsNone(s.see(1, 5))
         self.assertEqual(s.see(2, 3), (1, 3))   # a subscription starts at 1
+
+
+class LifecycleTest(unittest.TestCase):
+    def test_apply(self):
+        frames = fixture_lines('kalshi_lifecycle.jsonl')
+        from recorder.kalshi import lifecycle_fields
+        m = {'status': 'active', 'close_time': '2026-11-20T00:00:00Z'}
+        self.assertIsNone(apply_lifecycle(m, lifecycle_fields(frames[0])))   # created: kept raw only
+        closed = apply_lifecycle(m, lifecycle_fields(frames[1]))
+        self.assertEqual(closed['close_time'], '2026-11-06T01:00:00Z')        # the game ended early (1793926800)
+        self.assertEqual(m['close_time'], '2026-11-20T00:00:00Z')             # the cached row is not edited
+        self.assertEqual(apply_lifecycle(m, lifecycle_fields(frames[2])), dict(m, status='determined', result='yes'))
+        self.assertEqual(apply_lifecycle(m, lifecycle_fields(frames[3]))['status'], 'settled')
+        self.assertIsNone(apply_lifecycle(m, lifecycle_fields(frames[4])))
+
+
+def iso(t):
+    import datetime
+    return datetime.datetime.fromtimestamp(t, datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+
+class FakeWS:
+    def __init__(self):
+        self.sent = []
+
+    async def send(self, text):
+        self.sent.append(json.loads(text))
+
+
+@unittest.skipUnless(HAVE_CRYPTO, 'cryptography is not installed (pip install -r recorder/requirements.txt)')
+class RecorderListsTest(unittest.TestCase):
+    def setUp(self):
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric import ed25519
+        self.dir = tempfile.TemporaryDirectory()
+        pem = ed25519.Ed25519PrivateKey.generate().private_bytes(
+            serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption())
+        self.s = config.Settings(rest_url='https://127.0.0.1:9/trade-api/v2', ws_url='wss://127.0.0.1:9/trade-api/ws/v2',
+                                 data_dir=self.dir.name, book_series=['KXNATGAS15M'], college_series=['KXNCAAWBGAME'],
+                                 control_series=['KXNCAAMBGAME'], key_id='k', key_pem=pem, rest_fallback_s=0,
+                                 control_pick_h=0)
+        self.r = Recorder(self.s, Store(self.dir.name, 3600, lambda m: None))
+        self.now = time.time()
+        t = time.gmtime(self.now)   # the event tickers' date, KXNCAAMBGAME-26OCT21..., in any locale
+        self.day = '%02d%s%02d' % (t.tm_year % 100, 'JAN FEB MAR APR MAY JUN JUL AUG SEP OCT NOV DEC'.split()[t.tm_mon - 1],
+                                   t.tm_mday)
+        self.window = {'ticker': 'KXNATGAS15M-W1', 'status': 'active', 'open_time': iso(self.now - 60),
+                       'close_time': iso(self.now + 840)}
+        self.wb = [{'ticker': 'KXNCAAWBGAME-%sUCONNSC-%s' % (self.day, t), 'event_ticker': 'KXNCAAWBGAME-%sUCONNSC' % self.day,
+                    'status': 'active', 'open_time': iso(self.now - 86400), 'close_time': iso(self.now + 7 * 86400)}
+                   for t in ('UCONN', 'SC')]
+        self.mb = [{'ticker': 'KXNCAAMBGAME-%s%s-A' % (self.day, g), 'event_ticker': 'KXNCAAMBGAME-%s%s' % (self.day, g),
+                    'status': 'active', 'volume_fp': v, 'close_time': iso(self.now + 86400)}
+                   for g, v in (('THIN', '1.00'), ('BIG', '900.00'))]
+
+    def tearDown(self):
+        self.r.store.close()
+        self.dir.cleanup()
+
+    def see_all(self):
+        self.r.see_market('KXNATGAS15M', self.window, 'book')
+        for m in self.wb:
+            self.r.see_market('KXNCAAWBGAME', m, 'college')
+        for m in self.mb:
+            self.r.see_market('KXNCAAMBGAME', m, 'control')
+
+    def test_lists(self):
+        self.see_all()
+        self.r.recompute(self.now)
+        wb = {m['ticker'] for m in self.wb}
+        self.assertEqual(self.r.desired, {'KXNATGAS15M-W1'} | wb)      # no control game before the pick
+        self.assertEqual(self.r.college, wb)
+        self.assertEqual(self.r.lifecycle, self.r.desired)
+        self.r.pick_control(self.now)
+        self.r.recompute(self.now)
+        thin = 'KXNCAAMBGAME-%sTHIN-A' % self.day
+        self.assertIn(thin, self.r.desired)
+        self.assertNotIn('KXNCAAMBGAME-%sBIG-A' % self.day, self.r.desired)
+        self.r.store.flush()
+        ranked = spooled(self.dir.name, 'college_control')
+        self.assertEqual([(x['event_ticker'].split('-')[1][7:], x['picked']) for x in ranked],
+                         [('THIN', True), ('BIG', False)])
+        # REST books: the college list; the book series only in fallback
+        self.r.book_live = True
+        self.assertEqual(self.r.rest_listing(), {t: 'college' for t in wb | {thin}})
+        self.r.book_live = False                     # REC_REST_FALLBACK_S=0 here: at once
+        listed = self.r.rest_listing()
+        self.assertEqual(listed['KXNATGAS15M-W1'], 'fallback')
+        self.r.book_live = True
+        self.assertNotIn('KXNATGAS15M-W1', self.r.rest_listing())
+        self.r.store.flush()
+        self.assertEqual([g['kind'] for g in spooled(self.dir.name, 'gaps')], ['fallback_on', 'fallback_off'])
+        # the game ends: settled by the lifecycle channel, it leaves the lists without waiting an hour
+        uconn = self.wb[0]['ticker']
+        self.r.on_lifecycle({'type': 'market_lifecycle_v2', 'msg': {'market_ticker': uconn, 'event_type': 'settled'}})
+        self.assertNotIn(uconn, self.r.desired)
+        self.assertNotIn(uconn, self.r.lifecycle)
+        self.assertIn(uconn, self.r.recorded_between(int((self.now - 60) * 1e6), int(self.now * 1e6)))
+
+    def test_sync_explicit_lists(self):
+        self.see_all()
+        self.r.recompute(self.now)
+        from recorder.rec import Session
+        ws, sess = FakeWS(), Session(1)
+        asyncio.run(self.r.sync(ws, sess))
+        by = {c['params']['channels'][0]: c['params'] for c in ws.sent}
+        self.assertEqual(set(by), {'orderbook_delta', 'trade', 'market_lifecycle_v2'})
+        self.assertEqual(set(by['market_lifecycle_v2']['market_tickers']), self.r.lifecycle)
+        self.assertTrue(all(p['market_tickers'] for p in by.values()))   # never an empty list
+        # a venue that refuses the lifecycle list: not asked again for ten minutes
+        lid = next(i for i, p in sess.pending.items() if p[0] == 'market_lifecycle_v2')
+        self.r.changed = asyncio.Event()
+
+        async def refuse():
+            class Once:
+                def __init__(self, frames):
+                    self.frames = frames
+
+                def __aiter__(self):
+                    return self
+
+                async def __anext__(self):
+                    if not self.frames:
+                        raise StopAsyncIteration
+                    return self.frames.pop(0)
+            await self.r.read(Once([json.dumps({'id': lid, 'type': 'error', 'msg': {'code': 11, 'msg': 'x'}})]), sess)
+        asyncio.run(refuse())
+        self.assertGreater(sess.hold['market_lifecycle_v2'], time.monotonic())
+        ws.sent.clear()
+        asyncio.run(self.r.sync(ws, sess))
+        self.assertNotIn('market_lifecycle_v2', [c['params'].get('channels', [None])[0] for c in ws.sent])
+        # with no markets at all, nothing is subscribed: an empty list is never sent
+        r2 = Recorder(self.s, self.r.store)
+        ws2 = FakeWS()
+        asyncio.run(r2.sync(ws2, Session(2)))
+        self.assertEqual(ws2.sent, [])
+
+    def test_discovery_hourly_for_college(self):
+        def handler(route, p):
+            self.assertEqual(route, '/markets')
+            src = {'KXNATGAS15M': [self.window], 'KXNCAAWBGAME': self.wb, 'KXNCAAMBGAME': self.mb}[p['series_ticker']]
+            return {'markets': src if p['status'] == 'open' else [], 'cursor': ''}
+        self.r.venue, rest = fake_venue(handler)
+        self.r.changed = asyncio.Event()
+        asyncio.run(self.r.discover_once())
+        listed = {(p['series_ticker'], p['status']) for _, p in rest.calls}
+        self.assertIn(('KXNCAAWBGAME', 'settled'), listed)
+        self.assertIn(('KXNCAAMBGAME', 'open'), listed)
+        self.assertIn('KXNCAAMBGAME-%sTHIN-A' % self.day, self.r.desired)   # listed and picked in one round
+        self.assertTrue(self.r.changed.is_set())
+        rest.calls.clear()
+        asyncio.run(self.r.discover_once())
+        self.assertEqual({p['series_ticker'] for _, p in rest.calls}, {'KXNATGAS15M'})   # the games: hourly
+
+    def test_restart_is_a_gap(self):
+        st = self.r.store
+        st.write('kalshi_ws', {'recv_us': int((self.now - 90) * 1e6), 'mono_us': 0, 'conn': 1, 'type': 'x',
+                               'sid': None, 'seq': None, 'ticker': None, 'raw': '{}'})
+        st.flush()
+        self.r.note_restart()
+        st.flush()
+        g = [x for x in spooled(self.dir.name, 'gaps') if x['kind'] == 'restart']
+        self.assertEqual(len(g), 1)
+        self.assertEqual(g[0]['from_us'], int((self.now - 90) * 1e6))
+        self.assertEqual(len(self.r.backfill.windows), 1)
+        self.assertEqual(self.r.backfill.windows[0][2], 'restart')
 
 
 if __name__ == '__main__':

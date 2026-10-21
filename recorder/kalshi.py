@@ -98,18 +98,6 @@ class Rest:
         except urllib.error.HTTPError as e:
             raise HttpError(e.code, e.read().decode('utf-8', 'replace')) from None
 
-    def markets(self, series, status, min_close_ts=None, max_pages=10):
-        """Every market of a series in a status, through the cursor."""
-        out, cursor = [], ''
-        for _ in range(max_pages):
-            page = self.get('/markets', {'series_ticker': series, 'status': status, 'limit': 1000,
-                                         'cursor': cursor, 'min_close_ts': min_close_ts})
-            out.extend(page.get('markets') or [])
-            cursor = page.get('cursor') or ''
-            if not cursor:
-                break
-        return out
-
 
 # ---- WebSocket commands ------------------------------------------------------------------------
 
