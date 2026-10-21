@@ -136,6 +136,19 @@ class ConfigTest(unittest.TestCase):
                              REC_REST_BOOK_S='3\t# the top of book', REC_COLLEGE_SERIES='KXA,KXB  # two'))
         self.assertEqual((s.lead_s, s.rest_book_s, s.college_series), (600, 3.0, ['KXA', 'KXB']))
 
+    def test_game_group(self):
+        s = config.load(dict(self.env))
+        self.assertEqual((s.game_series, s.game_pre_s), (['KXNBAGAME'], 7200))
+        self.assertIn('basketball/nba', s.espn_leagues)
+        s = config.load(dict(self.env, REC_GAME_SERIES='off', REC_GAME_PRE_S='3600'))
+        self.assertEqual((s.game_series, s.game_pre_s), ([], 3600))   # 'off' is none, never every series
+        for bad in [{'REC_GAME_SERIES': 'KXNCAAWBGAME'},                       # a college series too
+                    {'REC_GAME_SERIES': 'KXNATGAS15M'},                        # a book series too
+                    {'REC_GAME_SERIES': 'KXNBAGAME', 'REC_CONTROL_SERIES': 'KXNBAGAME'},
+                    {'REC_GAME_SERIES': 'nba'}, {'REC_GAME_PRE_S': '-1'}]:
+            with self.assertRaises(ValueError, msg=str(bad)):
+                config.load(dict(self.env, **bad))
+
     def test_college_guards(self):
         for bad in [{'REC_COLLEGE_SERIES': 'kxlower'},                          # not a series ticker
                     {'REC_COLLEGE_SERIES': 'KXA', 'REC_CONTROL_SERIES': 'KXA'},  # in two lists

@@ -104,8 +104,8 @@ class RecorderListsTest(unittest.TestCase):
             serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption())
         self.s = config.Settings(rest_url='https://127.0.0.1:9/trade-api/v2', ws_url='wss://127.0.0.1:9/trade-api/ws/v2',
                                  data_dir=self.dir.name, book_series=['KXNATGAS15M'], college_series=['KXNCAAWBGAME'],
-                                 control_series=['KXNCAAMBGAME'], key_id='k', key_pem=pem, rest_fallback_s=0,
-                                 control_pick_h=0)
+                                 control_series=['KXNCAAMBGAME'], game_series=['KXNBAGAME'], key_id='k', key_pem=pem,
+                                 rest_fallback_s=0, control_pick_h=0)
         self.r = Recorder(self.s, Store(self.dir.name, 3600, lambda m: None))
         self.now = time.time()
         t = time.gmtime(self.now)   # the event tickers' date, KXNCAAMBGAME-26OCT21..., in any locale
@@ -119,6 +119,11 @@ class RecorderListsTest(unittest.TestCase):
         self.mb = [{'ticker': 'KXNCAAMBGAME-%s%s-A' % (self.day, g), 'event_ticker': 'KXNCAAMBGAME-%s%s' % (self.day, g),
                     'status': 'active', 'volume_fp': v, 'close_time': iso(self.now + 86400)}
                    for g, v in (('THIN', '1.00'), ('BIG', '900.00'))]
+        # NBA games, open for days: tonight's tips in an hour, the late one in five
+        self.nba = [{'ticker': 'KXNBAGAME-%s%s-%s' % (self.day, g, t), 'event_ticker': 'KXNBAGAME-%s%s' % (self.day, g),
+                     'status': 'active', 'open_time': iso(self.now - 3 * 86400), 'close_time': iso(self.now + 14 * 86400),
+                     'occurrence_datetime': iso(self.now + tip + 3 * 3600)}
+                    for g, tip in (('LALBOS', 3600), ('PHXGSW', 5 * 3600)) for t in (g[:3], g[3:])]
 
     def tearDown(self):
         self.r.store.close()
@@ -202,10 +207,59 @@ class RecorderListsTest(unittest.TestCase):
         asyncio.run(r2.sync(ws2, Session(2)))
         self.assertEqual(ws2.sent, [])
 
+    def test_game_group(self):
+        for m in self.nba:
+            self.r.see_market('KXNBAGAME', m, 'game')
+        self.r.recompute(self.now)
+        early = {m['ticker'] for m in self.nba[:2]}
+        # inside its window (two hours before the tip) the early game's books are on the socket;
+        # the late one's, open for days, are not, and neither has lifecycle before its window
+        self.assertEqual(self.r.desired, early)
+        self.assertEqual(self.r.games, early)
+        self.assertEqual(self.r.lifecycle, early)
+        self.assertEqual(self.r.college, set())
+        # socket books only: no REST book polling unless the socket's books are missing (fallback)
+        self.r.book_live = True
+        self.assertEqual(self.r.rest_listing(), {})
+        self.r.book_live = False                     # REC_REST_FALLBACK_S=0 here: at once
+        self.assertEqual(self.r.rest_listing(), {t: 'fallback' for t in early})
+        self.r.book_live = True
+        self.assertEqual(self.r.rest_listing(), {})
+        # an explicit list on every channel, never an empty one
+        from recorder.rec import Session
+        ws = FakeWS()
+        asyncio.run(self.r.sync(ws, Session(1)))
+        by = {c['params']['channels'][0]: set(c['params']['market_tickers']) for c in ws.sent}
+        self.assertEqual(by, {'orderbook_delta': early, 'trade': early, 'market_lifecycle_v2': early})
+        # three hours on, the late game's window opens too
+        self.r.recompute(self.now + 3 * 3600 + 1)
+        self.assertEqual(self.r.desired, {m['ticker'] for m in self.nba})
+        ws.sent.clear()
+        # the early game ended: closed by the lifecycle channel, off the lists after the linger
+        lal = self.nba[0]['ticker']
+        self.r.on_lifecycle({'type': 'market_lifecycle_v2', 'msg': {'market_ticker': lal, 'event_type': 'determined',
+                                                                     'result': 'yes'}})
+        self.r.on_lifecycle({'type': 'market_lifecycle_v2', 'msg': {'market_ticker': lal,
+                                                                     'event_type': 'close_date_updated',
+                                                                     'close_ts': int(self.now) - self.s.linger_s - 1}})
+        self.assertNotIn(lal, self.r.desired)
+        self.assertNotIn(lal, self.r.lifecycle)
+        self.assertIn(lal, self.r.recorded_between(int((self.now - 600) * 1e6), int(self.now * 1e6)))
+        # a restart's backfill: a game that tipped 3 h ago and closed 10 minutes ago, while the
+        # recorder was down, is read over its game's window and not over the days before it
+        r2 = Recorder(self.s, self.r.store)
+        over = dict(self.nba[0], status='closed', close_time=iso(self.now - 600),
+                    occurrence_datetime=iso(self.now))
+        r2.see_market('KXNBAGAME', over, 'game')
+        self.assertIn(lal, r2.recorded_between(int((self.now - 3600) * 1e6), int((self.now - 1800) * 1e6)))
+        self.assertNotIn(lal, r2.recorded_between(int((self.now - 3 * 86400) * 1e6),
+                                                  int((self.now - 3 * 3600 - 7201) * 1e6)))
+
     def test_discovery_hourly_for_college(self):
         def handler(route, p):
             self.assertEqual(route, '/markets')
-            src = {'KXNATGAS15M': [self.window], 'KXNCAAWBGAME': self.wb, 'KXNCAAMBGAME': self.mb}[p['series_ticker']]
+            src = {'KXNATGAS15M': [self.window], 'KXNCAAWBGAME': self.wb, 'KXNCAAMBGAME': self.mb,
+                   'KXNBAGAME': self.nba}[p['series_ticker']]
             return {'markets': src if p['status'] == 'open' else [], 'cursor': ''}
         self.r.venue, rest = fake_venue(handler)
         self.r.changed = asyncio.Event()
@@ -213,7 +267,10 @@ class RecorderListsTest(unittest.TestCase):
         listed = {(p['series_ticker'], p['status']) for _, p in rest.calls}
         self.assertIn(('KXNCAAWBGAME', 'settled'), listed)
         self.assertIn(('KXNCAAMBGAME', 'open'), listed)
+        self.assertIn(('KXNBAGAME', 'settled'), listed)
         self.assertIn('KXNCAAMBGAME-%sTHIN-A' % self.day, self.r.desired)   # listed and picked in one round
+        self.assertIn(self.nba[0]['ticker'], self.r.desired)                 # the game in its window
+        self.assertNotIn(self.nba[2]['ticker'], self.r.desired)
         self.assertTrue(self.r.changed.is_set())
         rest.calls.clear()
         asyncio.run(self.r.discover_once())

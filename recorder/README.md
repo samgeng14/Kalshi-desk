@@ -15,6 +15,10 @@ What it records (`rec.py`):
   (women's basketball, volleyball, college hockey, table tennis, AHL, Liiga, SHL, CS2), listed
   hourly, on the same socket lists and lead/linger rules; of men's college basketball (the
   control) only the thinnest tenth by pregame volume, picked once a day at 15 UTC and kept.
+- The game group (`games.py`, the NBA lanes' evidence): every game of the game series
+  (`KXNBAGAME`), listed hourly, but its `orderbook_delta` and `trade` on the socket only inside the
+  game's window, from `REC_GAME_PRE_S` (2 h) before its scheduled start to `REC_LINGER_S` after
+  its market closes. Socket books only: no REST book polling unless the day-one fallback is on.
 - `market_lifecycle_v2` on the recorded markets and the college games (raw, in `kalshi_ws`; a game
   closed, determined or settled leaves the lists at once instead of at the next hourly listing).
 - By public REST (`polls.py`): the college books every 4 s (every market's top of book in batches,
@@ -74,6 +78,15 @@ What it records (`rec.py`):
   from about 50 markets to several hundred. A refusal shows as `subscribe_error` gaps (the REST
   books still cover the college games). Likewise tickers per `GET /markets?tickers=` (100 per
   request; a refused batch halves itself).
+- **The NBA game group** (`REC_GAME_SERIES`, `REC_GAME_PRE_S`; the season started around Oct
+  20-21, so every night not recorded is evidence lost): the ticker `KXNBAGAME`, and a game's
+  scheduled start, read as the market's `occurrence_datetime` - 3 h (the sports hunt found that
+  equal to ESPN's start for 78-99% of games; without it, 10:00 ET on the ticker's date, so the
+  window opens early, never late). Check the first night's `kalshi_markets` rows (raw) for
+  `occurrence_datetime`, and that `kalshi_ws` has the games' snapshots from about two hours before
+  each tip. Volume, est.: two markets a game, a few book deltas a second in play, about 10-15
+  games a night: tens of MB a day of compressed `kalshi_ws` (check the first night's manifest:
+  `python3 -m recorder.report --days 1`).
 - **`mve_filter=exclude`** on the daily `GET /markets` (leave out the multivariate combinations):
   TO CONFIRM; an unknown parameter is ignored and the sweep is then just bigger.
 - The incentive types kept (`REC_INCENTIVE_TYPES`, default `liquidity,volume`).

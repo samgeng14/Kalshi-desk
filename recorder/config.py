@@ -35,11 +35,15 @@ COLLEGE_SERIES = ['KXNCAAWBGAME', 'KXNCAAWVMATCH', 'KXNCAAHOCKEYGAME', 'KXTTSTAR
                   'KXLIIGAGAME', 'KXSHLGAME', 'KXCS2GAME']
 # the control: men's college basketball, only its thinnest tenth by pregame volume (college.py)
 CONTROL_SERIES = ['KXNCAAMBGAME']
+# the game group (games.py): the NBA's game winners, books and trades on the socket only inside
+# each game's window (REC_GAME_PRE_S before its scheduled start to REC_LINGER_S after its close)
+GAME_SERIES = ['KXNBAGAME']
 # scoreboards (scores.py): ESPN 'sport/league[:groups]'; groups=50 is Division I for basketball.
 # Volleyball's and hockey's league names are ESPN's site paths, TO CONFIRM (ESPN has no AHL, Liiga,
-# SHL, CS2 or table tennis; their scores are not recorded).
+# SHL, CS2 or table tennis; their scores are not recorded). basketball/nba is the game group's,
+# the path deskd's ref/espn.cpp reads.
 ESPN_LEAGUES = ['basketball/womens-college-basketball:50', 'basketball/mens-college-basketball:50',
-                'volleyball/womens-college-volleyball', 'hockey/mens-college-hockey']
+                'volleyball/womens-college-volleyball', 'hockey/mens-college-hockey', 'basketball/nba']
 # NCAA.com's scoreboard JSON, 'sport/division': unofficial, TO CONFIRM
 NCAA_SPORTS = ['basketball-women/d1', 'basketball-men/d1', 'volleyball-women/d1', 'icehockey-men/d1']
 INCENTIVE_TYPES = ['liquidity', 'volume']
@@ -129,6 +133,9 @@ class Settings:
     control_pick_h: int = 15            # picked at 15 UTC (10-11 ET), before the first tip-offs
     college_discover_s: int = 3600      # the college series are listed hourly
     lifecycle: bool = True              # market_lifecycle_v2 on the recorded and college markets
+    # the game group (games.py): listed hourly, its books on the socket only around each game
+    game_series: list = field(default_factory=list)
+    game_pre_s: int = 7200              # from this long before a game's scheduled start
     # public REST
     rest_rps: int = 5                   # discovery, trade backfill, incentives, the daily listing
     rest_book_rps: int = 5              # the REST books
@@ -185,9 +192,12 @@ def load(env=None):
     _series('REC_BOOK_SERIES', s.book_series)
     s.college_series = _series('REC_COLLEGE_SERIES', _optlist(env.get('REC_COLLEGE_SERIES'), COLLEGE_SERIES))
     s.control_series = _series('REC_CONTROL_SERIES', _optlist(env.get('REC_CONTROL_SERIES'), CONTROL_SERIES))
-    every = s.book_series + s.college_series + s.control_series
+    s.game_series = _series('REC_GAME_SERIES', _optlist(env.get('REC_GAME_SERIES'), GAME_SERIES))
+    every = s.book_series + s.college_series + s.control_series + s.game_series
     if len(set(every)) != len(every):
-        raise ValueError('a series is in more than one of REC_BOOK_SERIES, REC_COLLEGE_SERIES, REC_CONTROL_SERIES')
+        raise ValueError('a series is in more than one of REC_BOOK_SERIES, REC_COLLEGE_SERIES, REC_CONTROL_SERIES, '
+                         'REC_GAME_SERIES')
+    s.game_pre_s = _int(env, 'REC_GAME_PRE_S', s.game_pre_s, 0, 86400)
     s.control_frac = _float(env, 'REC_CONTROL_FRAC', s.control_frac, 0.01, 1.0)
     # before 5 UTC the US date is still the day before the UTC date, so a pick then ranks the next
     # US day's games a day early, on thinner volume; allowed, but 15 is the default for a reason

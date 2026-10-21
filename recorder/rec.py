@@ -9,6 +9,9 @@ What it records, on a read-only key:
   - the same for every game of the college series (plan 5(d): women's basketball, volleyball,
     college hockey, table tennis, AHL, Liiga, SHL, CS2; REC_COLLEGE_SERIES), listed hourly, and
     for the thinnest tenth of the control series' games (men's basketball; college.py).
+  - the same for the game series (the NBA's KXNBAGAME; REC_GAME_SERIES), listed hourly, but on
+    the socket only inside each game's window, REC_GAME_PRE_S before its scheduled start to
+    REC_LINGER_S after its close (games.py), and never by REST unless the fallback is on.
   - market_lifecycle_v2 for the recorded markets and the college games, an explicit list too.
   - pyth_value for every underlying: the 15-minute series settle on it (the replication gate).
   - each market's REST row whenever its status, times, strike or result changed: open and
@@ -16,7 +19,8 @@ What it records, on a read-only key:
   - by public REST (polls.py): the college books every few seconds, and every recorded book once
     the socket's book subscription has been down REC_REST_FALLBACK_S; trades over every window
     the socket may have missed and every hour; incentive programs hourly; every open market daily.
-  - ESPN's and NCAA.com's scoreboards for the college sports, each change once (scores.py).
+  - ESPN's and NCAA.com's scoreboards for the college sports and the NBA, each change once
+    (scores.py).
   - gaps: disconnects and resumptions, sequence gaps, refused subscriptions, failed discovery and
     polls, clock steps, restarts, torn spool lines.
 
@@ -39,7 +43,7 @@ import urllib.request
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
-from . import college, config, kalshi, polls, scores
+from . import college, config, games, kalshi, polls, scores
 from .store import State, Store, mono_us, now_us
 
 BOOK_CHANNELS = ('orderbook_delta', 'trade')
@@ -231,7 +235,7 @@ class Recorder:
         self.ssl = kalshi.ssl_context(settings.ca_file) if settings.ws_url.startswith('wss') else None
         self.groups = {}
         for group, series in (('book', settings.book_series), ('college', settings.college_series),
-                              ('control', settings.control_series)):
+                              ('control', settings.control_series), ('game', settings.game_series)):
             for x in series:
                 self.groups[x] = group
         self.markets = {}          # ticker -> (series, latest REST row, group)
@@ -239,9 +243,10 @@ class Recorder:
         self.desired = set()       # books and trades on the socket
         self.lifecycle = set()     # market_lifecycle_v2 on the socket
         self.college = set()       # the desired markets of college and control games: books by REST too
+        self.games = set()         # the desired markets of the game group: socket books only
         self.recorded = {}         # ticker -> when it was last on the desired list (us), for backfill
-        self.next_college = {}     # series -> epoch s its next listing is due
-        self.college_failed = set()  # the college and control series whose last listing failed
+        self.next_college = {}     # series -> epoch s its next listing is due (college, control, game)
+        self.college_failed = set()  # the college, control and game series whose last listing failed
         self.reach_back = {}       # series -> epoch s: its next closed/settled listing reaches back here (a restart)
         self.control = college.ControlPicks(settings.control_frac, settings.control_pick_h, self.state)
         self.conn = 0
@@ -296,7 +301,7 @@ class Recorder:
         return out
 
     def due_series(self, now):
-        """This round's listings: every book series; a college or control series once an hour. A
+        """This round's listings: every book series; a college, control or game series once an hour. A
         control series also as soon as the day's pick is due, so the pick is made in the first
         round at or after pick_h, not at its next hourly listing (up to an hour later, or never
         with a daily one), unless its last listing failed (then COLLEGE_RETRY_S after that)."""
@@ -365,19 +370,27 @@ class Recorder:
             log('control: %d of %d games picked for %s: %s' % (len(picked), len(rows), rows[0]['game_date'],
                                                                ', '.join(picked[:10])))
 
+    def wants(self, m, group, now):
+        if group == 'game':
+            return games.wanted_game(m, now, self.s.game_pre_s, self.s.linger_s)
+        return wanted(m, now, self.s.lead_s, self.s.linger_s)
+
     def recompute(self, now=None):
         """The socket's lists from the cached rows: books and trades for every wanted market (a
-        control game only if picked), lifecycle for those and every unsettled college game."""
+        control game only if picked; a game-group market only inside its game's window), lifecycle
+        for those and every unsettled college game."""
         now = time.time() if now is None else now
-        desired, college_set, life = set(), set(), set()
+        desired, college_set, game_set, life = set(), set(), set(), set()
         for t, (series, m, group) in self.markets.items():
             if group == 'control' and not self.control.picked(m.get('event_ticker')):
                 continue
-            if wanted(m, now, self.s.lead_s, self.s.linger_s):
+            if self.wants(m, group, now):
                 desired.add(t)
-                if group != 'book':
+                if group in ('college', 'control'):
                     college_set.add(t)
-            if group != 'book' and m.get('status') not in DONE:
+                elif group == 'game':
+                    game_set.add(t)
+            if group in ('college', 'control') and m.get('status') not in DONE:
                 life.add(t)
         life = (life | desired) if self.s.lifecycle else set()
         stamp = int(now * 1_000_000)
@@ -386,9 +399,11 @@ class Recorder:
         for t in [t for t, u in self.recorded.items() if u < stamp - KEEP_MARKET_S * 1_000_000]:
             del self.recorded[t]
         self.college = college_set
+        self.games = game_set
         if desired != self.desired or life != self.lifecycle:
-            log('discovery: %d markets to record (+%d -%d), %d college, lifecycle on %d' % (
-                len(desired), len(desired - self.desired), len(self.desired - desired), len(college_set), len(life)))
+            log('discovery: %d markets to record (+%d -%d), %d college, %d game, lifecycle on %d' % (
+                len(desired), len(desired - self.desired), len(self.desired - desired), len(college_set),
+                len(game_set), len(life)))
             self.desired, self.lifecycle = desired, life
             if self.changed is not None:
                 self.changed.set()
@@ -396,16 +411,20 @@ class Recorder:
     def recorded_between(self, from_us, to_us):
         """The markets a trade backfill window reads: those on this process's recording list at
         some point since from_us, and every cached market (a control game only if picked) whose
-        span from lead_s before its open to linger_s after its close overlaps the window. The
-        second is a restart's: a window that closed, or opened and closed, while the recorder was
-        down was never on this process's list, but the first listing after the restart has its
-        row (note_restart sets how far back it reaches)."""
+        span from lead_s before its open to linger_s after its close (a game-group market's: its
+        game's window) overlaps the window. The second is a restart's: a window that closed, or
+        opened and closed, while the recorder was down was never on this process's list, but the
+        first listing after the restart has its row (note_restart sets how far back it reaches)."""
         out = {t for t, u in self.recorded.items() if u >= from_us} | set(self.desired)
         a, b, now = from_us / 1e6, to_us / 1e6, time.time()
         for t, (_, m, group) in self.markets.items():
             if t in out or (group == 'control' and not self.control.picked(m.get('event_ticker'))):
                 continue
-            if recordable_during(m, a, b, now, self.s.lead_s, self.s.linger_s):
+            if group == 'game':
+                hit = games.recordable_during(m, a, b, now, self.s.game_pre_s, self.s.linger_s)
+            else:
+                hit = recordable_during(m, a, b, now, self.s.lead_s, self.s.linger_s)
+            if hit:
                 out.add(t)
         return out
 
@@ -420,7 +439,8 @@ class Recorder:
     # ---- REST books: the college list, and every book once the socket's have been down -------
     def fallback(self):
         """Has the socket's book subscription been missing for REC_REST_FALLBACK_S, while there are
-        books it should carry? (The day-one fallback, plan section 7: REST snapshots.)"""
+        books it should carry (the book series' and the game group's)? (The day-one fallback, plan
+        section 7: REST snapshots.)"""
         t = time.monotonic()
         if self.book_live or not (self.desired - self.college):
             self.book_down_at = None
@@ -438,6 +458,8 @@ class Recorder:
         return on
 
     def rest_listing(self):
+        """The REST books' list: the college and control games always; every other recorded
+        market (the book series, the game group) only in the fallback."""
         listed = {t: 'college' for t in self.college}
         if self.fallback():
             for t in self.desired - self.college:
@@ -702,11 +724,11 @@ class Recorder:
                         asyncio.create_task(asyncio.to_thread(self._ping))
             if t - last_status >= 60:
                 last_status = t
-                log('status: %s, %d markets (%d college), %d frames, %d rows (rest books %d, scores %d, '
+                log('status: %s, %d markets (%d college, %d game), %d frames, %d rows (rest books %d, scores %d, '
                     'trades %d)%s' % (
                         'healthy' if self.healthy() else 'NOT HEALTHY (%s)' % (
                             'socket down' if not self.ws_up else 'discovery failing'),
-                        len(self.desired), len(self.college), self.frames, self.store.rows_written,
+                        len(self.desired), len(self.college), len(self.games), self.frames, self.store.rows_written,
                         self.rest_books.rows, self.scores.rows if self.scores else 0, self.backfill.rows,
                         ', REST FALLBACK' if self.fallback_on else ''))
         if compacting is not None:
@@ -774,10 +796,10 @@ class Recorder:
         loop.set_default_executor(concurrent.futures.ThreadPoolExecutor(max_workers=16, thread_name_prefix='rec'))
         for sig in (signal.SIGTERM, signal.SIGINT):
             loop.add_signal_handler(sig, self.stop.set)
-        log('recorder: %s and %s, %d book, %d college and %d control series, %d score feeds, data in %s, key %s' % (
-            self.s.rest_url, self.s.ws_url, len(self.s.book_series), len(self.s.college_series),
-            len(self.s.control_series), len(self.scores.feeds) if self.scores else 0, self.s.data_dir,
-            self.signer.kind))
+        log('recorder: %s and %s, %d book, %d college, %d control and %d game series, %d score feeds, data in %s, '
+            'key %s' % (self.s.rest_url, self.s.ws_url, len(self.s.book_series), len(self.s.college_series),
+                        len(self.s.control_series), len(self.s.game_series),
+                        len(self.scores.feeds) if self.scores else 0, self.s.data_dir, self.signer.kind))
         self.note_restart()
         self.backfill.seed(self.store.read_recent('kalshi_trades_rest', now_us() - polls.TradeBackfill.KEEP_US))
         # spools a crash left behind
