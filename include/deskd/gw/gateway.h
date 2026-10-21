@@ -293,6 +293,9 @@ class Gateway {
   std::string lane_row(const std::string& id) const;
   // Systematic's used worst case (sys_used over every lane and market) and its ceilings
   void sys_money(std::int64_t* used, std::int64_t* ceiling, std::int64_t* eff) const;   // micro-dollars
+  // Decisions 1: the budgets of the lanes `on`, venue by venue, against that venue's 70% ceiling;
+  // "" when they fit, else the venue, its lanes and the overflow (LaneSet and Start refuse it)
+  std::string budgets_over(const std::set<std::string>& on) const;
   // the part of p that grows its lane's position in its market, after the lane's working orders
   // there on the same side (`pending`): 0 for a reducing order
   Qty sys_grows(const PlaceIntent& p, Qty pending) const;

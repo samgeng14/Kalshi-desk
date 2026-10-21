@@ -316,10 +316,13 @@ void limits() {
   CHECK(d.until([&] { const auto v = d.gw->sys_view(); return v && v->used == (56500 + 80000 + 70000 + 500) * 100; }));
 }
 
-// the 70% ceiling: $10 of cash is $7, past which no lane grows (each lane's budget is $10)
+// the 70% ceiling: $10 of cash is $7, past which no lane grows (each lane's budget is $10). The
+// lanes went on, and Systematic started, while the cash was $1,000 (decisions 1: their budgets
+// fit the ceiling then); the ceiling moves with the equity, and place_sys reads it now.
 void ceiling() {
-  Desk d({lane_spec("L1", 10 * 10000), lane_spec("L2", 10 * 10000)}, 10 * 10000);
+  Desk d({lane_spec("L1", 10 * 10000), lane_spec("L2", 10 * 10000)}, 1000 * 10000);
   CHECK(d.run({"L1", "L2"}));
+  std::atomic_store(&d.snap, snapshot(now_ms(), 10 * 10000));
   CHECK(d.place("L1", "c-1", A1, Side::BUY, 4000, 1500).code == "SENT");   // $6.00
   auto o = d.place("L2", "c-2", B1, Side::BUY, 4000, 300);               // $7.20
   CHECK(o.code == "SYS_CEILING" && o.msg == "past the effective Systematic ceiling 7.0000");

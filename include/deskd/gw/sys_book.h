@@ -14,7 +14,9 @@
 //   N2 NBA FAV 90-95  K   IOC   $15   pregame 90-95c favourites, 5 contracts (a forward test)
 //   Q1 PM QUOTE       P   REST  $20   Polymarket reward quoting (decision 6)
 //   W1 WX 2-VENUE     KP  IOC   $10   the two-venue weather basket (family ARB)
-// Every lane starts off; the operator turns one on (POST /api/lane/{id}).
+// Every lane starts off; the operator turns one on (POST /api/lane/{id}). gw refuses that, and a
+// Start, when the budgets of the lanes on would sum past their venue's 70% ceiling (a KP lane's
+// counts on both venues): the lanes' budgets sum below the ceiling (plan section 4).
 //
 // Order groups (plan section 3): one per lane that is on and shard, each with a contracts limit over the
 // venue's rolling 15 s window of fills (about 2.5 x the per-side size x the markets in it).

@@ -43,6 +43,12 @@ when, and turning it on is refused). With that desk stopped, `build-deskd/deskct
 config, `--data-dir data/prod` and `--live`). Its open positions stay in the book, and its loss limit
 still counts them.
 
+Lanes run together only while their budgets fit their venue's 70% ceiling (0.7 x the account's cash
+and positions; a lane on both venues counts on each). Turning one on past it is refused, naming the
+lanes and the overflow; Kalshi's lanes add up to $210, far past the ceiling of a ~$140 account, so
+pick the ones that run. A Start whose lanes no longer fit (the equity fell) fails its CASH check:
+turn a lane off.
+
 Women's college basketball (KXNCAAWBGAME): `python3 tools/train_wcbb.py --panel FILE.csv` fits
 the in-game model and writes `models/wcbb_logit_v1.json` (the panel's columns and the pandas
 one-liner that makes it are in the script's docstring; `docs/wcbb_model.md` is the file format).

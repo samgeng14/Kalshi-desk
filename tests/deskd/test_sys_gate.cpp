@@ -7,6 +7,9 @@
 //     on refused, its orders LANE_OFF; across a restart it stays so, until deskctl lane-reset
 //   - a lane's event cap (LaneSpec::event_cap) counts what it holds and works in one event, and
 //     never refuses a reducing order
+//   - the budgets of the lanes on may not sum past their venue's 70% ceiling (decisions 1): a
+//     lane set on past it is refused BAD_REQUEST naming the lanes and the overflow, and a Start
+//     whose lanes no longer fit is refused PREFLIGHT, its CASH row failing
 // The ord and lane rows gw published, and the replies the web would send, checked by
 // contract.js itself (node): RETIRED is a contract WHY.
 #include <csignal>
@@ -24,6 +27,7 @@
 #include "deskd/gw/sys_book.h"
 #include "deskd/net/kalshi_sender.h"
 #include "deskd/rest/state.h"
+#include "deskd/web/contract.h"
 #include "net_fixture.h"
 using namespace deskd;
 using json = nlohmann::json;
@@ -125,6 +129,23 @@ struct Desk {
     if(f.wait_for(std::chrono::seconds(2))!=std::future_status::ready) { CHECK(!"gw answered"); return {"TIMEOUT","",{},0,{}}; }
     return f.get();
   }
+  ControlReply stop() {
+    auto p=std::make_shared<std::promise<ControlReply>>(); auto f=p->get_future();
+    CHECK(gw->post(Stop{"test",p}));
+    if(f.wait_for(std::chrono::seconds(2))!=std::future_status::ready) { CHECK(!"gw answered"); return {"TIMEOUT","",{},0,{}}; }
+    return f.get();
+  }
+  // a new account read with this much cash (and no positions: the equity), or none complete yet
+  void account(Money cash,bool ready=true) {
+    auto s=std::make_shared<rest::Snapshot>(*std::atomic_load(&snap));
+    s->balance.available=cash; s->balances[0]=cash; s->account_ready=s->ready=ready;
+    s->account_began_ms=now_ms(); s->account_ms=now_ms()+1; ++s->revision;
+    std::atomic_store(&snap,std::shared_ptr<const rest::Snapshot>(s));
+  }
+  std::set<std::string> lanes_on() {
+    const auto v=gw->sys_view();
+    return v ? v->lanes_on : std::set<std::string>{"?"};
+  }
   // a lane that is on, with its order group active (one shard here)
   bool lane_ready(const std::string& id) {
     if(!lane(id,true).code.empty()) return false;
@@ -189,6 +210,16 @@ json contract_capture() { return {{"snapshots",json::array()},{"events",json::ar
 void lane_response(json& cap,const LaneReply& r) {
   if(r.code.empty()) cap["responses"].push_back({{"key","POST /api/lane/{id}"},{"status",200},{"json",{{"ok",true},{"lane",json::parse(r.lane)}}}});
   else cap["responses"].push_back({{"key","POST /api/lane/{id}"},{"status",400},{"json",{{"ok",false},{"err",{{"code",r.code},{"msg",r.msg}}}}}});
+}
+// the web's reply to POST /api/start for gw's answer (web/server.cpp control_reply)
+void start_response(json& cap,const ControlReply& r) {
+  if(r.code.empty()) {
+    cap["responses"].push_back({{"key","POST /api/start"},{"status",200},{"json",{{"ok",true},{"run",run_json(r.run)},{"n",r.n}}}});
+    return;
+  }
+  json body=err_body(r.code,r.msg);
+  if(r.code=="PREFLIGHT") body["preflight"]=preflight_json(r.preflight);
+  cap["responses"].push_back({{"key","POST /api/start"},{"status",err_http(r.code)},{"json",body}});
 }
 void contract_check(const json& cap,const std::string& file) {
   if(std::string(DESKD_NODE).empty()) { std::printf("node not found: contract.js check SKIPPED\n"); return; }
@@ -320,10 +351,70 @@ void event_cap() {
   CHECK(o.code=="SYS_CEILING" && o.msg.find("event "+EVENT)!=std::string::npos);
   CHECK(d.place("E1","sell-1",Side::SELL,4500,100).code.empty());  // reducing: never refused for money
 }
+
+// Decisions 1: the budgets of the lanes on, venue by venue (a KP lane's on both), may not sum past
+// the venue's 70% ceiling. On past it is refused BAD_REQUEST, naming the lanes and the overflow,
+// and the lane stays off; at it is fine; off always goes. A Start whose lanes no longer fit (the
+// equity fell) is refused PREFLIGHT, its CASH row (free cash for the lanes) failing with the same
+// words. A venue whose ceiling gw does not know fits no budget: Kalshi without an account read,
+// Polymarket while gw reads no PM account.
+void budgets() {
+  TempDir dir;
+  auto lane=[](const std::string& id,Money budget,const std::string& venue) {
+    auto l=lane_spec(id); l.budget=budget*10000; l.venue=venue; return l; };
+  Desk d({lane("A",40,"K"),lane("B",30,"K"),lane("C",31,"K"),lane("Q",5,"P"),lane("W",5,"KP")},dir.file("systematic.json"));
+  json cap=contract_capture();
+  auto set=[&](const std::string& id,bool on) { auto r=d.lane(id,on); lane_response(cap,r); return r; };
+  d.account(100*10000);   // $100 of equity: a $70 ceiling
+  CHECK(set("A",true).code.empty());
+  auto r=set("C",true);   // $71
+  CHECK(r.code=="BAD_REQUEST" && r.msg=="lane C stays off: the lane budgets on K, A 40.0000 + C 31.0000 = 71.0000, "
+                                         "pass K's 70% ceiling 70.0000 by 1.0000");
+  CHECK(set("B",true).code.empty());   // $70: at the ceiling
+  CHECK(set("B",true).code.empty());   // on already: nothing more to fit
+  r=set("W",true);        // a KP lane counts on Kalshi too: $75
+  CHECK(r.code=="BAD_REQUEST" && r.msg=="lane W stays off: the lane budgets on K, A 40.0000 + B 30.0000 + W 5.0000 = 75.0000, "
+                                         "pass K's 70% ceiling 70.0000 by 5.0000");
+  CHECK(set("B",false).code.empty());
+  r=set("W",true);        // and on Polymarket, whose ceiling gw does not know yet
+  CHECK(r.code=="BAD_REQUEST" && r.msg=="lane W stays off: the lane budgets on P, W 5.0000 = 5.0000, need P's 70% ceiling, "
+                                         "and gw reads no Polymarket account yet");
+  r=set("Q",true);
+  CHECK(r.code=="BAD_REQUEST" && r.msg.rfind("lane Q stays off: the lane budgets on P, Q 5.0000 = 5.0000, need P's",0)==0);
+  CHECK(set("B",true).code.empty());
+  CHECK(d.until([&]{ return d.lanes_on()==std::set<std::string>({"A","B"}); }));
+  // the equity falls to $90: a $63 ceiling the lanes on no longer fit, so Start is refused
+  d.account(90*10000);
+  auto st=d.start();
+  start_response(cap,st);
+  const std::string over="the lane budgets on K, A 40.0000 + B 30.0000 = 70.0000, pass K's 70% ceiling 63.0000 by 7.0000";
+  CHECK(st.code=="PREFLIGHT" && st.msg=="preflight fails: CASH ("+over+")" && st.run.state==RunState::STOP);
+  CHECK(st.preflight.size()==2 && st.preflight[0].id=="KEY" && st.preflight[0].ok);
+  CHECK(st.preflight.size()==2 && st.preflight[1].id=="CASH" && !st.preflight[1].ok && st.preflight[1].why==over);
+  CHECK(set("B",false).code.empty());   // $40 fits: Start goes
+  st=d.start();
+  start_response(cap,st);
+  CHECK(st.code.empty() && st.run.state==RunState::RUN);
+  CHECK(d.stop().code.empty());
+  // no account read complete: the ceiling is unknown, so nothing more goes on
+  d.account(1000*10000,false);
+  r=set("C",true);
+  CHECK(r.code=="BAD_REQUEST" && r.msg=="lane C stays off: the lane budgets on K, A 40.0000 + C 31.0000 = 71.0000, "
+                                         "need K's 70% ceiling, and no account read has come yet");
+  st=d.start();
+  start_response(cap,st);
+  CHECK(st.code=="PREFLIGHT" && st.msg.find("no account read has come yet")!=std::string::npos);
+  d.account(1000*10000);   // $700
+  CHECK(set("C",true).code.empty() && set("B",true).code.empty());
+  CHECK(d.start().code.empty());
+  CHECK(d.until([&]{ return d.lanes_on()==std::set<std::string>({"A","B","C"}); }));
+  d.capture(cap);
+  contract_check(cap,dir.file("capture-budgets.json"));
+}
 }  // namespace
 
 int main() {
   std::signal(SIGPIPE, SIG_IGN);   // as deskd's runtime does process-wide (app/runtime.h)
-  gated(); retired(); event_cap();
+  gated(); retired(); event_cap(); budgets();
   return finish("deskd-sys-gate");
 }

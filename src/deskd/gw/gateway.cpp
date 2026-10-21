@@ -314,6 +314,13 @@ void Gateway::handle(GwMsg& m) {
   }
   if (auto* l = std::get_if<LaneSet>(&m)) {
     LaneReply r;
+    std::string over;   // decisions 1: the lanes on, this one with them, past their venue's ceiling
+    if (sys_ && l->on && sys_->lane(l->id) && !sys_->on(l->id)) {
+      sync_snapshot();
+      auto on = sys_->on_lanes();
+      on.insert(l->id);
+      over = budgets_over(on);
+    }
     if (!sys_ || !sys_->lane(l->id)) {
       r.code = "NOT_FOUND";
       r.msg = "no lane " + l->id;
@@ -323,6 +330,9 @@ void Gateway::handle(GwMsg& m) {
     } else if (l->on && !sys_->lane(l->id)->engine) {
       r.code = "BAD_REQUEST";
       r.msg = "lane " + l->id + " has no engine yet: nothing would trade it";
+    } else if (!over.empty()) {
+      r.code = "BAD_REQUEST";   // and it stays off
+      r.msg = "lane " + l->id + " stays off: " + over;
     } else {
       sys_->set_on(l->id, l->on);
       // off cancels that lane's working orders (contract: why LANE_OFF)
@@ -410,13 +420,27 @@ void Gateway::handle(GwMsg& m) {
       r.msg = "Systematic halted: " + own_.why;
     } else if (own_.state != RunState::RUN) {
       r.preflight = preflight_ ? preflight_() : std::vector<PreflightRow>{};
+      const bool none = r.preflight.empty();
+      // the lanes that are on still fit their venue's ceiling (decisions 1; it moves with the
+      // equity): else the CASH row, free cash for the lanes, fails naming them
+      std::string over;
+      if (sys_) {
+        sync_snapshot();
+        over = budgets_over(sys_->on_lanes());
+      }
+      if (!over.empty()) {
+        auto cash = std::find_if(r.preflight.begin(), r.preflight.end(), [](const PreflightRow& x) { return x.id == "CASH"; });
+        if (cash == r.preflight.end()) cash = r.preflight.insert(r.preflight.end(), PreflightRow{"CASH", true, ""});
+        cash->why = (cash->ok || cash->why.empty()) ? over : cash->why + "; " + over;
+        cash->ok = false;
+      }
       std::string failing;
       for (const auto& row : r.preflight)
         if (!row.ok && row.id != "DISK") failing += (failing.empty() ? "" : " ") + row.id;   // DISK only warns
-      if (r.preflight.empty()) failing = "no preflight";
+      if (none) failing = "no preflight";
       if (!failing.empty()) {
         r.code = "PREFLIGHT";
-        r.msg = "preflight fails: " + failing;
+        r.msg = "preflight fails: " + failing + (over.empty() ? "" : " (" + over + ")");
       } else {
         if (own_.state == RunState::HALTED) DLOG_INFO("Systematic's equity-floor HALT ended by Start");
         own_ = RunView{RunState::RUN, now_ms(), 0, ""};
@@ -1155,6 +1179,31 @@ void Gateway::sys_money(Micros* used, Micros* ceiling, Micros* eff) const {
   if (used) *used = u;
   if (ceiling) *ceiling = c;
   if (eff) *eff = e;
+}
+
+// Decisions 1 (plan section 4: "lane budgets sum below the ceiling"): the budgets of the lanes
+// in `on` may not sum past their venue's 70% ceiling (contract hdr.sys: 0.70 x the venue's cash
+// and positions), venue by venue; a KP lane's counts on both. A venue whose ceiling gw does not
+// know fits no budget: Kalshi before an account read, Polymarket while gw reads no PM account.
+std::string Gateway::budgets_over(const std::set<std::string>& on) const {
+  for (const std::string v : {"K", "P"}) {
+    Money sum = 0;
+    std::string lanes;
+    for (const auto& l : sys_->lanes()) {
+      if (!on.count(l.id) || l.venue.find(v) == std::string::npos) continue;
+      sum += l.budget;
+      lanes += (lanes.empty() ? "" : " + ") + l.id + " " + money_str(l.budget);
+    }
+    if (sum <= 0) continue;
+    const std::string what = "the lane budgets on " + v + ", " + lanes + " = " + money_str(sum);
+    if (v == "P") return what + ", need P's 70% ceiling, and gw reads no Polymarket account yet";
+    if (!snapshot_seen_ || !snapshot_seen_->account_ready) return what + ", need K's 70% ceiling, and no account read has come yet";
+    Micros ceiling = 0;
+    sys_money(nullptr, &ceiling, nullptr);
+    if (sum * 100 > ceiling)
+      return what + ", pass K's 70% ceiling " + money_str(ceiling / 100) + " by " + money_str((sum * 100 - ceiling + 99) / 100);
+  }
+  return "";
 }
 
 // a rebate (a negative fee) never gives the budget back (decisions 6): SysBook::Day::charged
