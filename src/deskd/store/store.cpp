@@ -2,7 +2,10 @@
 
 #include <sqlite3.h>
 
+#include <sys/stat.h>
+
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <vector>
 
@@ -10,6 +13,7 @@
 
 #include "deskd/app/log.h"
 #include "deskd/app/worker.h"
+#include "deskd/web/contract.h"
 
 namespace deskd {
 
@@ -161,7 +165,67 @@ void write_lip(sqlite3_stmt* st, const json& j) {
   sqlite3_bind_text(st, ++i, text.c_str(), static_cast<int>(text.size()), SQLITE_TRANSIENT);
 }
 
+std::int64_t file_bytes(const std::string& path) {
+  struct stat s {};
+  return ::stat(path.c_str(), &s) == 0 ? static_cast<std::int64_t>(s.st_size) : 0;
+}
+
+std::int64_t file_mtime_ms(const std::string& path) {
+  struct stat s {};
+  if (::stat(path.c_str(), &s) != 0) return 0;
+  return static_cast<std::int64_t>(s.st_mtim.tv_sec) * 1000 + s.st_mtim.tv_nsec / 1000000;
+}
+
 }  // namespace
+
+std::string StoreWorker::research_path(const std::string& db_path) {
+  const auto dot = db_path.rfind(".sqlite");
+  return (dot == std::string::npos ? db_path : db_path.substr(0, dot)) + "-research.sqlite";
+}
+
+void StoreWorker::measure(std::int64_t now) {
+  const std::int64_t bytes = file_bytes(path_) + file_bytes(path_ + "-wal");
+  size_bytes_.store(bytes);
+  if (bytes > cap_bytes_ && (alerted_ms_ == 0 || now - alerted_ms_ >= 3600000)) {
+    alerted_ms_ = now;
+    char msg[200];
+    std::snprintf(msg, sizeof msg, "ops.sqlite is %.0f MB, past its %.0f MB cap (plan section 7): move old rows out",
+                  bytes / 1048576.0, cap_bytes_ / 1048576.0);
+    DLOG_WARN("store: %s", msg);
+    if (alert_) alert_("CRIT", msg);
+  }
+}
+
+void StoreWorker::research_copy(std::int64_t now) {
+  const std::string dst = research_path(path_), tmp = dst + ".tmp";
+  copy_tried_ms_ = now;
+  std::remove(tmp.c_str());
+  sqlite3* src = nullptr;
+  std::string why;
+  // its own read-only connection: WAL lets the copy read a consistent snapshot while rows go on
+  if (sqlite3_open_v2(path_.c_str(), &src, SQLITE_OPEN_READONLY, nullptr) != SQLITE_OK) {
+    why = std::string("open: ") + (src ? sqlite3_errmsg(src) : "out of memory");
+  } else {
+    sqlite3_busy_timeout(src, 2000);
+    sqlite3_stmt* st = nullptr;
+    if (sqlite3_prepare_v2(src, "VACUUM INTO ?", -1, &st, nullptr) != SQLITE_OK ||
+        sqlite3_bind_text(st, 1, tmp.c_str(), -1, SQLITE_TRANSIENT) != SQLITE_OK || sqlite3_step(st) != SQLITE_DONE)
+      why = std::string("VACUUM INTO: ") + sqlite3_errmsg(src);
+    sqlite3_finalize(st);
+  }
+  if (src) sqlite3_close(src);
+  if (why.empty() && std::rename(tmp.c_str(), dst.c_str()) != 0) why = "cannot rename " + tmp + " to " + dst;
+  if (!why.empty()) {
+    std::remove(tmp.c_str());
+    DLOG_WARN("store: the research copy failed (%s); the last one stays", why.c_str());
+    std::atomic_store(&copy_why_, std::make_shared<const std::string>(why));
+    return;
+  }
+  copy_ms_.store(now);
+  copies_.fetch_add(1);
+  std::atomic_store(&copy_why_, std::make_shared<const std::string>());
+  DLOG_INFO("store: research copy written to %s", dst.c_str());
+}
 
 void StoreWorker::fail(const std::string& why) {
   const auto last = std::atomic_load(&why_);
@@ -212,6 +276,8 @@ void StoreWorker::run(Worker& self) {
     batch.clear();
   };
   auto next = std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
+  std::int64_t measured_ms = 0;
+  if (ok) copy_ms_.store(file_mtime_ms(research_path(path_)));   // the copy an earlier run wrote
   while (!self.stopping()) {
     if (auto r = inbox_.pop_for(std::chrono::milliseconds(250))) {
       received_.fetch_add(1, std::memory_order_relaxed);
@@ -220,6 +286,13 @@ void StoreWorker::run(Worker& self) {
     if (std::chrono::steady_clock::now() >= next || batch.size() >= 512) {
       flush();
       next = std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
+      const auto now = now_ms();
+      if (ok && now - measured_ms >= 60000) {
+        measured_ms = now;
+        measure(now);
+      }
+      // the research copy: none since this ET day began (and none failed in the last 10 minutes)
+      if (ok && copy_ms_.load() < et_midnight_ms(now) && now - copy_tried_ms_ >= 600000) research_copy(now);
     }
     self.beat();
   }

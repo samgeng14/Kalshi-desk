@@ -173,6 +173,7 @@ bool Deskd::start(std::string* err) {
     });
   });
   if (!cfg_.data_dir.empty()) store_.set_path(cfg_.data_dir + "/ops.sqlite");
+  store_.set_alert([this](const std::string& lvl, const std::string& msg) { if (pub_) pub_->alert(lvl, "STORE", msg); });
   by("store")->start([this](Worker& w) { store_.run(w); });
   by("pub")->start([this](Worker& w) { pub_->run(w); });
   by("ops")->start([this](Worker& w) { ops_->run(w); });
@@ -284,7 +285,9 @@ json Deskd::status() const {
                 {"received", store_.received()},
                 {"written", store_.written()},
                 {"failed", store_.failed()},
-                {"why", store_.why()}}},
+                {"why", store_.why()},
+                {"size_bytes", store_.size_bytes()},
+                {"research_copy", {{"path", store_.copy_path()}, {"ms", store_.copy_ms()}, {"why", store_.copy_why()}}}}},
               {"log", {{"dropped", log_dropped()}}},
               {"workers", workers}};
   result["feeds"] = feeds_json(feeds_);

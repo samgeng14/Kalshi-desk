@@ -7,9 +7,15 @@
 // writes them in one transaction every quarter second, in WAL mode, so a reader (research,
 // tools/latency_report.py) never blocks it. A full inbox loses the row and gw counts it; a
 // database that cannot be opened or written says why in /ops/status and the desk trades on.
-// Not yet: the money ledger (LIP payouts against these estimates among it), the nightly copy.
+//
+// Each minute it measures the file (with its WAL) and alerts CRIT, at most hourly, once it passes
+// 1 GB (plan section 7: ops.sqlite stays under 1 GB). After each ET midnight it writes the research
+// copy, ops-research.sqlite beside it, by VACUUM INTO a .tmp then a rename, so research reads a
+// whole copy and never the live file; a failed copy keeps the last one and tries again in 10 min.
+// Not yet: the money ledger (LIP payouts against these estimates among it).
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 
@@ -30,6 +36,18 @@ class StoreWorker {
   // The database's path; "" (the default) counts rows and writes nothing. Before run().
   void set_path(std::string path) { path_ = std::move(path); }
   const std::string& path() const { return path_; }
+  std::string copy_path() const { return path_.empty() ? std::string() : research_path(path_); }
+  static std::string research_path(const std::string& db_path);   // the copy beside it
+  // alert(level, message) from the store thread; and the size past which it alerts. Before run().
+  void set_alert(std::function<void(const std::string&, const std::string&)> alert) { alert_ = std::move(alert); }
+  void set_cap_bytes(std::int64_t cap) { cap_bytes_ = cap; }
+  std::int64_t size_bytes() const { return size_bytes_.load(); }   // 0 until measured
+  std::int64_t copy_ms() const { return copy_ms_.load(); }         // the research copy's time; 0: none
+  std::uint64_t copies() const { return copies_.load(); }          // copies this run wrote
+  std::string copy_why() const {   // the last copy's failure, "" after a good one
+    const auto w = std::atomic_load(&copy_why_);
+    return w ? *w : std::string();
+  }
   BoundedQueue<StoreRecord>& inbox() { return inbox_; }
   void run(Worker& self);
   std::uint64_t received() const { return received_.load(); }
@@ -42,10 +60,17 @@ class StoreWorker {
 
  private:
   void fail(const std::string& why);
+  void measure(std::int64_t now_ms);
+  void research_copy(std::int64_t now_ms);
   BoundedQueue<StoreRecord> inbox_;
   std::string path_;
-  std::atomic<std::uint64_t> received_{0}, written_{0}, failed_{0};
-  std::shared_ptr<const std::string> why_;   // std::atomic_load / std::atomic_store
+  std::function<void(const std::string&, const std::string&)> alert_;
+  std::int64_t cap_bytes_ = 1LL << 30;
+  std::int64_t alerted_ms_ = 0, copy_tried_ms_ = 0;
+  std::atomic<std::uint64_t> received_{0}, written_{0}, failed_{0}, copies_{0};
+  std::atomic<std::int64_t> size_bytes_{0}, copy_ms_{0};
+  std::shared_ptr<const std::string> why_;        // std::atomic_load / std::atomic_store
+  std::shared_ptr<const std::string> copy_why_;   // the same
 };
 
 }  // namespace deskd
