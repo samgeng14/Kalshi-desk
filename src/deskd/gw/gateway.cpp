@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdio>
 #include <fstream>
+#include <unordered_map>
 
 #include "deskd/app/log.h"
 #include "deskd/app/projection.h"
@@ -916,12 +917,29 @@ void Gateway::settle_uncertain(const rest::Snapshot& s) {
   std::vector<std::string> due;
   for (const auto& [cid, o] : ledger.orders())
     if (o.uncertain && !o.terminal()) due.push_back(cid);
+  if (due.empty()) {
+    reconcile_working(s);
+    return;
+  }
+  // the read indexed once (plan section 8: 5,000 orders through the UNKNOWN table against a day's
+  // read of thousands of rows must not cost their product): each id's first row, and by ticker
+  std::unordered_map<std::string, std::size_t> by_cid, by_oid;
+  std::unordered_map<std::string, std::vector<std::size_t>> orders_of, fills_of;
+  for (std::size_t i = 0; i < s.orders.size(); ++i) {
+    by_cid.emplace(s.orders[i].client_order_id, i);
+    by_oid.emplace(s.orders[i].order_id, i);
+    orders_of[s.orders[i].ticker].push_back(i);
+  }
+  for (std::size_t i = 0; i < s.fills.size(); ++i) fills_of[s.fills[i].ticker].push_back(i);
   for (const auto& cid : due) {
     const auto* o = ledger.find(cid);
     if (!o) continue;
-    const kalshi::OrderRow* row = nullptr;
-    for (const auto& r : s.orders)
-      if (r.client_order_id == cid || (!o->oid.empty() && r.order_id == o->oid)) { row = &r; break; }
+    // the first row naming its client order id or its order id, as a scan in order would find
+    std::size_t at = s.orders.size();
+    if (const auto c = by_cid.find(cid); c != by_cid.end()) at = c->second;
+    if (!o->oid.empty())
+      if (const auto d = by_oid.find(o->oid); d != by_oid.end()) at = std::min(at, d->second);
+    const kalshi::OrderRow* row = at < s.orders.size() ? &s.orders[at] : nullptr;
     if (row) {
       const bool healthy = ledger.healthy();
       if (ledger.observed(*row, s.account_ms)) {
@@ -942,8 +960,10 @@ void Gateway::settle_uncertain(const rest::Snapshot& s) {
     h.began_ms = s.account_began_ms;
     h.completed_ms = s.account_ms;
     h.orders_complete = h.fills_complete = true;   // rest refuses a read it could not page to the end
-    for (const auto& r : s.orders) if (r.ticker == h.ticker) h.orders.push_back(r);
-    for (const auto& f : s.fills) if (f.ticker == h.ticker) h.fills.push_back(f);
+    if (const auto it = orders_of.find(h.ticker); it != orders_of.end())
+      for (const auto i : it->second) h.orders.push_back(s.orders[i]);
+    if (const auto it = fills_of.find(h.ticker); it != fills_of.end())
+      for (const auto i : it->second) h.fills.push_back(s.fills[i]);
     if (ledger.resolve_absent(cid, h)) {
       DLOG_INFO("order %s: absent from a complete account read begun after its deadline, so it never rested (%s)",
                 cid.c_str(), ledger.find(cid)->why.c_str());

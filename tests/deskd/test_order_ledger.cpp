@@ -1,3 +1,4 @@
+#include <chrono>
 #include <fstream>
 #include "check.h"
 #include "deskd/build_paths.h"
@@ -144,6 +145,27 @@ static void unknown_table_and_proof() {
   bad.orders.push_back(r); CHECK(!l.resolve_absent("Mbulk-4999",bad));
   CHECK(l.resolve_absent("Mbulk-4999",h)); CHECK(!l.blocks("T-4999",3));
   CHECK(l.reserved(3)==1249LL*4200000 && l.blocks("T-4998",2)); record(l,"Mbulk-4999");
+  // plan section 8's race: the other 4,999 settle too, half by their rows (cancelled unfilled),
+  // half proven absent, in bounded time; then nothing is reserved, blocked or out of bounds
+  const auto t0=std::chrono::steady_clock::now();
+  for(int i=0;i<4999;++i) {
+    const auto cid="Mbulk-"+std::to_string(i), tk="T-"+std::to_string(i);
+    if(i%2) {
+      auto x=row(0,0,kalshi::OrderStatus::CANCELED,t+130000);
+      x.client_order_id=cid; x.order_id="oid-bulk-"+std::to_string(i); x.ticker=tk; x.exchange_index=i%4;
+      CHECK(l.observed(x,t+130000));
+    } else {
+      auto hh=h; hh.ticker=tk; hh.shard=i%4;
+      CHECK(l.resolve_absent(cid,hh));
+    }
+  }
+  const auto ms=std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-t0).count();
+  CHECK(ms<2000);
+  for(int s=0;s<4;++s) CHECK(l.reserved(s)==0);
+  int open=0, blocked=0;
+  for(const auto& [cid,o]:l.orders()) if(!o.terminal() || o.uncertain) ++open;
+  for(int i=0;i<5000;++i) if(l.blocks("T-"+std::to_string(i),i%4)) ++blocked;
+  CHECK(open==0 && blocked==0 && l.check().empty());
   auto post=ledger(); CHECK(post.unknown("Mledger-1"));
   h.ticker="TEST-A"; h.shard=0; h.began_ms=t+19999; h.completed_ms=t+30000;
   CHECK(!post.resolve_absent("Mledger-1",h)); ++h.began_ms;
