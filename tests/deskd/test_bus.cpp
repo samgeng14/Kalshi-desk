@@ -377,15 +377,26 @@ static void test_gateway_rules() {
   // docs/invariants.md S2-05)
   {
     const std::uint64_t e0 = gw.stats().erased_by_stop.load(), h0 = gw.stats().handled.load();
+    // which one went: the erased order is answered BAD_STATE by the Stop, the one left is handled
+    // (refused RO here, with no venue path attached)
+    auto sys = order("SM1-queued-1", Owner::SYS, "KXT-A");
+    auto man = order("Mqueued-2", Owner::MAN, "KXT-A");
+    sys.reply = std::make_shared<std::promise<OrderReply>>();
+    man.reply = std::make_shared<std::promise<OrderReply>>();
+    auto fsys = sys.reply->get_future(), fman = man.reply->get_future();
     Freeze f(gw);
-    gw.post(order("SM1-queued-1", Owner::SYS, "KXT-A"));
-    gw.post(order("Mqueued-2", Owner::MAN, "KXT-A"));
+    gw.post(std::move(sys));
+    gw.post(std::move(man));
     auto pt = std::make_shared<std::promise<ControlReply>>();
     gw.post(Stop{"operator", pt});
     f.thaw();
     CHECK(pt->get_future().wait_for(1s) == std::future_status::ready);
     CHECK(gw.stats().erased_by_stop.load() == e0 + 1);
     CHECK(settled(gw, h0 + 3));   // probe, the Stop, the Manual order it left
+    CHECK(fsys.wait_for(1s) == std::future_status::ready && fman.wait_for(1s) == std::future_status::ready);
+    const auto rs = fsys.get(), rm = fman.get();
+    CHECK(rs.code == "BAD_STATE");   // erased by the Stop
+    CHECK(rm.code == "RO");          // handled: no venue path in this fixture
   }
   // Start: refused PREFLIGHT while a check fails (DISK never counts), RUN once they pass
   {

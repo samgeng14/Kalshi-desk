@@ -184,6 +184,8 @@ void Deskd::attach_manual() {
   p.live = cfg_.live;
   p.check_each_message = options_.check_each_message;
   p.record = [this](const std::string& table, std::string row) { return store_.inbox().push(StoreRecord{table, std::move(row)}); };
+  // gw's alerts on the page: store falling behind on any desk, a lane's refusals with Systematic
+  p.alert = [this](const std::string& lvl, const std::string& src, const std::string& msg) { pub_->alert(lvl, src, msg); };
   if (cfg_.systematic_orders) {
     p.sys_send = [this](KalshiWriteJob j) { return q_sys_.push(std::move(j)); };
     p.sys_cancel = [this](KalshiWriteJob j) { return q_sys_.push(std::move(j), Lane::PRIORITY); };
@@ -207,7 +209,6 @@ void Deskd::attach_manual() {
       const auto it = m.find(lane);
       return it == m.end() ? Money{0} : it->second;
     };
-    p.alert = [this](const std::string& lvl, const std::string& src, const std::string& msg) { pub_->alert(lvl, src, msg); };
     p.publish_lane = [this](const std::string& row) {
       auto j = json::parse(row, nullptr, false);
       if (!j.is_discarded()) pub_->post(PubData{"lane", std::move(j)});
