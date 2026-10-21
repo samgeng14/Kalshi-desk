@@ -119,6 +119,7 @@ RunView Gateway::run_view() const {
 
 namespace {
 std::string qty_text(Qty q) { return nlohmann::json(qty_to_number(q)).dump(); }
+bool every(const std::string&) { return true; }   // a sys_used filter: every lane, or every market
 // "SM1-..." -> "M1": Systematic's client ids carry their lane (the contract's S<lane>- prefix)
 std::string lane_of_cid(const std::string& cid) {
   const auto dash = cid.find('-');
@@ -1121,10 +1122,29 @@ std::optional<Px> Gateway::mark(const std::string& ticker) const {
   return it == last_mark_.end() ? std::nullopt : std::optional<Px>(it->second);
 }
 
-void Gateway::sys_money(Micros* used, Micros* ceiling, Micros* eff) const {
+Micros Gateway::sys_used(const std::function<bool(const std::string&)>& lanes,
+                         const std::function<bool(const std::string&)>& in, const PlaceIntent* extra, bool ended) const {
   Micros u = 0;
-  for (const auto& [cid, o] : manual_->ledger().orders()) if (o.intent.owner == Owner::SYS) u += o.reservation();
-  for (const auto& x : sys_->lanes()) u += sys_->open_worst(x.id);
+  Qty pending = 0;   // extra's lane's working orders in its market, on its side
+  for (const auto& [cid, o] : manual_->ledger().orders()) {
+    if (o.intent.owner != Owner::SYS) continue;
+    if ((ended || !o.terminal()) && lanes(o.intent.lane) && in(o.intent.ticker)) u += o.reservation();
+    if (extra && !o.terminal() && o.intent.lane == extra->lane && o.intent.ticker == extra->ticker && o.intent.side == extra->side)
+      pending += o.left;
+  }
+  for (const auto& l : sys_->lanes()) if (lanes(l.id)) u += sys_->open_worst_in(l.id, in);
+  if (extra && lanes(extra->lane) && in(extra->ticker))
+    u += (extra->side == Side::BUY ? extra->price : kOneDollar - extra->price) * sys_grows(*extra, pending);
+  return u;
+}
+
+Qty Gateway::sys_grows(const PlaceIntent& p, Qty pending) const {
+  const Qty held = (p.side == Side::BUY ? 1 : -1) * sys_->position(p.lane, p.ticker) + pending;
+  return std::max<Qty>(0, held + p.count) - std::max<Qty>(0, held);
+}
+
+void Gateway::sys_money(Micros* used, Micros* ceiling, Micros* eff) const {
+  const Micros u = sys_used(every, every, nullptr, true);
   // contract hdr.sys: ceiling = 0.70 x (cash + open positions' value), eff = min(ceiling, used + free)
   Micros c = 0, e = 0;
   if (snapshot_seen_) {
@@ -1146,10 +1166,12 @@ Micros Gateway::sys_fees() const {
 std::string Gateway::lane_row(const std::string& id) const {
   const auto* l = sys_->lane(id);
   if (!l) return "";
-  Micros reserved = 0, used_all = 0, eff = 0;
+  // the row's used is the lane's sys_used (lane_json adds its open worst case back)
+  const Micros reserved = sys_used([&id](const std::string& lane) { return lane == id; }, every) - sys_->open_worst(id);
   int working = 0;
   for (const auto& [cid, o] : manual_->ledger().orders())
-    if (o.intent.owner == Owner::SYS && !o.terminal() && o.intent.lane == id) { reserved += o.reservation(); ++working; }
+    if (o.intent.owner == Owner::SYS && !o.terminal() && o.intent.lane == id) ++working;
+  Micros used_all = 0, eff = 0;
   sys_money(&used_all, nullptr, &eff);
   // an IOC-style lane past the day's cost budget takes nothing more (contract: CAPPED)
   if (l->style == "IOC" && sys_fees() >= kCostBudget * 100) eff = used_all;
@@ -1208,51 +1230,40 @@ void Gateway::place_sys(PlaceIntent& p) {
     return refuse("RO", "lane " + p.lane + "'s order group on shard " + std::to_string(shard) + " is not active");
   // Inventory (plan section 4): Systematic's net position per market, with its working orders on
   // the same side, may not grow past the lane's limit.
-  Qty pos = 0, pending = 0;
+  Qty pos = 0, pending = 0, lane_pending = 0;
   for (const auto& l : sys_->lanes()) pos += sys_->position(l.id, p.ticker);
   if (lane->style == "IOC" && sys_fees() >= kCostBudget * 100)
     return refuse("SYS_CEILING", "the IOC lanes' daily cost budget " + money_str(kCostBudget) + " is spent");
-  Micros reserved_lane = 0, used_all = 0;
-  Qty lane_pending = 0;
-  for (const auto& [cid, o] : manual_->ledger().orders()) {
-    if (o.intent.owner != Owner::SYS) continue;
-    used_all += o.reservation();
-    if (o.terminal()) continue;
-    if (o.intent.lane == p.lane) reserved_lane += o.reservation();
-    if (o.intent.ticker == p.ticker && o.intent.side == p.side) {
+  for (const auto& [cid, o] : manual_->ledger().orders())
+    if (o.intent.owner == Owner::SYS && !o.terminal() && o.intent.ticker == p.ticker && o.intent.side == p.side) {
       pending += o.left;
       if (o.intent.lane == p.lane) lane_pending += o.left;
     }
-  }
   const Qty grow = (p.side == Side::BUY ? 1 : -1) * (pending + p.count);
   if (std::abs(pos + grow) > lane->inventory && std::abs(pos + grow) > std::abs(pos))
     return refuse("SYS_CEILING", "inventory: " + qty_text(pos) + " held, " + qty_text(pending) + " working, limit " + qty_text(lane->inventory));
-  // The lane's budget and the venue's 70% ceiling, at the worst case of the part of this order
-  // that grows the lane's position (after its working orders on the same side): a reducing
-  // order, the T-60 s flatten among them, is never refused for money (plan section 4).
-  const Qty dir_pos = (p.side == Side::BUY ? 1 : -1) * sys_->position(p.lane, p.ticker) + lane_pending;
-  const Qty grows = std::max<Qty>(0, dir_pos + p.count) - std::max<Qty>(0, dir_pos);
-  const Micros worst = (p.side == Side::BUY ? p.price : kOneDollar - p.price) * grows;
-  for (const auto& l : sys_->lanes()) used_all += sys_->open_worst(l.id);
-  if (grows > 0 && sys_->open_worst(p.lane) + reserved_lane + worst > lane->budget * 100)
+  // The lane's budget, the venue's 70% ceiling, the correlated group and the lane's event cap,
+  // each with this order counted at the worst case of the part of it that grows the lane's
+  // position (sys_used): a reducing order, the T-60 s flatten among them, is never refused for
+  // money (plan section 4).
+  const bool grows = sys_grows(p, lane_pending) > 0;
+  const auto own = [&p](const std::string& l) { return l == p.lane; };
+  if (grows && sys_used(own, every, &p) > lane->budget * 100)
     return refuse("SYS_CEILING", "lane " + p.lane + " budget " + money_str(lane->budget));
   const Micros equity = (snapshot_seen_->balance.available + snapshot_seen_->balance.portfolio_value.value_or(0)) * 100;
-  const Micros eff = std::min<Micros>(equity * 7 / 10, used_all + manual_->venue_free());
-  if (grows > 0 && used_all + worst > eff)
+  Micros eff = 0;
+  sys_money(nullptr, nullptr, &eff);
+  if (grows && sys_used(every, every, &p, true) > eff)
     return refuse("SYS_CEILING", "past the effective Systematic ceiling " + money_str(eff / 100));
   // the correlated group (plan section 4, limit 2): every lane's worst case there, held and working
-  if (grows > 0) {
+  if (grows) {
     auto event_of = [this](const std::string& tk) {
       const auto it = snapshot_seen_->markets.find(tk);
       return it == snapshot_seen_->markets.end() ? std::string() : it->second.event_ticker;
     };
     const std::string grp = corr_group(p.ticker, m->second.event_ticker);
     const auto in_grp = [&](const std::string& tk) { return corr_group(tk, event_of(tk)) == grp; };
-    Micros in_group = worst;
-    for (const auto& l : sys_->lanes()) in_group += sys_->open_worst_in(l.id, in_grp);
-    for (const auto& [cid, o] : manual_->ledger().orders())
-      if (o.intent.owner == Owner::SYS && !o.terminal() && in_grp(o.intent.ticker)) in_group += o.reservation();
-    if (in_group > corr_group_cap(grp))
+    if (sys_used(every, in_grp, &p) > corr_group_cap(grp))
       return refuse("SYS_CEILING", "group " + grp + " worst case past " + money_str(corr_group_cap(grp) / 100));
     // the lane's own cap in one event (LaneSpec::event_cap: C1's $10 a game), held and working,
     // besides every lane's in the group (a 15-minute series' group spans many events)
@@ -1264,11 +1275,7 @@ void Gateway::place_sys(PlaceIntent& p) {
       };
       const std::string ev = event_key(p.ticker);
       const auto in_ev = [&](const std::string& tk) { return event_key(tk) == ev; };
-      Micros in_event = worst + sys_->open_worst_in(p.lane, in_ev);
-      for (const auto& [cid, o] : manual_->ledger().orders())
-        if (o.intent.owner == Owner::SYS && !o.terminal() && o.intent.lane == p.lane && in_ev(o.intent.ticker))
-          in_event += o.reservation();
-      if (in_event > lane->event_cap)
+      if (sys_used(own, in_ev, &p) > lane->event_cap)
         return refuse("SYS_CEILING", "lane " + p.lane + "'s worst case in event " + ev + " past " + money_str(lane->event_cap / 100));
     }
   }

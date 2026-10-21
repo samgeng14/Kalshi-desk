@@ -522,6 +522,8 @@ deskd_pure_test(calendar)
 deskd_pure_test(lip)
 deskd_pure_test(wcbb)
 deskd_pure_test(store)
+# sys_risk: gw's sys_used against the loops it replaced, on random books; place_sys's limits at their edges
+deskd_pure_test(sys_risk)
 deskd_fake_test(net)
 deskd_fake_test(wire)
 deskd_fake_test(md)
@@ -586,6 +588,7 @@ foreach(t
     deskd-sender
     deskd-sys_book
     deskd-sys_gate
+    deskd-sys_risk
     deskd-web
     deskd-wire
     deskd-write_budget

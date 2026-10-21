@@ -52,6 +52,19 @@ class Gateway {
   void attach_manual(const ManualPath& path);
   // gw thread only (inside a Probe): the Manual book, or nullptr
   ManualBook* manual_book() { return manual_.get(); }
+  // gw thread only (inside a Probe): Systematic's book, or nullptr
+  SysBook* sys_book() { return sys_.get(); }
+  // gw thread only (inside a Probe). Systematic's used worst case, micro-dollars (contract hdr.sys
+  // and the lane row's used; plan section 4's limits): the open worst case of the lanes `lanes`
+  // accepts in the markets `in` accepts, plus the reservations of those lanes' working orders
+  // there. `ended` adds what their ended orders still reserve (fills the venue reported that the
+  // book has not taken yet), as the venue's used and its 70% ceiling have always counted it; the
+  // lane, group and event limits have not. `extra`, an intent of such a lane in such a market, adds
+  // the worst case of the part of it that grows its lane's position (after the lane's working
+  // orders there on the same side): nothing for a reducing order.
+  std::int64_t sys_used(const std::function<bool(const std::string&)>& lanes,
+                        const std::function<bool(const std::string&)>& in, const PlaceIntent* extra = nullptr,
+                        bool ended = false) const;
   // Any thread: the cids gw's order book owns. Their rows come from gw alone (contract ORDER
   // REVISIONS: the page keeps the highest rev), so the REST publisher leaves them out.
   std::shared_ptr<const std::set<std::string>> manual_cids() const { return std::atomic_load(&owned_); }
@@ -278,8 +291,11 @@ class Gateway {
   std::set<int> shards() const;
   std::optional<Px> mark(const std::string& ticker) const;
   std::string lane_row(const std::string& id) const;
-  // Systematic's used worst case (open positions + working reservations) and its ceilings
+  // Systematic's used worst case (sys_used over every lane and market) and its ceilings
   void sys_money(std::int64_t* used, std::int64_t* ceiling, std::int64_t* eff) const;   // micro-dollars
+  // the part of p that grows its lane's position in its market, after the lane's working orders
+  // there on the same side (`pending`): 0 for a reducing order
+  Qty sys_grows(const PlaceIntent& p, Qty pending) const;
   std::int64_t sys_fees() const;
   void sync_snapshot();
 };
