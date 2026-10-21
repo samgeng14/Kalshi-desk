@@ -1,0 +1,21 @@
+# Plan section 2 (docs/invariants.md S2-31): deskd leaves out the old desk's code (perps, research
+# modes, lane stages, the manual queue, the old strategies), so nothing under src/deskd or
+# include/deskd includes a header from include/desk/. Run by ctest: cmake -DROOT=<source> -P this.
+file(GLOB_RECURSE files "${ROOT}/src/deskd/*.cpp" "${ROOT}/src/deskd/*.h" "${ROOT}/include/deskd/*.h")
+set(bad "")
+foreach(f IN LISTS files)
+  file(STRINGS "${f}" lines REGEX "^[ \t]*#[ \t]*include[ \t]*[\"<]desk/")
+  if(lines)
+    string(REPLACE "${ROOT}/" "" rel "${f}")
+    list(APPEND bad "${rel}: ${lines}")
+  endif()
+endforeach()
+list(LENGTH files n)
+if(n EQUAL 0)
+  message(FATAL_ERROR "no deskd sources found under ${ROOT}")
+endif()
+if(bad)
+  string(REPLACE ";" "\n  " shown "${bad}")
+  message(FATAL_ERROR "deskd includes the old desk's headers:\n  ${shown}")
+endif()
+message(STATUS "${n} deskd files, none includes include/desk/")

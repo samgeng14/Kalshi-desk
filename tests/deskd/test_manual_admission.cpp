@@ -86,6 +86,15 @@ static void expiry() {
   f.c.clock_trusted=false; CHECK(f.admit().code=="STALE");
   f.p.exp_ms=0; f.p.tif=Tif::IOC; CHECK(f.admit().ok()); // bad clock blocks POST only
   f.p.ttl_s=5; CHECK(f.admit().code=="BAD_REQUEST");
+  // a Systematic order lives at most 60 s (plan section 3; docs/invariants.md S3-11), relative or absolute
+  f.p.tif=Tif::POST; f.c.clock_trusted=true; f.p.owner=Owner::SYS; f.p.lane="M1"; f.p.cid="SM1-ttl-1";
+  f.p.ttl_s=60; CHECK(f.admit().ok());
+  f.p.ttl_s=61; CHECK(f.admit().code=="BAD_REQUEST");
+  f.p.ttl_s=300; CHECK(f.admit().code=="BAD_REQUEST");
+  f.p.ttl_s=0; f.p.exp_ms=(now/1000+60)*1000; CHECK(f.admit().ok());
+  f.p.exp_ms=(now/1000+62)*1000; CHECK(f.admit().code=="BAD_REQUEST");
+  f.p.exp_ms=*f.m.close_ms; CHECK(f.admit().code=="BAD_REQUEST");   // until the close: Manual only
+  f.p.exp_ms=0; f.p.owner=Owner::MAN; f.p.lane.clear(); f.p.cid="Msession-1";
 }
 static void prices() {
   Fixture f; f.p.price=4400; CHECK(f.admit().ok());

@@ -522,13 +522,15 @@ add_custom_target(deskd-all DEPENDS deskd deskctl deskd-test-bus deskd-test-ops 
                                     deskd-test-pub_data deskd-test-rest deskd-test-private deskd-test-order_ledger
                                     deskd-test-sender deskd-test-manual_admission deskd-test-manual_book deskd-test-manual_gw deskd-test-runtime_manual kalshi-demo-probe)
 
+add_test(NAME deskd-no-legacy-includes COMMAND ${CMAKE_COMMAND} -DROOT=${CMAKE_SOURCE_DIR} -P ${CMAKE_SOURCE_DIR}/tests/deskd/no_legacy_includes.cmake)
+
 # The plan's invariants (section 8; docs/invariants.md names each rule's test): every suite holding
 # one is labelled, so `ctest -L invariants` is the run that must be green before any live order.
 # A suite registered only where its runtime exists (node, python3) is labelled where it is.
 foreach(t deskd-bus deskd-http deskd-manual_admission deskd-manual_book deskd-manual_gw deskd-maker deskd-md
           deskd-net deskd-ops deskd-order_ledger deskd-process deskd-pub_data deskd-pyth deskd-rest
           deskd-runtime_manual deskd-sender deskd-sys_book deskd-web deskd-wire deskd-write_budget recorder-unit
-          ui-desk-v3 ui-desk-v3-manual)
+          ui-desk-v3 ui-desk-v3-manual deskd-no-legacy-includes)
   if(TEST ${t})
     set_property(TEST ${t} APPEND PROPERTY LABELS invariants)
   endif()

@@ -373,6 +373,20 @@ static void test_gateway_rules() {
     CHECK(rt.code.empty() && rt.run.state == RunState::STOP && rt.run.why == "operator");
     CHECK(gw.stats().erased_by_stop.load() == 1);
   }
+  // a Stop deletes the Systematic orders queued before it, never a Manual one (plan section 2;
+  // docs/invariants.md S2-05)
+  {
+    const std::uint64_t e0 = gw.stats().erased_by_stop.load(), h0 = gw.stats().handled.load();
+    Freeze f(gw);
+    gw.post(order("SM1-queued-1", Owner::SYS, "KXT-A"));
+    gw.post(order("Mqueued-2", Owner::MAN, "KXT-A"));
+    auto pt = std::make_shared<std::promise<ControlReply>>();
+    gw.post(Stop{"operator", pt});
+    f.thaw();
+    CHECK(pt->get_future().wait_for(1s) == std::future_status::ready);
+    CHECK(gw.stats().erased_by_stop.load() == e0 + 1);
+    CHECK(settled(gw, h0 + 3));   // probe, the Stop, the Manual order it left
+  }
   // Start: refused PREFLIGHT while a check fails (DISK never counts), RUN once they pass
   {
     auto p = std::make_shared<std::promise<ControlReply>>();

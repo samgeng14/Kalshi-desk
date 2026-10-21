@@ -448,8 +448,17 @@ void Gateway::publish_order(const std::string& cid) {
 
 void Gateway::record(const char* table, std::string json) {
   if (!path_->record) return;
-  if (path_->record(table, std::move(json))) stats_.records_sent.fetch_add(1);
-  else stats_.records_lost.fetch_add(1);
+  if (path_->record(table, std::move(json))) {
+    stats_.records_sent.fetch_add(1);
+    return;
+  }
+  // store has fallen behind (plan section 2: "an alert fires"); at most once a minute
+  const auto lost = stats_.records_lost.fetch_add(1) + 1;
+  if (path_->alert && now_ms() - records_alerted_ms_ >= 60000) {
+    records_alerted_ms_ = now_ms();
+    DLOG_WARN("store's inbox is full: %llu record(s) lost so far", static_cast<unsigned long long>(lost));
+    path_->alert("WARN", "STORE", "store is behind: " + std::to_string(lost) + " ops.sqlite record(s) lost (" + table + " among them)");
+  }
 }
 
 void Gateway::record_if_done(const std::string& cid, bool force) {

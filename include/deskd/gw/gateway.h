@@ -193,6 +193,7 @@ class Gateway {
   std::shared_ptr<const std::set<std::string>> owned_;   // std::atomic_load / std::atomic_store
   std::shared_ptr<const std::string> ledger_why_;        // std::atomic_load / std::atomic_store
   std::shared_ptr<const std::string> invariant_why_;     // the same
+  std::int64_t records_alerted_ms_ = 0;                 // the last "store is behind" alert
   WriteBudget budget_;                                    // gw thread only
   std::shared_ptr<const std::map<int, double>> write_view_;   // std::atomic_load / std::atomic_store
   std::atomic<double> write_cap_{0};

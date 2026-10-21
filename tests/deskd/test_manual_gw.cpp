@@ -50,6 +50,8 @@ struct Desk {
   std::shared_ptr<const rest::Snapshot> snap=snapshot(now_ms());
   MdBook book;
   std::atomic<bool> send_full{false};
+  std::atomic<bool> store_full{false};    // store's inbox refuses every record
+  std::vector<std::string> alerts;        // under mu: "LEVEL SRC msg"
   std::mutex mu;
   std::vector<json> published;
   Desk() {
@@ -73,6 +75,9 @@ struct Desk {
     path.send=[this](KalshiWriteJob j) { return !send_full.load() && qm.push(std::move(j)); };
     path.cancel=[this](KalshiWriteJob j) { return qc.push(std::move(j),Lane::PRIORITY); };
     path.publish=[this](const std::string& row) { std::lock_guard<std::mutex> lk(mu); published.push_back(json::parse(row)); };
+    path.record=[this](const std::string&, std::string) { return !store_full.load(); };
+    path.alert=[this](const std::string& lvl, const std::string& src, const std::string& msg) {
+      std::lock_guard<std::mutex> lk(mu); alerts.push_back(lvl+" "+src+" "+msg); };
     gw->attach_manual(path);
     pm->start(); pc->start(); CHECK(pm->wait_ready(1,3000)); CHECK(pc->wait_ready(1,3000));
     wm.start([this](Worker& w){manual->run(w);}); wc.start([this](Worker& w){cancel->run(w);});
@@ -361,8 +366,24 @@ void fill_before_201() {
 }
 }  // namespace
 
+// Plan section 2 (docs/invariants.md S2-10): when store falls behind, its lost records are
+// counted and an alert fires, once a minute, not once a record
+void store_behind() {
+  Desk d;
+  d.store_full=true;
+  CHECK(d.place(d.intent("Mstore-1",Side::BUY,4200,100)).code.empty());   // an IOC take: its fill and timeline go to store
+  CHECK(d.place(d.intent("Mstore-2",Side::BUY,4200,100)).code.empty());
+  // no private feed here: the timeline sweep records each ended order 5 s after it ended
+  for(int i=0;i<500 && d.gw->stats().records_lost<2;++i) std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  CHECK(d.gw->stats().records_lost>=2);
+  std::lock_guard<std::mutex> lk(d.mu);
+  int store_alerts=0;
+  for(const auto& a:d.alerts) if(a.rfind("WARN STORE store is behind",0)==0) ++store_alerts;
+  CHECK(store_alerts==1);
+}
+
 int main() {
   std::signal(SIGPIPE, SIG_IGN);   // as deskd's runtime does process-wide (app/runtime.h)
-  fills_and_rests(); refusals(); unknown_blocks(); unknown_settled_by_account_read(); expiry_backup(); missed_fill_from_account_read(); fill_before_201();
+  fills_and_rests(); refusals(); unknown_blocks(); unknown_settled_by_account_read(); expiry_backup(); missed_fill_from_account_read(); fill_before_201(); store_behind();
   return finish("deskd-manual-gw");
 }

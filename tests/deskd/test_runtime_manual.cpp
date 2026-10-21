@@ -964,6 +964,56 @@ void foreign_cancels() {
   // and a manual order on the market goes now that nothing foreign rests there
   CHECK(r.until([&]{ return r.order("Mforeign-1","BUY","0.3900",1.0,"POST",60)["status"]==200; },10000));
 }
+// Stop cancels Systematic's orders only, never with a cancel-all (plan section 3; docs/invariants.md
+// S3-33): a Manual order on another market rests on through it, and Stop triggers the lane's groups.
+void stop_keeps_manual() {
+  const std::string TK2="KXRUNTIME-26OCT10-B";
+  Run r(true,[&](fakex::Engine& e,std::int64_t now) {
+    auto s=fx::spec(TK2,0); s.close_ms=(now/1000+3600)*1000;
+    e.add_market(s,now);
+    e.street_add(TK2,false,3000,500,now);   // YES bid 0.30
+    e.street_add(TK2,true,6800,300,now);    // YES ask 0.32
+  },true);
+  CHECK(r.ready());
+  auto w=r.post("/api/watch",{{"v","K"},{"tk",TK2},{"on",true}});
+  CHECK(w && w->status==200);
+  CHECK(r.until([&]{ return r.d->status()["books_live"]>=2; },20000));
+  auto lane=r.post("/api/lane/M2",{{"on",true}});
+  CHECK(lane && lane->status==200);
+  std::string why;
+  CHECK(r.until([&]{ return r.d->gw().groups_ready(&why) && why.empty(); },20000));
+  httplib::Result start;
+  CHECK(r.until([&]{ start=r.post("/api/start",json::object()); return start && start->status==200; },10000));
+  PlaceIntent p; p.cid="SM2-stop-1"; p.owner=Owner::SYS; p.lane="M2"; p.ticker=TK; p.side=Side::BUY;
+  p.price=3900; p.count=100; p.tif=Tif::POST; p.ttl_s=30; p.reply=std::make_shared<std::promise<OrderReply>>();
+  auto f=p.reply->get_future();
+  CHECK(r.d->gw().post(std::move(p)));
+  CHECK(f.wait_for(std::chrono::seconds(5))==std::future_status::ready && f.get().code.empty());
+  json b={{"cid","Mstop-keep-1"},{"v","K"},{"tk",TK2},{"side","BUY"},{"px","0.2900"},{"qty",1.0},{"tif","POST"},
+          {"ttl_s",60},{"override",false},{"touch",nullptr},{"t_click_ms",now_ms()}};
+  auto m=r.post("/api/order",b);
+  CHECK(m && m->status==200);
+  CHECK(r.until([&]{ return r.resting()==2; }));
+  r.venue.f->clear_wire_log();   // what the Stop sends, from here
+  auto stop=r.post("/api/stop",json::object());
+  CHECK(stop && stop->status==200);
+  CHECK(r.until([&]{ return r.resting()==1; }));
+  const bool manual_rests=r.venue.f->with_engine([](fakex::Engine& e,std::int64_t) {
+    for(const fakex::Order* o:e.user_orders()) if(o->client_order_id=="Mstop-keep-1") return o->status==fakex::OrdStatus::RESTING;
+    return false; });
+  CHECK(manual_rests);
+  bool cancel_all=false;
+  auto triggered=[&]{
+    for(const auto& l:r.venue.f->wire_log()) if(l.find("/portfolio/order_groups/")!=std::string::npos && l.find("/trigger")!=std::string::npos) return true;
+    return false;
+  };
+  CHECK(r.until(triggered));   // the lane's groups were triggered
+  for(const auto& l:r.venue.f->wire_log()) {   // the cancel-all is DELETE .../portfolio/events/orders with no order id
+    const auto at=l.find("/portfolio/events/orders");
+    if(at!=std::string::npos && (at+24==l.size() || l[at+24]=='?' || l[at+24]==' ')) cancel_all=true;
+  }
+  CHECK(!cancel_all);
+}
 // Plan section 8's race: a duplicate fill message. The venue sends every fill twice on the private
 // socket; a Manual fill and a lane's fill each count once (the ledger, the position, the lane's
 // day), and the ledger stays healthy.
@@ -1201,6 +1251,6 @@ void equity_floor() {
 
 int main() {
   std::signal(SIGPIPE,SIG_IGN);
-  off_by_default(); orders_cancel_kill(); stop_reasons(); financial_fair(); systematic(); systematic_maker(); systematic_band(); systematic_paper(); systematic_races(); systematic_group_trigger(); systematic_book(); takeover(); shard_preflight(); foreign_cancels(); systematic_foreign(); duplicate_fills(); live_mode(); fill_estimates(); equity_floor();
+  off_by_default(); orders_cancel_kill(); stop_reasons(); financial_fair(); systematic(); systematic_maker(); systematic_band(); systematic_paper(); systematic_races(); systematic_group_trigger(); systematic_book(); takeover(); shard_preflight(); foreign_cancels(); systematic_foreign(); duplicate_fills(); stop_keeps_manual(); live_mode(); fill_estimates(); equity_floor();
   return finish("deskd-runtime-manual");
 }

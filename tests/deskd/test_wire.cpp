@@ -1059,9 +1059,32 @@ static void test_probe_binary() {
   CHECK(v.f->connections_accepted() > 0);   // the first run connected; the three refusals added nothing
 }
 
+// Plan sections 2-3 (docs/invariants.md S2-25, S3-36): the venue refusing for the moment (cash on
+// that shard, a self-trade, a post-only cross, a closed market, a triggered group) is soft and
+// never trips KILL; one that says the desk is wrong (bad request, auth, unknown) does.
+static void test_soft_refusals() {
+  const std::pair<int, const char*> soft[] = {
+      {400, "insufficient_balance: not enough cash on this shard"}, {400, "Insufficient funds"},
+      {400, "self-trade prevention: this order would match your own order"}, {409, "post only cross"},
+      {400, "market_closed"}, {400, "trading is paused"},
+      {400, "exceeded_order_group_contracts_limit"}};
+  for (const auto& [status, text] : soft) {
+    const auto c = classify_refusal(WireOp::CREATE, status, text);
+    if (!reject_is_soft(c) || reject_trips_kill(c)) std::fprintf(stderr, "  not soft: %d %s\n", status, text);
+    CHECK(reject_is_soft(c) && !reject_trips_kill(c));
+  }
+  CHECK(classify_refusal(WireOp::CREATE, 400, "insufficient_balance") == RejectClass::SOFT_COLLATERAL);
+  CHECK(classify_refusal(WireOp::CREATE, 400, "self_trade") == RejectClass::SOFT_SELF_TRADE);
+  CHECK(reject_trips_kill(classify_refusal(WireOp::CREATE, 400, "invalid_parameters: count")));
+  CHECK(reject_trips_kill(classify_refusal(WireOp::CREATE, 401, "")));
+  CHECK(reject_trips_kill(classify_refusal(WireOp::CREATE, 500, "something new")));
+  CHECK(!reject_trips_kill(classify_refusal(WireOp::CREATE, 429, "too many requests")));
+}
+
 int main() {
   ::signal(SIGPIPE, SIG_IGN);
   CHECK(fx::pki().ok);
+  test_soft_refusals();
   test_signer();
   test_values();
   test_builders();
