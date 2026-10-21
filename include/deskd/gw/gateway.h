@@ -131,6 +131,7 @@ class Gateway {
     std::atomic<std::uint64_t> erased_by_stop{0};     // queued SYS orders and Starts a Stop deleted
     std::atomic<std::uint64_t> erased_by_kill{0};     // queued new orders and Starts a KILL deleted
     std::atomic<std::uint64_t> kills_seen{0};         // KILL generations gw has applied
+    std::atomic<std::uint64_t> group_reset_fallbacks{0};   // resets taken on their 200 (no socket word)
     std::atomic<std::uint64_t> manual_sent{0};        // Manual orders handed to send-k1
     std::atomic<std::uint64_t> manual_cancels{0};     // Manual cancels handed to the cancel sender
     std::atomic<std::uint64_t> private_applied{0};    // private order updates and fills applied to Manual orders
@@ -246,7 +247,7 @@ class Gateway {
   std::int64_t fills_asked_ms_ = 0;   // the last account read asked for missing fills
   static constexpr std::int64_t kExpiryBackupMs = 1500;   // plan section 3: TTL + 1.5 s
   static constexpr std::int64_t kGroupResetWaitMs = 5000;  // a reset's socket confirmation, at most
-  std::set<std::string> expiry_asked_;                     // backup cancels already asked
+  std::map<std::string, std::int64_t> expiry_asked_;       // backup cancels asked, and when
   void expiry_sweep(std::int64_t now);
   std::set<std::string> man_held_;                                   // gw thread
   std::shared_ptr<const std::set<std::string>> man_view_;           // std::atomic_load / std::atomic_store

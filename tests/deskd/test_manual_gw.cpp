@@ -270,6 +270,16 @@ void expiry_backup() {
     return false; }));
   std::this_thread::sleep_for(std::chrono::milliseconds(600));
   CHECK(d.gw->stats().manual_cancels==1);   // once
+
+  // review 2026-10-21: a backup cancel the venue refused before processing (429) is asked again,
+  // 5 s on, and the order ends
+  fakex::HttpFault rate; rate.kind=fakex::HttpFault::Kind::RATE_LIMIT; rate.method="DELETE"; d.venue.f->add_fault(rate);
+  r=d.place(d.intent("Mgwexp-2",Side::BUY,3900,100,Tif::POST,5));
+  CHECK(r.code.empty());
+  const auto end2=mono_ms()+14000;
+  auto ended2=[&]{ const auto st=d.last_row("Mgwexp-2")["st"]; return st=="EXP" || st=="CXL"; };
+  while(mono_ms()<end2 && !ended2()) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  CHECK(d.last_row("Mgwexp-2")["st"]=="EXP" && d.gw->stats().manual_cancels==3);
 }
 // The private feed lost an update (it is not wired here at all): a resting post is taken in full
 // by the street. The account read shows the order executed, so gw ends it FILL and frees its

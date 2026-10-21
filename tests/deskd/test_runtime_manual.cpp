@@ -718,10 +718,9 @@ void systematic_group_trigger() {
   CHECK(r.d->status()["run"]["state"]=="RUN");   // never reset while running
   auto stop=r.post("/api/stop",json::object());
   CHECK(stop && stop->status==200);
-  const auto stopped=mono_ms();
   CHECK(r.until([&]{ return r.d->gw().groups_ready(&why) && why.empty(); },15000));
-  // re-armed by the socket's "reset" (plan section 3), well before the 5 s fallback to the 200
-  CHECK(mono_ms()-stopped<4500);
+  // re-armed by the socket's "reset" (plan section 3), never by the 5 s fallback to the 200
+  CHECK(r.d->status()["gw"]["group_reset_fallbacks"]==0);
   CHECK(!r.venue.f->with_engine([&](fakex::Engine& e,std::int64_t) { return e.group(gid)->triggered; }));
 }
 // Systematic's book against the venue's own records (the order-safety review, 2026-10-10):

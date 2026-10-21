@@ -520,6 +520,10 @@ void Gateway::manual_reply(const KalshiWriteReply& r) {
     if (r.cancel && !manual_->ledger().cancelled(r.cid, *r.cancel, why == cancel_why_.end() ? "USER" : why->second,
                                                  r.ack_ms ? r.ack_ms : now_ms()))
       DLOG_ERR("cancel reply for %s contradicts the order book: reconcile before trading", r.cid.c_str());
+    // one that never reached the venue (not sent, or refused before processing) may go again:
+    // the expiry backup and a pending cancel's flush ask once more
+    if (r.outcome.kind == K::NOT_SENT || (r.outcome.kind == K::REFUSED && r.outcome.cls == RejectClass::RETRYABLE))
+      cancel_sent_.erase(r.cid);
     publish_order(r.cid);
     return;   // a cancel that did not land leaves the order working until an order read or event says more
   }
@@ -646,7 +650,9 @@ void Gateway::fill_applied(const kalshi::FillRow& f, std::string cid, std::int64
   const OrderLedger::Order* o = cid.empty() ? nullptr : ledger.find(cid);
   if (!o) for (const auto& [c, x] : ledger.orders()) if (x.oid == f.order_id) o = &x;
   if (o) cid = o->intent.cid;
-  if (sys_ && o && o->intent.owner == Owner::SYS) {
+  // A fill from before the lane book's day is not counted into it: the day's roll forgot the
+  // earlier day's trade ids, and sys_reconcile (same rule) may have counted it before the roll
+  if (sys_ && o && o->intent.owner == Owner::SYS && (!f.ts_ms || f.ts_ms >= sys_->day_start_ms())) {
     if (sys_->fill(o->intent.lane, o->intent.cid, f.ticker, f.side == kalshi::BookSide::BID ? Side::BUY : Side::SELL,
                    f.count, f.yes_price, f.fee, at, fill_key(f)))
       sys_save_due_ = true;
@@ -676,16 +682,20 @@ void Gateway::fill_applied(const kalshi::FillRow& f, std::string cid, std::int64
 // One the venue did expire answers 404 (GONE), which is harmless.
 void Gateway::expiry_sweep(std::int64_t now) {
   for (auto it = expiry_asked_.begin(); it != expiry_asked_.end();) {
-    const auto* o = manual_->ledger().find(*it);
+    const auto* o = manual_->ledger().find(it->first);
     it = !o || o->terminal() ? expiry_asked_.erase(it) : std::next(it);
   }
   std::vector<std::string> due;
-  for (const auto& [cid, o] : manual_->ledger().orders())
-    if (!o.terminal() && o.intent.tif == Tif::POST && o.intent.exp_ms && now >= o.intent.exp_ms + kExpiryBackupMs &&
-        !cancel_sent_.count(cid) && !expiry_asked_.count(cid))
-      due.push_back(cid);
+  for (const auto& [cid, o] : manual_->ledger().orders()) {
+    if (o.terminal() || o.intent.tif != Tif::POST || !o.intent.exp_ms || now < o.intent.exp_ms + kExpiryBackupMs ||
+        cancel_sent_.count(cid))
+      continue;
+    // asked already: again only if that cancel never reached the venue, at most every 5 s
+    const auto asked = expiry_asked_.find(cid);
+    if (asked == expiry_asked_.end() || now - asked->second >= 5000) due.push_back(cid);
+  }
   for (const auto& cid : due) {
-    expiry_asked_.insert(cid);
+    expiry_asked_[cid] = now;
     const auto* o = manual_->ledger().find(cid);
     DLOG_WARN("order %s still working %lld ms past its expiry: cancelling it (the backup to the exchange's expiry)",
               cid.c_str(), static_cast<long long>(now - o->intent.exp_ms));
@@ -1315,6 +1325,7 @@ void Gateway::group_job(const std::string& lane, int shard, const std::string& a
   stats_.group_jobs.fetch_add(1);
   spend(0, WriteBudget::kOther);
   g.asked_ms = now_ms();
+  g.reset_acked_ms = 0;   // a fresh ask: no earlier reset's 200 counts for it
   g.state = action == "create" ? SysBook::GroupState::CREATING
           : action == "trigger" ? SysBook::GroupState::TRIGGERING : SysBook::GroupState::RESETTING;
 }
@@ -1345,8 +1356,9 @@ void Gateway::group_reply(const KalshiWriteReply& r) {
     else if (gone) { if (path_->groups) path_->groups->remove(g->id); *g = SysBook::Group{}; }
     else DLOG_WARN("order group %s not triggered: %s", g->id.c_str(), r.outcome.why.c_str());
   } else if (r.group_action == "reset") {
-    // the socket's "reset" makes it ACTIVE; it can come before the 200 (then it already is)
-    if (ok && g->state != SysBook::GroupState::ACTIVE) { g->state = SysBook::GroupState::RESETTING; g->reset_acked_ms = now_ms(); }
+    // the socket's "reset" makes it ACTIVE; it can come before the 200 (then it already is), and
+    // a trigger can overtake the reset (then it stays triggered): the 200 only starts the wait
+    if (ok) { if (g->state == SysBook::GroupState::RESETTING) g->reset_acked_ms = now_ms(); }
     else if (gone) { if (path_->groups) path_->groups->remove(g->id); *g = SysBook::Group{}; }
     else { g->state = SysBook::GroupState::TRIGGERED; DLOG_WARN("order group %s not reset: %s", g->id.c_str(), r.outcome.why.c_str()); }
   }
@@ -1440,6 +1452,7 @@ void Gateway::sys_tick(std::int64_t now) {
                     g.id.c_str(), l.id.c_str(), shard, static_cast<long long>(now - g.reset_acked_ms));
           g.state = SysBook::GroupState::ACTIVE;
           g.reset_acked_ms = 0;
+          stats_.group_reset_fallbacks.fetch_add(1);
           lanes_dirty_.insert(l.id);
         }
         const bool stuck = g.state != SysBook::GroupState::NONE && g.state != SysBook::GroupState::ACTIVE &&
