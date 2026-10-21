@@ -72,6 +72,18 @@ void parsing() {
   auto ref = espn_ref(*nba, g, false, EspnWp{0.71, 0.0, 1791676681000LL});
   CHECK(ref.per == "Q3" && ref.clock == "4:12" && ref.score == "70-74" && ref.espn == Px{2900} && ref.espn_ts_ms == 1791676681000LL);
   CHECK(espn_ref(*nba, g, true, EspnWp{0.71, 0.0, 0}).espn == Px{7100});
+  // the same state as numbers, from the YES team's side, for a model's fair
+  CHECK(ref.state == "in" && ref.period == 3 && ref.clock_s == 252 && ref.yes_score == 70 && ref.opp_score == 74);
+  const auto home = espn_ref(*nba, g, true, std::nullopt);
+  CHECK(home.yes_score == 74 && home.opp_score == 70);
+  auto late = g; late.clock = "0:35.4";
+  CHECK(espn_ref(*nba, late, true, std::nullopt).clock_s == 35.4);
+  auto secs = g; secs.clock = "12";
+  CHECK(espn_ref(*nba, secs, true, std::nullopt).clock_s == 12);
+  auto blank = g; blank.clock = "";
+  CHECK(espn_ref(*nba, blank, true, std::nullopt).clock_s == -1);
+  auto junk = g; junk.clock = "x:y";
+  CHECK(espn_ref(*nba, junk, true, std::nullopt).clock_s == -1);
   auto ot = g; ot.period = 5;
   CHECK(espn_ref(*nba, ot, true, std::nullopt).per == "OT" && !espn_ref(*nba, ot, true, std::nullopt).espn);
   const auto pre = espn_ref(*nba, games[1], true, std::nullopt);

@@ -80,6 +80,11 @@ struct EspnRef {
   std::optional<Px> espn;          // ESPN's win probability for this market's YES team
   std::int64_t espn_ts_ms = 0;     // 0: ESPN gave no play time
   std::int64_t fetched_ms = 0;
+  // the game state as numbers, for a model's fair (strat/wcbb_model.h): ESPN's state (pre, in,
+  // post), the period, the clock in seconds (-1 unread), and the scores from the YES team's side
+  std::string state;
+  int period = 0, yes_score = 0, opp_score = 0;
+  double clock_s = -1;
 };
 using EspnBoard = std::map<std::string, EspnRef>;   // by market ticker
 // The contract's per and clock for a game ("PRE" with the ET start, "Q3", "OT", "FINAL").

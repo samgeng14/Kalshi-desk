@@ -93,6 +93,17 @@ bool Deskd::init_venue(std::string* err) {
       DLOG_WARN("no data-release calendar (%s): the makers quote through releases", calendar_why_.c_str());
     }
   }
+  // the women's college basketball model: its fair on KXNCAAWBGAME ladders (docs/wcbb_model.md)
+  if (!cfg_.wcbb_model.empty()) {
+    wcbb_ = load_wcbb_model(cfg_.wcbb_model, &wcbb_why_);
+    if (wcbb_)
+      DLOG_INFO("WCBB model v%d (%s, %d games, held-out Brier %.4f vs the mid's %.4f)", wcbb_->version, wcbb_->trained.c_str(),
+                wcbb_->n_games, wcbb_->brier_model, wcbb_->brier_mid);
+    else if (::access(cfg_.wcbb_model.c_str(), F_OK) == 0)
+      DLOG_ERR("WCBB model refused: %s (no fair on women's college ladders)", wcbb_why_.c_str());
+    else
+      DLOG_INFO("no WCBB model (%s): train one with tools/train_wcbb.py", wcbb_why_.c_str());
+  }
   if (!options_.espn_url.empty()) {
     std::string why;
     if (auto ep = net::Endpoint::parse(options_.espn_url, &why)) {
@@ -621,6 +632,12 @@ json Deskd::ref_json(const std::string& ticker) const {
       ref["game"] = {{"per",e->second.per},{"clock",e->second.clock},{"score",e->second.score},{"src","ESPN"}};
       if (e->second.espn) ref["espn"] = price_str(*e->second.espn);
       if (e->second.espn && e->second.espn_ts_ms) ref["espn_ts_ms"] = e->second.espn_ts_ms;
+      // the WCBB model's fair while the game is on, from the pregame price captured before tip
+      const auto p0 = wcbb_p0_.find(ticker);
+      if (wcbb_ && p0 != wcbb_p0_.end() && ticker.rfind("KXNCAAWBGAME-", 0) == 0)
+        if (const auto p = wcbb_live_p(*wcbb_, e->second.state, e->second.period, e->second.clock_s,
+                                       e->second.yes_score - e->second.opp_score, p0->second))
+          ref["fair"] = price_str(static_cast<Px>(std::llround(*p * kOneDollar)));
     }
   }
   return ref;
@@ -636,6 +653,15 @@ void Deskd::republish_refs() {
 }
 
 void Deskd::on_book(const MdBook& b) {
+  // a women's college game's pregame YES price: the mid of a 15c-or-tighter book while ESPN says
+  // the game has not started (plan section 5(f): "the pregame Kalshi price"); kept once it starts
+  if (wcbb_ && espn_ && b.ticker.rfind("KXNCAAWBGAME-", 0) == 0 && !b.stale && !b.bids.empty() && !b.asks.empty() &&
+      b.asks.front().px - b.bids.front().px <= 1500) {
+    const auto board = espn_->board();
+    const auto e = board->find(b.ticker);
+    if (e != board->end() && e->second.state == "pre")
+      wcbb_p0_[b.ticker] = (b.bids.front().px + b.asks.front().px) / 2.0 / kOneDollar;
+  }
   // gw reads the latest book of each market, stale ones included, so a gap blocks orders.
   {
     auto next = std::make_shared<std::map<std::string, MdBook>>();

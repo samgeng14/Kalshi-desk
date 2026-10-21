@@ -68,7 +68,7 @@ DeskdConfig load_deskd_config(const std::string& path) {
                                               "http_port",   "web_threads", "keepalive_s",
                                               "max_streams", "heartbeat_window_ms", "daily_stop_dollars", "equity_floor_dollars",
                                               "manual_orders", "systematic_orders", "lip_series", "band_series", "paper_lane",
-                                              "peer_url", "write_tier", "calendar"};
+                                              "peer_url", "write_tier", "calendar", "wcbb_model"};
   for (auto kv = d.begin(); kv != d.end(); ++kv) {
     if (kv.key() == "live")
       throw std::runtime_error(where + ": \"live\" is a command-line flag only (--live), never a file setting");
@@ -90,6 +90,8 @@ DeskdConfig load_deskd_config(const std::string& path) {
   take(d, "peer_url", c.peer_url, where);
   take(d, "write_tier", c.write_tier, where);
   take(d, "calendar", c.calendar, where);
+  take(d, "wcbb_model", c.wcbb_model, where);
+  c.wcbb_model = expand_home(c.wcbb_model);
   c.calendar = expand_home(c.calendar);
   if (c.write_tier != "basic" && c.write_tier != "advanced")
     throw std::runtime_error(where + ": write_tier is \"basic\" or \"advanced\", not \"" + c.write_tier.substr(0, 40) + "\"");

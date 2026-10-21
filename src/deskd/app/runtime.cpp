@@ -299,6 +299,8 @@ json Deskd::status() const {
   result["band"] = band_ ? band_->status() : json(nullptr);
   result["paper"] = paper_ ? paper_->status() : json(nullptr);
   result["probe"] = probe_ ? probe_->status() : json(nullptr);
+  result["wcbb"] = {{"path", cfg_.wcbb_model}, {"loaded", wcbb_.has_value()}, {"why", wcbb_why_},
+                    {"version", wcbb_ ? wcbb_->version : 0}};
   result["markouts"] = markouts_ ? markouts_->status() : json(nullptr);
   if (const auto l = gw_->latency()) {
     auto ms = [](const std::optional<int>& v) { return v ? json(*v) : json(nullptr); };

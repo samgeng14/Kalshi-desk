@@ -42,6 +42,10 @@ struct DeskdConfig {
   // The data releases that pull the makers' quotes (strat/calendar.h); "" = none here, and deskd's
   // command line fills in the repo's config/calendar.json
   std::string calendar;
+  // The women's college basketball model (docs/wcbb_model.md; tools/train_wcbb.py writes it): the
+  // fair on KXNCAAWBGAME ladders. "" = models/wcbb_logit_v1.json in the source tree; a missing
+  // file runs without it (and says so), one that fails its golden rows is refused and said.
+  std::string wcbb_model;
   // Manual orders to the (demo) venue. Off by default: gw still admits and answers, but every
   // order is refused RO and the header stays read-only until the operator turns it on.
   bool manual_orders = false;

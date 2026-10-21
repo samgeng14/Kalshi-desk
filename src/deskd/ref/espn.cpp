@@ -281,6 +281,19 @@ EspnRef espn_ref(const EspnLeague& lg, const EspnGame& g, bool yes_home, const s
   EspnRef r;
   r.fetched_ms = g.fetched_ms;
   r.score = std::to_string(g.away_score) + "-" + std::to_string(g.home_score);
+  r.state = g.state;
+  r.period = g.period;
+  r.yes_score = yes_home ? g.home_score : g.away_score;
+  r.opp_score = yes_home ? g.away_score : g.home_score;
+  {   // "7:42", "0:35.4" or "12" (seconds): the period's time left
+    const auto colon = g.clock.find(':');
+    try {
+      if (colon != std::string::npos) r.clock_s = std::stoi(g.clock.substr(0, colon)) * 60.0 + std::stod(g.clock.substr(colon + 1));
+      else if (!g.clock.empty()) r.clock_s = std::stod(g.clock);
+    } catch (const std::exception&) {
+      r.clock_s = -1;
+    }
+  }
   if (g.state == "pre") {
     r.per = "PRE";
     const auto m = g.start_ms > 0 ? (g.start_ms - et_midnight_ms(g.start_ms)) / 60000 : 0;
