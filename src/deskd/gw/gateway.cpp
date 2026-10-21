@@ -1088,7 +1088,8 @@ std::string Gateway::lane_row(const std::string& id) const {
       if (!g || g->state != SysBook::GroupState::ACTIVE) { blocked = "order group on shard " + std::to_string(shard) + " not active"; break; }
     }
   const auto mk = [this](const std::string& tk) { return mark(tk); };
-  return sys_->lane_json(*l, run_view().state, reserved, working, eff - used_all, mk, blocked).dump();
+  const Micros lip = path_->lane_lip ? path_->lane_lip(id) * 100 : 0;
+  return sys_->lane_json(*l, run_view().state, reserved, working, eff - used_all, mk, blocked, lip).dump();
 }
 
 void Gateway::place_sys(PlaceIntent& p) {

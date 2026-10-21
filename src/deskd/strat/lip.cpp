@@ -69,6 +69,20 @@ void LipMeter::sample(const std::string& tk, const kalshi::IncentiveRow& p, cons
   w.share_sum += s.share();
   const double per_second = static_cast<double>(p.period_reward) / (static_cast<double>(p.end_ms - p.start_ms) / 1000.0);
   w.est += per_second * s.share();
+  const auto midnight = et_midnight_ms(now);
+  if (midnight != day_ms_) { day_ms_ = midnight; day_lane_.clear(); }
+  double size = 0;
+  for (const auto& o : ours) size += static_cast<double>(std::max<Qty>(0, o.left));
+  if (size > 0)
+    for (const auto& o : ours) day_lane_[o.lane] += per_second * s.share() * static_cast<double>(std::max<Qty>(0, o.left)) / size;
+}
+
+std::map<std::string, Money> LipMeter::lane_day(std::int64_t now) const {
+  std::map<std::string, Money> out;
+  std::lock_guard<std::mutex> lk(mu_);
+  if (et_midnight_ms(now) != day_ms_) return out;   // nothing yet today
+  for (const auto& [lane, est] : day_lane_) out[lane] = static_cast<Money>(std::llround(est));
+  return out;
 }
 
 nlohmann::json LipMeter::row(const std::string& key, const Window& w) {

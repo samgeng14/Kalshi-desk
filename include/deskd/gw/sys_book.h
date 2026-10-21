@@ -137,8 +137,9 @@ class SysBook {
   // on the ET day that began at day_start_ms. false (and nothing changed) on a malformed one.
   bool restore(const nlohmann::json& j, std::int64_t day_start_ms, Halt* halt, std::string* why);
   // the contract's lane row
+  // lip: the lane's LIP estimate today (strat/lip.h), its own line: never in "day" or the stop
   nlohmann::json lane_json(const LaneSpec& l, RunState run, Micros reserved, int working, Micros eff_left,
-                           const MarkFn& mark, const std::string& blocked) const;
+                           const MarkFn& mark, const std::string& blocked, Micros lip = 0) const;
 
  private:
   std::vector<LaneSpec> lanes_;

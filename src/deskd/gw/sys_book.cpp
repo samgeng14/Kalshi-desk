@@ -254,7 +254,7 @@ bool SysBook::restore(const json& j, std::int64_t day_start_ms, Halt* halt, std:
 }
 
 json SysBook::lane_json(const LaneSpec& l, RunState run, Micros reserved, int working, Micros eff_left,
-                        const MarkFn& mark, const std::string& blocked) const {
+                        const MarkFn& mark, const std::string& blocked, Micros lip) const {
   const auto* d = day(l.id);
   const Micros open = open_worst(l.id), used = open + reserved, unrl = unrealized(l.id, mark);
   const Micros fees = d ? d->fees : 0, real = d ? d->real - d->fees : 0;
@@ -278,7 +278,7 @@ json SysBook::lane_json(const LaneSpec& l, RunState run, Micros reserved, int wo
           {"budget", money(budget)}, {"used", money(used)}, {"open", money(open)}, {"wrk", working},
           {"sent", d ? d->sent : 0}, {"hit", d ? static_cast<int>(d->hit.size()) : 0}, {"fills", d ? d->fills : 0},
           {"ctrs", qty_to_number(d ? d->ctrs : 0)}, {"fees", money(fees)}, {"real", money(real)}, {"unrl", money(unrl)},
-          {"day", money(real + unrl)}, {"lip", money(0)}, {"cap_left", money(cap_left)},
+          {"day", money(real + unrl)}, {"lip", money(lip)}, {"cap_left", money(cap_left)},
           {"thr", l.thr ? json(money_str(*l.thr)) : json(nullptr)},
           {"last_ms", d && d->last_ms ? json(d->last_ms) : json(nullptr)}, {"why", why}};
 }

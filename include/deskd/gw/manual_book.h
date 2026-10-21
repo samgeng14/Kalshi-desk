@@ -60,6 +60,7 @@ struct ManualPath {
   std::function<bool(KalshiWriteJob)> sys_send, sys_cancel;
   std::function<ManualHealth()> sys_health;
   std::function<void(const std::string&)> publish_lane;
+  std::function<Money(const std::string& lane)> lane_lip;   // its LIP estimate today, 1/10,000 $
   Money daily_stop = 0;
   // the floor (plan section 4, limit 5): the account's equity (cash and positions, the venue's
   // marks) under it halts Systematic; 0 = none

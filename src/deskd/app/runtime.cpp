@@ -210,6 +210,12 @@ json write_budget_json(const Gateway& gw) {
     for (const auto& [shard, t] : *view) tokens[std::to_string(shard)] = std::round(t * 10) / 10;
   return {{"cap", gw.write_cap()}, {"sys_share", WriteBudget::kSysShare}, {"tokens", tokens}};
 }
+// today's LIP estimate per lane, as money strings
+json lip_lanes_json(const std::map<std::string, Money>& lanes) {
+  json out = json::object();
+  for (const auto& [lane, est] : lanes) out[lane.empty() ? "?" : lane] = money_str(est);
+  return out;
+}
 }  // namespace
 
 json Deskd::status() const {
@@ -269,6 +275,7 @@ json Deskd::status() const {
               {"kill", {{"generation", kill_.generation()}, {"active", kill_.active()}}},
               {"calendar", {{"path", cfg_.calendar}, {"releases", calendar_.size()}, {"why", calendar_why_}}},
               {"lip", {{"programs", rest_ ? rest_->snapshot()->lip.size() : 0}, {"markets", lip_meter_.status()},
+                       {"lanes", lip_lanes_json(lip_meter_.lane_day(now))},
                        {"note", "an estimate (strat/lip.h) until payouts are reconciled"}}},
               {"store",
                {{"path", store_.path()},

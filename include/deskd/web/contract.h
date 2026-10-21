@@ -67,6 +67,7 @@ struct HdrInputs {
   // day.man = the account's day - day.sys), its fees today and cost budget, and hdr.sys.K.
   struct Sys {
     Money day = 0, fees = 0, budget = 0, used = 0, ceiling = 0, eff = 0;
+    Money lip = 0;   // Systematic's LIP estimate today: day.lip, never in day.sys or the stop
   };
   std::optional<Sys> sys;
 };

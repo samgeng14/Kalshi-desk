@@ -189,6 +189,11 @@ void Deskd::attach_manual() {
       return h;
     };
     p.publish_market = [this](const std::string& tk) { publish_market(tk); };
+    p.lane_lip = [this](const std::string& lane) {
+      const auto m = lip_meter_.lane_day(now_ms());
+      const auto it = m.find(lane);
+      return it == m.end() ? Money{0} : it->second;
+    };
     p.alert = [this](const std::string& lvl, const std::string& src, const std::string& msg) { pub_->alert(lvl, src, msg); };
     p.publish_lane = [this](const std::string& row) {
       auto j = json::parse(row, nullptr, false);
@@ -340,6 +345,7 @@ HdrInputs Deskd::header() const {
       sys.used = v->used / 100;
       sys.ceiling = v->ceiling / 100;
       sys.eff = v->eff / 100;
+      for (const auto& [lane, est] : lip_meter_.lane_day(now_ms())) sys.lip += est;
       h.sys = sys;
     }
   return h;
@@ -785,7 +791,7 @@ void Deskd::lip_step(std::int64_t now) {
       if (view)
         for (const auto& [cid, o] : view->orders)
           if (o.ticker == tk && !o.terminal && o.left > 0 && (o.state == OrdState::WORK || o.state == OrdState::PART))
-            ours.push_back({o.side == Side::BUY, o.price, o.left});
+            ours.push_back({o.side == Side::BUY, o.price, o.left, o.lane});
       lip_meter_.sample(tk, program, b->second, ours, now);
     }
   }

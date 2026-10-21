@@ -530,6 +530,9 @@ void systematic_maker() {
     });
     if(!lip) std::fprintf(stderr,"lip: %s\n",r.d->status()["lip"].dump().c_str());
     CHECK(lip);
+    // and it is lane M1's: today's estimate on its own line (the lane row's and header's LIP)
+    CHECK(r.until([&]{ const auto l=r.d->status()["lip"]["lanes"];
+      return l.contains("M1") && parse_money(l["M1"].get<std::string>()).value_or(0)>0; }));
   }
   // the street sells 10 into our bid
   r.venue.f->with_engine([&](fakex::Engine& e,std::int64_t now) { CHECK(e.street_take(W,fakex::Side::ASK,4100,1000,now)==1000); });

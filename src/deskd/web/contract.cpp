@@ -156,7 +156,7 @@ json hdr_json(const HdrInputs& in) {
     // day_man arrives as the account's whole day; Systematic's part is gw's lanes
     const Money sys = in.sys->day;
     result["day"] = {{"total", money_str(in.day_man)}, {"sys", money_str(sys)}, {"man", money_str(in.day_man - sys)},
-                     {"lip", zero}};
+                     {"lip", money_str(in.sys->lip)}};
     const Money left = in.daily_stop + std::min<Money>(0, sys);
     result["stop"] = {{"left", money_str(left)}, {"limit", money_str(in.daily_stop)}, {"hit", left <= 0}};
     result["sys"]["K"] = {{"used", money_str(in.sys->used)}, {"ceiling", money_str(in.sys->ceiling)}, {"eff", money_str(in.sys->eff)}};

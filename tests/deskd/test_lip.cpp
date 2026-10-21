@@ -56,7 +56,7 @@ void meter() {
   p.start_ms = T0;
   p.end_ms = T0 + 900000;
   const auto b = book({{4000, 200 * C}, {3900, 200 * C}, {3800, 500 * C}}, {{4200, 300 * C}});
-  const std::vector<LipOwn> ours{{true, 4000, 100 * C}};
+  const std::vector<LipOwn> ours{{true, 4000, 100 * C, "M1"}};
   LipMeter m;
   m.sample(p.market_ticker, p, b, ours, T0 - 1000);                 // before the window: nothing
   for (int i = 0; i < 10; ++i) m.sample(p.market_ticker, p, b, ours, T0 + i * 1000);
@@ -77,6 +77,16 @@ void meter() {
           rows[0]["start_ms"] == T0);
   }
   CHECK(m.finished(T0 + 900000).empty() && m.status().empty());   // it came back once
+  // the day's estimate per lane: 10 scored seconds at a fifth of $20 / 900 s, all M1's
+  const auto lanes = m.lane_day(T0 + 900000);
+  CHECK(lanes.size() == 1 && lanes.count("M1") && lanes.at("M1") == 444);
+  CHECK(m.lane_day(T0 + 2 * 86400000LL).empty());   // another ET day: nothing yet
+  // two lanes resting there: the seconds' dollars split by their size (3 to 1)
+  LipMeter two;
+  const std::vector<LipOwn> both{{true, 4000, 75 * C, "M1"}, {true, 4000, 25 * C, "D1"}};
+  for (int i = 0; i < 9; ++i) two.sample(p.market_ticker, p, b, both, T0 + i * 1000);
+  const auto split = two.lane_day(T0 + 9000);
+  CHECK(split.size() == 2 && split.at("M1") == 300 && split.at("D1") == 100);
 }
 
 void wire() {

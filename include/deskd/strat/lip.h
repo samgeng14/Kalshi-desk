@@ -31,6 +31,7 @@ struct LipOwn {   // one of our resting orders
   bool bid = true;   // a YES bid; false: a YES ask
   Px price = 0;
   Qty left = 0;
+  std::string lane;  // the Systematic lane that rests it (its share of the estimate)
 };
 
 struct LipShare {
@@ -51,6 +52,10 @@ class LipMeter {
               const std::vector<LipOwn>& ours, std::int64_t now_ms);
   std::vector<nlohmann::json> finished(std::int64_t now_ms);   // windows past their end
   nlohmann::json status() const;                                // any thread
+  // Today's (ET) estimate per lane, in 1/10,000 $ (any thread): each scored second's dollars go
+  // to the lanes resting our contracts then, by their size. The lane row's and the header's LIP
+  // line (plan section 4: P&L with LIP on its own line, so a reward cannot hide losing fills).
+  std::map<std::string, Money> lane_day(std::int64_t now_ms) const;
 
  private:
   struct Window {
@@ -63,6 +68,8 @@ class LipMeter {
   static nlohmann::json row(const std::string& tk, const Window& w);
   mutable std::mutex mu_;
   std::map<std::string, Window> windows_;   // "ticker|start_ms"
+  std::map<std::string, double> day_lane_;  // today's estimate per lane, 1/10,000 $
+  std::int64_t day_ms_ = 0;                 // the ET midnight day_lane_ counts from
 };
 
 }  // namespace deskd
