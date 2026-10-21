@@ -189,7 +189,7 @@ class Gateway {
   std::shared_ptr<const rest::Snapshot> snapshot_seen_;
   std::map<std::string, OrderPromise> pending_;  // web threads waiting on a Manual order's write
   std::set<std::string> cancel_sent_;            // cids whose cancel went to the cancel sender
-  std::map<std::string, std::string> cancel_why_;   // a cancel gw itself asked for: STOP, LANE_OFF, HALT
+  std::map<std::string, std::string> cancel_why_;   // a cancel gw itself asked for: STOP, LANE_OFF, HALT, RETIRED
   std::shared_ptr<const std::set<std::string>> owned_;   // std::atomic_load / std::atomic_store
   std::shared_ptr<const std::string> ledger_why_;        // std::atomic_load / std::atomic_store
   std::shared_ptr<const std::string> invariant_why_;     // the same

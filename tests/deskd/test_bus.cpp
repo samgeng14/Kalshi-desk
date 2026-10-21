@@ -65,6 +65,7 @@ static void test_lanes() {
   CHECK(lane_of(PlaceIntent{}) == Lane::NORMAL);
   CHECK(lane_of(AmendIntent{}) == Lane::NORMAL);
   CHECK(lane_of(Start{}) == Lane::NORMAL);   // so a later Stop overtakes it
+  CHECK(lane_of(LaneMarkout{}) == Lane::NORMAL);   // nothing is late for it
 }
 
 static void test_queue() {
@@ -323,15 +324,16 @@ static void test_gateway_rules() {
   {
     Freeze f(gw);
     for (int i = 0; i < 100; ++i) CHECK(gw.post(order("Mq" + std::to_string(i) + "abcd", Owner::MAN, "KXT-A")));
+    CHECK(gw.post(LaneMarkout{"C1", "f-1", "300s", -100, 100}));   // a lane's markout is no order: it stays
     CHECK(kill.trip(now_ms(), mono, "test"));
-    CHECK(gw.inbox().size(Lane::NORMAL) == 100);
+    CHECK(gw.inbox().size(Lane::NORMAL) == 101);
     f.thaw();
-    CHECK(settled(gw, 1));   // the probe; nothing else
+    CHECK(settled(gw, 2));   // the probe and the markout; nothing else
     for (int i = 0; i < 200 && gw.stats().kills_seen.load() == 0; ++i) std::this_thread::sleep_for(5ms);
     CHECK(gw.stats().kills_seen.load() == 1);
     CHECK(gw.stats().erased_by_kill.load() == 100);
     CHECK(gw.stats().place_refused.load() == 0);
-    CHECK(gw.stats().handled.load() == 1);
+    CHECK(gw.stats().handled.load() == 2);
     CHECK(gw.inbox().size() == 0);
     CHECK(gw.run_view().state == RunState::KILLED);
     mono += 60000;
@@ -387,12 +389,13 @@ static void test_gateway_rules() {
     Freeze f(gw);
     gw.post(std::move(sys));
     gw.post(std::move(man));
+    gw.post(LaneMarkout{"C1", "f-2", "300s", 100, 100});
     auto pt = std::make_shared<std::promise<ControlReply>>();
     gw.post(Stop{"operator", pt});
     f.thaw();
     CHECK(pt->get_future().wait_for(1s) == std::future_status::ready);
     CHECK(gw.stats().erased_by_stop.load() == e0 + 1);
-    CHECK(settled(gw, h0 + 3));   // probe, the Stop, the Manual order it left
+    CHECK(settled(gw, h0 + 4));   // probe, the Stop, the Manual order and the markout it left
     CHECK(fsys.wait_for(1s) == std::future_status::ready && fman.wait_for(1s) == std::future_status::ready);
     const auto rs = fsys.get(), rm = fman.get();
     CHECK(rs.code == "BAD_STATE");   // erased by the Stop

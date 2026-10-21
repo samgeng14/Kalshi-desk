@@ -126,6 +126,15 @@ std::string lane_of_cid(const std::string& cid) {
 }
 // a fill's identity on both of its paths (the private feed and the REST read)
 std::string fill_key(const kalshi::FillRow& f) { return f.trade_id.empty() ? f.fill_id : f.trade_id; }
+// Why lane l may neither be switched on nor trade: its retirement (until deskctl lane-reset) or
+// its evidence gate; "" = neither. Decisions 12: LaneSet refuses it BAD_REQUEST and place_sys
+// LANE_OFF, never FORBIDDEN (the contract's word for the X-Desk token).
+std::string barred(const SysBook& sys, const LaneSpec& l) {
+  if (const auto* f = sys.life(l.id); f && f->retired)
+    return "lane " + l.id + " is retired: " + f->retired_why + " (deskctl lane-reset " + l.id + ", with deskd stopped)";
+  if (!l.gate_why.empty()) return "lane " + l.id + " is gated: " + l.gate_why;
+  return "";
+}
 bool own_matches(CancelIntent::Own f, Owner o) {
   return f == CancelIntent::Own::ANY || (f == CancelIntent::Own::MAN && o == Owner::MAN) ||
          (f == CancelIntent::Own::SYS && o == Owner::SYS);
@@ -307,6 +316,9 @@ void Gateway::handle(GwMsg& m) {
     if (!sys_ || !sys_->lane(l->id)) {
       r.code = "NOT_FOUND";
       r.msg = "no lane " + l->id;
+    } else if (const auto why = l->on ? barred(*sys_, *sys_->lane(l->id)) : ""; !why.empty()) {
+      r.code = "BAD_REQUEST";   // and it stays off
+      r.msg = why;
     } else if (l->on && !sys_->lane(l->id)->engine) {
       r.code = "BAD_REQUEST";
       r.msg = "lane " + l->id + " has no engine yet: nothing would trade it";
@@ -320,6 +332,11 @@ void Gateway::handle(GwMsg& m) {
       r.lane = lane_row(l->id);
     }
     if (l->reply) { try { l->reply->set_value(std::move(r)); } catch (const std::future_error&) {} }
+    return;
+  }
+  if (auto* mo = std::get_if<LaneMarkout>(&m)) {
+    // counted toward the lane's retire rule; sys_tick retires it once the rule fires
+    if (sys_ && sys_->markout(mo->lane, mo->fid, mo->h, mo->mo_net, mo->qty)) sys_save_due_ = true;
     return;
   }
   if (auto* e = std::get_if<PrivateMsg>(&m)) {
@@ -1168,8 +1185,11 @@ void Gateway::place_sys(PlaceIntent& p) {
   if (own_.state != RunState::RUN) return refuse("BAD_STATE", "a Systematic order while Systematic is not running");
   const auto* lane = sys_->lane(p.lane);
   if (!lane) return refuse("BAD_REQUEST", "no lane " + p.lane);
+  // a retired or gated lane is off too, but says which (decisions 12), reducing orders included:
+  // a retired lane trades nothing more, and what it holds goes to settlement or to Manual
+  if (const auto why = barred(*sys_, *lane); !why.empty()) return refuse("LANE_OFF", why);
   if (!sys_->on(p.lane)) return refuse("BAD_STATE", "lane " + p.lane + " is off");
-  if (lane->paper_only && path_->live) return refuse("FORBIDDEN", "lane " + p.lane + " trades only on the demo account");
+  if (lane->paper_only && path_->live) return refuse("LANE_OFF", "lane " + p.lane + " trades only on the demo account");
   if (!sys_restore_error_.empty()) return refuse("RO", sys_restore_error_);
   sync_snapshot();
   if (!snapshot_seen_) return refuse("STALE", "no account read yet");
@@ -1234,6 +1254,23 @@ void Gateway::place_sys(PlaceIntent& p) {
       if (o.intent.owner == Owner::SYS && !o.terminal() && in_grp(o.intent.ticker)) in_group += o.reservation();
     if (in_group > corr_group_cap(grp))
       return refuse("SYS_CEILING", "group " + grp + " worst case past " + money_str(corr_group_cap(grp) / 100));
+    // the lane's own cap in one event (LaneSpec::event_cap: C1's $10 a game), held and working,
+    // besides every lane's in the group (a 15-minute series' group spans many events)
+    if (lane->event_cap > 0) {
+      auto event_key = [&](const std::string& tk) {
+        const auto ev = event_of(tk);
+        const auto dash = tk.rfind('-');
+        return !ev.empty() ? ev : dash == std::string::npos ? tk : tk.substr(0, dash);
+      };
+      const std::string ev = event_key(p.ticker);
+      const auto in_ev = [&](const std::string& tk) { return event_key(tk) == ev; };
+      Micros in_event = worst + sys_->open_worst_in(p.lane, in_ev);
+      for (const auto& [cid, o] : manual_->ledger().orders())
+        if (o.intent.owner == Owner::SYS && !o.terminal() && o.intent.lane == p.lane && in_ev(o.intent.ticker))
+          in_event += o.reservation();
+      if (in_event > lane->event_cap)
+        return refuse("SYS_CEILING", "lane " + p.lane + "'s worst case in event " + ev + " past " + money_str(lane->event_cap / 100));
+    }
   }
   // the floor (plan section 4, limit 5): the account's equity under it halts Systematic
   if (path_->equity_floor > 0 && equity < path_->equity_floor * 100) {
@@ -1498,6 +1535,20 @@ void Gateway::sys_tick(std::int64_t now) {
   if (own_.state == RunState::RUN && path_->equity_floor > 0 && snapshot_seen_ && snapshot_seen_->account_ready) {
     const Micros equity = (snapshot_seen_->balance.available + snapshot_seen_->balance.portfolio_value.value_or(0)) * 100;
     if (equity < path_->equity_floor * 100) halt(floor_why(equity));
+  }
+  // A lane whose retire rule fires (gw/sys_book.h; plan 5(d) and 5(e)'s kill rules) is retired
+  // and off, its working orders cancelled (why RETIRED), and saved at once: it stays off across
+  // restarts until deskctl lane-reset (decisions 9). Checked whether or not Systematic runs.
+  for (const auto& l : sys_->lanes()) {
+    const auto why = sys_->retire_due(l, mk);
+    if (why.empty() || !sys_->retire(l.id, now, why)) continue;
+    const auto id = l.id;
+    const int n = cancel_sys([&id](const std::string& lane) { return lane == id; }, "RETIRED");
+    DLOG_WARN("lane %s retired: %s; %d working order(s) cancelled", id.c_str(), why.c_str(), n);
+    if (path_->alert) path_->alert("CRIT", id, "lane " + id + " retired: " + why + "; off until deskctl lane-reset " + id);
+    lanes_dirty_.insert(id);
+    sys_dirty_ = true;
+    save_sys();
   }
   // Order groups: one per lane and shard, created one at a time while Systematic can write;
   // triggered ones are reset once nothing runs (after a Stop or HALT; KILL's at its re-arm).

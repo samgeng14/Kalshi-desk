@@ -185,6 +185,14 @@ struct LaneSet {
   LanePromise reply;
 };
 
+// strat's net markout of one Systematic fill at one horizon (strat/markouts.h), for its lane's
+// retire rule: gw counts it when h is the lane's retire_h (gw/sys_book.h SysBook::markout)
+struct LaneMarkout {
+  std::string lane, fid, h;   // h as the stream's mo rows name it: "300s"
+  Money mo_net = 0;           // per contract, net of fees, + in our favour
+  Qty qty = 0;
+};
+
 // POST /api/release: the operator hands a market Manual took over back to Systematic
 struct ReleaseMarket {
   std::string ticker;
@@ -203,11 +211,12 @@ struct TransferIntent {
 };
 
 using GwMsg = std::variant<PlaceIntent, AmendIntent, CancelIntent, Start, Stop, SendResult, OrderEvent, Probe, ManualWrite,
-                           PrivateMsg, LaneSet, ReleaseMarket, TransferIntent>;
+                           PrivateMsg, LaneSet, ReleaseMarket, TransferIntent, LaneMarkout>;
 
 // Stop goes in the control lane, which nothing else fills; cancels and private events go before
 // new orders (plan section 2). Start and amends wait in the normal lane with the orders, so a
-// Stop sent after a Start overtakes it and deletes it instead of being undone by it.
+// Stop sent after a Start overtakes it and deletes it instead of being undone by it. A markout
+// waits there too: nothing is late for it, and neither a Stop nor a KILL deletes it.
 Lane lane_of(const GwMsg& m);
 
 }  // namespace deskd
