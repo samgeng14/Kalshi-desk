@@ -87,6 +87,20 @@ def wanted(m, now_s, lead_s, linger_s):
     return True
 
 
+def recordable_during(m, a_s, b_s, now_s, lead_s, linger_s):
+    """Was this market on the recording list at some time in [a_s, b_s]: does its span, lead_s
+    before it opens to linger_s after it closes, overlap it? A missing open time is unbounded; a
+    missing close time is now, unless the market is settled (when it stopped is then unknown)."""
+    open_s, close_s = ts_s(m.get('open_time')), ts_s(m.get('close_time'))
+    if close_s is None:
+        if m.get('status') in DONE:
+            return False
+        close_s = now_s
+    if close_s + linger_s < a_s:
+        return False
+    return open_s is None or open_s - lead_s <= b_s
+
+
 def market_row(series, m, recv):
     def num(k):
         v = m.get(k)
@@ -227,6 +241,7 @@ class Recorder:
         self.college = set()       # the desired markets of college and control games: books by REST too
         self.recorded = {}         # ticker -> when it was last on the desired list (us), for backfill
         self.next_college = {}     # series -> epoch s its next listing is due
+        self.reach_back = {}       # series -> epoch s: its next closed/settled listing reaches back here (a restart)
         self.control = college.ControlPicks(settings.control_frac, settings.control_pick_h, self.state)
         self.conn = 0
         self.ws_up = False
@@ -294,7 +309,9 @@ class Recorder:
                 statuses += ['closed', 'settled']
             series_ok = True
             for st in statuses:
-                since = int(now - 6 * 3600) if st in ('closed', 'settled') else None
+                # results of the last 6 h; after a restart, once, back to the start of its window
+                since = int(min(now - 6 * 3600, self.reach_back.get(series, now))) \
+                    if st in ('closed', 'settled') else None
                 try:
                     rows = await self.list_markets(series, st, since)
                 except Exception as e:   # one series' failure costs that series this round, not the rest
@@ -304,6 +321,8 @@ class Recorder:
                     continue
                 for m in rows:
                     self.see_market(series, m, group)
+            if series_ok and 'closed' in statuses:
+                self.reach_back.pop(series, None)
             if group == 'book':
                 ok = ok and series_ok
             else:
@@ -364,9 +383,20 @@ class Recorder:
                 self.changed.set()
 
     def recorded_between(self, from_us, to_us):
-        """The markets on the recording list at some point since from_us (what a trade backfill
-        window reads)."""
-        return {t for t, u in self.recorded.items() if u >= from_us} | set(self.desired)
+        """The markets a trade backfill window reads: those on this process's recording list at
+        some point since from_us, and every cached market (a control game only if picked) whose
+        span from lead_s before its open to linger_s after its close overlaps the window. The
+        second is a restart's: a window that closed, or opened and closed, while the recorder was
+        down was never on this process's list, but the first listing after the restart has its
+        row (note_restart sets how far back it reaches)."""
+        out = {t for t, u in self.recorded.items() if u >= from_us} | set(self.desired)
+        a, b, now = from_us / 1e6, to_us / 1e6, time.time()
+        for t, (_, m, group) in self.markets.items():
+            if t in out or (group == 'control' and not self.control.picked(m.get('event_ticker'))):
+                continue
+            if recordable_during(m, a, b, now, self.s.lead_s, self.s.linger_s):
+                out.add(t)
+        return out
 
     async def discovery_loop(self):
         while not self.stop.is_set():
@@ -700,6 +730,11 @@ class Recorder:
         self.gap('recorder', 'restart', 'not recording for %.0f s (stopped, crashed or rebooted)' % ((t - last) / 1e6),
                  from_us=last, to_us=t)
         self.backfill.add(last, t, 'restart')
+        # the first listing of each series reads the closed and settled rows back to the window's
+        # start, so the backfill knows the markets that closed while it was down (a day at most:
+        # discovery forgets a market a day after its close)
+        back = (last - polls.TradeBackfill.PAD_US) / 1e6 - self.s.linger_s
+        self.reach_back = {x: max(back, t / 1e6 - KEEP_MARKET_S) for x in self.groups}
 
     async def run(self, run_s=0):
         self.stop = asyncio.Event()

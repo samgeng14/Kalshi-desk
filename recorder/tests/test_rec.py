@@ -229,6 +229,66 @@ class RecorderListsTest(unittest.TestCase):
         self.assertEqual(len(self.r.backfill.windows), 1)
         self.assertEqual(self.r.backfill.windows[0][2], 'restart')
 
+    # ---- a restart's trade backfill: the markets that were recordable while it was down -------
+    STATUS = {'active': 'open', 'initialized': 'unopened', 'closed': 'closed', 'determined': 'closed',
+              'settled': 'settled', 'finalized': 'settled'}
+
+    def restart(self, down_s, listing):
+        """The recorder restarted down_s after its last frame: the venue lists `listing` ({series:
+        [rows]}, closed and settled rows from min_close_ts on, as Kalshi does). One discovery round,
+        then the restart's backfill drained: (the tickers whose trades it read, the listing calls)."""
+        read = []
+
+        def handler(route, p):
+            if route == '/markets/trades':
+                read.append(p['ticker'])
+                return {'trades': [], 'cursor': ''}
+            rows = [m for m in listing.get(p['series_ticker'], []) if self.STATUS[m['status']] == p['status']]
+            if 'min_close_ts' in p:
+                rows = [m for m in rows if iso(p['min_close_ts']) <= m['close_time']]
+            return {'markets': rows, 'cursor': ''}
+        self.r.venue, rest = fake_venue(handler)
+        self.r.backfill.venue = self.r.venue
+        self.r.changed = asyncio.Event()
+        self.r.store.write('kalshi_ws', {'recv_us': int((self.now - down_s) * 1e6), 'mono_us': 0, 'conn': 1,
+                                         'type': 'trade', 'sid': 2, 'seq': 9, 'ticker': None, 'raw': '{}'})
+        self.r.store.flush()
+        self.r.note_restart()
+        asyncio.run(self.r.discover_once())
+        asyncio.run(self.r.backfill.drain())
+        return set(read), rest.calls
+
+    def market(self, ticker, opened_s, closed_s, status, **kw):
+        return dict({'ticker': ticker, 'event_ticker': ticker.rsplit('-', 1)[0], 'status': status,
+                     'open_time': iso(self.now + opened_s), 'close_time': iso(self.now + closed_s)}, **kw)
+
+    def test_restart_backfills_markets_closed_while_down(self):
+        # down from 20 minutes ago: W0 traded for 8 minutes of that and closed 12 minutes ago
+        w0 = self.market('KXNATGAS15M-W0', -27 * 60, -12 * 60, 'closed')
+        old = self.market('KXNATGAS15M-WOLD', -4 * 3600, -3 * 3600, 'settled')   # over before the outage
+        game = dict(self.wb[0], status='settled', close_time=iso(self.now - 600))  # a game that ended in it
+        thin, big = [dict(m, status='closed', close_time=iso(self.now - 600)) for m in self.mb]
+        read, _ = self.restart(1200, {'KXNATGAS15M': [w0, self.window, old], 'KXNCAAWBGAME': [game, self.wb[1]],
+                                      'KXNCAAMBGAME': [thin, big]})
+        self.assertNotIn(w0['ticker'], self.r.desired)          # not wanted now, but recorded while down
+        self.assertEqual(read, {w0['ticker'], self.window['ticker'], game['ticker'], self.wb[1]['ticker'],
+                                thin['ticker']})               # the thin control game is picked; BIG is not
+
+    def test_restart_lists_closed_markets_back_to_its_window(self):
+        # down for 8 hours: the first listing reaches back past the usual 6 h, to the window's start
+        w = self.market('KXNATGAS15M-W7H', -7 * 3600 - 900, -7 * 3600, 'settled')
+        read, calls = self.restart(8 * 3600, {'KXNATGAS15M': [w, self.window]})
+        self.assertIn(w['ticker'], read)
+        since = [p['min_close_ts'] for _, p in calls if p.get('series_ticker') == 'KXNATGAS15M' and 'min_close_ts' in p]
+        self.assertEqual(len(since), 2)                          # closed and settled
+        self.assertTrue(all(s <= self.now - 8 * 3600 - self.s.linger_s for s in since), since)
+        # only once: the next listing of results is the usual 6 h
+        self.r.venue.rest.calls.clear()
+        self.r.last_settled = 0
+        asyncio.run(self.r.discover_once())
+        since = [p['min_close_ts'] for _, p in self.r.venue.rest.calls if 'min_close_ts' in p]
+        self.assertTrue(since and all(s >= self.now - 6 * 3600 - 5 for s in since), since)
+
 
 if __name__ == '__main__':
     unittest.main()
