@@ -3,6 +3,7 @@
 // and file (web's probe and every watched owner), the logger that never blocks a thread, config
 // loading, the empty-subscription guard, and the send guard that keeps production hosts closed
 // without --live and the production account's lock.
+#include <cctype>
 #include <fcntl.h>
 #include <signal.h>
 #include <sys/stat.h>
@@ -257,7 +258,17 @@ static void test_logger_never_blocks() {
   std::printf("20,000 log lines into a full pipe: %.1f ms, %llu dropped\n", ms, static_cast<unsigned long long>(dropped));
   CHECK(flushed);
   CHECK(got.find("] main: line 0 of a flood nobody reads\n") != std::string::npos);   // whole lines
-  CHECK(got.find(std::to_string(dropped) + " log lines dropped") != std::string::npos);
+  // every drop is reported: in one line, or several when the logger woke during the flood (it
+  // reports what was dropped so far each time it wakes; under load that splits the count)
+  std::uint64_t reported = 0;
+  for (std::size_t at = got.find(" log lines dropped"); at != std::string::npos; at = got.find(" log lines dropped", at + 1)) {
+    std::size_t b = at;
+    while (b > 0 && std::isdigit(static_cast<unsigned char>(got[b - 1]))) --b;
+    if (b < at) reported += std::stoull(got.substr(b, at - b));
+  }
+  if (reported != dropped) std::fprintf(stderr, "  reported %llu of %llu dropped\n", static_cast<unsigned long long>(reported),
+                                        static_cast<unsigned long long>(dropped));
+  CHECK(reported == dropped);
   ::close(p[0]);
   ::close(p[1]);
 }
