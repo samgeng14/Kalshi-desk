@@ -82,6 +82,21 @@ SCHEMAS = {
                    ('wallclock', 'string'), ('home_score', 'int32'), ('away_score', 'int32'), ('team_id', 'string'),
                    ('scoring', 'bool_'), ('score_value', 'int32'), ('type', 'string'), ('text', 'string'),
                    ('wp_home', 'float64'), ('wp_tie', 'float64'), ('revised', 'bool_'), ('raw', 'string')],
+    # Polymarket US's book of a listed slug (recorder/poly.py, public data only), written when it
+    # differs from the last one recorded for it: recv_us first seen, sent_us when that read left,
+    # prev_us the read before, polls how many reads saw the previous one; age_s and date_us the
+    # response's Age and Date headers (a cached answer: the book held from Date - Age at the
+    # latest). mode: game (a listed league's game) or listed (REC_PM_SLUGS). raw: every level
+    'pm_books': [('recv_us', 'int64'), ('sent_us', 'int64'), ('prev_us', 'int64'), ('polls', 'int32'),
+                 ('slug', 'string'), ('league', 'string'), ('mode', 'string'), ('bid', 'float64'),
+                 ('bid_size', 'float64'), ('ask', 'float64'), ('ask_size', 'float64'), ('age_s', 'float64'),
+                 ('date_us', 'int64'), ('raw', 'string')],
+    # a Polymarket game-winner market of a listed league each time its listing changed (start,
+    # end, active, closed, sides; not its quotes): what pairs it with a Kalshi game afterwards
+    'pm_markets': [('recv_us', 'int64'), ('league', 'string'), ('slug', 'string'), ('event_slug', 'string'),
+                   ('event_title', 'string'), ('question', 'string'), ('sports_type', 'string'),
+                   ('start_time', 'string'), ('end_time', 'string'), ('active', 'bool_'), ('closed', 'bool_'),
+                   ('raw', 'string')],
     # the control decile (plan 5(d)): every game of the control series on its date, ranked by
     # pregame volume when the pick was made, the picked ones flagged
     'college_control': [('recv_us', 'int64'), ('series', 'string'), ('game_date', 'string'),

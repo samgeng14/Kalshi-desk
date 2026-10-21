@@ -12,7 +12,9 @@ a second, so a silent minute is an outage even if nothing logged one, e.g. a dea
 share is over the minutes the recorder covered that day (its first to last row, plus any gap
 minutes). fallback_on/off rows say what the REST books did; they are not gaps. Nor is spool_torn:
 its from_us..to_us is the hour bucket the torn line was in, not an outage, and the stop that tore
-it is already a restart row (from the socket's last frame to the restart) and silent minutes.
+it is already a restart row (from the socket's last frame to the restart) and silent minutes. Nor
+is not_found: a Polymarket slug the gateway does not know (mistyped, or gone) is a setting to fix,
+said once an hour, not minutes lost.
 
 Parquet is read with pyarrow, else duckdb; without either the Parquet files are counted from the
 manifest only (rows and bytes) and their gaps and minutes skipped, which the report says.
@@ -28,7 +30,7 @@ from .store import read_manifest
 
 MIN_US = 60_000_000
 DAY_MIN = 1440
-INFO_KINDS = ('fallback_on', 'fallback_off', 'spool_torn')   # counted apart, not as gap minutes
+INFO_KINDS = ('fallback_on', 'fallback_off', 'spool_torn', 'not_found')   # counted apart, not as gap minutes
 MAX_SPAN_MIN = 7 * DAY_MIN    # a gap row claiming more than a week is cut to its last week
 GOAL = 0.01
 

@@ -22,6 +22,9 @@ What it records, on a read-only key:
   - ESPN's and NCAA.com's scoreboards for the college sports and the NBA, each change once, and
     a game in progress's clock at most every REC_SCORES_CLOCK_S; ESPN's summaries of the games
     in progress in REC_SUMMARY_LEAGUES, each play once when first seen (scores.py).
+  - only if configured (REC_PM_LEAGUES, REC_PM_SLUGS; both empty by default): Polymarket US's
+    public books, gateway.polymarket.us with no key, every few seconds for an explicit slug list
+    (poly.py).
   - gaps: disconnects and resumptions, sequence gaps, refused subscriptions, failed discovery and
     polls, clock steps, restarts, torn spool lines.
 
@@ -44,7 +47,7 @@ import urllib.request
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
-from . import college, config, games, kalshi, polls, scores
+from . import college, config, games, kalshi, polls, poly, scores
 from .store import State, Store, mono_us, now_us
 
 BOOK_CHANNELS = ('orderbook_delta', 'trade')
@@ -275,6 +278,8 @@ class Recorder:
         # the summaries read the games in progress on these feeds' scoreboards
         plays = [f for f in feeds if f.source == 'espn' and scores.in_leagues(f.spec, settings.summary_leagues)]
         self.summaries = scores.Summaries(plays, self.store, self.gap, settings.summary_s) if plays else None
+        # Polymarket's public books: None unless REC_PM_LEAGUES or REC_PM_SLUGS names something
+        self.poly = poly.from_settings(settings, self.store, self.gap)
 
     # ---- gaps --------------------------------------------------------------------------------
     def gap(self, source, kind, detail, from_us=None, to_us=None, key=None, every_s=0):
@@ -730,13 +735,13 @@ class Recorder:
             if t - last_status >= 60:
                 last_status = t
                 log('status: %s, %d markets (%d college, %d game), %d frames, %d rows (rest books %d, scores %d, '
-                    'plays %d, trades %d)%s' % (
+                    'plays %d, trades %d, pm books %d)%s' % (
                         'healthy' if self.healthy() else 'NOT HEALTHY (%s)' % (
                             'socket down' if not self.ws_up else 'discovery failing'),
                         len(self.desired), len(self.college), len(self.games), self.frames, self.store.rows_written,
                         self.rest_books.rows, self.scores.rows if self.scores else 0,
                         self.summaries.rows if self.summaries else 0, self.backfill.rows,
-                        ', REST FALLBACK' if self.fallback_on else ''))
+                        self.poly.rows if self.poly else 0, ', REST FALLBACK' if self.fallback_on else ''))
         if compacting is not None:
             for r in await compacting:
                 self.store.note_compacted(r)
@@ -803,10 +808,13 @@ class Recorder:
         for sig in (signal.SIGTERM, signal.SIGINT):
             loop.add_signal_handler(sig, self.stop.set)
         log('recorder: %s and %s, %d book, %d college, %d control and %d game series, %d score feeds (%d with '
-            'summaries), data in %s, key %s' % (
+            'summaries), %s, data in %s, key %s' % (
                 self.s.rest_url, self.s.ws_url, len(self.s.book_series), len(self.s.college_series),
                 len(self.s.control_series), len(self.s.game_series), len(self.scores.feeds) if self.scores else 0,
-                len(self.summaries.feeds) if self.summaries else 0, self.s.data_dir, self.signer.kind))
+                len(self.summaries.feeds) if self.summaries else 0,
+                'Polymarket books from %s (%d leagues, %d slugs)' % (self.s.pm_url, len(self.s.pm_leagues),
+                                                                     len(self.s.pm_slugs))
+                if self.poly else 'no Polymarket', self.s.data_dir, self.signer.kind))
         self.note_restart()
         self.backfill.seed(self.store.read_recent('kalshi_trades_rest', now_us() - polls.TradeBackfill.KEEP_US))
         # spools a crash left behind
@@ -826,6 +834,8 @@ class Recorder:
             tasks.append(asyncio.create_task(self.scores.run(self.stop, self.sleep)))
         if self.summaries:
             tasks.append(asyncio.create_task(self.summaries.run(self.stop, self.sleep)))
+        if self.poly:
+            tasks.append(asyncio.create_task(self.poly.run(self.stop, self.sleep)))
         if run_s:
             loop.call_later(run_s, self.stop.set)
         await self.stop.wait()

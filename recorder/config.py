@@ -2,8 +2,9 @@
 
 Kalshi's hosts have no default: the VM's recorder.env names production (read-only key), a local
 soak names demo or the fake. (The public scoreboards, ESPN's and NCAA.com's, have one: there is
-only one of each.) Every series list is explicit; 'off' empties a list, and an empty list
-records nothing. Secrets come from $CREDENTIALS_DIRECTORY (systemd LoadCredential) or,
+only one of each; so does Polymarket's public data, but it names no league or market by default,
+so nothing is read there unless the operator names some.) Every series list is explicit; 'off'
+empties a list, and an empty list records nothing. Secrets come from $CREDENTIALS_DIRECTORY (systemd LoadCredential) or,
 for a run by hand, from files named in the environment; never from the environment itself and
 never from a command line (both are visible in ps).
 """
@@ -52,9 +53,14 @@ NCAA_SPORTS = ['basketball-women/d1', 'basketball-men/d1', 'volleyball-women/d1'
 PLAY_DIGEST_LEAGUES = ['basketball/nba']
 SUMMARY_LEAGUES = ['basketball/nba']
 INCENTIVE_TYPES = ['liquidity', 'volume']
+# Polymarket US's public market data (poly.py): the one host the recorder may read there, with no
+# key. Its leagues and slugs have no default: off unless the operator names some.
+PM_URL = 'https://gateway.polymarket.us'
+PM_HOST = 'gateway.polymarket.us'
 
 OFF = ('off', 'none')
 TICKER = re.compile(r'[A-Z0-9]+')
+SLUG = re.compile(r'[a-z0-9][a-z0-9-]*')
 
 
 def _uncomment(v):
@@ -86,6 +92,13 @@ def _series(name, items):
     return items
 
 
+def _slugs(name, items):
+    for s in items:
+        if not SLUG.fullmatch(s):
+            raise ValueError('%s: %r is not a Polymarket slug (a-z, 0-9, -)' % (name, s))
+    return items
+
+
 def _int(env, name, default, lo, hi):
     v = env.get(name)
     n = default if v is None or v == '' else int(v)
@@ -113,6 +126,17 @@ def check_url(url, schemes, name):
     # plain http/ws only to loopback (the fake exchange in tests)
     if u.scheme in ('http', 'ws') and not is_loopback(u.hostname):
         raise ValueError('%s: plain %s only to loopback' % (name, u.scheme))
+    return url
+
+
+def check_pm_url(url):
+    """Polymarket's public data host, or loopback (tests): never api.polymarket.us, the signed
+    trading host, nor anything else."""
+    check_url(url, ('https', 'http'), 'REC_PM_URL')
+    host = urlparse(url).hostname
+    if host != PM_HOST and not is_loopback(host):
+        raise ValueError('REC_PM_URL must be %s (public data, no key; never api.polymarket.us) or loopback: %r'
+                         % (PM_URL, url))
     return url
 
 
@@ -164,6 +188,14 @@ class Settings:
     play_digest_leagues: list = field(default_factory=list)
     summary_leagues: list = field(default_factory=list)
     summary_s: float = 10.0             # each game in progress's summary this often
+    # Polymarket US's public books (poly.py): off unless a league or a slug is named
+    pm_url: str = PM_URL
+    pm_leagues: list = field(default_factory=list)   # every game-winner market of these, around its game
+    pm_slugs: list = field(default_factory=list)     # and these markets, always (weather only once confirmed)
+    pm_book_s: float = 3.0              # each listed book this often (the plan's 2-5 s)
+    pm_list_s: int = 600                # the leagues' listing this often
+    pm_game_s: int = 21600              # a game's book until this long after its start (REC_GAME_PRE_S before)
+    pm_rps: int = 5                     # requests a second, listing and books together
 
 
 def read_secret(env, cred_name, file_var):
@@ -234,6 +266,13 @@ def load(env=None):
     s.play_digest_leagues = _optlist(env.get('REC_PLAY_DIGEST_LEAGUES'), PLAY_DIGEST_LEAGUES)
     s.summary_leagues = _optlist(env.get('REC_SUMMARY_LEAGUES'), SUMMARY_LEAGUES)
     s.summary_s = _float(env, 'REC_SUMMARY_S', s.summary_s, 3.0, 300.0)
+    s.pm_url = check_pm_url(env.get('REC_PM_URL', '') or s.pm_url).rstrip('/')
+    s.pm_leagues = _slugs('REC_PM_LEAGUES', _optlist(env.get('REC_PM_LEAGUES'), []))
+    s.pm_slugs = _slugs('REC_PM_SLUGS', _optlist(env.get('REC_PM_SLUGS'), []))
+    s.pm_book_s = _float(env, 'REC_PM_BOOK_S', s.pm_book_s, 2.0, 5.0)
+    s.pm_list_s = _int(env, 'REC_PM_LIST_S', s.pm_list_s, 60, 86400)
+    s.pm_game_s = _int(env, 'REC_PM_GAME_S', s.pm_game_s, 3600, 86400)
+    s.pm_rps = _int(env, 'REC_PM_RPS', s.pm_rps, 1, 15)
     s.ca_file = env.get('REC_CA_FILE', '')
     if s.ca_file and not all(is_loopback(urlparse(u).hostname) for u in (rest, ws)):
         raise ValueError('REC_CA_FILE is for loopback tests only')

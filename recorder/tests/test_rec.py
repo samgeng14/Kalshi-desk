@@ -268,6 +268,12 @@ class RecorderListsTest(unittest.TestCase):
         r = Recorder(config.Settings(**dict(vars(s), espn_leagues=[])), self.r.store)   # no NBA board: nothing to read
         self.assertIsNone(r.summaries)
 
+    def test_polymarket_off_unless_configured(self):
+        self.assertIsNone(self.r.poly)
+        r = Recorder(config.Settings(**dict(vars(self.s), pm_leagues=['nba'])), self.r.store)
+        self.assertEqual((r.poly.http.base, r.poly.leagues, r.poly.pre_s),
+                         ('https://gateway.polymarket.us', ['nba'], self.s.game_pre_s))
+
     def test_discovery_hourly_for_college(self):
         def handler(route, p):
             self.assertEqual(route, '/markets')

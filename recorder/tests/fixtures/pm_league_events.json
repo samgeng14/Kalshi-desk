@@ -1,0 +1,73 @@
+{
+  "_provenance": "Hand-built in the shape the old desk read from gateway.polymarket.us/v2/leagues/{league}/events (src/poly.cpp refresh_universe and parse_poly_market, tests/test_poly.cpp pm_winner): events[].{slug,title,markets[]}, a market's slug, question, sportsMarketType, gameStartTime, endDate, active, closed, marketSides, best quotes. Not a capture: TO CONFIRM on the VM.",
+  "league": {"slug": "nba"},
+  "events": [
+    {
+      "slug": "nba-lal-bos-2026-10-21",
+      "title": "Lakers vs. Celtics",
+      "markets": [
+        {
+          "slug": "aec-nba-lal-bos-2026-10-21",
+          "question": "Who will win Lakers vs Celtics?",
+          "sportsMarketType": "basketball_team_full_game_winner",
+          "orderPriceMinTickSize": 0.005,
+          "minimumTradeQty": 1,
+          "feeCoefficient": 0.06,
+          "active": true,
+          "closed": false,
+          "bestBidQuote": {"value": "0.385", "currency": "USD"},
+          "bestAskQuote": {"value": "0.390", "currency": "USD"},
+          "gameStartTime": "2026-10-21T23:30:00Z",
+          "endDate": "2026-10-22T03:30:00Z",
+          "updatedAt": "2026-10-21T20:00:00Z",
+          "marketSides": [
+            {"description": "Lakers", "long": true, "team": {"abbreviation": "lal", "name": "Los Angeles Lakers", "safeName": "Los Angeles", "alias": "Lakers", "league": "nba"}},
+            {"description": "Celtics", "long": false, "team": {"abbreviation": "bos", "name": "Boston Celtics", "safeName": "Boston", "alias": "Celtics", "league": "nba"}}
+          ]
+        },
+        {
+          "slug": "asc-nba-lal-bos-2026-10-21-pos-4pt5",
+          "question": "Lakers +4.5?",
+          "sportsMarketType": "basketball_team_spread",
+          "active": true,
+          "closed": false,
+          "gameStartTime": "2026-10-21T23:30:00Z"
+        }
+      ]
+    },
+    {
+      "slug": "nba-phx-gsw-2026-10-22",
+      "title": "Suns vs. Warriors",
+      "markets": [
+        {
+          "slug": "aec-nba-phx-gsw-2026-10-22",
+          "question": "Who will win Suns vs Warriors?",
+          "sportsMarketType": "basketball_team_full_game_winner",
+          "active": true,
+          "closed": false,
+          "gameStartTime": "2026-10-22T02:00:00Z",
+          "endDate": "2026-10-22T06:00:00Z",
+          "marketSides": [
+            {"description": "Suns", "long": true, "team": {"abbreviation": "phx", "name": "Phoenix Suns"}},
+            {"description": "Warriors", "long": false, "team": {"abbreviation": "gsw", "name": "Golden State Warriors"}}
+          ]
+        }
+      ]
+    },
+    {
+      "slug": "nba-ny-cle-2026-10-21",
+      "title": "Knicks vs. Cavaliers",
+      "markets": [
+        {
+          "slug": "aec-nba-ny-cle-2026-10-21",
+          "question": "Who will win Knicks vs Cavaliers?",
+          "sportsMarketType": "basketball_team_full_game_winner",
+          "active": false,
+          "closed": true,
+          "gameStartTime": "2026-10-21T22:00:00Z",
+          "endDate": "2026-10-22T02:00:00Z"
+        }
+      ]
+    }
+  ]
+}

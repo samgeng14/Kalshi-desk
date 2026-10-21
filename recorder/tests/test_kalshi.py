@@ -160,6 +160,25 @@ class ConfigTest(unittest.TestCase):
             with self.assertRaises(ValueError, msg=str(bad)):
                 config.load(dict(self.env, **bad))
 
+    def test_polymarket(self):
+        # off unless configured: no league, no slug
+        s = config.load(dict(self.env))
+        self.assertEqual((s.pm_url, s.pm_leagues, s.pm_slugs), ('https://gateway.polymarket.us', [], []))
+        self.assertEqual((s.pm_book_s, s.pm_list_s, s.pm_game_s, s.pm_rps), (3.0, 600, 21600, 5))
+        s = config.load(dict(self.env, REC_PM_LEAGUES='nba, nfl', REC_PM_SLUGS='wx-nyc-high-2026-10-21-b70',
+                             REC_PM_BOOK_S='2', REC_PM_URL='https://gateway.polymarket.us/'))
+        self.assertEqual((s.pm_leagues, s.pm_slugs, s.pm_book_s, s.pm_url),
+                         (['nba', 'nfl'], ['wx-nyc-high-2026-10-21-b70'], 2.0, 'https://gateway.polymarket.us'))
+        self.assertEqual(config.load(dict(self.env, REC_PM_LEAGUES='off')).pm_leagues, [])
+        self.assertEqual(config.load(dict(self.env, REC_PM_URL='http://127.0.0.1:9')).pm_url, 'http://127.0.0.1:9')
+        for bad in [{'REC_PM_URL': 'https://api.polymarket.us'},                 # the signed trading host
+                    {'REC_PM_URL': 'https://polymarket.example.com'},
+                    {'REC_PM_URL': 'http://gateway.polymarket.us'},               # plain http off loopback
+                    {'REC_PM_LEAGUES': 'NBA'}, {'REC_PM_SLUGS': 'a b'}, {'REC_PM_SLUGS': '../x'},
+                    {'REC_PM_BOOK_S': '1'}, {'REC_PM_BOOK_S': '6'}, {'REC_PM_RPS': '20'}]:
+            with self.assertRaises(ValueError, msg=str(bad)):
+                config.load(dict(self.env, **bad))
+
     def test_college_guards(self):
         for bad in [{'REC_COLLEGE_SERIES': 'kxlower'},                          # not a series ticker
                     {'REC_COLLEGE_SERIES': 'KXA', 'REC_CONTROL_SERIES': 'KXA'},  # in two lists

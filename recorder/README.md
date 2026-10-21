@@ -1,9 +1,11 @@
 # deskd recorder
 
 Kalshi's market data to hourly zstd Parquet, 24/7, on the Oracle VM (plan section 7;
-`docs/deploy-oracle.md` is the deployment plan). Read-only: GETs and socket subscriptions, never
-an order (`kalshi.py` has no write route). Every subscription and every REST poll is an explicit
-list of markets; an empty list records nothing (to Kalshi it would mean the whole exchange).
+`docs/deploy-oracle.md` is the deployment plan), with the scores and, if configured, Polymarket's
+public books. Read-only: GETs and socket subscriptions, never an order (`kalshi.py` has no write
+route; `poly.py` reads only Polymarket's public host, with no key). Every subscription and every
+REST poll is an explicit list of markets; an empty list records nothing (to Kalshi it would mean
+the whole exchange).
 
 What it records (`rec.py`):
 
@@ -36,6 +38,13 @@ What it records (`rec.py`):
 - ESPN's summary of each NBA game in progress (`REC_SUMMARY_LEAGUES`) every 10 s
   (`REC_SUMMARY_S`), and once more as it ends: each play once, at the read that first showed it,
   and again if ESPN corrects its score or text or its win-probability point first appears.
+- Only if configured: Polymarket US's books (`poly.py`), public data from
+  `gateway.polymarket.us` with no key (never `api.polymarket.us`), every 3 s (`REC_PM_BOOK_S`,
+  2-5) for an explicit slug list: every game-winner market of the leagues in `REC_PM_LEAGUES`
+  from `REC_GAME_PRE_S` before its start to `REC_PM_GAME_S` after it (the games Kalshi lists too;
+  pairing them is done afterwards), and the slugs in `REC_PM_SLUGS`. Both are empty by default,
+  and then nothing is read there. Each book is written when it changes, with the response's
+  `Age` and `Date` headers.
 - A gaps table: disconnects and resumptions, sequence gaps, refused subscriptions, failed
   discovery and polls (one row spanning each outage), clock steps, restarts (from the socket's
   last frame on disk), torn spool lines.
@@ -62,6 +71,8 @@ What it records (`rec.py`):
 | `espn_scores`, `ncaa_scores` | game whose state, status, period, score, start or line scores changed, or (NBA) its last play; a game in progress whose clock moved, at most every `REC_SCORES_CLOCK_S` | recv_us = first seen; prev_us = the poll before |
 | `espn_plays` | play of an NBA game in progress, when first seen; again (`revised`) when its score or text changes or its win-probability point first appears | recv_us = first seen; prev_us = the game's read before; wallclock = ESPN's own (it looks ahead) |
 | `college_control` | control game on its date, ranked by volume when picked, `picked` flagged | recv_us |
+| `pm_books` | Polymarket book that differs from the last one recorded for its slug (`mode` game or listed) | recv_us = first seen; sent_us; prev_us = the read before; age_s, date_us = the `Age` and `Date` headers |
+| `pm_markets` | Polymarket game-winner market of a listed league whose listing changed (start, end, active, closed, sides; not its quotes) | recv_us |
 | `gaps` | gap (source, kind, from_us..to_us) | recv_us |
 
 ## To confirm before November 2 (operator)
@@ -102,6 +113,15 @@ What it records (`rec.py`):
 - **Volleyball line scores** (`tests/fixtures/espn_wvb_scoreboard.json`, hand-built): whether
   ESPN's volleyball scoreboard carries the current set's points live in `linescores`. If it does,
   `espn_scores` has a row per point; if not, a row per set.
+- **Polymarket** (off until you set `REC_PM_LEAGUES`, e.g. `nba`): the league slugs (the old
+  desk read `nfl, cfb, mlb, nba, nhl, wnba` and soccer's), the shapes of
+  `/v2/leagues/{league}/events` and `/v1/markets/{slug}/book` (`tests/fixtures/pm_*.json` are
+  hand-built from the old desk's parsers, not captures), whether the gateway sends `Age` (a
+  `pm_books` row with `age_s` empty says it does not), and how fast it lets one IP read
+  (`REC_PM_RPS`, default 5; listed books past what that covers in `REC_PM_BOOK_S` stretch the
+  cycle, the log's `pm books` count says how many rows). **Weather**: docs/polymarket.md
+  (2026-09-08) found none on Polymarket US; record it only once you confirm it is listed, by its
+  slugs in `REC_PM_SLUGS`.
 - **`mve_filter=exclude`** on the daily `GET /markets` (leave out the multivariate combinations):
   TO CONFIRM; an unknown parameter is ignored and the sweep is then just bigger.
 - The incentive types kept (`REC_INCENTIVE_TYPES`, default `liquidity,volume`).
@@ -129,8 +149,9 @@ python3 -m venv .venv && .venv/bin/pip install -r recorder/requirements.txt
 ctest runs the same (`recorder-unit`) with whatever `python3` it finds: tests that need pyarrow,
 cryptography, websockets or duckdb skip without them. `test_rec_fake` runs the recorder against
 `build-deskd/fake-kalshi` (build it first, or set `FAKE_KALSHI`) with the scoreboards served from
-loopback; `test_base_sh` runs `deploy/base.sh` with every system command stubbed. No test touches
-the network.
+loopback; `test_poly` plays `gateway.polymarket.us` with a stdlib server on loopback;
+`test_base_sh` runs `deploy/base.sh` with every system command stubbed. No test touches the
+network.
 
 ## Run by hand (a local soak)
 

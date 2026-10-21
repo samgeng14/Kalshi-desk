@@ -124,6 +124,19 @@ class SpoolTest(Checks, unittest.TestCase):
         self.assertEqual(rep['info'], {'store': 1})
         self.assertIn('not gaps: store 1', report.render(rep))
 
+    def test_unknown_polymarket_slug_is_not_a_gap(self):
+        # a named slug the gateway answers 404 for, said every hour: a setting, not lost minutes
+        s = Store(self.dir, 3600, lambda m: None)
+        day0 = T0 + 2 * 3600 * 1_000_000   # 2026-11-06T00:00Z
+        for m in range(1440):
+            s.write('kalshi_ws', ws(day0 + m * MIN + 1))
+        for h in range(24):
+            s.write('gaps', gap(day0 + h * 60 * MIN + 2, 'pm_books', 'not_found'))
+        s.close()
+        rep = report.build(self.dir, engine=None)
+        self.assertEqual((rep['last_24h']['gap_minutes'], rep['last_24h']['pass']), (0, True))
+        self.assertEqual(rep['info'], {'pm_books': 24})
+
     def test_gap_minutes(self):
         self.assertEqual(list(report.gap_minutes({'recv_us': 5 * MIN + 1})), [5])
         self.assertEqual(list(report.gap_minutes({'recv_us': 9 * MIN, 'from_us': 7 * MIN})), [7, 8, 9])
