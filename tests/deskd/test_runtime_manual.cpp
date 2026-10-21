@@ -956,6 +956,71 @@ void foreign_cancels() {
   // and a manual order on the market goes now that nothing foreign rests there
   CHECK(r.until([&]{ return r.order("Mforeign-1","BUY","0.3900",1.0,"POST",60)["status"]==200; },10000));
 }
+// Plan section 8's race: a duplicate fill message. The venue sends every fill twice on the private
+// socket; a Manual fill and a lane's fill each count once (the ledger, the position, the lane's
+// day), and the ledger stays healthy.
+void duplicate_fills() {
+  auto sent_twice=[](Run& r) {   // the fake did send a fill message again
+    for(const auto& l:r.venue.f->wire_log()) if(l.find(" fill ")!=std::string::npos && l.find(" again")!=std::string::npos) return true;
+    return false;
+  };
+  {   // Manual: an IOC take of 2
+    Run r(true);
+    CHECK(r.ready());
+    Stream st(r.d->port(),"rt-dup-1");
+    CHECK(r.until([&]{ return !st.envelopes().empty(); }));
+    r.venue.f->duplicate_ws_messages("fill",10);
+    auto o=r.order("Mdup-1","BUY","0.4200",2,"IOC");
+    CHECK(o["status"]==200 && o["ord"]["filled"]==2);
+    CHECK(r.until([&]{
+      for(const auto& e:of(st,"pos")) for(const auto& p:e["data"].value("rows",json::array())) if(p.value("tk","")==TK && p["pos"]==2) return true;
+      for(const auto& e:of(st,"pos")) if(e["data"].value("tk","")==TK && e["data"]["pos"]==2) return true;
+      return false; },10000));
+    std::this_thread::sleep_for(std::chrono::milliseconds(1500));   // the echoes have come and gone
+    double filled=0; std::set<std::string> fids;
+    for(const auto& e:of(st,"fill")) if(e["data"]["cid"]=="Mdup-1" && fids.insert(e["data"].value("fid",e["data"].dump())).second) filled+=e["data"]["qty"].get<double>();
+    CHECK(filled==2);
+    bool doubled=false;
+    for(const auto& e:of(st,"pos")) {
+      for(const auto& p:e["data"].value("rows",json::array())) if(p.value("tk","")==TK && p["pos"]!=2 && p["pos"]!=0) doubled=true;
+      if(e["data"].value("tk","")==TK && e["data"]["pos"]!=2 && e["data"]["pos"]!=0) doubled=true;
+    }
+    CHECK(!doubled);
+    CHECK(sent_twice(r));
+    CHECK(r.d->status()["gw"]["ledger_healthy"]==true);
+  }
+  {   // Systematic: lane M2's bid at 0.41 taken for 2
+    Run r(false,{},true);
+    CHECK(r.ready());
+    Stream st(r.d->port(),"rt-dup-2");
+    CHECK(r.until([&]{ return !st.envelopes().empty(); }));
+    auto lane=r.post("/api/lane/M2",{{"on",true}});
+    CHECK(lane && lane->status==200);
+    std::string why;
+    CHECK(r.until([&]{ return r.d->gw().groups_ready(&why) && why.empty(); },20000));
+    httplib::Result start;
+    CHECK(r.until([&]{ start=r.post("/api/start",json::object()); return start && start->status==200; },10000));
+    PlaceIntent p; p.cid="SM2-dup-1"; p.owner=Owner::SYS; p.lane="M2"; p.ticker=TK; p.side=Side::BUY;
+    p.price=4100; p.count=200; p.tif=Tif::POST; p.ttl_s=30; p.reply=std::make_shared<std::promise<OrderReply>>();
+    auto f=p.reply->get_future();
+    CHECK(r.d->gw().post(std::move(p)));
+    CHECK(f.wait_for(std::chrono::seconds(5))==std::future_status::ready && f.get().code.empty());
+    r.venue.f->duplicate_ws_messages("fill",10);
+    r.venue.f->with_engine([&](fakex::Engine& e,std::int64_t now) { CHECK(e.street_take(TK,fakex::Side::ASK,4100,200,now)==200); });
+    auto gw_pos=[&]{
+      const auto v=r.d->gw().sys_view();
+      return v && v->positions.count("M2|"+TK) ? v->positions.at("M2|"+TK) : Qty{0};
+    };
+    CHECK(r.until([&]{ return gw_pos()==200; }));
+    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+    CHECK(gw_pos()==200);
+    int most=0;   // the lane row's fill count, as the page saw it
+    for(const auto& e:of(st,"lane")) if(e["data"]["id"]=="M2") most=std::max(most,e["data"]["fills"].get<int>());
+    CHECK(most==1);
+    CHECK(sent_twice(r));
+    CHECK(r.d->status()["gw"]["ledger_healthy"]==true);
+  }
+}
 // A foreign order blocks its market for Systematic too (plan section 2): a lane's order goes
 // through the same admission as a click, so it is refused RO there until the order is cancelled
 void systematic_foreign() {
@@ -1128,6 +1193,6 @@ void equity_floor() {
 
 int main() {
   std::signal(SIGPIPE,SIG_IGN);
-  off_by_default(); orders_cancel_kill(); stop_reasons(); financial_fair(); systematic(); systematic_maker(); systematic_band(); systematic_paper(); systematic_races(); systematic_group_trigger(); systematic_book(); takeover(); shard_preflight(); foreign_cancels(); systematic_foreign(); live_mode(); fill_estimates(); equity_floor();
+  off_by_default(); orders_cancel_kill(); stop_reasons(); financial_fair(); systematic(); systematic_maker(); systematic_band(); systematic_paper(); systematic_races(); systematic_group_trigger(); systematic_book(); takeover(); shard_preflight(); foreign_cancels(); systematic_foreign(); duplicate_fills(); live_mode(); fill_estimates(); equity_floor();
   return finish("deskd-runtime-manual");
 }
