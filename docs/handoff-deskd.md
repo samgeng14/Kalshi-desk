@@ -55,11 +55,21 @@ partial, 141 missing) set this round's order: what protects money before LIVE fi
   hourly incentive programs, a daily /markets sweep, trade backfill, `market_lifecycle_v2`,
   `python3 -m recorder.report` (the 24 h / 1% gap check), and `deploy/base.sh` (chrony, swap,
   journald cap, security-only upgrades; plan mode by default).
+- **The WCBB model** (plan 5(f); `docs/wcbb_model.md`): `tools/train_wcbb.py --panel FILE.csv`
+  fits the logistic (pure Python; held-out Brier against the Kalshi mid, Stern's model and p0;
+  never overwrites a model without `--force`) and writes `models/wcbb_logit_v1.json` with 10
+  golden rows. deskd loads it at start (`deskd.wcbb_model`), refuses it unless its golden rows
+  reproduce to 1e-6, keeps each game's pregame mid while ESPN says "pre", and shows the model's
+  p as `book.ref.fair` while the game is on (possession unknown: 0). No model ships: train it on
+  the Mac from the WCBB panel; `deskd-wcbb` checks the C++ side against a synthetic file the
+  trainer wrote. Systematic use waits for the plan's gate (150+ settled games, held-out Brier at
+  least the mid's, positive overlay markouts).
 - **Still open, deliberately:** Stop by batch cancel (per-order cancels work); adopting the last
   run's own resting orders at start (short expiries; cash accounting risk); `cancel_epoch` (needs
   a browser-side sequence to be correct); the money ledger (settlements endpoint unverified); S1
   arbitrage (week 4; the plan's own evidence puts it at about $0); Polymarket (needs the account);
-  the WCBB model (needs training data); `config/lanes.json`; the 8-hour faulted soak.
+  the WCBB model's training (needs the panel, on the Mac); `config/lanes.json`; the 8-hour
+  faulted soak.
 
 ## 2026-10-14: paper trading on the Mac
 

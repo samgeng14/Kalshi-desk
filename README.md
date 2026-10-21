@@ -37,6 +37,12 @@ everything at the exchange with the desk's own key (for LIVE: the prod config an
 only while the lock says "deskd LIVE"). `python3 tools/scorecard.py` (or `scorecard.py live`) prints
 each lane's day and the plan's lane rules.
 
+Women's college basketball (KXNCAAWBGAME): `python3 tools/train_wcbb.py --panel FILE.csv` fits
+the in-game model and writes `models/wcbb_logit_v1.json` (the panel's columns and the pandas
+one-liner that makes it are in the script's docstring; `docs/wcbb_model.md` is the file format).
+With that file present, deskd shows the model's fair on those ladders while a game is on, from
+the pregame Kalshi price it saw before tip. Without it there is no fair, and the log says so.
+
 Each desk's log also goes to `deskd.log` in its data directory. After anything odd, run
 `python3 tools/desk.py report` (or `report live`): the run state and why, any stopped sender, and
 every KILL, refusal and unsent order from the log. On PAPER, Systematic has lane D1 PAPER, on from
