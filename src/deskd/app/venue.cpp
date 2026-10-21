@@ -511,9 +511,10 @@ void Deskd::on_rest(std::shared_ptr<const rest::Snapshot>) {
     if (markouts_) {
       const auto px = parse_price(f.at("px").get<std::string>());
       const auto qty = qty_from_number(f.at("qty").get<double>());
-      if (px && qty)
+      const auto fee = parse_money(f.at("fee").get<std::string>());   // the fill's, for the net markouts
+      if (px && qty && fee)
         markouts_->fill(fid, f.at("lane").is_string() ? f.at("lane").get<std::string>() : "", f.at("tk").get<std::string>(),
-                        f.at("side") == "BUY" ? Side::BUY : Side::SELL, *px, *qty, f.at("ts_ms").get<std::int64_t>());
+                        f.at("side") == "BUY" ? Side::BUY : Side::SELL, *px, *qty, f.at("ts_ms").get<std::int64_t>(), *fee);
     }
   }
   std::vector<json> positions;

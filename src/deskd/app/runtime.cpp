@@ -165,10 +165,10 @@ bool Deskd::start(std::string* err) {
       if (paper_) paper_->step(now_ms());
       if (probe_) probe_->step(now_ms());
       lip_step(now_ms());
-      if (markouts_)
-        for (auto& row : markouts_->step(now_ms())) {
-          store_.inbox().push(StoreRecord{"markouts", row.dump()});
-          pub_->post(PubData{"mo", std::move(row)});
+      if (markouts_)   // every row to the store; the contract's horizons (1s, 10s, 60s) to the stream
+        for (const auto& row : markouts_->step(now_ms())) {
+          store_.inbox().push(StoreRecord{"markouts", row.store().dump()});
+          if (row.on_stream()) pub_->post(PubData{"mo", row.pub()});
         }
     });
   });
