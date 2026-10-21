@@ -1,0 +1,31 @@
+{
+  "_provenance": "Hand-built in the shape of site.api.espn.com/apis/site/v2/sports/volleyball/womens-college-volleyball/scoreboard: score is sets won, linescores the points of each set (the current set last). Not a capture: TO CONFIRM the league path and whether the current set's linescore carries its points live, then replace with a capture from the VM.",
+  "events": [
+    {
+      "id": "401830201",
+      "date": "2026-10-21T23:00Z",
+      "name": "Texas Longhorns at Nebraska Cornhuskers",
+      "shortName": "TEX @ NEB",
+      "competitions": [
+        {
+          "id": "401830201",
+          "status": {
+            "clock": 0.0,
+            "displayClock": "0:00",
+            "period": 3,
+            "type": {"id": "2", "name": "STATUS_IN_PROGRESS", "state": "in", "completed": false,
+                     "detail": "3rd Set", "shortDetail": "3rd Set"}
+          },
+          "competitors": [
+            {"homeAway": "home", "score": "1",
+             "team": {"id": "158", "abbreviation": "NEB", "displayName": "Nebraska Cornhuskers"},
+             "linescores": [{"value": 25.0}, {"value": 21.0}, {"value": 12.0}]},
+            {"homeAway": "away", "score": "1",
+             "team": {"id": "251", "abbreviation": "TEX", "displayName": "Texas Longhorns"},
+             "linescores": [{"value": 22.0}, {"value": 25.0}, {"value": 10.0}]}
+          ]
+        }
+      ]
+    }
+  ]
+}

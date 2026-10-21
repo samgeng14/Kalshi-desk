@@ -1,0 +1,83 @@
+{
+  "_provenance": "Hand-built in the shape of site.api.espn.com/apis/site/v2/sports/basketball/nba/summary?event=401810101 (header, plays[] with id, sequenceNumber, type, text, homeScore/awayScore, period.number, clock.displayValue, scoringPlay, scoreValue, team.id, wallclock; winprobability[] keyed by playId), the fields deskd's ref/espn.cpp parse_summary_wp reads. Not a capture: TO CONFIRM, replace with one from the VM's first night. The chart's last point lags the last play here on purpose (it has none yet).",
+  "header": {
+    "id": "401810101",
+    "competitions": [
+      {
+        "status": {"displayClock": "7:11", "period": 2, "type": {"state": "in", "name": "STATUS_IN_PROGRESS"}},
+        "competitors": [
+          {"homeAway": "home", "id": "2", "score": "38"},
+          {"homeAway": "away", "id": "13", "score": "35"}
+        ]
+      }
+    ]
+  },
+  "plays": [
+    {
+      "id": "4018101010001",
+      "sequenceNumber": "1",
+      "type": {"id": "615", "text": "Jumpball"},
+      "text": "Kristaps Porzingis vs. Anthony Davis (Jayson Tatum gains possession)",
+      "awayScore": 0,
+      "homeScore": 0,
+      "period": {"number": 1, "displayValue": "1st Quarter"},
+      "clock": {"displayValue": "12:00"},
+      "scoringPlay": false,
+      "scoreValue": 0,
+      "team": {"id": "2"},
+      "wallclock": "2026-10-21T23:41:02Z",
+      "shootingPlay": false
+    },
+    {
+      "id": "4018101010004",
+      "sequenceNumber": "4",
+      "type": {"id": "92", "text": "Jump Shot"},
+      "text": "LeBron James makes 21-foot two point shot",
+      "awayScore": 2,
+      "homeScore": 0,
+      "period": {"number": 1, "displayValue": "1st Quarter"},
+      "clock": {"displayValue": "11:37"},
+      "scoringPlay": true,
+      "scoreValue": 2,
+      "team": {"id": "13"},
+      "wallclock": "2026-10-21T23:41:31Z",
+      "shootingPlay": true
+    },
+    {
+      "id": "4018101010140",
+      "sequenceNumber": "140",
+      "type": {"id": "44", "text": "Shooting Foul"},
+      "text": "Austin Reaves shooting foul",
+      "awayScore": 35,
+      "homeScore": 36,
+      "period": {"number": 2, "displayValue": "2nd Quarter"},
+      "clock": {"displayValue": "7:31"},
+      "scoringPlay": false,
+      "scoreValue": 0,
+      "team": {"id": "13"},
+      "wallclock": "2026-10-22T00:24:50Z",
+      "shootingPlay": false
+    },
+    {
+      "id": "4018101010142",
+      "sequenceNumber": "142",
+      "type": {"id": "92", "text": "Jump Shot"},
+      "text": "Jayson Tatum makes 18-foot pullup jump shot",
+      "awayScore": 35,
+      "homeScore": 38,
+      "period": {"number": 2, "displayValue": "2nd Quarter"},
+      "clock": {"displayValue": "7:11"},
+      "scoringPlay": true,
+      "scoreValue": 2,
+      "team": {"id": "2"},
+      "wallclock": "2026-10-22T00:25:20Z",
+      "shootingPlay": true
+    },
+    {"sequenceNumber": "143", "text": "a play without an id is skipped"}
+  ],
+  "winprobability": [
+    {"playId": "4018101010001", "homeWinPercentage": 0.58, "tiePercentage": 0.0},
+    {"playId": "4018101010004", "homeWinPercentage": 0.555, "tiePercentage": 0.0},
+    {"playId": "4018101010140", "homeWinPercentage": 0.598, "tiePercentage": 0.0}
+  ]
+}

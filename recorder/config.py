@@ -46,6 +46,11 @@ ESPN_LEAGUES = ['basketball/womens-college-basketball:50', 'basketball/mens-coll
                 'volleyball/womens-college-volleyball', 'hockey/mens-college-hockey', 'basketball/nba']
 # NCAA.com's scoreboard JSON, 'sport/division': unofficial, TO CONFIRM
 NCAA_SPORTS = ['basketball-women/d1', 'basketball-men/d1', 'volleyball-women/d1', 'icehockey-men/d1']
+# ESPN leagues whose scoreboard's last play (situation.lastPlay) is a change, so its win
+# probability on a play that scores nothing is recorded; and whose games in progress have their
+# summaries (play-by-play, win-probability chart) read into espn_plays. Either may be 'off'.
+PLAY_DIGEST_LEAGUES = ['basketball/nba']
+SUMMARY_LEAGUES = ['basketball/nba']
 INCENTIVE_TYPES = ['liquidity', 'volume']
 
 OFF = ('off', 'none')
@@ -155,6 +160,10 @@ class Settings:
     ncaa_sports: list = field(default_factory=list)
     scores_s: float = 4.0               # while a game is on
     scores_idle_s: float = 60.0         # otherwise
+    scores_clock_s: float = 30.0        # a game in progress whose clock moved: a row at most this often (0: never)
+    play_digest_leagues: list = field(default_factory=list)
+    summary_leagues: list = field(default_factory=list)
+    summary_s: float = 10.0             # each game in progress's summary this often
 
 
 def read_secret(env, cred_name, file_var):
@@ -221,6 +230,10 @@ def load(env=None):
     s.ncaa_sports = _optlist(env.get('REC_NCAA_SPORTS'), NCAA_SPORTS)
     s.scores_s = _float(env, 'REC_SCORES_S', s.scores_s, 3.0, 60.0)
     s.scores_idle_s = _float(env, 'REC_SCORES_IDLE_S', s.scores_idle_s, s.scores_s, 3600.0)
+    s.scores_clock_s = _float(env, 'REC_SCORES_CLOCK_S', s.scores_clock_s, 0.0, 3600.0)
+    s.play_digest_leagues = _optlist(env.get('REC_PLAY_DIGEST_LEAGUES'), PLAY_DIGEST_LEAGUES)
+    s.summary_leagues = _optlist(env.get('REC_SUMMARY_LEAGUES'), SUMMARY_LEAGUES)
+    s.summary_s = _float(env, 'REC_SUMMARY_S', s.summary_s, 3.0, 300.0)
     s.ca_file = env.get('REC_CA_FILE', '')
     if s.ca_file and not all(is_loopback(urlparse(u).hostname) for u in (rest, ws)):
         raise ValueError('REC_CA_FILE is for loopback tests only')

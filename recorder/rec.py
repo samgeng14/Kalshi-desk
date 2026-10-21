@@ -19,8 +19,9 @@ What it records, on a read-only key:
   - by public REST (polls.py): the college books every few seconds, and every recorded book once
     the socket's book subscription has been down REC_REST_FALLBACK_S; trades over every window
     the socket may have missed and every hour; incentive programs hourly; every open market daily.
-  - ESPN's and NCAA.com's scoreboards for the college sports and the NBA, each change once
-    (scores.py).
+  - ESPN's and NCAA.com's scoreboards for the college sports and the NBA, each change once, and
+    a game in progress's clock at most every REC_SCORES_CLOCK_S; ESPN's summaries of the games
+    in progress in REC_SUMMARY_LEAGUES, each play once when first seen (scores.py).
   - gaps: disconnects and resumptions, sequence gaps, refused subscriptions, failed discovery and
     polls, clock steps, restarts, torn spool lines.
 
@@ -268,8 +269,12 @@ class Recorder:
         self.backfill = polls.TradeBackfill(self.venue, self.store, self.gap, self.recorded_between,
                                             save=self.save_backfill)
         feeds = score_feeds(settings)
-        self.scores = scores.Scoreboards(feeds, self.store, self.gap, settings.scores_s,
-                                         settings.scores_idle_s) if feeds else None
+        self.scores = scores.Scoreboards(feeds, self.store, self.gap, settings.scores_s, settings.scores_idle_s,
+                                         clock_s=settings.scores_clock_s,
+                                         digest_leagues=settings.play_digest_leagues) if feeds else None
+        # the summaries read the games in progress on these feeds' scoreboards
+        plays = [f for f in feeds if f.source == 'espn' and scores.in_leagues(f.spec, settings.summary_leagues)]
+        self.summaries = scores.Summaries(plays, self.store, self.gap, settings.summary_s) if plays else None
 
     # ---- gaps --------------------------------------------------------------------------------
     def gap(self, source, kind, detail, from_us=None, to_us=None, key=None, every_s=0):
@@ -725,11 +730,12 @@ class Recorder:
             if t - last_status >= 60:
                 last_status = t
                 log('status: %s, %d markets (%d college, %d game), %d frames, %d rows (rest books %d, scores %d, '
-                    'trades %d)%s' % (
+                    'plays %d, trades %d)%s' % (
                         'healthy' if self.healthy() else 'NOT HEALTHY (%s)' % (
                             'socket down' if not self.ws_up else 'discovery failing'),
                         len(self.desired), len(self.college), len(self.games), self.frames, self.store.rows_written,
-                        self.rest_books.rows, self.scores.rows if self.scores else 0, self.backfill.rows,
+                        self.rest_books.rows, self.scores.rows if self.scores else 0,
+                        self.summaries.rows if self.summaries else 0, self.backfill.rows,
                         ', REST FALLBACK' if self.fallback_on else ''))
         if compacting is not None:
             for r in await compacting:
@@ -796,10 +802,11 @@ class Recorder:
         loop.set_default_executor(concurrent.futures.ThreadPoolExecutor(max_workers=16, thread_name_prefix='rec'))
         for sig in (signal.SIGTERM, signal.SIGINT):
             loop.add_signal_handler(sig, self.stop.set)
-        log('recorder: %s and %s, %d book, %d college, %d control and %d game series, %d score feeds, data in %s, '
-            'key %s' % (self.s.rest_url, self.s.ws_url, len(self.s.book_series), len(self.s.college_series),
-                        len(self.s.control_series), len(self.s.game_series),
-                        len(self.scores.feeds) if self.scores else 0, self.s.data_dir, self.signer.kind))
+        log('recorder: %s and %s, %d book, %d college, %d control and %d game series, %d score feeds (%d with '
+            'summaries), data in %s, key %s' % (
+                self.s.rest_url, self.s.ws_url, len(self.s.book_series), len(self.s.college_series),
+                len(self.s.control_series), len(self.s.game_series), len(self.scores.feeds) if self.scores else 0,
+                len(self.summaries.feeds) if self.summaries else 0, self.s.data_dir, self.signer.kind))
         self.note_restart()
         self.backfill.seed(self.store.read_recent('kalshi_trades_rest', now_us() - polls.TradeBackfill.KEEP_US))
         # spools a crash left behind
@@ -817,6 +824,8 @@ class Recorder:
             self.rest_books.run(self.stop, self.sleep))]
         if self.scores:
             tasks.append(asyncio.create_task(self.scores.run(self.stop, self.sleep)))
+        if self.summaries:
+            tasks.append(asyncio.create_task(self.summaries.run(self.stop, self.sleep)))
         if run_s:
             loop.call_later(run_s, self.stop.set)
         await self.stop.wait()

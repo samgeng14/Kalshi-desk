@@ -66,10 +66,22 @@ SCHEMAS = {
                              ('event_ticker', 'string'), ('status', 'string'), ('open_time', 'string'),
                              ('close_time', 'string'), ('volume', 'float64'), ('open_interest', 'float64'),
                              ('yes_bid', 'float64'), ('yes_ask', 'float64'), ('raw', 'string')],
-    # a scoreboard's game each time its state or score changed (recorder/scores.py): recv_us the
-    # poll that first showed it, prev_us the poll before (the change came after that)
+    # a scoreboard's game each time its state, score or line scores changed (in the NBA its last
+    # play too), and a game in progress whose clock moved at most every REC_SCORES_CLOCK_S
+    # (recorder/scores.py): recv_us the poll that first showed it, prev_us the poll before (the
+    # change came after that)
     'espn_scores': SCORE_COLUMNS,
     'ncaa_scores': SCORE_COLUMNS,
+    # ESPN's play-by-play of the games in progress in the summary leagues (recorder/scores.py
+    # Summaries): each play at the read that first showed it (recv_us; prev_us the game's read
+    # before), again with revised set when its score or text changed or its win-probability point
+    # (wp_home, wp_tie) first appeared. wallclock is ESPN's own time for the play: it looks ahead,
+    # so it is never the time the play was visible
+    'espn_plays': [('recv_us', 'int64'), ('prev_us', 'int64'), ('league', 'string'), ('game_id', 'string'),
+                   ('play_id', 'string'), ('seq', 'int64'), ('period', 'int32'), ('clock', 'string'),
+                   ('wallclock', 'string'), ('home_score', 'int32'), ('away_score', 'int32'), ('team_id', 'string'),
+                   ('scoring', 'bool_'), ('score_value', 'int32'), ('type', 'string'), ('text', 'string'),
+                   ('wp_home', 'float64'), ('wp_tie', 'float64'), ('revised', 'bool_'), ('raw', 'string')],
     # the control decile (plan 5(d)): every game of the control series on its date, ranked by
     # pregame volume when the pick was made, the picked ones flagged
     'college_control': [('recv_us', 'int64'), ('series', 'string'), ('game_date', 'string'),

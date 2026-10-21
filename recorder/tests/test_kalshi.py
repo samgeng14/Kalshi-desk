@@ -149,6 +149,17 @@ class ConfigTest(unittest.TestCase):
             with self.assertRaises(ValueError, msg=str(bad)):
                 config.load(dict(self.env, **bad))
 
+    def test_scores_clock_plays_and_summaries(self):
+        s = config.load(dict(self.env))
+        self.assertEqual((s.scores_clock_s, s.play_digest_leagues, s.summary_leagues, s.summary_s),
+                         (30.0, ['basketball/nba'], ['basketball/nba'], 10.0))
+        s = config.load(dict(self.env, REC_SCORES_CLOCK_S='0', REC_PLAY_DIGEST_LEAGUES='off', REC_SUMMARY_LEAGUES='none',
+                             REC_SUMMARY_S='5'))
+        self.assertEqual((s.scores_clock_s, s.play_digest_leagues, s.summary_leagues, s.summary_s), (0.0, [], [], 5.0))
+        for bad in [{'REC_SCORES_CLOCK_S': '-1'}, {'REC_SUMMARY_S': '1'}, {'REC_SUMMARY_S': '600'}]:
+            with self.assertRaises(ValueError, msg=str(bad)):
+                config.load(dict(self.env, **bad))
+
     def test_college_guards(self):
         for bad in [{'REC_COLLEGE_SERIES': 'kxlower'},                          # not a series ticker
                     {'REC_COLLEGE_SERIES': 'KXA', 'REC_CONTROL_SERIES': 'KXA'},  # in two lists

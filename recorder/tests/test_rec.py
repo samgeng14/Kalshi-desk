@@ -255,6 +255,19 @@ class RecorderListsTest(unittest.TestCase):
         self.assertNotIn(lal, r2.recorded_between(int((self.now - 3 * 86400) * 1e6),
                                                   int((self.now - 3 * 3600 - 7201) * 1e6)))
 
+    def test_summaries_for_the_summary_leagues_only(self):
+        s = config.Settings(**dict(vars(self.s), espn_leagues=['basketball/womens-college-basketball:50', 'basketball/nba'],
+                                   ncaa_sports=['basketball-women/d1'], summary_leagues=['basketball/nba'],
+                                   play_digest_leagues=['basketball/nba'], scores_clock_s=20.0))
+        r = Recorder(s, self.r.store)
+        self.assertEqual([f.spec for f in r.summaries.feeds], ['basketball/nba'])
+        self.assertIs(r.summaries.feeds[0], r.scores.feeds[1])      # the scoreboard's own feed: its games
+        self.assertEqual((r.scores.book.clock_us, r.scores.book.digest_leagues), (20_000_000, {'basketball/nba'}))
+        r = Recorder(config.Settings(**dict(vars(s), summary_leagues=[])), self.r.store)
+        self.assertIsNone(r.summaries)
+        r = Recorder(config.Settings(**dict(vars(s), espn_leagues=[])), self.r.store)   # no NBA board: nothing to read
+        self.assertIsNone(r.summaries)
+
     def test_discovery_hourly_for_college(self):
         def handler(route, p):
             self.assertEqual(route, '/markets')

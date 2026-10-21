@@ -29,7 +29,13 @@ What it records (`rec.py`):
   too), a window not read before a stop read after the restart; incentive programs hourly; every
   open market once a day.
 - ESPN's and NCAA.com's scoreboards (`scores.py`) every 4 s while a game is on, each change of
-  state or score written once with the local time it was first seen.
+  state, score or line scores (a volleyball point moves only its set's line) written once with
+  the local time it was first seen; in the NBA (`REC_PLAY_DIGEST_LEAGUES`) each new last play
+  too, with ESPN's win probability on it; and a game in progress whose clock moved at most every
+  30 s (`REC_SCORES_CLOCK_S`), so the time left is known between scores.
+- ESPN's summary of each NBA game in progress (`REC_SUMMARY_LEAGUES`) every 10 s
+  (`REC_SUMMARY_S`), and once more as it ends: each play once, at the read that first showed it,
+  and again if ESPN corrects its score or text or its win-probability point first appears.
 - A gaps table: disconnects and resumptions, sequence gaps, refused subscriptions, failed
   discovery and polls (one row spanning each outage), clock steps, restarts (from the socket's
   last frame on disk), torn spool lines.
@@ -53,7 +59,8 @@ What it records (`rec.py`):
 | `kalshi_trades_rest` | public print by REST, once per trade_id (`reason`: restart, disconnect, seq_gap, hourly) | recv_us, created_us |
 | `kalshi_incentives` | incentive program of the kept types, every hour (`sweep_us` groups a sweep) | recv_us, sweep_us |
 | `kalshi_markets_daily` | open market, once a day (raw without the rules text) | recv_us, sweep_us |
-| `espn_scores`, `ncaa_scores` | game whose state, status, period, score or start changed (the clock alone is no change) | recv_us = first seen; prev_us = the poll before |
+| `espn_scores`, `ncaa_scores` | game whose state, status, period, score, start or line scores changed, or (NBA) its last play; a game in progress whose clock moved, at most every `REC_SCORES_CLOCK_S` | recv_us = first seen; prev_us = the poll before |
+| `espn_plays` | play of an NBA game in progress, when first seen; again (`revised`) when its score or text changes or its win-probability point first appears | recv_us = first seen; prev_us = the game's read before; wallclock = ESPN's own (it looks ahead) |
 | `college_control` | control game on its date, ranked by volume when picked, `picked` flagged | recv_us |
 | `gaps` | gap (source, kind, from_us..to_us) | recv_us |
 
@@ -87,6 +94,14 @@ What it records (`rec.py`):
   each tip. Volume, est.: two markets a game, a few book deltas a second in play, about 10-15
   games a night: tens of MB a day of compressed `kalshi_ws` (check the first night's manifest:
   `python3 -m recorder.report --days 1`).
+- **ESPN's NBA scoreboard and summary shapes** (`tests/fixtures/espn_nba_scoreboard.json`,
+  `espn_nba_summary.json`, hand-built, not captures): whether the scoreboard's
+  `situation.lastPlay` carries an id and a `probability` on NBA boards, and the summary's `plays`
+  and `winprobability` keys. TODO: capture one of each on the VM the first night and replace the
+  fixtures; the first `espn_plays` rows show at once whether plays are read.
+- **Volleyball line scores** (`tests/fixtures/espn_wvb_scoreboard.json`, hand-built): whether
+  ESPN's volleyball scoreboard carries the current set's points live in `linescores`. If it does,
+  `espn_scores` has a row per point; if not, a row per set.
 - **`mve_filter=exclude`** on the daily `GET /markets` (leave out the multivariate combinations):
   TO CONFIRM; an unknown parameter is ignored and the sweep is then just bigger.
 - The incentive types kept (`REC_INCENTIVE_TYPES`, default `liquidity,volume`).

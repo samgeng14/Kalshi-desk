@@ -1,10 +1,11 @@
 """The recorder against the fake exchange (tests/fake_exchange, built as build-deskd/fake-kalshi),
 as a process, over TLS, with ESPN's and NCAA.com's scoreboards served from loopback (fixtures):
 the windows it subscribes (the open one and the next, not one hours away), the weather market, a
-women's college game and the thinnest men's game (the others not), books, trades, lifecycle and
-pyth_value to the spool, the college books by REST, a restart's trades backfilled by REST, the
-daily market sweep and the incentive sweep, each window's REST row with its strike, a clean exit
-on SIGTERM (systemd's stop), and the spools compacted to Parquet afterwards.
+women's college game and the thinnest men's game (the others not), an NBA game in its window
+(socket books only), books, trades, lifecycle and pyth_value to the spool, the college books by
+REST, a restart's trades backfilled by REST, the daily market sweep and the incentive sweep,
+each window's REST row with its strike, the NBA game in progress's plays from its summary, a
+clean exit on SIGTERM (systemd's stop), and the spools compacted to Parquet afterwards.
 
 Nothing here leaves the machine: Kalshi is the fake on 127.0.0.1 and the scoreboards a local
 server; the recorder's environment is scrubbed of every REC_, KALSHI_ and credential setting."""
@@ -36,6 +37,7 @@ D = today()
 UCONN, SC = 'KXNCAAWBGAME-%sUCONNSC-UCONN' % D, 'KXNCAAWBGAME-%sUCONNSC-SC' % D
 MB_BUSY, MB_THIN, MB_THIN2 = ('KXNCAAMBGAME-%sAAABBB-AAA' % D, 'KXNCAAMBGAME-%sCCCDDD-CCC' % D,
                               'KXNCAAMBGAME-%sEEEFFF-EEE' % D)
+NBA = 'KXNBAGAME-%sLALBOS-BOS' % D   # the game group; REC_GAME_PRE_S below opens its window all day
 
 
 def game(ticker):
@@ -50,7 +52,8 @@ SCENARIO = [
     {'t': 0, 'market': {'ticker': 'KXNATGAS15M-26OCT101800-00', 'exchange_index': 2, 'ticks': 'tapered_deci_cent',
                         'open_in_ms': 9000000, 'close_in_ms': 9900000}},
     {'t': 0, 'market': {'ticker': 'KXHIGHNY-26OCT10-B70', 'exchange_index': 0, 'ticks': 'linear_cent', 'close_in_ms': 36000000}},
-    game(UCONN), game(SC), game(MB_BUSY), game(MB_THIN), game(MB_THIN2),
+    game(UCONN), game(SC), game(MB_BUSY), game(MB_THIN), game(MB_THIN2), game(NBA),
+    {'t': 0, 'snapshot': {'ticker': NBA, 'yes': [['0.6000', '300.00']], 'no': [['0.3800', '250.00']]}},
     {'t': 0, 'snapshot': {'ticker': 'KXNATGAS15M-26OCT101500-00', 'yes': [['0.4500', '100.00']], 'no': [['0.5300', '80.00']]}},
     {'t': 0, 'snapshot': {'ticker': 'KXHIGHNY-26OCT10-B70', 'yes': [['0.9600', '50.00']], 'no': [['0.0200', '40.00']]}},
     {'t': 0, 'snapshot': {'ticker': UCONN, 'yes': [['0.4100', '12.00']], 'no': [['0.5500', '7.00']]}},
@@ -70,7 +73,11 @@ class Boards(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         Boards.paths.append(self.path)
-        if '/apis/site/v2/sports/' in self.path and '/scoreboard?' in self.path:
+        if self.path.startswith('/apis/site/v2/sports/basketball/nba/scoreboard?'):
+            body = json.dumps(fixture('espn_nba_scoreboard.json')).encode()
+        elif self.path.startswith('/apis/site/v2/sports/basketball/nba/summary?event='):
+            body = json.dumps(fixture('espn_nba_summary.json')).encode()
+        elif '/apis/site/v2/sports/' in self.path and '/scoreboard?' in self.path:
             body = json.dumps(fixture('espn_wcbb_scoreboard.json')).encode()
         elif self.path.startswith('/casablanca/scoreboard/') and self.path.endswith('/scoreboard.json'):
             body = json.dumps(fixture('ncaa_scoreboard.json')).encode()
@@ -137,9 +144,12 @@ class RecorderAgainstFake(unittest.TestCase):
                        REC_CA_FILE=os.path.join(d, 'tls', 'ca.pem'), KALSHI_KEY_FILE=os.path.join(d, 'key.pem'),
                        KALSHI_KEY_ID_FILE=os.path.join(d, 'key.id'), REC_BOOK_SERIES='KXNATGAS15M,KXHIGHNY',
                        REC_COLLEGE_SERIES='KXNCAAWBGAME', REC_CONTROL_SERIES='KXNCAAMBGAME', REC_CONTROL_PICK_UTC_H='0',
+                       REC_GAME_SERIES='KXNBAGAME', REC_GAME_PRE_S='86400',
                        REC_DISCOVER_S='1', REC_LEAD_S='1200', REC_REST_RPS='15', REC_REST_BOOK_RPS='15',
-                       REC_REST_BOOK_S='1', REC_MARKETS_DAILY_UTC_H='0', REC_SCORES_S='3',
-                       REC_ESPN_URL=local + '/apis/site/v2/sports', REC_ESPN_LEAGUES='basketball/womens-college-basketball:50',
+                       REC_REST_BOOK_S='1', REC_MARKETS_DAILY_UTC_H='0', REC_SCORES_S='3', REC_SUMMARY_S='3',
+                       REC_ESPN_URL=local + '/apis/site/v2/sports',
+                       REC_ESPN_LEAGUES='basketball/womens-college-basketball:50,basketball/nba',
+                       REC_SUMMARY_LEAGUES='basketball/nba',
                        REC_NCAA_URL=local + '/casablanca/scoreboard', REC_NCAA_SPORTS='basketball-women/d1')
             rec = subprocess.Popen([sys.executable, '-m', 'recorder.rec'], cwd=ROOT, env=env, stdout=subprocess.PIPE,
                                    stderr=subprocess.STDOUT, text=True)
@@ -161,9 +171,10 @@ class RecorderAgainstFake(unittest.TestCase):
             self.assertTrue({'subscribed', 'orderbook_snapshot', 'orderbook_delta', 'pyth_value'} <= types, types)
             self.assertIn('trade', types)
             booked = {r['ticker'] for r in ws if r['type'] == 'orderbook_snapshot'}
-            # the windows and the weather market; the women's game; of the men's, only the thinnest
+            # the windows and the weather market; the women's game; of the men's, only the thinnest;
+            # the NBA game in its window
             self.assertEqual(booked, {'KXNATGAS15M-26OCT101500-00', 'KXNATGAS15M-26OCT101515-15', 'KXHIGHNY-26OCT10-B70',
-                                      UCONN, SC, MB_THIN}, out)
+                                      UCONN, SC, MB_THIN, NBA}, out)
             channels = {json.loads(r['raw'])['msg']['channel'] for r in ws if r['type'] == 'subscribed'}
             self.assertIn('market_lifecycle_v2', channels)
             pyth = [json.loads(r['raw'])['msg']['value_usd'] for r in ws if r['type'] == 'pyth_value']
@@ -175,7 +186,8 @@ class RecorderAgainstFake(unittest.TestCase):
             control = {r['event_ticker']: r['picked'] for r in tables.get('college_control', [])}
             self.assertEqual(control, {MB_BUSY.rsplit('-', 1)[0]: False, MB_THIN.rsplit('-', 1)[0]: True,
                                        MB_THIN2.rsplit('-', 1)[0]: False})
-            # the college books by REST: top of book for every college market, depth for the moving ones
+            # the college books by REST: top of book for every college market, depth for the moving
+            # ones; the NBA game's books are the socket's only
             books = tables.get('kalshi_rest_books', [])
             self.assertEqual({r['ticker'] for r in books if r['kind'] == 'top'}, {UCONN, SC, MB_THIN})
             depth = {r['ticker']: r for r in books if r['kind'] == 'depth'}
@@ -192,10 +204,17 @@ class RecorderAgainstFake(unittest.TestCase):
             self.assertTrue({UCONN, SC, MB_BUSY, 'KXHIGHNY-26OCT10-B70'} <= daily, daily)
             self.assertIn('incentives: 0 kept', out)   # the fake lists none; asked, answered, no gap
             espn = tables.get('espn_scores', [])
-            self.assertEqual(sorted(r['game_id'] for r in espn), ['401820001', '401820002', '401820003'])
+            self.assertEqual(sorted(r['game_id'] for r in espn if r['league'] != 'basketball/nba'),
+                             ['401820001', '401820002', '401820003'])
+            self.assertEqual(sorted(r['game_id'] for r in espn if r['league'] == 'basketball/nba'),
+                             ['401810100', '401810101', '401810102'])
             self.assertEqual(len(tables.get('ncaa_scores', [])), 3)
             self.assertTrue(any('/basketball/womens-college-basketball/scoreboard?dates=' in p and 'groups=50' in p
                                 for p in Boards.paths), Boards.paths)
+            # the NBA game in progress: its summary read, each play once; never the others'
+            plays = tables.get('espn_plays', [])
+            self.assertEqual(sorted(r['play_id'][-3:] for r in plays), ['001', '004', '140', '142'])
+            self.assertEqual({p.split('event=')[1] for p in Boards.paths if '/summary?' in p}, {'401810101'})
             gaps = tables.get('gaps', [])
             kinds = {(g['source'], g['kind']) for g in gaps}
             self.assertIn(('recorder', 'restart'), kinds)
