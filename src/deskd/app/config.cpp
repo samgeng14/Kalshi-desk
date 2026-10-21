@@ -63,12 +63,29 @@ DeskdConfig load_deskd_config(const std::string& path) {
   const std::string where = path + " deskd";
   if (!d.is_object()) throw std::runtime_error(where + ": not an object");
   // A misspelt key is an error, not a silently ignored default: "heartbeat_window" for
-  // "heartbeat_window_ms" would otherwise leave the supervisor's rule unchanged.
-  static const std::set<std::string> known = {"data_dir",    "lock_dir",    "ui_dir",
-                                              "http_port",   "web_threads", "keepalive_s",
-                                              "max_streams", "heartbeat_window_ms", "daily_stop_dollars", "equity_floor_dollars",
-                                              "manual_orders", "systematic_orders", "lip_series", "band_series", "paper_lane",
-                                              "peer_url", "write_tier", "calendar", "wcbb_model"};
+  // "heartbeat_window_ms" would otherwise leave the supervisor's rule unchanged. One key a line,
+  // so a new setting is a line added here, not a line rewritten.
+  static const std::set<std::string> known = {
+      "data_dir",
+      "lock_dir",
+      "ui_dir",
+      "http_port",
+      "web_threads",
+      "keepalive_s",
+      "max_streams",
+      "heartbeat_window_ms",
+      "daily_stop_dollars",
+      "equity_floor_dollars",
+      "manual_orders",
+      "systematic_orders",
+      "lip_series",
+      "band_series",
+      "paper_lane",
+      "peer_url",
+      "write_tier",
+      "calendar",
+      "wcbb_model",
+  };
   for (auto kv = d.begin(); kv != d.end(); ++kv) {
     if (kv.key() == "live")
       throw std::runtime_error(where + ": \"live\" is a command-line flag only (--live), never a file setting");

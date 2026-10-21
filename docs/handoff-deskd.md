@@ -210,7 +210,7 @@ Nothing is pushed. `ui/desk/js/contract.js` is the API contract deskd must serve
 - Never read the main repo's `data/`, `config/desk.json`, `.secrets/`, or `~/Downloads`. Never log, print or commit key material.
 - Builds: `build-deskd/` only, Ninja, `nice -n 15`, at most `-j 4`, one build at a time (README has the arm64 recipe). Never a second build dir.
 - Tests: `ctest --test-dir build-deskd -R "deskd-|ui-desk"` (deskd suites take about a minute; `ui-desk-v3` alone about 3 minutes).
-- Commits: `deskd: what changed`, logical steps, no warnings, tests with the repo's CHECK style registered in CMakeLists.txt.
+- Commits: `deskd: what changed`, logical steps, no warnings, tests with the repo's CHECK style registered in CMakeLists.txt, one line a suite (`deskd_pure_test(x)`, `deskd_fake_test(x)` with the fake exchange, `fake_kalshi_test(x)` for the fake's own) and one line a config key in `config.cpp`'s known set.
 
 ## Done
 
