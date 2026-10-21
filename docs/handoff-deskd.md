@@ -1,4 +1,4 @@
-# deskd handoff (2026-10-07, updated 2026-10-14)
+# deskd handoff (2026-10-07, updated 2026-10-21)
 
 The desk is being rebuilt as `deskd`, an event-driven C++17 trading desk, per `docs/impl_plan.md` (the operator-approved plan; read sections 2-4, 8 and 9 first). This file says where everything is and what to do next.
 
@@ -24,6 +24,42 @@ Rules in code:
   re-arm; Systematic lanes M1 and M2 quoting, Start, Stop cancelling.
 
 The work is on GitHub: `samgeng14/kalshi-desk`, branch `claude/pensive-meitner-8k2wae` (draft PR #1).
+
+## 2026-10-21: a plan audit, order safety, the LIP probe, deskctl's direct KILL, the recorder
+
+A section-by-section audit of `docs/impl_plan.md` against the code (471 items: 219 done, 106
+partial, 141 missing) set this round's order: what protects money before LIVE first.
+
+- **Order safety.** A post still working 1.5 s past its exchange expiry is cancelled by gw (plan
+  section 3's backup; "nothing lives 2 s past expiry"). After KILL's cancel-all, send-cx reads the
+  account's resting orders and batch-cancels anything still listed. Each account read now settles
+  working orders and missed fills from the venue's rows (a private-feed drop no longer leaves an
+  order WORK holding its cash), and an order with more filled than its fills for 5 s takes the
+  account read's fill rows; REST and feed reports of one trade count once. A private fill that
+  beats its order's 201 waits 5 s for it. An order group re-arms only once order_group_updates
+  confirms the reset (the 200 alone after 5 s, counted in `gw.group_reset_fallbacks`). An
+  adversarial review of these found three defects, fixed with tests (75ac677).
+- **deskctl kill --direct --config FILE [--live]**: KILL at the exchange when deskd hangs
+  (cancel-all, every order group triggered, a batch cancel of what still rests). Production only
+  with --live, a prod config and a lock whose holder line says "deskd LIVE"; a free lock it takes.
+- **LIP-15:** a 2-tick move of the touch pulls both sides; a deep 1-tick queue is never joined on
+  the fill pace's relaxed edge; the lane row, `hdr.day.lip` and `/ops/status lip.lanes` show
+  today's LIP estimate per lane (its own line, never in the stop). **Lane P1 LIP PROBE** (off
+  until you turn it on): 30 a side in minutes 0-5 of M1's windows, 40 windows a day, paused at
+  -$15 (plan 5(a), decision 4).
+- **`tools/scorecard.py [paper|live]`**: the daily scorecard per lane and the plan's lane rules
+  (the 200-fill rule for M1/P1, BAND's, X1/C1's) as advice.
+- **Recorder** (`recorder/`, deployed by you): college and thin-sport games (WCBB from Nov 2, the
+  thin men's decile as control; series tickers to confirm in `recorder.env.example`), their books
+  by REST every 4 s (also the socket's fallback), ESPN and NCAA scores with first-seen times,
+  hourly incentive programs, a daily /markets sweep, trade backfill, `market_lifecycle_v2`,
+  `python3 -m recorder.report` (the 24 h / 1% gap check), and `deploy/base.sh` (chrony, swap,
+  journald cap, security-only upgrades; plan mode by default).
+- **Still open, deliberately:** Stop by batch cancel (per-order cancels work); adopting the last
+  run's own resting orders at start (short expiries; cash accounting risk); `cancel_epoch` (needs
+  a browser-side sequence to be correct); the money ledger (settlements endpoint unverified); S1
+  arbitrage (week 4; the plan's own evidence puts it at about $0); Polymarket (needs the account);
+  the WCBB model (needs training data); `config/lanes.json`; the 8-hour faulted soak.
 
 ## 2026-10-14: paper trading on the Mac
 

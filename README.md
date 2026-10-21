@@ -32,6 +32,11 @@ orders; one command starts both and Ctrl-C stops both. The live config starts wi
 off; set `"systematic_orders": true` in `~/.kalshi/deskd-prod.json` yourself when you want lanes
 there. `python3 tools/desk.py paper` or `live` runs one alone.
 
+If a desk hangs, `build-deskd/deskctl kill --direct --config ~/.kalshi/deskd-demo.json` cancels
+everything at the exchange with the desk's own key (for LIVE: the prod config and `--live`, and
+only while the lock says "deskd LIVE"). `python3 tools/scorecard.py` (or `scorecard.py live`) prints
+each lane's day and the plan's lane rules.
+
 Each desk's log also goes to `deskd.log` in its data directory. After anything odd, run
 `python3 tools/desk.py report` (or `report live`): the run state and why, any stopped sender, and
 every KILL, refusal and unsent order from the log. On PAPER, Systematic has lane D1 PAPER, on from
