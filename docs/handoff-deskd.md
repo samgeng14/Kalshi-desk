@@ -97,6 +97,11 @@ partial, 141 missing) set this round's order: what protects money before LIVE fi
   against each 15-minute window's strike, deskd's own rules), and `--write-replication` to seed
   deskd's `replication.json` from it once the recorder has run (never over an existing file
   without `--force`).
+- **`tools/lip_join.py --data DIR`** (the plan's join rule: a series joins when both sides hold
+  the program's target in most minutes, sampled mid-minute) and **`tools/fillsim2.py --data DIR`**
+  (queue position behind the touch: fill rate, 10/60 s markouts and LIP $ per contract by
+  placement and age cap). Both read the recorder's books; an adversarial review's 4 findings in
+  them are fixed with tests. Run them once the recorder has a few days of natgas.
 - **Still open, deliberately:** Manual order groups (KILL's cancel-all and the batch sweep cover
   what they would add); exit 75 and the supervisor (the plan returns the LaunchAgent only once
   deskd is the production binary: your call); Stop by batch cancel (per-order cancels work); adopting the last

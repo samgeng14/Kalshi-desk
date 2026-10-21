@@ -45,7 +45,9 @@ the pregame Kalshi price it saw before tip. Without it there is no fair, and the
 
 Before LIVE: `ctest --test-dir build-deskd -L invariants --output-on-failure` runs every test that
 `docs/invariants.md` names for the plan's rules. `python3 tools/replication.py --data DIR` (the
-recorder's data) counts the 15-minute windows whose strike pyth_value reproduced, LIP-15's anchor gate.
+recorder's data) counts the 15-minute windows whose strike pyth_value reproduced, LIP-15's anchor gate;
+`tools/lip_join.py` and `tools/fillsim2.py` (the same `--data DIR`) give the join rule per series
+and what resting behind the touch would have earned.
 
 Research reads `ops-research.sqlite`, the copy the desk writes beside `ops.sqlite` after each ET
 midnight, never the live file. `/ops/status` shows the live file's size; past 1 GB the desk alerts.
