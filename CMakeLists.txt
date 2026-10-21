@@ -341,6 +341,7 @@ add_library(deskd_core STATIC
   src/deskd/gw/kalshi_sign.cpp
   src/deskd/gw/kalshi_wire.cpp
   src/deskd/gw/reject.cpp
+  src/deskd/gw/fees.cpp
   src/deskd/strat/strat.cpp
   src/deskd/strat/terminal_price.cpp
   src/deskd/strat/fair.cpp
@@ -530,6 +531,8 @@ deskd_fake_test(sender)
 deskd_fake_test(manual_gw)
 deskd_fake_test(runtime_manual)
 deskd_fake_test(pyth)
+# fees: gw/fees.h against the fake's model_fee and charge_fee, at the fake's own balance precision
+deskd_fake_test(fees)
 add_dependencies(deskd-test-sender deskctl)   # its deskctl kill --direct case runs the binary
 # The Systematic soak (tests/deskd/soak.cpp): 60 s under ctest; DESKD_SOAK_SECONDS=14400 for the
 # plan's 4 hours, in a build configured with -DDESKD_TSAN=ON.
