@@ -479,7 +479,7 @@ void systematic() {
   if(snap && snap->status==200) {
     const auto sj=json::parse(snap->body);
     cap["snapshots"].push_back(sj);
-    CHECK(sj["lanes"].size()==7);   // M1 P1 M2 S1 C1 X1, and D1 PAPER on the demo account
+    CHECK(sj["lanes"].size()==11);   // M1 M2 P1 S1 C1 X1 N1 N2 Q1 W1, and D1 PAPER on the demo account
   }
   const std::string file=r.dir.path+"/capture-sys.json";
   std::ofstream(file)<<cap.dump();

@@ -1,4 +1,6 @@
 // Systematic's book (gw/sys_book.h): lanes, groups, a lane's day by average cost, and its life.
+#include <algorithm>
+#include <cstdio>
 #include "check.h"
 #include "deskd/gw/sys_book.h"
 using namespace deskd;
@@ -6,7 +8,7 @@ using json = nlohmann::json;
 namespace {
 void lanes_and_groups() {
   SysBook b;
-  CHECK(b.lanes().size() == 6 && b.lane("M1")->name == "LIP-15" && b.lane("M1")->budget == 550000);
+  CHECK(b.lanes().size() == 10 && b.lane("M1")->name == "LIP-15" && b.lane("M1")->budget == 550000);
   CHECK(b.lane("P1") && b.lane("P1")->name == "LIP PROBE" && b.lane("P1")->inventory == 4000 && !b.on("P1"));
   CHECK(!b.on("M1") && b.on_lanes().empty() && !b.set_on("Z9", true));
   std::string why;
@@ -19,6 +21,68 @@ void lanes_and_groups() {
   b.group("M1", 1).state = SysBook::GroupState::ACTIVE;
   CHECK(b.groups_ready({0, 1}, &why) && why.empty());
   CHECK(b.set_on("M1", false) && !b.on("M1"));
+}
+
+// Every lane's row (decisions 1 and the lane tracks' specs): its budget, venue, limits and rules.
+// The lanes no engine trades yet have engine=false, and no lane is on at start.
+void default_rows() {
+  using R = LaneSpec::RetireRule;
+  const auto& L = default_lanes();
+  std::vector<std::string> ids;
+  for (const auto& l : L) ids.push_back(l.id);
+  CHECK(ids == std::vector<std::string>({"M1", "M2", "P1", "S1", "C1", "X1", "N1", "N2", "Q1", "W1"}));
+  struct Row {
+    const char* id;
+    const char* name;
+    const char* style;
+    const char* venue;
+    const char* family;
+    Money budget;
+    Qty inventory, group_limit;
+    std::optional<Money> thr;
+    bool engine;
+    Micros event_cap;
+    R rule;
+    int trades;
+    Micros loss;
+    const char* h;
+  };
+  const std::vector<Row> want = {
+      {"M1", "LIP-15", "REST", "K", "", 550000, 4000, 5000, std::nullopt, true, 0, R::NONE, 0, 0, ""},
+      {"M2", "BAND 96-99", "REST", "K", "", 250000, 2000, 5000, std::nullopt, true, 0, R::NONE, 0, 0, ""},
+      {"P1", "LIP PROBE", "REST", "K", "", 250000, 4000, 7500, std::nullopt, true, 0, R::NONE, 0, 0, ""},
+      {"S1", "ARB", "IOC", "K", "ARB", 150000, 2000, 30000, Money{100}, false, 0, R::NONE, 0, 0, ""},
+      {"C1", "COLLEGE TAKE", "IOC", "K", "", 400000, 2000, 5000, Money{2000}, false, 10000000, R::MARKOUT, 100, 20000000, "300s"},
+      {"X1", "ESPN EXP", "IOC", "K", "", 50000, 400, 1000, Money{300}, false, 10000000, R::CAP, 100, 20000000, ""},
+      {"N1", "NBA MODEL", "IOC", "K", "", 200000, 1000, 2000, Money{1000}, false, 10000000, R::NONE, 0, 20000000, ""},
+      {"N2", "NBA FAV 90-95", "IOC", "K", "", 150000, 500, 1000, std::nullopt, false, 0, R::CAP, 60, 15000000, ""},
+      {"Q1", "PM QUOTE", "REST", "P", "", 200000, 2000, 5000, std::nullopt, false, 0, R::NONE, 0, 0, ""},
+      {"W1", "WX 2-VENUE", "IOC", "KP", "ARB", 100000, 2000, 5000, Money{100}, false, 0, R::NONE, 0, 0, ""},
+  };
+  for (const auto& w : want) {
+    const auto it = std::find_if(L.begin(), L.end(), [&](const LaneSpec& l) { return l.id == w.id; });
+    if (it == L.end()) { CHECK(!"every lane has a row"); continue; }
+    const auto& l = *it;
+    const int failed = fails;
+    CHECK(l.name == w.name && l.style == w.style && l.venue == w.venue && l.family == w.family && l.budget == w.budget);
+    CHECK(l.inventory == w.inventory && l.group_limit == w.group_limit && l.thr == w.thr && l.engine == w.engine);
+    CHECK(l.event_cap == w.event_cap && l.retire_rule == w.rule && l.retire_trades == w.trades && l.retire_loss == w.loss &&
+          l.retire_h == w.h);
+    CHECK(!l.paper_only && !l.on_at_start && l.gate_why.empty());
+    if (fails != failed) std::fprintf(stderr, "  (lane %s)\n", w.id);
+  }
+  // every lane off at start; the Kalshi budgets sum to $210 (a KP lane's counts on Kalshi), past
+  // any ceiling under $300 of equity, so gw decides which may be on together (decisions 1)
+  SysBook b;
+  CHECK(b.on_lanes().empty());
+  Money k = 0;
+  for (const auto& l : L) if (l.venue.find('K') != std::string::npos) k += l.budget;
+  CHECK(k == 210 * 10000);
+  // a lane's row carries its venue and thr
+  CHECK(b.lane_json(*b.lane("Q1"), RunState::RUN, 0, 0, 0, {}, "")["venue"] == "P");
+  CHECK(b.lane_json(*b.lane("W1"), RunState::RUN, 0, 0, 0, {}, "")["venue"] == "KP");
+  CHECK(b.lane_json(*b.lane("C1"), RunState::RUN, 0, 0, 0, {}, "")["thr"] == "0.2000");
+  CHECK(b.lane_json(*b.lane("N2"), RunState::RUN, 0, 0, 0, {}, "")["thr"].is_null());
 }
 
 void lane_day() {
@@ -127,7 +191,7 @@ void rebates() {
   CHECK(b.day("M1")->charged == 0 && b.day("M1")->fees == 0);
 }
 
-// default_lanes() with the retire rules the lane tracks give C1 and X1, at small counts
+// default_lanes() with C1's and X1's retire rules at small counts
 std::vector<LaneSpec> ruled_lanes() {
   auto lanes = default_lanes();
   for (auto& l : lanes) {
@@ -253,18 +317,24 @@ void retire_rules() {
   CHECK(m.retire_due(*m.lane("C1"), mark_at(500)) == "down $20.0000 over its life, its limit $20.0000");
   CHECK(m.day_total(mark_at(500)) == -4500000);
   // lanes without a rule never retire, and every new field's default is a no-op
+  const LaneSpec blank;
+  CHECK(blank.venue == "K" && blank.family.empty() && blank.event_cap == 0 && blank.gate_why.empty());
+  CHECK(blank.retire_rule == LaneSpec::RetireRule::NONE && blank.retire_trades == 0 && blank.retire_loss == 0 && blank.retire_h.empty());
   auto lanes = default_lanes();
   lanes.push_back(paper_lane());
   SysBook d(lanes);
   d.roll(day);
   CHECK(d.on("D1"));
+  int unruled = 0;
   for (const auto& x : d.lanes()) {
-    CHECK(x.venue == "K" && x.family.empty() && x.event_cap == 0 && x.gate_why.empty());
-    CHECK(x.retire_rule == LaneSpec::RetireRule::NONE && x.retire_trades == 0 && x.retire_loss == 0 && x.retire_h.empty());
+    if (x.retire_rule != LaneSpec::RetireRule::NONE || x.retire_loss) continue;
+    ++unruled;
+    CHECK(x.retire_trades == 0 && x.retire_h.empty());
     for (int i = 0; i < 200; ++i)
       d.fill(x.id, "S" + x.id + "-" + std::to_string(i), "TK-" + x.id, Side::BUY, 10000, 9900, 0, t + i, x.id + std::to_string(i));
     CHECK(d.life(x.id)->trades == 200 && d.retire_due(x, none).empty() && !d.markout(x.id, x.id + "0", "", 0, 100));
   }
+  CHECK(unruled == 7);   // M1 M2 P1 S1 Q1 W1 D1
 }
 
 // A life is saved and read back on any day: its counts, the ids it counted, its markouts and a
@@ -373,7 +443,7 @@ void groups_of_markets() {
 }
 
 int main() {
-  lanes_and_groups(); lane_day(); settle_and_restore(); rebates(); groups_of_markets();
+  lanes_and_groups(); default_rows(); lane_day(); settle_and_restore(); rebates(); groups_of_markets();
   life_counts(); retire_rules(); life_across_restart(); gated_and_venue();
   return finish("deskd-sys_book");
 }

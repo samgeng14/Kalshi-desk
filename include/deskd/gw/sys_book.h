@@ -2,12 +2,18 @@
 // Systematic's half of gw's book (gw thread only; no locks, no I/O): the lanes and their
 // operator switches, each lane's order group per shard, and each lane's day by average cost.
 //
-// Lanes (plan section 5; budgets from section 4: "LIP-15 $55, band $25, arbitrage $15"):
-//   M1 LIP-15        REST  $55   the 15-minute financial markets (natural gas first)
-//   M2 BAND 96-99    REST  $25   post-only bids on the 96-99c side
-//   S1 ARB           IOC   $15   ladder and dominance arbitrage
-//   C1 COLLEGE TAKE  IOC   $10   thin-college late-game stale quotes
-//   X1 ESPN EXP      IOC    $5   EXPERIMENT: $1-2 takes on ESPN's direction
+// Lanes (plan section 5; budgets from section 4, "LIP-15 $55, band $25, arbitrage $15", and
+// decisions 1), by venue (K Kalshi, P Polymarket, KP both):
+//   M1 LIP-15         K   REST  $55   the 15-minute financial markets (natural gas first)
+//   M2 BAND 96-99     K   REST  $25   post-only bids on the 96-99c side
+//   P1 LIP PROBE      K   REST  $25   30 a side in minutes 0-5 of LIP-15's windows
+//   S1 ARB            K   IOC   $15   ladder and dominance arbitrage (family ARB)
+//   C1 COLLEGE TAKE   K   IOC   $40   thin-college late-game stale quotes, $10 a game
+//   X1 ESPN EXP       K   IOC    $5   EXPERIMENT: $1-2 takes on ESPN's direction
+//   N1 NBA MODEL      K   IOC   $20   the in-game NBA model, $10 a game
+//   N2 NBA FAV 90-95  K   IOC   $15   pregame 90-95c favourites, 5 contracts (a forward test)
+//   Q1 PM QUOTE       P   REST  $20   Polymarket reward quoting (decision 6)
+//   W1 WX 2-VENUE     KP  IOC   $10   the two-venue weather basket (family ARB)
 // Every lane starts off; the operator turns one on (POST /api/lane/{id}).
 //
 // Order groups (plan section 3): one per lane that is on and shard, each with a contracts limit over the
@@ -57,8 +63,9 @@ struct LaneSpec {
   Qty group_limit = 5000;               // contracts over the venue's 15 s window
   std::vector<std::string> series;      // the markets it trades ("" = any)
   std::optional<Money> thr;             // IOC lanes: the net edge per contract it needs
-  // false: no engine trades it yet (S1 needs event exclusivity, C1 its model, X1 its backtest), so
-  // it cannot be switched on (on, it would only hold order groups that GROUPS waits for)
+  // false: no engine trades it yet (S1 needs event exclusivity, C1 and N1 their models, X1 its
+  // backtest, N2, Q1 and W1 their engines), so it cannot be switched on (on, it would only hold
+  // order groups that GROUPS waits for)
   bool engine = true;
   // D1 PAPER: gw refuses its orders on the production account (ManualPath::live), and deskd lists
   // it only on demo; on at start, so START on PAPER trades at once (other lanes start off)

@@ -5,18 +5,60 @@
 namespace deskd {
 using json = nlohmann::json;
 
+// Each lane's budget (decisions 1), limits and rules. A lane whose engine is not built yet has
+// engine=false and cannot be switched on; deskd sets a lane's series, gate and engine where it
+// builds the engine (app/venue.cpp).
 const std::vector<LaneSpec>& default_lanes() {
-  static const std::vector<LaneSpec> L = {
-      {"M1", "LIP-15", "REST", 55 * 10000, 4000, 5000, {"KXNATGAS15M"}, std::nullopt},
-      {"M2", "BAND 96-99", "REST", 25 * 10000, 2000, 5000, {}, std::nullopt},
-      // the LIP probe (plan section 5(a), decision 4): 30 a side in minutes 0-5 of LIP-15's
-      // windows, about 40 windows a day, its own $15 loss cap (the engine's lane_pause); 40
-      // contracts and the $25 LIP group cap (limits 2 and 3)
-      {"P1", "LIP PROBE", "REST", 25 * 10000, 4000, 7500, {"KXNATGAS15M"}, std::nullopt},
-      {"S1", "ARB", "IOC", 15 * 10000, 2000, 5000, {}, Money{200}, false},
-      {"C1", "COLLEGE TAKE", "IOC", 10 * 10000, 2000, 5000, {}, Money{300}, false},
-      {"X1", "ESPN EXP", "IOC", 5 * 10000, 200, 1000, {}, Money{300}, false},
-  };
+  static const std::vector<LaneSpec> L = [] {
+    constexpr Micros kDollar = 1000000;
+    // the LIP probe (plan section 5(a), decision 4): 30 a side in minutes 0-5 of LIP-15's
+    // windows, about 40 windows a day, its own $15 loss cap (the engine's lane_pause); 40
+    // contracts and the $25 LIP group cap (limits 2 and 3)
+    LaneSpec p1{"P1", "LIP PROBE", "REST", 25 * 10000, 4000, 7500, {"KXNATGAS15M"}, std::nullopt};
+    // arbitrage (plan 5(c)): baskets of up to 6 legs of 10 contracts, 1c a contract after fees;
+    // 2.5 x 10 x 6 x 2 passes in its group's 15 s window; its $15 shared with W1 (family ARB)
+    LaneSpec s1{"S1", "ARB", "IOC", 15 * 10000, 2000, 30000, {}, Money{100}, false};
+    s1.family = "ARB";
+    // thin college games (plan 5(d)): 20c net of the fee, $10 a game, ~$40 open; retired after
+    // 100 trades if the net 300 s markout is not positive, or once down $20
+    LaneSpec c1{"C1", "COLLEGE TAKE", "IOC", 40 * 10000, 2000, 5000, {}, Money{2000}, false};
+    c1.event_cap = 10 * kDollar;
+    c1.retire_rule = LaneSpec::RetireRule::MARKOUT;
+    c1.retire_trades = 100;
+    c1.retire_h = "300s";
+    c1.retire_loss = 20 * kDollar;
+    // the ESPN experiment (plan 5(e)): $1-2 takes of at most 4 contracts, and every NBA lane's $10
+    // game cap (its $5 budget binds first); retired after 100 trades or $20 lost
+    LaneSpec x1{"X1", "ESPN EXP", "IOC", 5 * 10000, 400, 1000, {}, Money{300}, false};
+    x1.event_cap = 10 * kDollar;
+    x1.retire_rule = LaneSpec::RetireRule::CAP;
+    x1.retire_trades = 100;
+    x1.retire_loss = 20 * kDollar;
+    // the NBA model (decisions 2, on 5(d)'s template): 10c net, 10 contracts a market, $10 a game;
+    // retired once down $20 (its engine holds it on its markouts)
+    LaneSpec n1{"N1", "NBA MODEL", "IOC", 20 * 10000, 1000, 2000, {}, Money{1000}, false};
+    n1.event_cap = 10 * kDollar;
+    n1.retire_loss = 20 * kDollar;
+    // pregame 90-95c NBA favourites (decisions 2): a forward test of 5 contracts, held to
+    // settlement; retired after 60 trades or $15 lost. A price band, not an edge: no thr
+    LaneSpec n2{"N2", "NBA FAV 90-95", "IOC", 15 * 10000, 500, 1000, {}, std::nullopt, false};
+    n2.retire_rule = LaneSpec::RetireRule::CAP;
+    n2.retire_trades = 60;
+    n2.retire_loss = 15 * kDollar;
+    // Polymarket reward quoting (decision 6): blocked until poly_checks records a GTD lead of 60 s
+    // or less (decisions 3)
+    LaneSpec q1{"Q1", "PM QUOTE", "REST", 20 * 10000, 2000, 5000, {}, std::nullopt, false};
+    q1.venue = "P";
+    // the two-venue weather NO basket (plan 5(c), decisions 4): a 1c lock after both venues'
+    // fees, inside the ARB family's $15
+    LaneSpec w1{"W1", "WX 2-VENUE", "IOC", 10 * 10000, 2000, 5000, {}, Money{100}, false};
+    w1.venue = "KP";
+    w1.family = "ARB";
+    return std::vector<LaneSpec>{
+        {"M1", "LIP-15", "REST", 55 * 10000, 4000, 5000, {"KXNATGAS15M"}, std::nullopt},
+        {"M2", "BAND 96-99", "REST", 25 * 10000, 2000, 5000, {}, std::nullopt},
+        p1, s1, c1, x1, n1, n2, q1, w1};
+  }();
   return L;
 }
 
