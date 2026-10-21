@@ -157,21 +157,23 @@ bool Deskd::start(std::string* err) {
   by("send-cx")->start([this, alert](Worker& w) {
     if (cx_sender_) cx_sender_->run(w); else run_cancel_sender(w, q_cx_, cx_stats_, kill_, alert);
   });
-  by("strat")->start([this](Worker& w) {
-    run_strat(w, [this] {
-      if (fair_ && rest_) fair_->step(*rest_->snapshot(), now_ms());
-      if (lip_) lip_->step(now_ms());
-      if (band_) band_->step(now_ms());
-      if (paper_) paper_->step(now_ms());
-      if (probe_) probe_->step(now_ms());
-      lip_step(now_ms());
-      if (markouts_)   // every row to the store; the contract's horizons (1s, 10s, 60s) to the stream
-        for (const auto& row : markouts_->step(now_ms())) {
-          store_.inbox().push(StoreRecord{"markouts", row.store().dump()});
-          if (row.on_stream()) pub_->post(PubData{"mo", row.pub()});
-        }
-    });
+  // The strat thread's engines, each at its own cadence and in this order when due together: the
+  // fair before the makers that read it. An engine with work in flight registers with paced().
+  StratSteps steps;
+  steps.every(250, [this] { if (fair_ && rest_) fair_->step(*rest_->snapshot(), now_ms()); });
+  steps.every(250, [this] { if (lip_) lip_->step(now_ms()); });
+  steps.every(250, [this] { if (band_) band_->step(now_ms()); });
+  steps.every(250, [this] { if (paper_) paper_->step(now_ms()); });
+  steps.every(250, [this] { if (probe_) probe_->step(now_ms()); });
+  steps.every(250, [this] { lip_step(now_ms()); });
+  steps.every(250, [this] {
+    if (markouts_)   // every row to the store; the contract's horizons (1s, 10s, 60s) to the stream
+      for (const auto& row : markouts_->step(now_ms())) {
+        store_.inbox().push(StoreRecord{"markouts", row.store().dump()});
+        if (row.on_stream()) pub_->post(PubData{"mo", row.pub()});
+      }
   });
+  by("strat")->start([steps](Worker& w) mutable { run_strat(w, [&steps] { return steps.step(mono_ms()); }); });
   if (!cfg_.data_dir.empty()) store_.set_path(cfg_.data_dir + "/ops.sqlite");
   store_.set_alert([this](const std::string& lvl, const std::string& msg) { if (pub_) pub_->alert(lvl, "STORE", msg); });
   by("store")->start([this](Worker& w) { store_.run(w); });

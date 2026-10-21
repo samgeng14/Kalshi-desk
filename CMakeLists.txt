@@ -524,6 +524,8 @@ deskd_pure_test(wcbb)
 deskd_pure_test(store)
 # sys_risk: gw's sys_used against the loops it replaced, on random books; place_sys's limits at their edges
 deskd_pure_test(sys_risk)
+# strat: the strat loop's sleep, clamped to 5..250 ms, and each engine's cadence (strat/strat.h)
+deskd_pure_test(strat)
 deskd_fake_test(net)
 deskd_fake_test(wire)
 deskd_fake_test(md)

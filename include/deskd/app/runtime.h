@@ -6,7 +6,9 @@
 //   gw               the gateway: run state, inbox lanes and deletions
 //   send-k1          Manual's sender; send-k2, send-k3 Systematic's (week 0: placeholders)
 //   send-cx          cancels and KILL, on its own path
-//   strat, store     placeholders
+//   strat            the fair, the makers, the LIP meter and the markouts, each engine at its own
+//                    cadence (strat/strat.h)
+//   store            the only writer of ops.sqlite
 //   pub              the screen's streams, hb, hdr, snapshots
 //   ops              heartbeat file, disk, preflight rows
 //   web              cpp-httplib, 16 request threads of its own
