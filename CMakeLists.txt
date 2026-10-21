@@ -396,6 +396,32 @@ add_executable(deskctl src/deskd/app/deskctl.cpp)
 target_link_libraries(deskctl PRIVATE deskd_core)
 target_precompile_headers(deskctl REUSE_FROM deskd_core)
 
+# One line registers one suite: a step that adds a suite adds a line and edits no shared list
+# (2026-10-21: the automatic lanes are built in parallel worktrees, and every one of them would
+# otherwise edit the same foreach). Each suite also joins deskd-all.
+#   deskd_pure_test(x)   tests/deskd/test_x.cpp on deskd_core: binary deskd-test-x, ctest deskd-x
+#   deskd_fake_test(x)   the same, also linked with the fake exchange (fake_kalshi, below)
+#   fake_kalshi_test(x)  tests/deskd/test_fake_x.cpp on the fake alone: deskd-test-fake-x, ctest deskd-fake-x
+add_custom_target(deskd-all)
+function(deskd_suite target source)
+  add_executable(${target} ${source})
+  target_link_libraries(${target} PRIVATE ${ARGN})
+  target_precompile_headers(${target} REUSE_FROM deskd_core)
+  add_dependencies(deskd-all ${target})
+endfunction()
+function(deskd_pure_test name)
+  deskd_suite(deskd-test-${name} tests/deskd/test_${name}.cpp deskd_core)
+  add_test(NAME deskd-${name} COMMAND deskd-test-${name})
+endfunction()
+function(deskd_fake_test name)
+  deskd_suite(deskd-test-${name} tests/deskd/test_${name}.cpp deskd_core fake_kalshi)
+  add_test(NAME deskd-${name} COMMAND deskd-test-${name})
+endfunction()
+function(fake_kalshi_test name)
+  deskd_suite(deskd-test-fake-${name} tests/deskd/test_fake_${name}.cpp fake_kalshi)
+  add_test(NAME deskd-fake-${name} COMMAND deskd-test-fake-${name})
+endfunction()
+
 # tests/deskd: the repo's CHECK style, one executable per area.
 #   bus      units, messages, the two-lane queue (priority overtakes, a full lane drops and marks a gap)
 #   ops      the account lock, the heartbeat rule, config, the subscription and send guards
@@ -405,12 +431,10 @@ target_precompile_headers(deskctl REUSE_FROM deskd_core)
 #            with send-cx's inbox full
 #   process  the real binaries: a second deskd refused (also from another working directory),
 #            SIGTERM, deskctl status and kill
-foreach(t bus ops web process)
-  add_executable(deskd-test-${t} tests/deskd/test_${t}.cpp)
-  target_link_libraries(deskd-test-${t} PRIVATE deskd_core)
-  target_precompile_headers(deskd-test-${t} REUSE_FROM deskd_core)
-  add_test(NAME deskd-${t} COMMAND deskd-test-${t})
-endforeach()
+deskd_pure_test(bus)
+deskd_pure_test(ops)
+deskd_pure_test(web)
+deskd_pure_test(process)
 # Without node the contract.js conformance check cannot run: deskd-test-web returns 77 and ctest
 # reports the test skipped, not passed (until 2026-10-06 it printed a line and passed).
 set_tests_properties(deskd-web PROPERTIES SKIP_RETURN_CODE 77)
@@ -466,12 +490,8 @@ endif()
 #                overflow, market limit, command rate), one order's private messages kept in order
 #                under REPLY_FIRST, the fixture tape over the socket, eight clients at once, and
 #                the fake-kalshi binary started and stopped
-foreach(t engine wire)
-  add_executable(deskd-test-fake-${t} tests/deskd/test_fake_${t}.cpp)
-  target_link_libraries(deskd-test-fake-${t} PRIVATE fake_kalshi)
-  target_precompile_headers(deskd-test-fake-${t} REUSE_FROM deskd_core)
-  add_test(NAME deskd-fake-${t} COMMAND deskd-test-fake-${t})
-endforeach()
+fake_kalshi_test(engine)
+fake_kalshi_test(wire)
 add_dependencies(deskd-test-fake-wire fake-kalshi)  # it starts the binary once
 
 # ---- week 1: net/ and the Kalshi wire (plan sections 2-3) ------------------------------------------
@@ -485,18 +505,31 @@ add_dependencies(deskd-test-fake-wire fake-kalshi)  # it starts the binary once
 #   wire   the signer (RSA-PSS and Ed25519, verified by the fake), the builders and parsers against
 #          the documented shapes and the fake over TLS, what each write reply means, and the demo
 #          probe binary run against the fake
-foreach(t http pub_data order_ledger manual_admission manual_book fair espn sys_book maker markouts fill write_budget calendar lip wcbb store)
-  add_executable(deskd-test-${t} tests/deskd/test_${t}.cpp)
-  target_link_libraries(deskd-test-${t} PRIVATE deskd_core)
-  target_precompile_headers(deskd-test-${t} REUSE_FROM deskd_core)
-  add_test(NAME deskd-${t} COMMAND deskd-test-${t})
-endforeach()
-foreach(t net wire md rest private sender manual_gw runtime_manual pyth)
-  add_executable(deskd-test-${t} tests/deskd/test_${t}.cpp)
-  target_link_libraries(deskd-test-${t} PRIVATE deskd_core fake_kalshi)
-  target_precompile_headers(deskd-test-${t} REUSE_FROM deskd_core)
-  add_test(NAME deskd-${t} COMMAND deskd-test-${t})
-endforeach()
+deskd_pure_test(http)
+deskd_pure_test(pub_data)
+deskd_pure_test(order_ledger)
+deskd_pure_test(manual_admission)
+deskd_pure_test(manual_book)
+deskd_pure_test(fair)
+deskd_pure_test(espn)
+deskd_pure_test(sys_book)
+deskd_pure_test(maker)
+deskd_pure_test(markouts)
+deskd_pure_test(fill)
+deskd_pure_test(write_budget)
+deskd_pure_test(calendar)
+deskd_pure_test(lip)
+deskd_pure_test(wcbb)
+deskd_pure_test(store)
+deskd_fake_test(net)
+deskd_fake_test(wire)
+deskd_fake_test(md)
+deskd_fake_test(rest)
+deskd_fake_test(private)
+deskd_fake_test(sender)
+deskd_fake_test(manual_gw)
+deskd_fake_test(runtime_manual)
+deskd_fake_test(pyth)
 add_dependencies(deskd-test-sender deskctl)   # its deskctl kill --direct case runs the binary
 # The Systematic soak (tests/deskd/soak.cpp): 60 s under ctest; DESKD_SOAK_SECONDS=14400 for the
 # plan's 4 hours, in a build configured with -DDESKD_TSAN=ON.
@@ -519,21 +552,41 @@ target_link_libraries(kalshi-demo-probe PRIVATE deskd_core)
 target_precompile_headers(kalshi-demo-probe REUSE_FROM deskd_core)
 add_dependencies(deskd-test-wire kalshi-demo-probe)
 
-add_custom_target(deskd-all DEPENDS deskd deskctl deskd-test-bus deskd-test-ops deskd-test-web deskd-test-process
-                                    fake-kalshi deskd-test-fake-engine deskd-test-fake-wire
-                                    deskd-test-http deskd-test-net deskd-test-wire deskd-test-md
-                                    deskd-test-pub_data deskd-test-rest deskd-test-private deskd-test-order_ledger
-                                    deskd-test-sender deskd-test-manual_admission deskd-test-manual_book deskd-test-manual_gw deskd-test-runtime_manual kalshi-demo-probe)
+# deskd-all: deskd, deskctl, fake-kalshi, the soak and the probe; every suite joined it through its helper
+add_dependencies(deskd-all deskd deskctl fake-kalshi deskd-soak kalshi-demo-probe)
 
 add_test(NAME deskd-no-legacy-includes COMMAND ${CMAKE_COMMAND} -DROOT=${CMAKE_SOURCE_DIR} -P ${CMAKE_SOURCE_DIR}/tests/deskd/no_legacy_includes.cmake)
 
 # The plan's invariants (section 8; docs/invariants.md names each rule's test): every suite holding
 # one is labelled, so `ctest -L invariants` is the run that must be green before any live order.
 # A suite registered only where its runtime exists (node, python3) is labelled where it is.
-foreach(t deskd-bus deskd-http deskd-manual_admission deskd-manual_book deskd-manual_gw deskd-maker deskd-md
-          deskd-net deskd-ops deskd-order_ledger deskd-process deskd-pub_data deskd-pyth deskd-rest
-          deskd-runtime_manual deskd-sender deskd-sys_book deskd-web deskd-wire deskd-write_budget recorder-unit
-          ui-desk-v3 ui-desk-v3-manual deskd-no-legacy-includes)
+# One suite a line, as above.
+foreach(t
+    deskd-bus
+    deskd-http
+    deskd-manual_admission
+    deskd-manual_book
+    deskd-manual_gw
+    deskd-maker
+    deskd-md
+    deskd-net
+    deskd-ops
+    deskd-order_ledger
+    deskd-process
+    deskd-pub_data
+    deskd-pyth
+    deskd-rest
+    deskd-runtime_manual
+    deskd-sender
+    deskd-sys_book
+    deskd-web
+    deskd-wire
+    deskd-write_budget
+    recorder-unit
+    ui-desk-v3
+    ui-desk-v3-manual
+    deskd-no-legacy-includes
+    )
   if(TEST ${t})
     set_property(TEST ${t} APPEND PROPERTY LABELS invariants)
   endif()
