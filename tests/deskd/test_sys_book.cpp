@@ -6,7 +6,8 @@ using json = nlohmann::json;
 namespace {
 void lanes_and_groups() {
   SysBook b;
-  CHECK(b.lanes().size() == 5 && b.lane("M1")->name == "LIP-15" && b.lane("M1")->budget == 550000);
+  CHECK(b.lanes().size() == 6 && b.lane("M1")->name == "LIP-15" && b.lane("M1")->budget == 550000);
+  CHECK(b.lane("P1") && b.lane("P1")->name == "LIP PROBE" && b.lane("P1")->inventory == 4000 && !b.on("P1"));
   CHECK(!b.on("M1") && b.on_lanes().empty() && !b.set_on("Z9", true));
   std::string why;
   CHECK(b.groups_ready({0, 1}, &why) && why == "no lane is on");

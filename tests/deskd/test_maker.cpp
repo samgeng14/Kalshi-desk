@@ -678,8 +678,38 @@ void touch_pull() {
   CHECK(cancels == 2 && e.status()["last"][tk] == "the touch moved 2 ticks");
 }
 
+// The LIP probe's window cap: with 2 windows a day, a third market waits ("done for today"), the
+// two already quoted go on; the next ET day starts again.
+void window_cap() {
+  auto view = std::make_shared<Gateway::SysView>();
+  view->run = RunState::RUN;
+  view->lanes_on = {"P1"};
+  auto snap = std::make_shared<rest::Snapshot>();
+  snap->clock.post_trusted = true;
+  const std::int64_t T = OPEN;
+  for (const char* t : {"KXNATGAS15M-26OCT101500-00", "KXNATGAS15M-26OCT101500-01", "KXNATGAS15M-26OCT101500-02"}) {
+    kalshi::MarketRow m; m.ticker = t; m.event_ticker = "KXNATGAS15M-26OCT101500"; m.status = "active";
+    m.open_ms = T; m.close_ms = T + 900000; m.price_ranges = CENT;
+    snap->markets[t] = m;
+  }
+  std::vector<GwMsg> posted;
+  MakerEngine::Env env;
+  env.view = [&] { return std::shared_ptr<const Gateway::SysView>(view); };
+  env.snapshot = [&] { return std::shared_ptr<const rest::Snapshot>(snap); };
+  env.book = [&](const std::string&) { return std::optional<MdBook>(book(4000, 500, 4600, 500)); };
+  env.private_up = [] { return true; };
+  env.post = [&](GwMsg g) { posted.push_back(std::move(g)); return true; };
+  MakerParams p; p.size = 3000; p.window_cap = 2;
+  MakerEngine e("P1", {"KXNATGAS15M"}, env, p);
+  e.step(T + 60000);
+  std::set<std::string> quoted;
+  for (const auto& g : posted) if (const auto* pi = std::get_if<PlaceIntent>(&g)) quoted.insert(pi->ticker);
+  CHECK(quoted.size() == 2 && !quoted.count("KXNATGAS15M-26OCT101500-02"));
+  CHECK(e.status()["last"]["KXNATGAS15M-26OCT101500-02"] == "done for today: 2 windows quoted");
+}
+
 int main() {
-  grid(); quotes(); deep_join(); touch_pull(); anchor_and_pulls(); band(); engine_limits(); review_fixes(); engine_own_quotes(); fill_pace();
+  grid(); quotes(); deep_join(); touch_pull(); window_cap(); anchor_and_pulls(); band(); engine_limits(); review_fixes(); engine_own_quotes(); fill_pace();
   paper(); paper_pick(); paper_engine(); paper_engine_leaving();
   return finish("deskd-maker");
 }

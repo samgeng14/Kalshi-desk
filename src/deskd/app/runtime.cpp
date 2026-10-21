@@ -163,6 +163,7 @@ bool Deskd::start(std::string* err) {
       if (lip_) lip_->step(now_ms());
       if (band_) band_->step(now_ms());
       if (paper_) paper_->step(now_ms());
+      if (probe_) probe_->step(now_ms());
       lip_step(now_ms());
       if (markouts_)
         for (auto& row : markouts_->step(now_ms())) {
@@ -297,6 +298,7 @@ json Deskd::status() const {
   result["maker"] = lip_ ? lip_->status() : json(nullptr);
   result["band"] = band_ ? band_->status() : json(nullptr);
   result["paper"] = paper_ ? paper_->status() : json(nullptr);
+  result["probe"] = probe_ ? probe_->status() : json(nullptr);
   result["markouts"] = markouts_ ? markouts_->status() : json(nullptr);
   if (const auto l = gw_->latency()) {
     auto ms = [](const std::optional<int>& v) { return v ? json(*v) : json(nullptr); };

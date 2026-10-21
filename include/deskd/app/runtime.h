@@ -128,6 +128,7 @@ class Deskd {
   std::unique_ptr<MakerEngine> lip_;   // lane M1's quoter, on the strat thread
   std::unique_ptr<MakerEngine> band_;  // lane M2's
   std::unique_ptr<MakerEngine> paper_; // lane D1's (demo only)
+  std::unique_ptr<MakerEngine> probe_; // lane P1's, the LIP probe
   std::unique_ptr<Markouts> markouts_;   // every fill's 1/10/60 s markout
   ReleaseCalendar calendar_;             // read once at start; const after
   LipMeter lip_meter_;                   // our LIP share each second (strat thread), read by status

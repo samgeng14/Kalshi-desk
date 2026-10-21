@@ -72,6 +72,9 @@ struct MakerParams {
   // plan section 3: never join the back of a 1-tick queue deeper than this many times our size
   // unless fair clears the price by the full edge floor (the fill pace's relaxation aside)
   int deep_join_x = 3;
+  // the LIP probe (plan section 5(a)): a new market (window) is started only while fewer than
+  // this many have been quoted today (ET); 0 = no cap. In memory: a restart starts the count again
+  int window_cap = 0;
   // D1 PAPER (paper_quote) only: an opening IOC after probe_every_ms with no fill and no IOC in
   // the market; a position held hold_max_ms leaves by IOC at the touch, at most one IOC each
   // ioc_gap_ms
@@ -194,6 +197,8 @@ class MakerEngine {
   std::map<std::string, std::int64_t> cool_until_;      // after a fill of ours, or a 0.5 sigma move
   std::map<std::string, double> quote_spot_;            // the underlying when the quotes went out
   std::map<std::string, std::pair<Px, Px>> quote_touch_; // everyone else's touch then (bid, ask)
+  std::set<std::string> windows_;                        // markets quoted today (window_cap)
+  std::int64_t windows_day_ = 0;                         // the ET midnight windows_ counts from
   std::map<std::string, std::string> cool_why_;
   // per market: when the position went from flat, the last fill or IOC (or the start of quoting),
   // the last IOC (MakerInput::held_ms, quiet_ms, since_ioc_ms)

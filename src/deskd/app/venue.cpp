@@ -205,7 +205,7 @@ void Deskd::attach_manual() {
     p.sys_state_file = cfg_.data_dir + "/systematic.json";
     p.lanes = default_lanes();
     for (auto& l : p.lanes) {
-      if (l.id == "M1") l.series = cfg_.lip_series;
+      if (l.id == "M1" || l.id == "P1") l.series = cfg_.lip_series;
       if (l.id == "M2") l.series = cfg_.band_series;
     }
     if (!cfg_.live && cfg_.paper_lane) p.lanes.push_back(paper_lane());   // D1: the demo account only
@@ -266,6 +266,19 @@ void Deskd::attach_manual() {
     lip.ttl_s = 15;       // plan section 2: maker orders rest 5-15 s (late fills are the toxic ones)
     lip.pull_touch_ticks = 2;   // plan section 5(a): a 2-tick touch move pulls both sides
     lip_ = std::make_unique<MakerEngine>("M1", cfg_.lip_series, env, lip);
+    // the LIP probe (lane P1, off until the operator turns it on): LIP-15's windows at 30 a side,
+    // two-sided in minutes 0-5 only (then only the reducing side), 40 windows a day, paused once
+    // its day is down $15 (plan section 5(a))
+    MakerParams probe = lip;
+    probe.size = 3000;
+    probe.two_sided_ms = 300000;
+    probe.window_cap = 40;
+    probe.lane_pause = 15 * 1000000LL;
+    probe.mo_after = 0;   // a measurement of share and payout, not the markout rule
+    auto probe_env = env;
+    probe_env.want = want("P1");
+    probe_env.markout = [this] { const auto m = markouts_->lane_mean("P1", "60s"); return std::make_pair(m.fills, m.mean); };
+    probe_ = std::make_unique<MakerEngine>("P1", cfg_.lip_series, probe_env, probe);
     // BAND 96-99 (lane M2): the weather highs first (deskd.band_series); no anchor; 5 a market,
     // $15 an event (a city's day), and it stops quoting once its day is down $20 (plan section 5)
     MakerParams band;
@@ -374,7 +387,7 @@ PreflightRow Deskd::shard_row(const rest::Snapshot& s, bool fresh) const {
   const auto v = cfg_.systematic_orders ? gw_->sys_view() : nullptr;
   if (!v) return {"SHARD", true, ""};
   constexpr Money kQuote = 5 * 10000;   // a 10-lot at 0.50, or the band's 5 at 0.97
-  const std::map<std::string, std::vector<std::string>> series = {{"M1", cfg_.lip_series}, {"M2", cfg_.band_series}};
+  const std::map<std::string, std::vector<std::string>> series = {{"M1", cfg_.lip_series}, {"P1", cfg_.lip_series}, {"M2", cfg_.band_series}};
   const auto now = now_ms();
   for (const auto& lane : v->lanes_on) {
     const auto it = series.find(lane);

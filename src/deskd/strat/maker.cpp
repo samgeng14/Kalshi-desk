@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include "deskd/app/log.h"
 #include "deskd/rest/state.h"
+#include "deskd/web/contract.h"
 
 namespace deskd {
 using json = nlohmann::json;
@@ -353,7 +354,10 @@ void MakerEngine::step(std::int64_t now) {
     // what stops new risk; the T-60 s flatten still goes
     const auto day = view->lane_day.find(lane_);
     std::string hold;
+    if (p_.window_cap > 0 && et_midnight_ms(now) != windows_day_) { windows_day_ = et_midnight_ms(now); windows_.clear(); }
     if (p_.lane_pause > 0 && day != view->lane_day.end() && day->second <= -p_.lane_pause) hold = "lane paused: its day is past the loss limit";
+    else if (p_.window_cap > 0 && static_cast<int>(windows_.size()) >= p_.window_cap && !windows_.count(tk))
+      hold = "done for today: " + std::to_string(windows_.size()) + " windows quoted";
     else if (p_.mo_after > 0 && env_.markout && env_.markout().first >= p_.mo_after && env_.markout().second < -p_.mo_floor)
       hold = "lane paused: its 60 s markout is below the floor";
     else if (m != snap->markets.end() && p_.event_cap > 0 && event_worst(*view, *snap, m->second.event_ticker) >= p_.event_cap)
@@ -444,6 +448,7 @@ void MakerEngine::step(std::int64_t now) {
         s.acted_ms = now;
         ++places_;
         if (w->second.ioc) ioc_ms_[tk] = active_ms_[tk] = now;
+        else if (p_.window_cap > 0) windows_.insert(tk);
         if (a.spot > 0 && !quote_spot_.count(tk)) quote_spot_[tk] = a.spot;
         if (book && !book->bids.empty() && !book->asks.empty() && !quote_touch_.count(tk))
           quote_touch_[tk] = {book->bids.front().px, book->asks.front().px};
