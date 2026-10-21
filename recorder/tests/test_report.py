@@ -103,6 +103,27 @@ class SpoolTest(Checks, unittest.TestCase):
         self.assertEqual((rep['last_24h']['gap_minutes'], rep['last_24h']['pass']), (18, False))  # 1.25%
         self.assertIn('FAIL', report.render(rep))
 
+    def test_torn_line_is_not_an_hour_of_gaps(self):
+        s = Store(self.dir, 3600, lambda m: None)
+        day0 = T0 + 2 * 3600 * 1_000_000   # 2026-11-06T00:00Z
+        for m in range(1440):
+            if m != 600:
+                s.write('kalshi_ws', ws(day0 + m * MIN + 1))
+        # killed at 10:00 mid-line, back 10 s later: the restart row is the outage
+        s.write('gaps', gap(day0 + 600 * MIN + 11_000_000, 'recorder', 'restart', day0 + 600 * MIN + 1,
+                            day0 + 600 * MIN + 11_000_000))
+        # the torn line, found when the 10:00 hour was compacted: its row spans the whole bucket
+        # (Store.note_compacted), which says where the line was, not that the hour was lost
+        s.write('gaps', gap(day0 + 661 * MIN, 'store', 'spool_torn', day0 + 600 * MIN, day0 + 660 * MIN))
+        s.close()
+        rep = report.build(self.dir, engine=None)
+        d = rep['days']['2026-11-06']
+        self.assertEqual((d['sources'], d['silent_ws'], d['any']), ({'recorder': 1}, 1, 1))
+        l24 = rep['last_24h']
+        self.assertEqual((l24['complete'], l24['gap_minutes'], l24['pass']), (True, 1, True))
+        self.assertEqual(rep['info'], {'store': 1})
+        self.assertIn('not gaps: store 1', report.render(rep))
+
     def test_gap_minutes(self):
         self.assertEqual(list(report.gap_minutes({'recv_us': 5 * MIN + 1})), [5])
         self.assertEqual(list(report.gap_minutes({'recv_us': 9 * MIN, 'from_us': 7 * MIN})), [7, 8, 9])

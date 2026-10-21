@@ -87,7 +87,8 @@ python3 -m recorder.report --data /var/lib/deskd-recorder --days 1 --json
 
 Minutes with a gap per source and day, minutes the socket recorded nothing in (`silent_ws`: a dead
 VM logs nothing, but leaves silence), their share of each day's recorded minutes, rows and bytes
-per table, and a PASS/FAIL for the last 24 hours. Parquet is read with pyarrow, else duckdb;
+per table, and a PASS/FAIL for the last 24 hours. REST fallback switches and torn spool lines are
+counted apart, not as gap minutes (the stop that tore a line is its restart row). Parquet is read with pyarrow, else duckdb;
 without either it counts the Parquet files from the manifest and says so.
 
 ## Tests

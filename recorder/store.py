@@ -35,6 +35,7 @@ SCHEMAS = {
                        ('expiration_value', 'string'), ('raw', 'string')],
     # every disconnect, sequence gap, refused subscription, failed discovery or poll, torn spool
     # line, clock step and restart; source names the feed, from_us/to_us the stretch when known
+    # (a spool_torn row's is the hour bucket the line was in: where it was, not an outage)
     'gaps': [('recv_us', 'int64'), ('source', 'string'), ('kind', 'string'), ('detail', 'string'),
              ('from_us', 'int64'), ('to_us', 'int64')],
     # a market's book by public REST (plan 5(d), and the fallback while the socket cannot
