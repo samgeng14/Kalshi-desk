@@ -776,7 +776,7 @@ def run(argv, league=None, prog=None, description=None):
     ap.add_argument("--self-test", action="store_true")
     a = ap.parse_args(argv)
     if a.self_test:
-        return self_test(("wcbb",) if league == "wcbb" else tuple(LEAGUES))
+        return self_test(("wcbb",) if league == "wcbb" else tuple(LEAGUES), prog)
     if league is None and a.write_synthetic:
         try:
             write_model(a.write_synthetic, synthetic_nba_model(), a.force)
@@ -1006,7 +1006,7 @@ def write_csv(path, rows, with_mid, with_ot=False, with_espn=False):
             w.writerow(out)
 
 
-def self_test(leagues=("wcbb", "nba")):
+def self_test(leagues=("wcbb", "nba"), prog="train_bball"):
     results = []
 
     def check(name, ok, detail=""):
@@ -1084,7 +1084,7 @@ def self_test(leagues=("wcbb", "nba")):
               n >= 10 and worst <= 1e-6 and err is None, f"{n} rows, worst {worst:.2e}" + (f"; {err}" if err else ""))
 
     failed = results.count(False)
-    print(f"train_bball self-test ({', '.join(leagues)}): {'ok' if not failed else f'FAILED {failed} of {len(results)}'}")
+    print(f"{prog} self-test: {'ok' if not failed else f'FAILED {failed} of {len(results)}'}")
     return 1 if failed else 0
 
 
