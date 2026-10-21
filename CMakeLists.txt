@@ -231,6 +231,7 @@ if(PYTHON3_EXE)
   add_test(NAME alpha-decay COMMAND ${PYTHON3_EXE} ${CMAKE_SOURCE_DIR}/tests/test_alpha_decay.py)
   add_test(NAME latency-report COMMAND ${PYTHON3_EXE} ${CMAKE_SOURCE_DIR}/tools/latency_report.py --self-test)
   add_test(NAME train-wcbb COMMAND ${PYTHON3_EXE} ${CMAKE_SOURCE_DIR}/tools/train_wcbb.py --self-test)
+  add_test(NAME replication COMMAND ${PYTHON3_EXE} ${CMAKE_SOURCE_DIR}/tools/replication.py --self-test)
   add_test(NAME scorecard COMMAND ${PYTHON3_EXE} ${CMAKE_SOURCE_DIR}/tools/scorecard.py --self-test)
   # The commodity replay's own proof that it cannot see the future: it builds its data in memory,
   # moves the reference after a chosen instant and checks no earlier probability changed.
