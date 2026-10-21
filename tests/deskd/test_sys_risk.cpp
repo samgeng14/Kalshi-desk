@@ -9,6 +9,8 @@
 //   - through place_sys: the lane budget, the ceiling and the group refuse just past their edge
 //     and not at it, an order counts only the part of it that grows its lane's position, and a
 //     reducing order at a full budget passes
+//   - the IOC lanes' $5 cost budget counts every fee charged: a rebate (a negative fee) is the
+//     lane's P&L but gives none of it back (decisions 6)
 #include <future>
 #include <mutex>
 #include <random>
@@ -328,9 +330,30 @@ void ceiling() {
     return v && v->used == 7000000 && v->ceiling == 7000000 && v->eff == 7000000;
   }));
 }
+
+// $3.00 and $2.50 charged to an IOC lane, $1.00 rebated to a quoting one: $4.50 net, $5.50 spent
+void rebates() {
+  auto ioc = lane_spec("I1", 10 * 10000);
+  ioc.style = "IOC";
+  Desk d({ioc, lane_spec("L1", 10 * 10000)}, 1000 * 10000);
+  CHECK(d.run({"I1", "L1"}));
+  CHECK(d.on_gw([&] {
+    auto& sys = *d.gw->sys_book();
+    const auto t = now_ms();
+    return sys.fill("I1", "SI1-1", A1, Side::BUY, 100, 4000, 3000000, t, "t-1") &&
+           sys.fill("I1", "SI1-2", A1, Side::SELL, 100, 4100, 2500000, t, "t-2") &&
+           sys.fill("L1", "SL1-1", B1, Side::BUY, 100, 4000, -1000000, t, "t-3");
+  }));
+  CHECK(d.until([&] { const auto v = d.gw->sys_view(); return v && v->fees == 5500000; }));   // hdr.cost used
+  const auto o = d.place("I1", "i-1", A1, Side::BUY, 4000, 100);
+  CHECK(o.code == "SYS_CEILING" && o.msg == "the IOC lanes' daily cost budget 5.0000 is spent");
+  CHECK(d.place("L1", "q-1", B1, Side::BUY, 3900, 100).code == "SENT");   // a quoting lane is not capped
+  CHECK(d.until([&] { return d.row("I1")["state"] == "CAPPED" && d.row("L1")["state"] == "ON"; }));
+  CHECK(d.row("I1")["fees"] == "5.5000" && d.row("I1")["cap_left"] == "0.0000" && d.row("L1")["fees"] == "-1.0000");
+}
 }  // namespace
 
 int main() {
-  same_numbers(); limits(); ceiling();
+  same_numbers(); limits(); ceiling(); rebates();
   return finish("deskd-sys-risk");
 }

@@ -1157,9 +1157,10 @@ void Gateway::sys_money(Micros* used, Micros* ceiling, Micros* eff) const {
   if (eff) *eff = e;
 }
 
+// a rebate (a negative fee) never gives the budget back (decisions 6): SysBook::Day::charged
 Micros Gateway::sys_fees() const {
   Micros f = 0;
-  for (const auto& l : sys_->lanes()) if (const auto* d = sys_->day(l.id)) f += d->fees;
+  for (const auto& l : sys_->lanes()) if (const auto* d = sys_->day(l.id)) f += d->charged;
   return f;
 }
 

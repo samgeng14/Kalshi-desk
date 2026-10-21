@@ -125,6 +125,9 @@ class SysBook {
     std::set<std::string> hit;          // cids with any fill today
     Qty ctrs = 0;
     Micros fees = 0, real = 0;          // real: realized P&L before fees
+    // the fees alone, each fill's max(0, fee): a rebate (a negative fee) is P&L in fees, but never
+    // gives back the IOC lanes' cost budget (decisions 6; contract hdr.cost)
+    Micros charged = 0;
     std::int64_t last_ms = 0;
     std::map<std::string, Inv> inv;     // by market
   };

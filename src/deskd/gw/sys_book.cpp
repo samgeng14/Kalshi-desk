@@ -83,6 +83,7 @@ bool SysBook::fill(const std::string& lane, const std::string& cid, const std::s
   }
   d.ctrs += count;
   d.fees += fee;
+  d.charged += std::max<Micros>(0, fee);
   life.fees += fee;
   d.last_ms = at;
   auto& inv = d.inv[ticker];
@@ -282,7 +283,7 @@ json SysBook::to_json(const Halt& halt, std::int64_t saved_ms) const {
     json inv = json::object();
     for (const auto& [tk, i] : d.inv) if (i.pos) inv[tk] = {i.pos, i.cost};
     lanes[lane] = {{"sent", d.sent}, {"fills", d.fills}, {"hit", d.hit}, {"ctrs", d.ctrs}, {"fees", d.fees},
-                   {"real", d.real}, {"last_ms", d.last_ms}, {"inv", inv}};
+                   {"charged", d.charged}, {"real", d.real}, {"last_ms", d.last_ms}, {"inv", inv}};
   }
   json lives = json::object();
   for (const auto& [lane, f] : lives_)
@@ -312,6 +313,8 @@ bool SysBook::restore(const json& j, std::int64_t day_start_ms, Halt* halt, std:
         d.hit = l.at("hit").get<std::set<std::string>>();
         d.ctrs = l.at("ctrs").get<Qty>();
         d.fees = l.at("fees").get<Micros>();
+        // a book saved before rebates were kept apart: every fee then was a charge
+        d.charged = l.contains("charged") ? l.at("charged").get<Micros>() : d.fees;
         d.real = l.at("real").get<Micros>();
         d.last_ms = l.at("last_ms").get<std::int64_t>();
       }

@@ -103,6 +103,30 @@ void settle_and_restore() {
   CHECK(!m.restore(json{{"v", 2}}, day, &back, &why));
 }
 
+// A rebate (a negative fee) is P&L, so the day's and the life's fees are net of it; the IOC lanes'
+// cost budget reads charged, each fill's max(0, fee) (decisions 6). Both read back; a book saved
+// before charged was kept takes its fees.
+void rebates() {
+  SysBook b;
+  const std::int64_t day = 1791000000000, t = day + 3600000;
+  b.roll(day);
+  CHECK(b.fill("M1", "SM1-1", "TK-A", Side::BUY, 1000, 4000, 70000, t, "tr-1"));
+  CHECK(b.fill("M1", "SM1-2", "TK-A", Side::SELL, 1000, 4100, -20000, t + 1, "tr-2"));   // a maker's rebate
+  CHECK(b.day("M1")->fees == 50000 && b.day("M1")->charged == 70000 && b.life("M1")->fees == 50000);
+  CHECK(b.day("M1")->real == 100000 && b.day_total({}) == 100000 - 50000);
+  const json saved = b.to_json({}, t + 2);
+  SysBook::Halt back;
+  std::string why;
+  SysBook c;
+  CHECK(c.restore(saved, day, &back, &why) && c.day("M1")->charged == 70000 && c.day("M1")->fees == 50000);
+  json old = saved;
+  old["lanes"]["M1"].erase("charged");
+  SysBook o;
+  CHECK(o.restore(old, day, &back, &why) && o.day("M1")->charged == 50000);
+  b.roll(day + 86400000);   // a new day's budget
+  CHECK(b.day("M1")->charged == 0 && b.day("M1")->fees == 0);
+}
+
 // default_lanes() with the retire rules the lane tracks give C1 and X1, at small counts
 std::vector<LaneSpec> ruled_lanes() {
   auto lanes = default_lanes();
@@ -349,7 +373,7 @@ void groups_of_markets() {
 }
 
 int main() {
-  lanes_and_groups(); lane_day(); settle_and_restore(); groups_of_markets();
+  lanes_and_groups(); lane_day(); settle_and_restore(); rebates(); groups_of_markets();
   life_counts(); retire_rules(); life_across_restart(); gated_and_venue();
   return finish("deskd-sys_book");
 }

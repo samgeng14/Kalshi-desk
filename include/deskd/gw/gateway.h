@@ -296,6 +296,7 @@ class Gateway {
   // the part of p that grows its lane's position in its market, after the lane's working orders
   // there on the same side (`pending`): 0 for a reducing order
   Qty sys_grows(const PlaceIntent& p, Qty pending) const;
+  // the IOC lanes' cost budget's measure (contract hdr.cost): the fees charged today, rebates left out
   std::int64_t sys_fees() const;
   void sync_snapshot();
 };
