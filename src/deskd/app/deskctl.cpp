@@ -9,6 +9,9 @@
 //                               kill does the same if deskd hangs"): cancel-all, every order
 //                               group triggered, then a batch cancel of anything still listed
 //                               resting; exit 0 once the cancel-all is confirmed and nothing rests
+//   deskctl lane-reset LANE --config FILE --data-dir DIR [--live]
+//                               a retired lane's life cleared (decisions 9), with deskd stopped:
+//                               exit 0 once DIR/systematic.json no longer holds it
 //
 // KILL reads the token the way the page refreshes it: GET / and take <meta name="desk-token">.
 // If deskd does not answer, deskctl says so and exits 1.
@@ -156,7 +159,7 @@ struct Direct {
 };
 
 struct DirectArgs {
-  std::string config, sim_url, sim_ca;
+  std::string config, sim_url, sim_ca, data_dir;
   bool live = false;
 };
 
@@ -298,37 +301,136 @@ int kill_direct(const DirectArgs& a) {
   return clean ? 0 : 1;
 }
 
+// ---- deskctl lane-reset ------------------------------------------------------------------------
+// A lane its kill rule retired stays off across restarts (gw/sys_book.h) until this clears its
+// life: its entry under "life" in DIR/systematic.json, the book gw saves (deskd --data-dir DIR;
+// tools/desk.py runs the paper desk on data/demo, the live one on data/prod). The next deskd
+// starts the lane with no trades, markouts or retirement, off until the operator turns it on.
+// Its open positions stay in the book, and its loss rule still counts them at the mark.
+//
+// deskd must be stopped: deskctl takes the account's lock (the config's env and lock_dir, as
+// kill --direct), which a running deskd holds, and rewrites the file as gw does (tmp + rename).
+int lane_reset(const std::string& lane, const DirectArgs& a) {
+  using namespace deskd;
+  DeskdConfig cfg;
+  try {
+    cfg = load_deskd_config(expand_home(a.config));
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "deskctl: %s\n", e.what());
+    return 2;
+  }
+  if (!AccountLock::env_ok(cfg.env)) {
+    std::fprintf(stderr, "deskctl: the config's env is \"%s\": \"demo\" (paper) or \"prod\" (live)\n", cfg.env.c_str());
+    return 2;
+  }
+  if ((cfg.env == "prod") != a.live) {
+    std::fprintf(stderr, "deskctl: %s\n", a.live ? "--live takes a production config (env \"prod\")" : "a production config needs --live");
+    return 2;
+  }
+  std::string err;
+  const bool default_dir = cfg.lock_dir.empty();
+  const std::string dir = default_dir ? AccountLock::default_dir(&err) : cfg.lock_dir;
+  std::unique_ptr<AccountLock> lock;
+  if (!dir.empty()) lock = AccountLock::acquire(dir, cfg.env, "deskctl lane-reset", default_dir, &err);
+  if (!lock) {
+    std::fprintf(stderr, "deskctl: LANE NOT RESET: no %s account lock (%s): stop deskd first\n", cfg.env.c_str(), err.c_str());
+    return 1;
+  }
+  const std::string file = expand_home(a.data_dir) + "/systematic.json";
+  std::ifstream in(file);
+  if (!in) {
+    std::fprintf(stderr, "deskctl: LANE NOT RESET: no saved Systematic book at %s\n", file.c_str());
+    return 1;
+  }
+  auto j = json::parse(in, nullptr, false);
+  in.close();
+  if (j.is_discarded() || !j.is_object() || j.value("v", 0) != 1) {
+    std::fprintf(stderr, "deskctl: LANE NOT RESET: %s is not a version 1 Systematic book\n", file.c_str());
+    return 1;
+  }
+  if (!j.contains("life") || !j["life"].is_object() || !j["life"].contains(lane)) {
+    std::string kept;
+    if (j.contains("life") && j["life"].is_object())
+      for (const auto& [id, f] : j["life"].items()) kept += (kept.empty() ? "" : " ") + id;
+    std::fprintf(stderr, "deskctl: LANE NOT RESET: %s holds no life for lane %s (lanes with one: %s)\n", file.c_str(),
+                 lane.c_str(), kept.empty() ? "none" : kept.c_str());
+    return 1;
+  }
+  // what it held, as far as it reads (a malformed entry, which would block deskd's restore, goes too)
+  const json f = j["life"][lane];
+  auto has = [&f](const char* k) { return f.is_object() && f.contains(k); };
+  auto num = [&](const char* k) { return has(k) && f[k].is_number_integer() ? f[k].get<long long>() : 0LL; };
+  if (has("retired") && f["retired"].is_boolean() && f["retired"].get<bool>())
+    std::printf("lane %s: retired at %lld (epoch ms): %s\n", lane.c_str(), num("retired_ms"),
+                has("retired_why") && f["retired_why"].is_string() ? f["retired_why"].get<std::string>().c_str() : "");
+  else
+    std::printf("lane %s: not retired\n", lane.c_str());
+  std::printf("cleared: %lld trade(s) since %lld (epoch ms), realized %s, fees %s, %lld fill(s) marked\n", num("trades"),
+              num("first_ms"), money_str(num("real") / 100).c_str(), money_str(num("fees") / 100).c_str(), num("mo_n"));
+  j["life"].erase(lane);
+  const std::string tmp = file + ".tmp";
+  {
+    std::ofstream out(tmp, std::ios::trunc);
+    out << j.dump();
+    out.flush();
+    if (!out) {
+      std::fprintf(stderr, "deskctl: LANE NOT RESET: cannot write %s\n", tmp.c_str());
+      return 1;
+    }
+  }
+  if (std::rename(tmp.c_str(), file.c_str()) != 0) {
+    std::fprintf(stderr, "deskctl: LANE NOT RESET: cannot replace %s\n", file.c_str());
+    std::remove(tmp.c_str());
+    return 1;
+  }
+  std::printf("lane %s reset: the next deskd starts it with a fresh life, off until it is turned on. Its open\n"
+              "positions stay in the book and its loss rule still counts them.\n", lane.c_str());
+  return 0;
+}
+
 void usage() {
   std::fprintf(stderr, "usage: deskctl [--port N] status|kill\n"
-                       "       deskctl kill --direct --config FILE [--live] [--sim URL --sim-ca FILE]\n");
+                       "       deskctl kill --direct --config FILE [--live] [--sim URL --sim-ca FILE]\n"
+                       "       deskctl lane-reset LANE --config FILE --data-dir DIR [--live]\n");
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
   int port = 8788;
-  std::string cmd;
-  bool direct = false;
+  std::string cmd, lane;
+  bool direct = false, port_set = false;
   DirectArgs d;
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
-    if (a == "--port" && i + 1 < argc) port = std::atoi(argv[++i]);
+    if (a == "--port" && i + 1 < argc) { port = std::atoi(argv[++i]); port_set = true; }
     else if (a == "--direct") direct = true;
     else if (a == "--live") d.live = true;
     else if (a == "--config" && i + 1 < argc) d.config = argv[++i];
+    else if (a == "--data-dir" && i + 1 < argc) d.data_dir = argv[++i];
     else if (a == "--sim" && i + 1 < argc) d.sim_url = argv[++i];
     else if (a == "--sim-ca" && i + 1 < argc) d.sim_ca = argv[++i];
     else if (a == "-h" || a == "--help") {
       usage();
       return 0;
     } else if (cmd.empty()) cmd = a;
+    else if (cmd == "lane-reset" && lane.empty()) lane = a;
     else {
       usage();
       return 2;
     }
   }
+  // lane-reset names its lane, the desk's config and its data dir (no default: never data/
+  // by accident), and talks to no deskd
+  if (cmd == "lane-reset") {
+    if (lane.empty() || d.config.empty() || d.data_dir.empty() || direct || port_set || !d.sim_url.empty() || !d.sim_ca.empty()) {
+      usage();
+      return 2;
+    }
+    return lane_reset(lane, d);
+  }
   if (port <= 0 || port > 65535 || (cmd != "status" && cmd != "kill") || (direct && cmd != "kill") ||
-      (!direct && (d.live || !d.config.empty() || !d.sim_url.empty()))) {
+      (!direct && (d.live || !d.config.empty() || !d.sim_url.empty())) || !d.data_dir.empty()) {
     usage();
     return 2;
   }

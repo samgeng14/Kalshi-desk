@@ -431,7 +431,7 @@ endfunction()
 #            snapshot and replies checked by contract.js itself (node), KILL with gw frozen and
 #            with send-cx's inbox full
 #   process  the real binaries: a second deskd refused (also from another working directory),
-#            SIGTERM, deskctl status and kill
+#            SIGTERM, deskctl status, kill and lane-reset
 deskd_pure_test(bus)
 deskd_pure_test(ops)
 deskd_pure_test(web)
@@ -533,9 +533,10 @@ deskd_fake_test(runtime_manual)
 deskd_fake_test(pyth)
 # fees: gw/fees.h against the fake's model_fee and charge_fee, at the fake's own balance precision
 deskd_fake_test(fees)
-# sys_gate: gw's lane gates, retirement (LaneMarkout, why RETIRED) and event cap
+# sys_gate: gw's lane gates, retirement (LaneMarkout, why RETIRED, deskctl lane-reset) and event cap
 deskd_fake_test(sys_gate)
 add_dependencies(deskd-test-sender deskctl)   # its deskctl kill --direct case runs the binary
+add_dependencies(deskd-test-sys_gate deskctl)   # its lane-reset case runs the binary
 # The Systematic soak (tests/deskd/soak.cpp): 60 s under ctest; DESKD_SOAK_SECONDS=14400 for the
 # plan's 4 hours, in a build configured with -DDESKD_TSAN=ON.
 add_executable(deskd-soak tests/deskd/soak.cpp)

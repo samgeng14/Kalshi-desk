@@ -37,6 +37,12 @@ everything at the exchange with the desk's own key (for LIVE: the prod config an
 only while the lock says "deskd LIVE"). `python3 tools/scorecard.py` (or `scorecard.py live`) prints
 each lane's day and the plan's lane rules.
 
+A lane its kill rule retired stays off across restarts (the lane row says why, a CRIT alert said
+when, and turning it on is refused). With that desk stopped, `build-deskd/deskctl lane-reset C1
+--config ~/.kalshi/deskd-demo.json --data-dir data/demo` gives it a fresh life (for LIVE: the prod
+config, `--data-dir data/prod` and `--live`). Its open positions stay in the book, and its loss limit
+still counts them.
+
 Women's college basketball (KXNCAAWBGAME): `python3 tools/train_wcbb.py --panel FILE.csv` fits
 the in-game model and writes `models/wcbb_logit_v1.json` (the panel's columns and the pandas
 one-liner that makes it are in the script's docstring; `docs/wcbb_model.md` is the file format).

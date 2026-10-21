@@ -4,13 +4,14 @@
 //     off; its orders are refused LANE_OFF and never reach the venue (decisions 12)
 //   - a lane whose retire rule fires (its fill from the account read, its markouts from strat as
 //     LaneMarkout) is retired: its working order cancelled with why RETIRED, a CRIT alert, LaneSet
-//     on refused, its orders LANE_OFF; across a restart it stays so
+//     on refused, its orders LANE_OFF; across a restart it stays so, until deskctl lane-reset
 //   - a lane's event cap (LaneSpec::event_cap) counts what it holds and works in one event, and
 //     never refuses a reducing order
 // The ord and lane rows gw published, and the replies the web would send, checked by
 // contract.js itself (node): RETIRED is a contract WHY.
 #include <csignal>
 #include <fstream>
+#include <iterator>
 #include <mutex>
 #include <nlohmann/json.hpp>
 #include "deskd/app/log.h"
@@ -226,7 +227,8 @@ void gated() {
 }
 
 // A lane retired by its rule (MARKOUT after 1 trade, 50 marked at 300 s, mean <= 0): working
-// order cancelled RETIRED, CRIT, refused on and LANE_OFF; kept across a restart.
+// order cancelled RETIRED, CRIT, refused on and LANE_OFF; kept across a restart; cleared only by
+// deskctl lane-reset with gw stopped.
 void retired() {
   TempDir dir;
   auto l=lane_spec("R1");
@@ -276,6 +278,26 @@ void retired() {
     CHECK(d.until([&]{ return d.last("lane","id","R1")["why"]=="retired: 1 trades, mean net 300s markout -0.0100 over 50 marked"; }));
     const auto r=d.lane("R1",true);
     CHECK(r.code=="BAD_REQUEST" && r.msg.rfind("lane R1 is retired: ",0)==0);
+  }
+  // deskctl lane-reset, gw stopped (it takes the account lock a running deskd holds)
+  const std::string cfg=dir.file("desk.json");
+  std::ofstream(cfg)<<json{{"env","demo"},{"deskd",{{"lock_dir",dir.path}}}}.dump();
+  const std::string cmd=std::string("\"")+DESKCTL_BIN+"\" lane-reset R1 --config \""+cfg+"\" --data-dir \""+dir.path+
+                        "\" >\""+dir.file("reset.out")+"\" 2>&1";
+  CHECK(std::system(cmd.c_str())==0);
+  {
+    std::ifstream in(dir.file("reset.out"));
+    const std::string out((std::istreambuf_iterator<char>(in)),std::istreambuf_iterator<char>());
+    CHECK(out.find("lane R1: retired at ")!=std::string::npos && out.find("lane R1 reset")!=std::string::npos);
+  }
+  {
+    Desk d({l},file);
+    const auto r=d.lane("R1",true);   // a fresh life: it may be turned on again
+    CHECK(r.code.empty());
+    if(r.code.empty()) {
+      const auto row=json::parse(r.lane);
+      CHECK(row["on"]==true && row["why"]=="STOP");
+    }
   }
 }
 
