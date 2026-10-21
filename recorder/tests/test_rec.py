@@ -229,6 +229,49 @@ class RecorderListsTest(unittest.TestCase):
         self.assertEqual(len(self.r.backfill.windows), 1)
         self.assertEqual(self.r.backfill.windows[0][2], 'restart')
 
+    def test_restart_starts_at_the_socket_last_frame(self):
+        # the socket dropped 150 s ago; until the watchdog killed the recorder 30 s ago it went on
+        # writing disconnect rows on its backoff and REST books
+        st = self.r.store
+        drop = int((self.now - 150) * 1e6)
+        st.write('kalshi_ws', {'recv_us': drop, 'mono_us': 0, 'conn': 1, 'type': 'trade', 'sid': 2, 'seq': 9,
+                               'ticker': None, 'raw': '{}'})
+        for d in (0, 1, 3, 7, 15, 31, 61, 91):
+            st.write('gaps', {'recv_us': drop + d * 1_000_000, 'source': 'kalshi_ws', 'kind': 'disconnect',
+                              'detail': '', 'from_us': drop, 'to_us': None})
+        st.write('kalshi_rest_books', {'recv_us': drop + 120_000_000, 'kind': 'top', 'ticker': 'X'})
+        st.flush()
+        self.r.note_restart()
+        st.flush()
+        g = [x for x in spooled(self.dir.name, 'gaps') if x['kind'] == 'restart']
+        self.assertEqual(g[0]['from_us'], drop)                  # the whole stretch since the socket's last frame
+        self.assertIn('not recording for 30 s', g[0]['detail'])
+        self.assertEqual(self.r.backfill.windows, [(drop - polls.TradeBackfill.PAD_US,
+                                                    g[0]['to_us'] + polls.TradeBackfill.PAD_US, 'restart')])
+
+    def test_unread_backfill_windows_survive_a_restart(self):
+        # a run restarted 10 minutes ago after an hour's outage, had a sequence gap on trades, and
+        # was killed before either window was read
+        st = self.r.store
+        self.r.backfill.add(int((self.now - 3600) * 1e6), int((self.now - 600) * 1e6), 'restart')
+        self.r.backfill.add(int((self.now - 400) * 1e6), int((self.now - 390) * 1e6), 'seq_gap')
+        st.write('kalshi_ws', {'recv_us': int((self.now - 30) * 1e6), 'mono_us': 0, 'conn': 2, 'type': 'trade',
+                               'sid': 2, 'seq': 10, 'ticker': None, 'raw': '{}'})
+        st.flush()
+        r2 = Recorder(self.s, st)
+        r2.note_restart()
+        got = polls.merge_windows(r2.backfill.windows)
+        pad = polls.TradeBackfill.PAD_US
+        self.assertEqual([(a, w) for a, _, w in got], [(int((self.now - 3600) * 1e6) - pad, 'restart'),
+                                                      (int((self.now - 400) * 1e6) - pad, 'seq_gap'),
+                                                      (int((self.now - 30) * 1e6) - pad, 'restart')])
+        # once read, nothing is left to queue again
+        r2.backfill.venue, _ = fake_venue(lambda route, p: {'trades': [], 'cursor': ''})
+        asyncio.run(r2.backfill.drain())
+        r3 = Recorder(self.s, st)
+        r3.note_restart()
+        self.assertEqual([w for _, _, w in r3.backfill.windows], ['restart'])
+
     # ---- a restart's trade backfill: the markets that were recordable while it was down -------
     STATUS = {'active': 'open', 'initialized': 'unopened', 'closed': 'closed', 'determined': 'closed',
               'settled': 'settled', 'finalized': 'settled'}

@@ -21,12 +21,14 @@ What it records (`rec.py`):
   the whole book of those whose top moved in the last 5 minutes), and every recorded book once the
   socket's book subscription has been missing 5 minutes (the day-one fallback); trades over every
   window the socket may have missed (a disconnect, a sequence gap on trades, a restart) and every
-  hour; incentive programs hourly; every open market once a day.
+  hour, for every market recordable in the window (one that closed while the recorder was down
+  too), a window not read before a stop read after the restart; incentive programs hourly; every
+  open market once a day.
 - ESPN's and NCAA.com's scoreboards (`scores.py`) every 4 s while a game is on, each change of
   state or score written once with the local time it was first seen.
 - A gaps table: disconnects and resumptions, sequence gaps, refused subscriptions, failed
-  discovery and polls (one row spanning each outage), clock steps, restarts (from the last row on
-  disk), torn spool lines.
+  discovery and polls (one row spanning each outage), clock steps, restarts (from the socket's
+  last frame on disk), torn spool lines.
 
 `upload.py` sends finished hours to Cloudflare R2, verified by Content-MD5, on its own hourly timer.
 
@@ -35,7 +37,8 @@ What it records (`rec.py`):
 <data>/parquet/<table>/date=YYYY-MM-DD/<table>-<hour>.parquet
 <data>/manifest.jsonl                  one row per Parquet file (rows, time range, sha256)
 <data>/uploaded.jsonl                  one row per verified upload
-<data>/state/recorder.json             the day's control picks, the day of the last daily sweep
+<data>/state/recorder.json             the day's control picks, the day of the last daily sweep,
+                                       the trade backfill windows not yet read
 ```
 
 | Table | One row per | Times |

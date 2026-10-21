@@ -259,7 +259,8 @@ class Recorder:
         self.changed = None
         self.rest_books = polls.RestBooks(self.book_venue, self.store, self.gap, self.rest_listing,
                                           settings.rest_book_s, settings.rest_book_hot_s)
-        self.backfill = polls.TradeBackfill(self.venue, self.store, self.gap, self.recorded_between)
+        self.backfill = polls.TradeBackfill(self.venue, self.store, self.gap, self.recorded_between,
+                                            save=self.save_backfill)
         feeds = score_feeds(settings)
         self.scores = scores.Scoreboards(feeds, self.store, self.gap, settings.scores_s,
                                          settings.scores_idle_s) if feeds else None
@@ -720,15 +721,33 @@ class Recorder:
         except Exception as e:
             log('healthchecks: %s' % short(e))
 
+    def save_backfill(self, windows):
+        try:
+            self.state.set('backfill', [list(w) for w in windows])
+        except OSError as e:   # a backfill window lost on a restart is a smaller harm than a stop
+            log('state: the backfill windows not saved: %s' % short(e))
+
     def note_restart(self):
-        """A restart is a gap: from the newest row on disk (read before this run writes any) to
-        now, with its trades backfilled. Nothing on a new data directory."""
-        last = self.store.last_recv_us()
-        if last is None:
-            return
+        """A restart is a gap: from the socket's last frame on disk (read before this run writes
+        any) to now, with its trades backfilled; the windows a previous run queued and never read
+        are queued again. The socket's last frame, not the newest row of any table: with the
+        socket down the recorder goes on writing disconnect rows, REST books and scores until the
+        watchdog kills it, and the trades of that stretch were never on the socket. (Any table's
+        newest row when the socket left none; nothing on a new data directory.)"""
         t = now_us()
-        self.gap('recorder', 'restart', 'not recording for %.0f s (stopped, crashed or rebooted)' % ((t - last) / 1e6),
-                 from_us=last, to_us=t)
+        n = self.backfill.restore(self.state.get('backfill'), t)
+        if n:
+            log('backfill: %d window(s) a previous run had not read, queued again' % n)
+        newest = self.store.last_recv_us()
+        if newest is None:
+            return
+        last = self.store.last_recv_us('kalshi_ws') or newest
+        detail = 'not recording for %.0f s (stopped, crashed or rebooted)' % ((t - newest) / 1e6)
+        if newest - last > 5_000_000:
+            detail += '; the socket silent for %.0f s' % ((t - last) / 1e6)
+        self.gap('recorder', 'restart', detail, from_us=last, to_us=t)
+        # trades back to the socket's last frame; two days at most (a socket down for days)
+        last = max(last, t - polls.TradeBackfill.KEEP_US)
         self.backfill.add(last, t, 'restart')
         # the first listing of each series reads the closed and settled rows back to the window's
         # start, so the backfill knows the markets that closed while it was down (a day at most:

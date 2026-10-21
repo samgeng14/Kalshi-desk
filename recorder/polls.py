@@ -242,17 +242,23 @@ class TradeBackfill:
     """GET /markets/trades over windows the socket may have missed: a disconnect (from the last
     frame before it to the resubscription), a sequence gap on the trade subscription, a restart,
     and every hour. Read for each market recorded during the window (tickers_for), each print
-    written once: overlapping windows and repeated hours return the same trade_ids."""
+    written once: overlapping windows and repeated hours return the same trade_ids.
+
+    save(windows), when given, is called with every window queued or not yet read each time
+    that changes, so a run killed before it read them (a watchdog kill, a redeploy mid-drain)
+    leaves them for the next run's restore()."""
 
     PAD_US = 60_000_000          # either side of a window: the venue's and our clocks differ
     KEEP_US = 2 * 86400 * 1_000_000
 
-    def __init__(self, venue, store, gap, tickers_for, max_pages=20):
+    def __init__(self, venue, store, gap, tickers_for, max_pages=20, save=None):
         self.venue = venue
         self.store = store
         self.tickers_for = tickers_for
         self.max_pages = max_pages
+        self.save = save
         self.windows = []
+        self.reading = []        # the running drain's windows not finished yet
         self.seen = {}           # trade_id -> when it was recorded (us), forgotten KEEP_US later
         self.rows = 0
         self.outage = Outage(gap, 'kalshi_trades_rest')
@@ -261,6 +267,29 @@ class TradeBackfill:
         if from_us is None or to_us is None or to_us < from_us:
             return
         self.windows.append((from_us - self.PAD_US, to_us + self.PAD_US, reason))
+        self.saved()
+
+    def pending(self):
+        """Every window queued or not yet read, merged."""
+        return merge_windows(self.reading + self.windows)
+
+    def saved(self):
+        if self.save is not None:
+            self.save(self.pending())
+
+    def restore(self, windows, now):
+        """Queue again the windows a previous run saved and never read (already padded); one
+        that ended over KEEP_US ago, or is unreadable, is dropped. How many were queued."""
+        n = 0
+        for w in windows if isinstance(windows, list) else []:
+            try:
+                a, b, why = int(w[0]), int(w[1]), str(w[2])
+            except (TypeError, ValueError, IndexError, KeyError):
+                continue
+            if a <= b and b >= now - self.KEEP_US:
+                self.windows.append((a, b, why))
+                n += 1
+        return n
 
     def seed(self, rows):
         """Trade ids already recorded (the table's recent rows on disk), so a restart does not
@@ -302,11 +331,17 @@ class TradeBackfill:
         it) and the failure is raised for the outage row."""
         todo, self.windows = merge_windows(self.windows), []
         for i, (a, b, reason) in enumerate(todo):
+            self.reading = todo[i:]
+            self.saved()             # the ones before are read
             try:
                 await self.window(a, b, reason)
             except Exception:
+                self.reading = []
                 self.windows.extend(todo[i:])
+                self.saved()
                 raise
+        self.reading = []
+        self.saved()
         self.prune(now_us())
 
 

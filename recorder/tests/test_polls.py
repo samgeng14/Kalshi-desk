@@ -220,6 +220,31 @@ class BackfillTest(Base):
             asyncio.run(bf.drain())
         self.assertEqual(len(bf.windows), 1)   # tried again on the next pass
 
+    def test_unread_windows_saved(self):
+        saves, at_read = [], {}
+
+        def handler(route, p):
+            at_read[p['min_ts']] = saves[-1]     # what a kill at this moment would leave on disk
+            if p['min_ts'] == 940:
+                raise OSError('503')
+            return {'trades': [], 'cursor': ''}
+        venue, _ = fake_venue(handler)
+        bf = polls.TradeBackfill(venue, self.store, gap_log(), lambda a, b: {UCONN}, save=saves.append)
+        bf.add(100_000_000, 200_000_000, 'restart')
+        bf.add(1000_000_000, 1010_000_000, 'seq_gap')
+        w1, w2 = (40_000_000, 260_000_000, 'restart'), (940_000_000, 1070_000_000, 'seq_gap')
+        self.assertEqual(saves[-1], [w1, w2])
+        with self.assertRaises(OSError):
+            asyncio.run(bf.drain())
+        self.assertEqual(at_read, {40: [w1, w2], 940: [w2]})   # the first read is off the list
+        self.assertEqual(saves[-1], [w2])                          # the failed one stays
+        # a new run queues again what was saved, not what is two days old or unreadable
+        bf2 = polls.TradeBackfill(venue, self.store, gap_log(), lambda a, b: {UCONN})
+        now = 3 * 86400 * 1_000_000
+        self.assertEqual(bf2.restore([list(w2), [now - 10, now - 5, 'hourly'], ['x'], [5, 1, 'bad']], now), 1)
+        self.assertEqual(bf2.windows, [(now - 10, now - 5, 'hourly')])
+        self.assertEqual(bf2.restore(None, now), 0)
+
 
 class SweepTest(Base):
     def test_incentives(self):

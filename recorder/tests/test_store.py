@@ -165,6 +165,21 @@ class ReadBackTest(unittest.TestCase):
         self.assertEqual(State(self.root, logs.append).get('x'), None)   # unreadable: start empty, say so
         self.assertTrue(logs)
 
+    def test_last_recv_of_one_table(self):
+        s = Store(self.root, 3600, lambda m: None)
+        s.write('kalshi_ws', row(T0 + 10, 1))
+        s.write('gaps', {'recv_us': T0 + 20, 'source': 'x', 'kind': 'y', 'detail': '', 'from_us': None, 'to_us': None})
+        s.close()
+        self.assertEqual(s.last_recv_us('kalshi_ws'), T0 + 10)   # the socket's last frame, not the newest row
+        self.assertEqual(s.last_recv_us(), T0 + 20)
+        self.assertIsNone(s.last_recv_us('espn_scores'))
+        # a compacted hour counts by its manifest row, of its own table only
+        with open(os.path.join(self.root, 'manifest.jsonl'), 'w') as f:
+            f.write(json.dumps({'table': 'kalshi_ws', 't_max_us': T0 + 15}) + '\n')
+            f.write(json.dumps({'table': 'gaps', 't_max_us': T0 + 99}) + '\n')
+        self.assertEqual(s.last_recv_us('kalshi_ws'), T0 + 15)
+        self.assertEqual(s.last_recv_us(), T0 + 99)
+
 
 if __name__ == '__main__':
     unittest.main()

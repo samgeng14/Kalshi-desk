@@ -234,17 +234,19 @@ class Store:
                 'from_us': start_us, 'to_us': start_us + self.bucket_us}
 
     # ---- reading back ------------------------------------------------------------------------
-    def last_recv_us(self):
-        """The newest row on disk, any table: the last complete line of each spool (only its
-        tail is read; a spool holds an hour of frames) and the manifest's newest file. None on
-        a new data directory. A restart reads this before writing anything, to log how long
-        the recorder was down."""
+    def last_recv_us(self, table=None):
+        """The newest row on disk, of one table or (None) of any: the last complete line of each
+        spool (only its tail is read; a spool holds an hour of frames) and the manifest's newest
+        file. None when there is none (a new data directory). A restart reads this before
+        writing anything: how long the recorder was down, and since when the socket was."""
         last = None
-        for path in glob.glob(os.path.join(self.root, 'spool', '*', '*.jsonl')):
+        for path in glob.glob(os.path.join(self.root, 'spool', table or '*', '*.jsonl')):
             t = _last_recv(path)
             if t is not None and (last is None or t > last):
                 last = t
         for e in read_manifest(self.root):
+            if table is not None and e.get('table') != table:
+                continue
             t = e.get('t_max_us')
             if isinstance(t, int) and (last is None or t > last):
                 last = t
@@ -304,8 +306,8 @@ def _last_recv(path, tail=65536):
 
 class State:
     """A few facts that must survive a restart (the day's control picks, the day the daily sweep
-    ran), in <data>/state/recorder.json, replaced atomically. Losing it costs a repeat sweep or a
-    re-pick, never data."""
+    ran, the trade backfill windows not yet read), in <data>/state/recorder.json, replaced
+    atomically. Losing it costs a repeat sweep, a re-pick or a backfill window, never data."""
 
     def __init__(self, root, log=print):
         self.path = os.path.join(root, 'state', 'recorder.json')
