@@ -25,16 +25,22 @@ The queue (the rules chosen):
   - placed, an order joins the back of the visible queue at its price: the level's size is ahead
     of it, nothing behind it.
   - size added at its price joins behind it.
-  - size removed at its price is an execution when a print at that price accounts for it (a
-    removal and a print at one price within 1 s of each other, in either order, are one
-    execution), else a cancel. Cancels come from the BACK of the queue first: those behind the
+  - size removed at its price is an execution as far as a print accounts for it, else a cancel.
+    A first pass over the frames pairs each print with the removals at its price and side
+    received within 1 s of it, before or after: one of exactly the print's count first, then the
+    nearest in time. A removal's unpaired part is a cancel, applied as it is received, to the
+    queue as it stands then. Cancels come from the BACK of the queue first: those behind the
     order go before any ahead of it, so it moves up only once nobody is behind it.
     --cancel-front assumes the other: cancels come from the front, ahead of it first.
   - a print at its price fills the queue in order: the size ahead of it first, then the order,
     then those behind. A print through its price (below a bid, above an ask) fills it up to the
-    print's count: that price traded only once the order's level was used up. A print that a
-    removal from before the order was placed accounts for is not counted for it.
-  - only prints fill: an ask that comes down to a resting bid without a print does not fill it.
+    print's count: that price traded only once the order's level was used up. The part of a print
+    paired with a removal received before the order was placed is not counted for it: its queue
+    was measured without that size.
+  - an order arriving on the other side at or through its price with no print (an ask added at
+    or below a resting bid, a bid at or above a resting ask) fills it at its own price, up to the
+    size that arrived: no real order stood at that price (the real book would have crossed), so
+    the arrival would have traded with ours first. What a partial fill leaves rests on, and earns.
   - a dropped book (a gap, a disconnect) ends its orders where they stand; each counts for the
     caps it had reached.
 
@@ -88,7 +94,7 @@ S = 1_000_000
 PLACEMENTS = (('join', 0), ('improve', 1), ('behind1', -1), ('behind2', -2))   # ticks toward the other side
 CAPS = (5, 15, 60)
 HORIZONS = (10, 60)
-MATCH_US = 1_000_000   # a removal and a print at one price this close are one execution
+MATCH_US = 1_000_000   # a print pairs with the removals at its price received this close to it
 # The plan's LIP-15 lane runs on fee-free series: section 1's "seven fee-free non-crypto series",
 # named in docs/edge_results.json (the self-test checks this copy against it).
 PLAN_FEE_FREE = ('KXEURUSD15M', 'KXGBPUSD15M', 'KXUSDJPY15M', 'KXNATGAS15M', 'KXPLATINUM15M', 'KXPALLADIUM15M',
@@ -171,6 +177,60 @@ def markout(bid, px, mid2):
 
 
 # ---- the replay -----------------------------------------------------------------------------
+def frame_key(r):
+    return (r.get('recv_us'), r.get('conn'), r.get('sid'), r.get('seq'))
+
+
+def pair_prints(data, keep):
+    """The first pass over the frames: each print paired with the removals at its price, on the
+    side it hit, received less than MATCH_US before or after it: one of exactly the print's count
+    first, then the nearest in time; prints in the order received. (executed: a removal's frame ->
+    the count prints account for; paired: a print's frame -> [(the removal's recv_us, count)])."""
+    removals, waiting, executed, paired = {}, deque(), {}, {}
+
+    def settle(t, key, level, q):
+        cands = [r for r in removals.get(level, ()) if r[2] and abs(r[0] - t) < MATCH_US]
+        cands.sort(key=lambda r: (r[2] != q, abs(r[0] - t)))
+        for r in cands:
+            if not q:
+                break
+            x = min(q, r[2])
+            r[2] -= x
+            q -= x
+            executed[r[1]] = executed.get(r[1], 0) + x
+            paired.setdefault(key, []).append((r[0], x))
+
+    for r in lj.rows(data, 'kalshi_ws'):
+        t, typ = r.get('recv_us'), r.get('type')
+        if not isinstance(t, int) or isinstance(t, bool):
+            continue
+        while waiting and waiting[0][0] + MATCH_US <= t:   # every removal it could pair with is in
+            settle(*waiting.popleft())
+        tk = r.get('ticker')
+        if typ not in ('orderbook_delta', 'trade') or not tk or not keep(tk):
+            continue
+        try:
+            msg = json.loads(r.get('raw') or '{}').get('msg')
+        except (ValueError, AttributeError):
+            continue
+        if not isinstance(msg, dict):
+            continue
+        if typ == 'trade':
+            px, q, side = lj.px_of(msg.get('yes_price_dollars')), lj.qty_of(msg.get('count_fp')), msg.get('taker_side')
+            if px is not None and q and q > 0 and side in ('yes', 'no'):
+                waiting.append((t, frame_key(r), (tk, side == 'no', px), q))
+            continue
+        side, px, d = msg.get('side'), lj.px_of(msg.get('price_dollars')), lj.qty_of(msg.get('delta_fp'), True)
+        if side in ('yes', 'no') and px is not None and d is not None and d < 0:
+            level = removals.setdefault((tk, side == 'yes', px if side == 'yes' else UNIT - px), deque())
+            while level and level[0][0] < t - 3 * MATCH_US:
+                level.popleft()
+            level.append([t, frame_key(r), -d])
+    while waiting:
+        settle(*waiting.popleft())
+    return executed, paired
+
+
 class Order:
     __slots__ = ('place', 'bid', 'tk', 'px', 't0', 'size', 'left', 'ahead', 'behind', 'fills', 'lip', 'lost')
 
@@ -185,11 +245,13 @@ class Order:
 
 class Replay(lj.Replay):
     now = 0
+    cur = None   # the frame being applied (frame_key)
 
     def row(self, r):
         t = r.get('recv_us')
         if isinstance(t, int):
             self.now = t
+        self.cur = frame_key(r)
         super().row(r)
 
 
@@ -198,7 +260,7 @@ class Sim:
         self.data, self.series, self.size, self.every, self.front = data, series, size * CT, every * S, front
         self.markets = lj.load_markets(data)
         self.terms = lj.Terms(lj.load_programs(data), self.markets)
-        mine = lambda tk: lj.series_of(tk, self.markets) == series   # noqa: E731
+        self.mine = mine = lambda tk: lj.series_of(tk, self.markets) == series   # noqa: E731
         self.rp = Replay(keep=mine)
         self.rp.on_drop, self.rp.on_level, self.rp.on_trade = self.dropped, self.level, self.trade
         self.wins, self.lip_terms, self.lip_src = [], {}, Counter()
@@ -228,7 +290,7 @@ class Sim:
         self.grids = {}
         self.live = {}          # ticker -> its live orders
         self.orders = []        # every order placed
-        self.levels = {}        # (ticker, bid, px) -> (removals not yet explained, prints not yet seen removed)
+        self.executed, self.paired = {}, {}   # pair_prints()
         self.timers = []
         self.ntimer = 0
         self.active, self.nxt = {}, 0
@@ -267,8 +329,6 @@ class Sim:
         for o in list(self.live.get(tk, ())):
             o.lost = max(0, self.rp.now - o.t0)
             self.finish(o)
-        for key in [k for k in self.levels if k[0] == tk]:
-            del self.levels[key]
 
     # -- the queue
     def cancel(self, o, c):
@@ -281,57 +341,35 @@ class Sim:
             o.behind -= b
             o.ahead -= min(o.ahead, c - b)
 
-    def level_state(self, tk, bid, px, now):
-        """The level's unexplained removals and unmatched prints, those over MATCH_US old settled
-        first: an old removal becomes a cancel for each order placed before it, an old print is
-        forgotten."""
-        st = self.levels.get((tk, bid, px))
-        if st is None:
-            st = self.levels[(tk, bid, px)] = (deque(), deque())
-        pend, prints = st
-        while pend and now - pend[0][0] >= MATCH_US:
-            t, c = pend.popleft()
-            for o in self.live.get(tk, ()):
-                if o.bid == bid and o.px == px and o.t0 < t:
-                    self.cancel(o, c)
-        while prints and now - prints[0][0] >= MATCH_US:
-            prints.popleft()
-        return st
-
     def level(self, tk, bid, px, before, after, t):
-        pend, prints = self.level_state(tk, bid, px, t)
-        if after > before:
-            for o in self.live.get(tk, ()):
-                if o.bid == bid and o.px == px:
-                    o.behind += after - before
+        live = self.live.get(tk)
+        if not live:
             return
-        d = before - after
-        while d and prints:   # the removal of a print already seen
-            x = min(d, prints[0][1])
-            d -= x
-            prints[0][1] -= x
-            if not prints[0][1]:
-                prints.popleft()
-        if d:
-            pend.append([t, d])
+        if after > before:
+            d = after - before
+            for o in list(live):
+                if o.bid == bid:
+                    if o.px == px:
+                        o.behind += d   # joins behind it
+                elif (px <= o.px) if o.bid else (px >= o.px):
+                    self.fill(o, min(o.left, d), t)   # the other side at or through it, no print
+            return
+        c = before - after - self.executed.get(self.rp.cur, 0)   # what no print accounts for
+        if c > 0:
+            for o in live:
+                if o.bid == bid and o.px == px:
+                    self.cancel(o, c)   # against the queue as it stands now
 
     def trade(self, tk, p, q, taker_yes, t):
         bid = not taker_yes   # a taker selling YES hits the bids
-        pend, prints = self.level_state(tk, bid, p, t)
-        seen, left = [], q    # removals already in the book that this print explains
-        while left and pend:
-            x = min(left, pend[0][1])
-            seen.append((pend[0][0], x))
-            left -= x
-            pend[0][1] -= x
-            if not pend[0][1]:
-                pend.popleft()
-        if left:
-            prints.append([t, left])
-        for o in list(self.live.get(tk, ())):
+        live = self.live.get(tk)
+        if not live:
+            return
+        pre = self.paired.get(self.rp.cur, ())
+        for o in list(live):
             if o.bid != bid:
                 continue
-            v = q - sum(x for ts, x in seen if ts <= o.t0)   # what happened before the order is not its
+            v = q - sum(x for tr, x in pre if tr <= o.t0)   # removed before the order was placed: not in its queue
             if v <= 0:
                 continue
             if o.px == p:
@@ -409,6 +447,7 @@ class Sim:
                         o.lip[ci] += usd
 
     def run(self):
+        self.executed, self.paired = pair_prints(self.data, self.mine)
         self.span = lj.drive(self.data, self.rp, S, self.second, lj.down_instants(self.data), self.timers)
         end = self.span[1]
         for orders in self.live.values():
@@ -470,9 +509,10 @@ def report(res):
     lip = res['lip_terms']
     lines = ['fillsim2: %s, %d market(s), %s to %s UTC; %d-contract orders every %d s on the YES bid and the YES ask' % (
         res['series'], res['markets'], res['from'] or '-', res['to'] or '-', res['size'], res['every_s']),
-        'queue: cancels come from the %s of the queue first%s; a removal and a print at one price within 1 s are '
-        'one execution' % (res['cancels'], ' (--cancel-front)' if res['cancels'] == 'front' else
-                           ' (--cancel-front: from the front)'),
+        'queue: cancels come from the %s of the queue first%s; a print pairs with the removals at its price '
+        'within 1 s (its own count first, then the nearest); the other side arriving at or through an order '
+        'fills it' % (res['cancels'], ' (--cancel-front)' if res['cancels'] == 'front' else
+                      ' (--cancel-front: from the front)'),
         'maker fee: %.2fc a contract (%s)' % (res['maker_fee'], res['maker_fee_from']),
         'LIP (an estimate, deskd strat/lip.h each second): %d market(s) on their own program, %d on their series\' '
         'latest terms, %d without' % (lip.get('own', 0), lip.get('series', 0), lip.get('none', 0)),
@@ -519,6 +559,66 @@ def run(argv):
 
 
 # ---- self-test ------------------------------------------------------------------------------
+_T0 = int(datetime(2026, 10, 20, 14, 50, tzinfo=timezone.utc).timestamp()) * S
+_M = 'KXNATGAS15M-26OCT201505-05'
+
+
+def _window(d):
+    """A natural-gas window from 14:50 UTC (_T0) to 15:05, its program $20, target 10, discount
+    0.5: (the spool, seconds from _T0 -> recv_us, the next book sequence number)."""
+    sp = lj.Spool(d)
+    sp.market(_T0 - 60 * S, 'KXNATGAS15M', _M, _T0, _T0 + 900 * S,
+              {'price_ranges': [{'start': '0.0000', 'end': '1.0000', 'step': '0.0100'}]})
+    sp.program(_T0 - 60 * S, _M, 'liquidity', _T0, _T0 + 900 * S, 10, 5000, 200000)
+    seq = iter(range(1, 10000))
+    return sp, (lambda sec: _T0 + int(round(sec * S))), (lambda: next(seq))
+
+
+def _crossed(d):
+    """Bids 50c x300, asks 52c x300. At 3 s an ask of 4 comes in at 51c, the improve bid's price,
+    with no print; at 4 s the 50c bids go, a bid comes in at 47c and an ask of 50 at 49c: at or
+    through the join bid (50c), behind1 (49c) and the improve bid's last 6 (51c), again no print."""
+    sp, at, n = _window(d)
+    sp.snapshot(at(-5), 1, 1, n(), _M, [(0.50, 300)], [(0.48, 300)])
+    sp.delta(at(3), 1, 1, n(), _M, 'no', 0.49, 4)
+    sp.delta(at(4), 1, 1, n(), _M, 'yes', 0.50, -300)
+    sp.delta(at(4.01), 1, 1, n(), _M, 'yes', 0.47, 100)
+    sp.delta(at(4.02), 1, 1, n(), _M, 'no', 0.51, 50)
+    sp.delta(at(130), 1, 1, n(), _M, 'yes', 0.46, 1)
+
+
+def _requeue(d, add_s):
+    """Bids 50c x30: the join bid has 30 ahead, nobody behind. At 2 s 10 are cancelled at 50c and
+    re-posted add_s later; 25 sell at 50c at 8 s."""
+    sp, at, n = _window(d)
+    sp.snapshot(at(-5), 1, 1, n(), _M, [(0.50, 30)], [(0.48, 100)])
+    sp.delta(at(2.0), 1, 1, n(), _M, 'yes', 0.50, -10)
+    sp.delta(at(2.0 + add_s), 1, 1, n(), _M, 'yes', 0.50, 10)
+    sp.trade(at(8.0), 1, 2, 1, _M, 0.50, 25, 'no')
+    sp.delta(at(8.01), 1, 1, n(), _M, 'yes', 0.50, -25)
+    sp.delta(at(130), 1, 1, n(), _M, 'yes', 0.40, 1)
+
+
+def _early_cancel(d, delta_first):
+    """Bids 50c x30. 5 cancelled and re-posted at 50c 0.4 s before the placement; 20 join behind the
+    join bid 0.2 s after it; 30 sell at 50c at 0.3 s, the print and its removal 10 ms apart (the
+    removal first when delta_first); 10 sell at 5 s."""
+    sp, at, n = _window(d)
+    sp.snapshot(at(-5), 1, 1, n(), _M, [(0.50, 30)], [(0.48, 100)])
+    sp.delta(at(-0.4), 1, 1, n(), _M, 'yes', 0.50, -5)
+    sp.delta(at(-0.39), 1, 1, n(), _M, 'yes', 0.50, 5)
+    sp.delta(at(0.2), 1, 1, n(), _M, 'yes', 0.50, 20)
+    if delta_first:
+        sp.delta(at(0.29), 1, 1, n(), _M, 'yes', 0.50, -30)
+        sp.trade(at(0.3), 1, 2, 1, _M, 0.50, 30, 'no')
+    else:
+        sp.trade(at(0.3), 1, 2, 1, _M, 0.50, 30, 'no')
+        sp.delta(at(0.31), 1, 1, n(), _M, 'yes', 0.50, -30)
+    sp.trade(at(5.0), 1, 2, 2, _M, 0.50, 10, 'no')
+    sp.delta(at(5.01), 1, 1, n(), _M, 'yes', 0.50, -10)
+    sp.delta(at(130), 1, 1, n(), _M, 'yes', 0.40, 1)
+
+
 def self_test():
     fails = []
 
@@ -640,6 +740,39 @@ def self_test():
         check('--cancel-front: the 5.5 s cancel comes from ahead, so the print fills all 10 at 6.5 s',
               (front[('join', 15)]['contracts'], front[('join', 15)]['full']) == (10.0, 0.5), front[('join', 15)])
         check('the CLI runs', run(['--data', d, '--every', '600']) == 0)
+
+    def rows_of(build, *args):
+        with tempfile.TemporaryDirectory() as d:
+            build(d, *args)
+            return {(r['placement'], r['cap_s']): r for r in simulate(d, 'KXNATGAS15M', 10, 600)['rows']}
+
+    # the other side arriving at or through a resting order, with no print, fills it at its price
+    c = rows_of(_crossed)
+    ci, cj, cb = c[('improve', 5)], c[('join', 5)], c[('behind1', 5)]
+    check('crossed, no print: the improve bid fills 4 at 3 s, its last 6 at 4.02 s, at 51c; the mid then 48c',
+          (ci['fill'], ci['full'], ci['avg_s'], ci['contracts']) == (0.5, 0.5, 3.0, 10.0) and near(ci['mo10'], -3.0)
+          and near(ci['mo60'], -3.0), ci)
+    check('crossed, no print: the join bid (50c) and behind1 (49c, at its price) fill 10 at 4.02 s',
+          cj['contracts'] == 10.0 and near(cj['avg_s'], 4.02) and near(cj['mo10'], -2.0)
+          and cb['contracts'] == 10.0 and near(cb['mo10'], -1.0) and c[('behind2', 5)]['contracts'] == 0, (cj, cb))
+    # LIP stops when the bid is filled, and its last 6 earn after the partial fill: the bid 1 a second
+    # for 0-2 s and 0.75 at 3 s (6 of 6 + 4 x 0.5 at 50c); the ask 1 for 0-2 s and 0.6 at 3 s (6 of the
+    # 10 counted, 4 others ahead of ours at 51c); nothing at 4 s (no bids), then the 49c ask is first
+    check('crossed: LIP stops once the improve bid is filled; 7.35 side-seconds in all, at every cap',
+          all(near(c[('improve', cap)]['lip_usd'], 7.35 * 20 / 900 / 2) for cap in CAPS),
+          [c[('improve', cap)]['lip_usd'] for cap in CAPS])
+    # a cancel is settled against the queue as it was when it came: nobody was behind, so it moves
+    # the order up, and the re-post goes behind it, however soon after it comes
+    for add_s in (0.1, 1.2):
+        r = rows_of(_requeue, add_s)[('join', 15)]
+        check('a cancel at 2 s with the re-post %.1f s later: 30 -> 20 ahead, 25 sold fill 5' % add_s,
+              r['contracts'] == 5.0 and r['avg_s'] == 8.0, r)
+    # a print pairs with its own removal (the same count, 10 ms away), not with a cancel from
+    # before the placement: all 30 ahead trade, so the next 10 sold are the order's
+    for delta_first in (False, True):
+        r = rows_of(_early_cancel, delta_first)[('join', 15)]
+        check('a cancel 0.4 s before the placement, a print of 30 and its removal (%s first): the next 10 fill it'
+              % ('removal' if delta_first else 'print'), (r['contracts'], r['full'], r['avg_s']) == (10.0, 0.5, 5.0), r)
     print('fillsim2 self-test: %s' % ('ok' if not fails else 'FAILED (%d)' % len(fails)))
     return 1 if fails else 0
 
