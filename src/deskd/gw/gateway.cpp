@@ -1313,7 +1313,8 @@ void Gateway::group_reply(const KalshiWriteReply& r) {
     else if (gone) { if (path_->groups) path_->groups->remove(g->id); *g = SysBook::Group{}; }
     else DLOG_WARN("order group %s not triggered: %s", g->id.c_str(), r.outcome.why.c_str());
   } else if (r.group_action == "reset") {
-    if (ok) g->state = SysBook::GroupState::ACTIVE;
+    // the socket's "reset" makes it ACTIVE; it can come before the 200 (then it already is)
+    if (ok && g->state != SysBook::GroupState::ACTIVE) { g->state = SysBook::GroupState::RESETTING; g->reset_acked_ms = now_ms(); }
     else if (gone) { if (path_->groups) path_->groups->remove(g->id); *g = SysBook::Group{}; }
     else { g->state = SysBook::GroupState::TRIGGERED; DLOG_WARN("order group %s not reset: %s", g->id.c_str(), r.outcome.why.c_str()); }
   }
@@ -1333,6 +1334,7 @@ void Gateway::group_event(const std::string& id, const std::string& event) {
       if (g.state != SysBook::GroupState::RESETTING) g.state = SysBook::GroupState::TRIGGERED;
     } else if (event == "reset") {
       g.state = SysBook::GroupState::ACTIVE;
+      g.reset_acked_ms = 0;
     } else if (event == "deleted") {
       if (path_->groups) path_->groups->remove(g.id);
       g = SysBook::Group{};
@@ -1400,6 +1402,14 @@ void Gateway::sys_tick(std::int64_t now) {
       bool asked = false;
       for (const int shard : shards()) {
         auto& g = sys_->group(l.id, shard);
+        // a reset the venue took (200) whose socket confirmation never came: the 200 stands
+        if (g.state == SysBook::GroupState::RESETTING && g.reset_acked_ms && now - g.reset_acked_ms > kGroupResetWaitMs) {
+          DLOG_WARN("order group %s (%s, shard %d): no order_group_updates reset %lld ms after the 200; taking the 200",
+                    g.id.c_str(), l.id.c_str(), shard, static_cast<long long>(now - g.reset_acked_ms));
+          g.state = SysBook::GroupState::ACTIVE;
+          g.reset_acked_ms = 0;
+          lanes_dirty_.insert(l.id);
+        }
         const bool stuck = g.state != SysBook::GroupState::NONE && g.state != SysBook::GroupState::ACTIVE &&
                            g.state != SysBook::GroupState::TRIGGERED && now - g.asked_ms > 15000;
         if (stuck) {   // a reply that never came: ask again (a create may leave an empty group behind)

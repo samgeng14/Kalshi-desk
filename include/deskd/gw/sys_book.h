@@ -83,6 +83,9 @@ class SysBook {
     std::string id;
     GroupState state = GroupState::NONE;
     std::int64_t asked_ms = 0;
+    // a reset the venue answered 200 to, still RESETTING until order_group_updates says "reset"
+    // (plan section 3: re-arm and Start wait for it); 0 = none pending
+    std::int64_t reset_acked_ms = 0;
   };
   Group& group(const std::string& lane, int shard) { return groups_[{lane, shard}]; }
   const Group* find_group(const std::string& lane, int shard) const;

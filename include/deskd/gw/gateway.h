@@ -240,6 +240,7 @@ class Gateway {
   void reconcile_working(const rest::Snapshot& s);
   std::int64_t fills_asked_ms_ = 0;   // the last account read asked for missing fills
   static constexpr std::int64_t kExpiryBackupMs = 1500;   // plan section 3: TTL + 1.5 s
+  static constexpr std::int64_t kGroupResetWaitMs = 5000;  // a reset's socket confirmation, at most
   std::set<std::string> expiry_asked_;                     // backup cancels already asked
   void expiry_sweep(std::int64_t now);
   std::set<std::string> man_held_;                                   // gw thread
