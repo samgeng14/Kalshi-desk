@@ -9,7 +9,7 @@
 #   - chrony keeps the clock (the recorder stamps first-seen times, so the offset matters), and
 #     systemd-timesyncd is off: two NTP clients fight. Ubuntu's chrony package conflicts with
 #     timesyncd's, so apt removes that one package; if apt would remove anything else, the
-#     install is refused. timesyncd is turned off only once chrony is installed.
+#     install is refused. timesyncd is turned off only once chrony is installed and running.
 #   - swap: a SWAP_MB (2048) MB /swapfile, enabled by a systemd swap unit (fstab is not edited),
 #     and only when the VM has no swap at all
 #   - the journal capped at 1 GB (SystemMaxUse=1G), in a journald drop-in
@@ -40,7 +40,8 @@ act() {   # act "what" cmd...: run it with --apply, else say it
 }
 SUDO=sudo; [ "$(id -u)" = 0 ] && SUDO=
 APT="env DEBIAN_FRONTEND=noninteractive apt-get -y -o Dpkg::Options::=--force-confold"
-installed() { dpkg -s "$1" >/dev/null 2>&1; }
+# dpkg's install state: dpkg -s also succeeds for a package removed but not purged (config-files)
+installed() { [ "$(dpkg-query -W -f='${db:Status-Status}' "$1" 2>/dev/null)" = installed ]; }
 unit_on() { systemctl is-enabled --quiet "$1" 2>/dev/null && systemctl is-active --quiet "$1" 2>/dev/null; }
 unit_any() { systemctl is-enabled --quiet "$1" 2>/dev/null || systemctl is-active --quiet "$1" 2>/dev/null; }
 
@@ -92,15 +93,18 @@ else
   fi
 fi
 if [ "$CHRONY" = 1 ]; then
-  if unit_any systemd-timesyncd; then
-    act "stop and disable systemd-timesyncd (chrony keeps the clock)" $SUDO systemctl disable --now systemd-timesyncd
-  else
-    log "ok: systemd-timesyncd is off"
-  fi
+  # chrony up first, timesyncd off only once it runs: a failure never leaves the VM without NTP
   if unit_on chrony; then
     log "ok: chrony enabled and running"
+  elif ! act "enable and start chrony" $SUDO systemctl enable --now chrony; then
+    log "FAILED: systemctl enable --now chrony (see systemctl status chrony)"
+  fi
+  if ! unit_any systemd-timesyncd; then
+    log "ok: systemd-timesyncd is off"
+  elif [ "$MODE" = apply ] && ! systemctl is-active --quiet chrony 2>/dev/null; then
+    log "REFUSED: chrony is not running; systemd-timesyncd left on"
   else
-    act "enable and start chrony" $SUDO systemctl enable --now chrony
+    act "stop and disable systemd-timesyncd (chrony keeps the clock)" $SUDO systemctl disable --now systemd-timesyncd
   fi
 fi
 

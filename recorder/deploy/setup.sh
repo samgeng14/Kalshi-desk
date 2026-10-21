@@ -53,7 +53,8 @@ log "setup mode: $MODE, release $REL_ID from $SRC"
 if [ "$MODE" = apply ]; then bash "$SRC/recorder/deploy/base.sh" --apply; else bash "$SRC/recorder/deploy/base.sh"; fi
 
 # 1. packages: python3-venv only (pip comes with the venv). confold: existing configs are kept.
-if ! dpkg -s python3-venv >/dev/null 2>&1; then
+# Installed means dpkg's state: dpkg -s also succeeds for a package removed but not purged.
+if [ "$(dpkg-query -W -f='${db:Status-Status}' python3-venv 2>/dev/null)" != installed ]; then
   act "apt-get install python3-venv" $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y \
     -o Dpkg::Options::=--force-confold --no-remove python3-venv
 else

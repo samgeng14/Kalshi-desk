@@ -1,7 +1,9 @@
 """deploy/base.sh (chrony, swap, the journald cap, security-only upgrades) run under a temporary
 root with every system command stubbed: plan mode changes nothing, --apply does each thing once,
 a second --apply does nothing, a file you changed is kept (ours goes beside it as .new), and chrony
-is not installed if apt would remove more than timesyncd (which then stays on)."""
+is not installed if apt would remove more than timesyncd (which then stays on). A package removed
+but not purged is not installed; timesyncd goes off only once chrony runs. setup.sh's own package
+check, in plan mode."""
 import os
 import shutil
 import subprocess
@@ -17,14 +19,22 @@ def slurp(path):
     with open(path) as f:
         return f.read()
 
+# A package dpkg knows is $STUB_STATE/pkg-NAME holding its state (installed, config-files, ...).
+# dpkg -s succeeds for any of them, as the real one does (a package removed but not purged too).
 STUBS = {
     'dpkg': '[ "$1" = -s ] && [ -e "$STUB_STATE/pkg-$2" ] && exit 0\nexit 1\n',
+    'dpkg-query': 'for a in "$@"; do p=$a; done\n'
+                  '[ -e "$STUB_STATE/pkg-$p" ] || { echo "dpkg-query: no packages found matching $p" >&2; exit 1; }\n'
+                  'cat "$STUB_STATE/pkg-$p"\n',
     'apt-get': 'for a in "$@"; do [ "$a" = -s ] && { cat "$STUB_STATE/apt-sim" 2>/dev/null; exit 0; }; done\n'
                'last=; for a in "$@"; do last=$a; done\n'
-               'case " $* " in *" install "*) touch "$STUB_STATE/pkg-$last";; esac\nexit 0\n',
+               'case " $* " in *" install "*) echo installed > "$STUB_STATE/pkg-$last"; rm -f "$STUB_STATE/broken-$last";;\n'
+               'esac\nexit 0\n',
+    # a unit with broken-UNIT cannot be enabled (masked, or its package gone); dead-UNIT never comes up
     'systemctl': 'case "$1" in\n'
                  '  is-enabled|is-active) u=$2; [ "$u" = --quiet ] && u=$3; [ -e "$STUB_STATE/on-$u" ]; exit $? ;;\n'
-                 '  enable) [ "$2" = --now ] && touch "$STUB_STATE/on-$3"\n'
+                 '  enable) [ -e "$STUB_STATE/broken-$3" ] && { echo "Failed to enable unit: $3 is masked." >&2; exit 1; }\n'
+                 '          [ "$2" = --now ] && [ ! -e "$STUB_STATE/dead-$3" ] && touch "$STUB_STATE/on-$3"\n'
                  '          [ "$3" = swapfile.swap ] && echo "/swapfile file 16M 0B -2" > "$STUB_STATE/swaps"; exit 0 ;;\n'
                  '  disable) [ "$2" = --now ] && rm -f "$STUB_STATE/on-$3"; exit 0 ;;\n'
                  '  *) exit 0 ;;\nesac\n',
@@ -73,13 +83,13 @@ class BaseShTest(unittest.TestCase):
     def read(self, rel):
         return slurp(self.path(rel))
 
-    def run_base(self, *args):
+    def run_base(self, *args, script='base.sh'):
         if os.path.exists(self.log):
             os.unlink(self.log)
         env = dict(os.environ, PATH=self.stubs + os.pathsep + os.environ.get('PATH', '/usr/bin:/bin'),
                    STUB_LOG=self.log, STUB_STATE=self.state, DESKD_BASE_ROOT=self.root, SWAP_MB='16',
                    TMPDIR=os.path.join(self.dir, 'tmp'))
-        p = subprocess.run(['bash', os.path.join(DEPLOY, 'base.sh')] + list(args), env=env, capture_output=True,
+        p = subprocess.run(['bash', os.path.join(DEPLOY, script)] + list(args), env=env, capture_output=True,
                            text=True, timeout=60)
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         calls = slurp(self.log).splitlines() if os.path.exists(self.log) else []
@@ -112,8 +122,10 @@ class BaseShTest(unittest.TestCase):
                   'systemctl enable --now swapfile.swap', 'systemctl restart systemd-journald',
                   'apt-get -y -o Dpkg::Options::=--force-confold --no-remove install unattended-upgrades'):
             self.assertIn(c, did)
-        # timesyncd went off only after chrony was in
+        # timesyncd went off only after chrony was in and running
         self.assertLess(did.index('install chrony'), did.index('disable --now systemd-timesyncd'))
+        self.assertLess(did.index('enable --now chrony'), did.index('disable --now systemd-timesyncd'))
+        self.assertLess(did.index('is-active --quiet chrony'), did.index('disable --now systemd-timesyncd'))
         self.assertEqual(self.read('etc/systemd/journald.conf.d/deskd.conf').splitlines()[-2:], ['[Journal]', 'SystemMaxUse=1G'])
         uu = self.read('etc/apt/apt.conf.d/52deskd-unattended-upgrades')
         self.assertIn('Unattended-Upgrade::Automatic-Reboot "false";', uu)
@@ -163,6 +175,49 @@ class BaseShTest(unittest.TestCase):
         self.assertNotIn('mkswap', did)
         self.assertTrue(os.path.exists(os.path.join(self.state, 'on-systemd-timesyncd')))
         self.assertEqual(slurp(self.path('swapfile')), 'not swap')
+
+    def test_removed_but_not_purged_is_not_installed(self):
+        # chrony and unattended-upgrades were removed without purge: dpkg -s still succeeds
+        self.write_state('pkg-chrony', 'config-files')
+        self.write_state('broken-chrony', '')            # no unit file: it went with the package
+        self.write_state('pkg-unattended-upgrades', 'config-files')
+        out, calls = self.run_base('--apply')
+        did = '\n'.join(calls)
+        self.assertNotIn('ok: chrony installed', out)
+        self.assertNotIn('ok: unattended-upgrades installed', out)
+        self.assertIn('apt-get -y -o Dpkg::Options::=--force-confold install chrony', did)
+        self.assertIn('--no-remove install unattended-upgrades', did)
+        self.assertLess(did.index('enable --now chrony'), did.index('disable --now systemd-timesyncd'))
+        self.assertTrue(os.path.exists(os.path.join(self.state, 'on-chrony')))
+        self.assertFalse(os.path.exists(os.path.join(self.state, 'on-systemd-timesyncd')))
+
+    def check_timesyncd_kept(self, out, calls):
+        self.assertIn('base done (apply)', out)                    # and the rest went on
+        self.assertNotIn('disable --now systemd-timesyncd', '\n'.join(calls))
+        self.assertTrue(os.path.exists(os.path.join(self.state, 'on-systemd-timesyncd')))
+
+    def test_timesyncd_kept_when_chrony_cannot_start(self):
+        self.write_state('pkg-chrony', 'installed')
+        self.write_state('broken-chrony', '')            # masked: enable fails
+        out, calls = self.run_base('--apply')
+        self.assertIn('FAILED: systemctl enable --now chrony', out)
+        self.check_timesyncd_kept(out, calls)
+
+    def test_timesyncd_kept_when_chrony_does_not_run(self):
+        self.write_state('pkg-chrony', 'installed')
+        self.write_state('dead-chrony', '')              # enabled, but it does not come up
+        out, calls = self.run_base('--apply')
+        self.assertIn('REFUSED: chrony is not running; systemd-timesyncd left on', out)
+        self.check_timesyncd_kept(out, calls)
+
+    def test_setup_python3_venv_check(self):
+        self.write_state('pkg-python3-venv', 'config-files')   # removed, not purged: dpkg -s says yes
+        out, _ = self.run_base(script='setup.sh')
+        self.assertIn('would: apt-get install python3-venv', out)
+        self.write_state('pkg-python3-venv', 'installed')
+        out, _ = self.run_base(script='setup.sh')
+        self.assertIn('ok: python3-venv installed', out)
+        self.assertIn('base done (plan)', out)
 
     def test_setup_runs_it_in_its_own_mode(self):
         text = slurp(os.path.join(DEPLOY, 'setup.sh'))
