@@ -265,6 +265,9 @@ class Gateway {
   void reset_groups();
   void sys_tick(std::int64_t now);
   void halt(const std::string& why);
+  bool floor_halted() const;                         // HALTED by the equity floor (not the day's stop)
+  std::string floor_why(std::int64_t equity) const;  // equity in Micros
+  bool over_floor();
   std::set<int> shards() const;
   std::optional<Px> mark(const std::string& ticker) const;
   std::string lane_row(const std::string& id) const;

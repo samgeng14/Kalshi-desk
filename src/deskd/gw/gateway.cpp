@@ -373,9 +373,13 @@ void Gateway::handle(GwMsg& m) {
     if (kill_.active()) {
       r.code = "KILLED";
       r.msg = "KILL lockout active; re-arm first";
-    } else if (own_.state == RunState::HALTED) {
+    } else if (own_.state == RunState::HALTED && !floor_halted()) {
       r.code = "HALTED";
-      r.msg = "Systematic halted by the daily stop";
+      r.msg = "Systematic halted: " + own_.why + " (it ends at ET midnight)";
+    } else if (own_.state == RunState::HALTED && !over_floor()) {
+      // the floor's HALT ends only here: a Start with the account's equity back over the floor
+      r.code = "HALTED";
+      r.msg = "Systematic halted: " + own_.why;
     } else if (own_.state != RunState::RUN) {
       r.preflight = preflight_ ? preflight_() : std::vector<PreflightRow>{};
       std::string failing;
@@ -386,8 +390,10 @@ void Gateway::handle(GwMsg& m) {
         r.code = "PREFLIGHT";
         r.msg = "preflight fails: " + failing;
       } else {
+        if (own_.state == RunState::HALTED) DLOG_INFO("Systematic's equity-floor HALT ended by Start");
         own_ = RunView{RunState::RUN, now_ms(), 0, ""};
         publish();
+        sys_save_due_ = true;   // a cleared floor HALT stays cleared across a restart
         r.preflight.clear();
       }
     }
@@ -1192,8 +1198,8 @@ void Gateway::place_sys(PlaceIntent& p) {
   }
   // the floor (plan section 4, limit 5): the account's equity under it halts Systematic
   if (path_->equity_floor > 0 && equity < path_->equity_floor * 100) {
-    halt("equity floor: the account's equity " + money_str(equity / 100) + " is under " + money_str(path_->equity_floor));
-    return refuse("HALTED", "Systematic halted by the equity floor");
+    halt(floor_why(equity));
+    return refuse("HALTED", "Systematic halted: " + own_.why);
   }
   // the daily loss stop (decision 1): Systematic's day, marked at the mids
   const auto mk = [this](const std::string& tk) { return mark(tk); };
@@ -1403,6 +1409,23 @@ void Gateway::reset_groups() {
   for (const auto& [lane, shard] : keys) group_job(lane, shard, "reset");
 }
 
+bool Gateway::floor_halted() const { return SysBook::Halt{own_.state == RunState::HALTED, own_.since_ms, own_.why}.floor(); }
+
+std::string Gateway::floor_why(std::int64_t equity) const {
+  return std::string(SysBook::Halt::kFloorWhy) + ": the account's equity " + money_str(equity / 100) + " is under " +
+         money_str(path_->equity_floor) + " (Start again once it is back over)";
+}
+
+// the account's equity (cash plus positions as the venue values them) is over the floor, by the
+// latest complete account read; false when no read has come yet
+bool Gateway::over_floor() {
+  if (path_->equity_floor <= 0) return true;
+  sync_snapshot();
+  if (!snapshot_seen_ || !snapshot_seen_->account_ready) return false;
+  const Micros equity = (snapshot_seen_->balance.available + snapshot_seen_->balance.portfolio_value.value_or(0)) * 100;
+  return equity >= path_->equity_floor * 100;
+}
+
 void Gateway::halt(const std::string& why) {
   if (own_.state == RunState::HALTED) return;
   DLOG_WARN("Systematic HALTED: %s", why.c_str());
@@ -1423,7 +1446,7 @@ void Gateway::sys_tick(std::int64_t now) {
   if (midnight > sys_day_ms_) {
     sys_day_ms_ = midnight;
     sys_->roll(midnight);
-    if (own_.state == RunState::HALTED && own_.since_ms < midnight) {
+    if (own_.state == RunState::HALTED && own_.since_ms < midnight && !floor_halted()) {
       own_ = RunView{RunState::STOP, now, 0, "new day"};
       publish();
     }
@@ -1435,8 +1458,7 @@ void Gateway::sys_tick(std::int64_t now) {
   if (own_.state == RunState::RUN && path_->daily_stop > 0 && sys_->day_total(mk) <= -path_->daily_stop * 100) halt("daily stop");
   if (own_.state == RunState::RUN && path_->equity_floor > 0 && snapshot_seen_ && snapshot_seen_->account_ready) {
     const Micros equity = (snapshot_seen_->balance.available + snapshot_seen_->balance.portfolio_value.value_or(0)) * 100;
-    if (equity < path_->equity_floor * 100)
-      halt("equity floor: the account's equity " + money_str(equity / 100) + " is under " + money_str(path_->equity_floor));
+    if (equity < path_->equity_floor * 100) halt(floor_why(equity));
   }
   // Order groups: one per lane and shard, created one at a time while Systematic can write;
   // triggered ones are reset once nothing runs (after a Stop or HALT; KILL's at its re-arm).

@@ -92,6 +92,11 @@ void settle_and_restore() {
   CHECK(n.restore(saved, day + 86400000, &back, &why) && !back.on);
   CHECK(n.position("M2", "TK-B") == -500 && n.day("M2")->fees == 0 && n.day("M1")->real == 0);
   CHECK(n.fill("M2", "SM2-1", "TK-B", Side::SELL, 500, 9700, 3500, t, "trade-2"));   // a new day's ids
+  // the equity floor's HALT is read back on any day: it lasts until the operator's Start
+  const SysBook::Halt fl{true, t + 5, "equity floor: the account's equity $120 is under $150"};
+  CHECK(fl.floor() && !h.floor() && !SysBook::Halt{}.floor());
+  SysBook f;
+  CHECK(f.restore(b.to_json(fl, t + 6), day + 86400000, &back, &why) && back.on && back.floor());
   // a malformed one changes nothing
   SysBook m;
   CHECK(!m.restore(json{{"v", 1}, {"lanes", 3}}, day, &back, &why) && !why.empty() && m.held().empty());

@@ -131,10 +131,19 @@ class SysBook {
   std::int64_t day_start_ms() const { return day_start_ms_; }
 
   // ---- across a restart
-  struct Halt { bool on = false; std::int64_t ms = 0; std::string why; };
+  struct Halt {
+    bool on = false;
+    std::int64_t ms = 0;
+    std::string why;
+    // the equity floor's HALT (plan section 4, limit 5) lasts until the operator starts Systematic
+    // again with the equity back over the floor; the daily stop's ends at ET midnight
+    bool floor() const { return on && why.rfind(kFloorWhy, 0) == 0; }
+    static constexpr const char* kFloorWhy = "equity floor";
+  };
   nlohmann::json to_json(const Halt& halt, std::int64_t saved_ms) const;
-  // A saved book: positions always; the day's counters, trade ids and HALT only when it was saved
-  // on the ET day that began at day_start_ms. false (and nothing changed) on a malformed one.
+  // A saved book: positions always; the day's counters, trade ids and a daily-stop HALT only when
+  // it was saved on the ET day that began at day_start_ms (a floor HALT on any day). false (and
+  // nothing changed) on a malformed one.
   bool restore(const nlohmann::json& j, std::int64_t day_start_ms, Halt* halt, std::string* why);
   // the contract's lane row
   // lip: the lane's LIP estimate today (strat/lip.h), its own line: never in "day" or the stop

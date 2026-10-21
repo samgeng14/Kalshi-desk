@@ -245,7 +245,10 @@ bool SysBook::restore(const json& j, std::int64_t day_start_ms, Halt* halt, std:
     std::set<std::string> trades;
     if (today) trades = j.at("trades").get<std::set<std::string>>();
     Halt h;
-    if (today && j.at("halt").is_object()) h = Halt{true, j["halt"].at("ms").get<std::int64_t>(), j["halt"].at("why").get<std::string>()};
+    if (j.at("halt").is_object()) {
+      const Halt saved{true, j["halt"].at("ms").get<std::int64_t>(), j["halt"].at("why").get<std::string>()};
+      if (today || saved.floor()) h = saved;   // a floor HALT outlives the day
+    }
     days_ = std::move(days);
     trades_ = std::move(trades);
     day_start_ms_ = day_start_ms;

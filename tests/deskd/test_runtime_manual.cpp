@@ -1078,6 +1078,20 @@ void equity_floor() {
   CHECK(r.until([&]{ start=r.post("/api/start",json::object()); return start && start->status==200; },10000));
   CHECK(r.until([&]{ return r.d->status()["run"]["state"]=="HALTED"; },10000));
   CHECK(r.d->status()["run"]["why"].get<std::string>().find("equity floor")==0);
+  // it lasts until a Start with the equity back over the floor: a restart keeps it, a Start under
+  // the floor is refused and says why, and it does not wait for ET midnight
+  r.restart();
+  CHECK(r.ready());
+  CHECK(r.d->status()["run"]["state"]=="HALTED");
+  start=r.post("/api/start",json::object());
+  CHECK(start && start->status!=200 && start->body.find("equity floor")!=std::string::npos);
+  CHECK(start && start->body.find("daily stop")==std::string::npos);
+  r.venue.f->with_engine([](fakex::Engine& e,std::int64_t now) { e.set_cash(0,0,5000*fx::D,now); });   // $6,000 with shard 2's $1,000
+  CHECK(r.until([&]{ start=r.post("/api/start",json::object()); return start && start->status==200; },15000));
+  CHECK(r.d->status()["run"]["state"]=="RUN");
+  r.restart();
+  CHECK(r.ready());
+  CHECK(r.d->status()["run"]["state"]!="HALTED");
 }
 }  // namespace
 
