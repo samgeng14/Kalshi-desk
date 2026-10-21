@@ -6,6 +6,10 @@
 #include "deskd/gw/kalshi_sign.h"
 #include "deskd/gw/kill.h"
 #include "deskd/net/kalshi_sender.h"
+#include <cstdio>
+#include <fstream>
+#include <sys/wait.h>
+#include "deskd/build_paths.h"
 #include "net_fixture.h"
 using namespace deskd;
 using Kind=kalshi::WriteOutcome::Kind;
@@ -279,8 +283,51 @@ void kill_overtakes_inflight_create() {
   CHECK(h.venue.f->with_engine([](fakex::Engine& e,std::int64_t) {return e.reserved(0,0);})==0);
 }
 }
+// deskctl kill --direct (plan section 2: "deskctl kill does the same if deskd hangs"): the real
+// binary, the desk's own key and config, against the fake: two resting orders and an order group;
+// it cancels all, triggers the group and finds nothing left resting. Its guard rules: a production
+// config without --live, and --live with --sim, are refused before any connection.
+void deskctl_direct() {
+  Harness h; h.start();
+  CHECK(h.qm.push(h.order("Mdirect-1"))); CHECK(h.qm.push(h.order("Mdirect-2")));
+  CHECK(h.wait("Mdirect-1").outcome.kind==Kind::ACK && h.wait("Mdirect-2").outcome.kind==Kind::ACK);
+  const auto gid=h.venue.f->with_engine([](fakex::Engine& e,std::int64_t now) { return e.group_create(0,0,10000,now); });
+  CHECK(!gid.empty());
+  TempDir d;
+  const std::string key=d.path+"/k.pem", locks=d.path+"/locks", cfg=d.path+"/desk.json", prod=d.path+"/prod.json";
+  { std::ofstream f(key); f<<pem; }
+  ::mkdir(locks.c_str(),0700);
+  { std::ofstream f(cfg); f<<"{\"env\":\"demo\",\"key_id\":\"sender-test\",\"pem_path\":\""<<key<<"\",\"key_type\":\"ed25519\","
+                            "\"deskd\":{\"lock_dir\":\""<<locks<<"\"}}"; }
+  { std::ofstream f(prod); f<<"{\"env\":\"prod\",\"key_id\":\"sender-test\",\"pem_path\":\""<<key<<"\",\"key_type\":\"ed25519\","
+                             "\"deskd\":{\"lock_dir\":\""<<locks<<"\"}}"; }
+  const std::string url="https://127.0.0.1:"+std::to_string(h.venue.port());
+  auto run=[&](const std::string& args,std::string* out) {
+    FILE* p=::popen((std::string(DESKCTL_BIN)+" "+args+" 2>&1").c_str(),"r");
+    if(!p) return -1;
+    char buf[512]; std::string s;
+    while(std::fgets(buf,sizeof buf,p)) s+=buf;
+    const int st=::pclose(p);
+    if(out) *out=s;
+    return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+  };
+  std::string out;
+  const int code=run("kill --direct --config "+cfg+" --sim "+url+" --sim-ca "+fx::pki().p.ca_cert,&out);
+  if(code!=0) std::fprintf(stderr,"deskctl: %s\n",out.c_str());
+  CHECK(code==0 && out.find("cancel-all: confirmed")!=std::string::npos && out.find("order groups: 1 triggered of 1")!=std::string::npos &&
+        out.find("KILLED at the exchange")!=std::string::npos);
+  CHECK(h.venue.f->with_engine([](fakex::Engine& e,std::int64_t) {
+    for(const fakex::Order* o:e.user_orders()) if(o->status==fakex::OrdStatus::RESTING) return false; return true; }));
+  CHECK(h.venue.f->with_engine([&](fakex::Engine& e,std::int64_t) { return e.group(gid) && e.group(gid)->triggered; }));
+  // refused before any connection: production without --live; --live with --sim
+  const auto before=h.venue.f->http_requests();
+  CHECK(run("kill --direct --config "+prod+" --sim "+url+" --sim-ca "+fx::pki().p.ca_cert,&out)==2 && out.find("needs --live")!=std::string::npos);
+  CHECK(run("kill --direct --live --config "+prod+" --sim "+url+" --sim-ca "+fx::pki().p.ca_cert,&out)==2 && out.find("never --live")!=std::string::npos);
+  CHECK(run("kill --direct",&out)==2);
+  CHECK(h.venue.f->http_requests()==before);
+}
 int main() {
   std::signal(SIGPIPE,SIG_IGN);
-  writes_and_faults(); permits_and_kill(); lost_result_and_unconfirmed_kill(); hard_refusal_recovers(); systematic_role(); kill_overtakes_inflight_create(); kill_sweeps_leftovers();
+  writes_and_faults(); permits_and_kill(); lost_result_and_unconfirmed_kill(); hard_refusal_recovers(); systematic_role(); kill_overtakes_inflight_create(); kill_sweeps_leftovers(); deskctl_direct();
   return finish("deskd-sender");
 }

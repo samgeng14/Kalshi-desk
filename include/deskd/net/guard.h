@@ -36,6 +36,10 @@ class SendGuard {
   // loopback (tests). Every venue host is refused, demo included, so a data factory can never
   // reach an account.
   static SendGuard data_hosts(std::vector<std::string> hosts);
+  // deskctl's direct KILL (deskctl.cpp): it runs while a hung deskd still holds the account lock,
+  // so it cannot take it. A production host is allowed only with --live AND a lock file whose
+  // holder line names "deskd LIVE" (the caller reads it); demo and loopback as always.
+  static SendGuard direct_kill(bool live, bool holder_is_deskd_live);
 
   // "" when a connection to host may be opened, else why not
   std::string refuse(const std::string& host) const;
@@ -45,6 +49,7 @@ class SendGuard {
   bool live_;
   const AccountLock* lock_;
   bool data_ = false;
+  bool direct_ = false, holder_live_ = false;
   std::vector<std::string> hosts_;   // data_ only, lower case
 };
 

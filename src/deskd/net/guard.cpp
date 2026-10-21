@@ -42,6 +42,13 @@ SendGuard SendGuard::data_hosts(std::vector<std::string> hosts) {
   return g;
 }
 
+SendGuard SendGuard::direct_kill(bool live, bool holder_is_deskd_live) {
+  SendGuard g(live, nullptr);
+  g.direct_ = true;
+  g.holder_live_ = holder_is_deskd_live;
+  return g;
+}
+
 std::string SendGuard::refuse(const std::string& host) const {
   if (data_) {
     const auto cls = classify_host(host);
@@ -58,6 +65,11 @@ std::string SendGuard::refuse(const std::string& host) const {
     case HostClass::DEMO:
       return "";
     case HostClass::PRODUCTION:
+      if (direct_) {
+        if (!live_) return host + " is a production host and deskctl was not given --live";
+        if (!holder_live_) return host + " is a production host and the production lock's holder is not \"deskd LIVE\"";
+        return "";
+      }
       if (!live_) return host + " is a production host and deskd was not started with --live";
       if (!lock_ || !lock_->held() || lock_->env() != "prod")
         return host + " is a production host and the production account's lock is not held";

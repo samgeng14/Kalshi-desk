@@ -469,6 +469,7 @@ foreach(t net wire md rest private sender manual_gw runtime_manual pyth)
   target_precompile_headers(deskd-test-${t} REUSE_FROM deskd_core)
   add_test(NAME deskd-${t} COMMAND deskd-test-${t})
 endforeach()
+add_dependencies(deskd-test-sender deskctl)   # its deskctl kill --direct case runs the binary
 # The Systematic soak (tests/deskd/soak.cpp): 60 s under ctest; DESKD_SOAK_SECONDS=14400 for the
 # plan's 4 hours, in a build configured with -DDESKD_TSAN=ON.
 add_executable(deskd-soak tests/deskd/soak.cpp)

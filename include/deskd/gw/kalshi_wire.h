@@ -160,6 +160,13 @@ struct ListQuery {   // the read routes' shared filters; empty / -1 / 0 = left o
 };
 WireRequest build_get_order(const std::string& order_id);
 WireRequest build_get_orders(const ListQuery& q);
+// GET /portfolio/order_groups: the account's order groups (deskctl's direct KILL triggers each)
+WireRequest build_get_order_groups(int subaccount = -1);
+struct OrderGroupRow {
+  std::string id;
+  std::optional<int> exchange_index;   // not always in the row: the caller assumes shard 0
+};
+std::optional<std::vector<OrderGroupRow>> parse_order_groups(const std::string& body, std::string* why);
 WireRequest build_get_fills(const ListQuery& q);
 WireRequest build_get_positions(const ListQuery& q);
 WireRequest build_get_balance(int exchange_index = -1, int subaccount = -1);

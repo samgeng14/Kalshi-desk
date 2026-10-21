@@ -773,6 +773,33 @@ std::optional<std::string> parse_create_order_group(const std::string& body, std
 }
 
 WireRequest build_get_order(const std::string& order_id) { return get("/portfolio/orders/" + url_encode(order_id)); }
+WireRequest build_get_order_groups(int subaccount) {
+  std::string s;
+  add_q(s, "subaccount", subaccount, subaccount >= 0);
+  return get("/portfolio/order_groups", s);
+}
+std::optional<std::vector<OrderGroupRow>> parse_order_groups(const std::string& body, std::string* why) {
+  auto j = parse_object(body, why);
+  if (!j) return std::nullopt;
+  const auto it = j->find("order_groups");
+  if (it == j->end() || !(it->is_array() || it->is_null())) {
+    if (why) *why = "order groups: no order_groups array";
+    return std::nullopt;
+  }
+  std::vector<OrderGroupRow> out;
+  if (it->is_array())
+    for (const auto& g : *it) {
+      if (!g.is_object() || !g.contains("id") || !g["id"].is_string() || !id_ok(g["id"].get<std::string>())) {
+        if (why) *why = "order groups: a row without an id";
+        return std::nullopt;
+      }
+      OrderGroupRow row;
+      row.id = g["id"].get<std::string>();
+      if (g.contains("exchange_index") && g["exchange_index"].is_number_integer()) row.exchange_index = g["exchange_index"].get<int>();
+      out.push_back(std::move(row));
+    }
+  return out;
+}
 WireRequest build_get_orders(const ListQuery& q) {
   std::string s;
   list_query(q, s, false, false);
