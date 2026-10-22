@@ -197,16 +197,17 @@ Qty SysBook::position(const std::string& lane, const std::string& ticker) const 
   return it == d->inv.end() ? 0 : it->second.pos;
 }
 
-Micros SysBook::unrealized(const std::string& lane, const MarkFn& mark, int* unmarked) const {
-  if (unmarked) *unmarked = 0;
+Micros SysBook::unrealized(const std::string& lane, const MarkFn& mark, Micros* upside) const {
+  if (upside) *upside = 0;
   const auto* d = day(lane);
   if (!d) return 0;
   Micros u = 0;
   for (const auto& [tk, inv] : d->inv) {
     if (!inv.pos) continue;
     const auto m = mark ? mark(tk) : std::nullopt;
-    if (!m && unmarked) ++*unmarked;
-    // never priced: counted as worthless (a long loses its cost, a short pays $1 a contract)
+    // never priced: counted as worthless (a long loses its cost, a short pays $1 a contract); at
+    // its best it is $1 a contract better (a long wins, a short pays nothing)
+    if (!m && upside) *upside += kOneDollar * std::abs(inv.pos);
     const Micros value = (m ? *m : (inv.pos > 0 ? 0 : kOneDollar)) * std::abs(inv.pos);
     u += inv.pos > 0 ? value - inv.cost : inv.cost - value;
   }
@@ -291,13 +292,14 @@ std::string SysBook::retire_due(const LaneSpec& l, const MarkFn& mark) const {
   if (f && f->retired) return "";
   // the loss rule, at any count: realized less fees over its life, its open positions at the mark.
   // A retirement lasts, so unlike the daily stop it never counts a position with no mark as
-  // worthless: it waits (after a restart md has no book yet and gw's last mids are gone; a closed
-  // market has none until it settles)
+  // worthless (after a restart md has no book yet and gw's last mids are gone; a closed market has
+  // none until it settles, a one-sided book none at all): it counts each at its best, and so waits
+  // only while that could bring the lane back inside its limit
   if (l.retire_loss > 0) {
-    int unmarked = 0;
-    const Micros pnl = (f ? f->real - f->fees : 0) + unrealized(l.id, mark, &unmarked);
-    if (!unmarked && pnl <= -l.retire_loss)
-      return "down $" + money_str(-pnl / 100) + " over its life, its limit $" + money_str(l.retire_loss / 100);
+    Micros upside = 0;
+    const Micros best = (f ? f->real - f->fees : 0) + unrealized(l.id, mark, &upside) + upside;
+    if (best <= -l.retire_loss)
+      return "down $" + money_str(-best / 100) + " over its life, its limit $" + money_str(l.retire_loss / 100);
   }
   if (!f || l.retire_trades <= 0 || f->trades < l.retire_trades) return "";
   if (l.retire_rule == LaneSpec::RetireRule::CAP)

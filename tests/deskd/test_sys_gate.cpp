@@ -350,25 +350,28 @@ void retired() {
 }
 
 // The loss rule after a restart: C1 holds positions from yesterday, md has no book for them yet
-// and gw's last mids went with the old process. A position with no mark leaves the rule
-// undecided (not $24 lost), and the rule waits for the first account read (the fills the saved
-// book missed, the held markets that settled since); then a mark that really loses $20 retires.
+// and gw's last mids went with the old process. A position with no mark counts at its best ($1 a
+// contract), not worthless ($24 lost), and the rule waits for the first account read (the fills
+// the saved book missed, the held markets that settled since); then a mark that really loses $20
+// retires, and so does a lane down past its limit whatever its unmarked position settles at.
 void loss_at_boot() {
   TempDir dir;
   const auto& lanes=default_lanes();
   const LaneSpec c1=*std::find_if(lanes.begin(),lanes.end(),[](const LaneSpec& l) { return l.id=="C1"; });
   const std::string U="KXTEST-26OCT06-B";   // no book, and not in the account read: never settled
-  // yesterday's book: C1 long n at px in tk, its loss limit $20
-  auto saved=[&](const std::string& file,const std::string& tk,Qty n,Px px) {
+  // yesterday's book: C1 long n at px in each tk, its loss limit $20
+  struct Held { std::string tk; Qty n; Px px; };
+  auto saved=[&](const std::string& file,const std::vector<Held>& held) {
     const std::int64_t yesterday=et_midnight_ms(now_ms())-86400000;
     SysBook b({c1});
     b.roll(yesterday);
-    CHECK(b.fill("C1","SC1-held",tk,Side::BUY,n,px,0,yesterday+1,"tr-held"));
+    for(std::size_t i=0;i<held.size();++i)
+      CHECK(b.fill("C1","SC1-held"+std::to_string(i),held[i].tk,Side::BUY,held[i].n,held[i].px,0,yesterday+1,"tr-held"+std::to_string(i)));
     std::ofstream(file)<<b.to_json(SysBook::Halt{},yesterday+2).dump();
   };
   {   // 30 at 0.80 in U: $24 of cost, unmarked
     const std::string file=dir.file("unmarked.json");
-    saved(file,U,3000,8000);
+    saved(file,{{U,3000,8000}});
     Desk d({c1},file);
     CHECK(d.until([&]{ return d.lane_day("C1")==-24000000; }));   // its day prices it worthless
     std::this_thread::sleep_for(std::chrono::milliseconds(400));   // sys_tick has looked, more than once
@@ -387,13 +390,21 @@ void loss_at_boot() {
   }
   {   // 50 at 0.90 in fx::T, marked at 0.41: down $24.50, but no account read yet
     const std::string file=dir.file("unread.json");
-    saved(file,fx::T,5000,9000);
+    saved(file,{{fx::T,5000,9000}});
     Desk d({c1},file,false,false);
     CHECK(d.until([&]{ return d.lane_day("C1")==-24500000; }));
     std::this_thread::sleep_for(std::chrono::milliseconds(400));
     CHECK(d.alerts_with("CRIT")==0);
     d.account(1000*10000);
     CHECK(d.until([&]{ return d.alerts_with("CRIT C1 lane C1 retired: down $24.5000 over its life, its limit $20.0000")==1; }));
+  }
+  {   // 50 at 0.82 in fx::T, marked at 0.41, down $20.50; 10 at 0.95 in U, closed and not settled:
+      // down $20 even if U wins, so retired at the first read with U still unmarked
+    const std::string file=dir.file("certain.json");
+    saved(file,{{fx::T,5000,8200},{U,1000,9500}});
+    Desk d({c1},file);
+    CHECK(d.until([&]{ return d.alerts_with("CRIT C1 lane C1 retired: down $20.0000 over its life, its limit $20.0000")==1; }));
+    CHECK(d.until([&]{ return d.lane_day("C1")==-30000000; }));   // U worthless in its day
   }
 }
 

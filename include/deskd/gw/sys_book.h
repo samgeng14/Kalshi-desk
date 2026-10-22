@@ -80,8 +80,8 @@ struct LaneSpec {
   // Retirement (SysBook::retire_due): CAP after retire_trades trades; MARKOUT at retire_trades
   // trades or more once SysBook::kRetireMarked fills are marked at retire_h ("300s") and their mean
   // net markout is <= 0; and under any rule, NONE too, once its life's P&L (real - fees +
-  // unrealized at the mark) is down retire_loss, at any count, undecided while a position it
-  // holds has no mark. 0 = no such rule.
+  // unrealized at the mark) is down retire_loss, at any count, a position with no mark at its
+  // best ($1 a contract long, $0 short). 0 = no such rule.
   enum class RetireRule { NONE, CAP, MARKOUT };
   int retire_trades = 0;
   RetireRule retire_rule = RetireRule::NONE;
@@ -156,8 +156,9 @@ class SysBook {
   Qty position(const std::string& lane, const std::string& ticker) const;
 
   using MarkFn = std::function<std::optional<Px>(const std::string&)>;
-  // unmarked, when given: how many of its open positions mark has no price for (counted worthless)
-  Micros unrealized(const std::string& lane, const MarkFn& mark, int* unmarked = nullptr) const;
+  // a position mark has no price for counts worthless; upside, when given: how much better those
+  // positions are at their best, $1 a contract
+  Micros unrealized(const std::string& lane, const MarkFn& mark, Micros* upside = nullptr) const;
   Micros open_worst(const std::string& lane) const;
   // the same, over the lane's markets `in` accepts
   Micros open_worst_in(const std::string& lane, const std::function<bool(const std::string&)>& in) const;
@@ -193,7 +194,7 @@ class SysBook {
   // lane's retire_h; false: not counted (no such lane, another horizon, the fid already counted)
   bool markout(const std::string& lane, const std::string& fid, const std::string& h, Money mo_net, Qty qty);
   // why l's retire rule fires now; "" when it does not, or the lane is already retired (the loss
-  // rule waits while a position of the lane has no mark)
+  // rule waits while a position with no mark, at its best, could bring the lane back inside)
   std::string retire_due(const LaneSpec& l, const MarkFn& mark) const;
   // retired from `at` for `why`, and off; false: no such lane, or already retired (the first
   // retirement stays)

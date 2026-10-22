@@ -108,8 +108,12 @@ void lane_day() {
   CHECK(b.day("M2")->real == 2250000 + (3000 - 4500) * 500);
   CHECK(b.open_worst("M2") == 10000 * 500 - 1500000);   // a short can lose 1 - its price
   CHECK(b.unrealized("M2", mark) == 1500000 - 5500 * 500);
-  // never priced: counted worthless, never flat (a short of 5 at 0.30 owes $1 a contract)
-  CHECK(b.unrealized("M2", [](const std::string&) { return std::optional<Px>(); }) == 1500000 - 10000 * 500);
+  // never priced: counted worthless, never flat (a short of 5 at 0.30 owes $1 a contract); at
+  // its best it owes nothing, $5 better
+  Micros upside = 0;
+  CHECK(b.unrealized("M2", [](const std::string&) { return std::optional<Px>(); }, &upside) == 1500000 - 10000 * 500);
+  CHECK(upside == 10000 * 500);
+  CHECK(b.unrealized("M2", mark, &upside) == 1500000 - 5500 * 500 && upside == 0);
   // the contract's row
   const auto row = b.lane_json(*b.lane("M2"), RunState::RUN, 780000, 1, 100000000, mark, "");
   CHECK(row["state"] == "OFF" && row["why"] == "" && row["sent"] == 1 && row["fills"] == 4 && row["hit"] == 4);
@@ -304,13 +308,26 @@ void retire_rules() {
   CHECK(l.fill("X1", "SX1-1", "TK-L", Side::BUY, 10000, 3000, 0, t, "l1"));
   CHECK(l.retire_due(*l.lane("X1"), mark_at(1001)).empty());
   CHECK(l.retire_due(*l.lane("X1"), mark_at(1000)) == "down $20.0000 over its life, its limit $20.0000");
-  // never priced (no book yet after a restart, a closed market until it settles): undecided, not
-  // worthless; and so while any one of its positions is, though the rest are down past the limit
-  CHECK(l.retire_due(*l.lane("X1"), none).empty());
+  // never priced (no book yet after a restart, a closed market until it settles, a one-sided
+  // book): not worthless but at its best, a long at $1 and a short at $0, so undecided while that
+  // could bring it back inside its limit, and down at least that much when it could not
+  CHECK(l.retire_due(*l.lane("X1"), none).empty());   // up $70 at best
   CHECK(l.fill("X1", "SX1-2", "TK-M", Side::BUY, 100, 5000, 0, t + 1, "l2"));
-  const SysBook::MarkFn only_l = [](const std::string& tk) { return tk == "TK-L" ? std::optional<Px>(900) : std::nullopt; };
-  CHECK(l.retire_due(*l.lane("X1"), only_l).empty());
+  const auto only_l = [](Px px) -> SysBook::MarkFn {
+    return [px](const std::string& tk) { return tk == "TK-L" ? std::optional<Px>(px) : std::nullopt; };
+  };
+  CHECK(l.retire_due(*l.lane("X1"), only_l(1000)).empty());   // TK-L down $20, TK-M up $0.50 at best
+  CHECK(l.retire_due(*l.lane("X1"), only_l(900)) == "down $20.5000 over its life, its limit $20.0000");
+  CHECK(l.retire_due(*l.lane("X1"), only_l(950)) == "down $20.0000 over its life, its limit $20.0000");
   CHECK(l.retire_due(*l.lane("X1"), mark_at(900)) == "down $21.4100 over its life, its limit $20.0000");
+  // a short with no mark keeps what it brought in at best: C1 bought 100 at 0.30 in TK-L and
+  // sold 1 at 0.40 in TK-N, inside its limit at best with TK-L down $20, not with it down $20.50
+  SysBook s(ruled_lanes());
+  s.roll(day);
+  CHECK(s.fill("C1", "SC1-1", "TK-L", Side::BUY, 10000, 3000, 0, t, "s1"));
+  CHECK(s.fill("C1", "SC1-2", "TK-N", Side::SELL, 100, 4000, 0, t + 1, "s2"));
+  CHECK(s.retire_due(*s.lane("C1"), only_l(1000)).empty());
+  CHECK(s.retire_due(*s.lane("C1"), only_l(950)) == "down $20.1000 over its life, its limit $20.0000");
   // over its life, across ET midnight, with its fees: C1 lost $15 and paid $0.50 yesterday, and
   // holds 10 at 0.50 today: down $20 at 0.05, though today alone is down $4.50
   SysBook m(ruled_lanes());
