@@ -60,9 +60,16 @@ struct Snapshot {
   // else the next), from GET /incentive_programs; lip_ms when they were read (0: never)
   std::map<std::string, kalshi::IncentiveRow> lip;
   std::int64_t lip_ms = 0;
+  // the rows of the events State::set_events asks for (event_ticker -> GET /events/{t}, its markets
+  // nested), each with the time it was read; a row the listing shows to lack a market of its event
+  // is left out (State::events). events_ms: when every event asked for last had a row younger than
+  // Options::event_cache_ms that the listing agreed with (0: never).
+  std::map<std::string, kalshi::EventRow> events;
+  std::int64_t events_ms = 0;
   std::uint64_t revision = 0;
   std::string error;
   std::string metadata_error;
+  std::string events_error;   // this poll's last failed or held-back event row; "" when none
 };
 
 struct Options {
@@ -93,6 +100,10 @@ struct Options {
   // LIP programs (strat/lip.h): read every lip_poll_ms for markets of these series; none: never
   std::vector<std::string> lip_series;
   int lip_poll_ms = 120000, lip_max_pages = 10;
+  // Event rows (set_events): each read again event_cache_ms after it was read, and at most
+  // event_reads of them a poll, so a long list of new events is read over a few polls instead of
+  // holding up one poll's account and listing.
+  int event_cache_ms = 600000, event_reads = 16;
 };
 
 class State {
@@ -109,6 +120,10 @@ class State {
   // inventory, so a market that settles after its position left the unsettled list still shows
   // gw its result. No subscription, no publication.
   void set_held(std::set<std::string> held);
+  // Events whose rows the snapshot carries (GET /events/{t}: the venue's mutually_exclusive and
+  // every market of the event, for gw/event_risk.h): the events S1 scans and those Systematic
+  // holds. Read from the next poll on; no publication.
+  void set_events(std::set<std::string> event_tickers);
   // Orders created since this time are read too (default: since start): a restart reads the
   // previous run's last orders, so their fills can be told apart by client id. Before run().
   void set_orders_since(std::int64_t ms) { orders_since_ms_ = ms; }
@@ -134,6 +149,7 @@ class State {
   bool listing(Snapshot& next, std::string* why, Worker* worker);
   void metadata(Snapshot& next, Worker* worker);
   void incentives(Snapshot& next, Worker* worker);
+  void events(Snapshot& next, Worker* worker);
   void publish(Snapshot next);
   void backfill_trades(Worker* worker);
   void controls(bool pins, std::set<std::string> values);
@@ -146,7 +162,7 @@ class State {
   std::function<bool(std::uint64_t)> commit_;
   std::shared_ptr<const Snapshot> published_;
   std::mutex controls_mu_;  // controls/publication only, never held over I/O or callbacks
-  std::set<std::string> pins_, live_, held_;
+  std::set<std::string> pins_, live_, held_, events_;
   TradesCallback trades_cb_;
   std::map<std::string, std::int64_t> trades_wanted_;   // ticker -> since ms (under controls_mu_)
   std::map<std::string, std::int64_t> trades_failed_;   // ticker -> mono ms of the last failure
@@ -160,6 +176,8 @@ class State {
   std::int64_t last_request_mono_ = 0;   // the venue answered 400 to mve_filter=exclude: listed without it
   struct CachedSeries { kalshi::SeriesRow row; std::int64_t fetched_ms = 0, attempted_ms = 0; };
   std::map<std::string,CachedSeries> series_;
+  struct CachedEvent { kalshi::EventRow row; std::int64_t attempted_ms = 0; };   // row.fetched_ms 0: never read
+  std::map<std::string, CachedEvent> event_rows_;   // REST owner only
 };
 
 // Contract 1.5 projections. Missing exchange_index remains null; the gateway must refuse a

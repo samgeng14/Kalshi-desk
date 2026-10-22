@@ -318,6 +318,120 @@ void incremental() {
   CHECK(by_id()==0 && s->orders.size()==8 && s->fills.size()==1);
   CHECK(find(*s,"Minc-b0")->status==kalshi::OrderStatus::CANCELED && find(*s,"Minc-b1")->status==kalshi::OrderStatus::RESTING);
 }
+// Event rows (rest::State::set_events): GET /events/{t} with the markets nested, at most event_reads
+// a poll, read again once older than event_cache_ms or when a newer listing shows a market the row
+// lacks. A failed read keeps the last row; a row the listing shows to lack a market is left out
+// until a read lists it.
+void event_rows() {
+  fakex::FakeConfig cfg; cfg.rate_limits=false;
+  fakex::FakeKalshi fake(cfg);
+  const std::string E="KXHIGHTST-26OCT22";
+  auto bracket=[&](fakex::Engine& e,std::int64_t now,int lo) {
+    fakex::MarketSpec m; m.ticker=E+"-B"+std::to_string(lo)+".5"; m.close_ms=now+3600000;
+    m.strike_type="between"; m.floor_strike=lo; m.cap_strike=lo+1; e.add_market(m,now);
+  };
+  std::set<std::string> many{E,"KXGONE-26OCT22"};   // the venue does not know KXGONE's
+  fake.with_engine([&](fakex::Engine& e,std::int64_t now) {
+    bracket(e,now,70); bracket(e,now,72);
+    fakex::EventSpec ev; ev.event_ticker=E; ev.mutually_exclusive=true; e.add_event(ev);
+    for (int i=0;i<20;++i) {
+      fakex::EventSpec other; other.event_ticker="KXMANY-"+std::to_string(100+i); e.add_event(other);
+      many.insert(other.event_ticker);
+    }
+    e.set_cash(0,0,500*fakex::kMicrosPerDollar,now);
+  });
+  std::string why; CHECK(fake.start(&why));
+  auto signer=key();
+  SendGuard guard(false,nullptr); net::ConnFactory factory(guard);
+  const auto endpoint=net::Endpoint::parse("http://127.0.0.1:"+std::to_string(fake.port())+"/trade-api/v2",&why);
+  auto reads=[&] {   // event reads since the log was cleared
+    std::vector<std::string> out;
+    for (const auto& line:fake.wire_log()) if (line.find(" GET /events/")!=std::string::npos) out.push_back(line);
+    return out;
+  };
+  rest::Options opts; opts.request_gap_ms=0; opts.listing_poll_ms=100;
+  rest::State state(factory,*endpoint,signer.get(),{},opts);
+  fake.clear_wire_log();
+  CHECK(state.refresh_once() && reads().empty() && state.snapshot()->events.empty());   // none asked
+  // asked for: read at the next poll, with the time it was read
+  state.set_events({E});
+  CHECK(state.snapshot()->events.empty());
+  const auto asked=now_ms();
+  fake.clear_wire_log();
+  CHECK(state.refresh_once() && reads().size()==1);
+  auto s=state.snapshot();
+  CHECK(s->events.size()==1 && s->events.count(E));
+  const auto first=s->events.count(E) ? s->events.at(E) : kalshi::EventRow{};
+  CHECK(first.mutually_exclusive==std::optional<bool>(true) && first.series_ticker=="KXHIGHTST" && first.markets.size()==2);
+  CHECK(first.fetched_ms>=asked && s->events_ms>=first.fetched_ms && s->events_error.empty());
+  fake.clear_wire_log();   // younger than event_cache_ms: kept, not read again
+  CHECK(state.refresh_once() && reads().empty() && state.snapshot()->events.at(E).fetched_ms==first.fetched_ms);
+  // a bracket added: the next listing shows it and the row is read again in the same poll
+  fake.with_engine([&](fakex::Engine& e,std::int64_t now) { bracket(e,now,74); });
+  std::this_thread::sleep_for(std::chrono::milliseconds(110));   // listing_poll_ms is at least 100
+  fake.clear_wire_log();
+  CHECK(state.refresh_once() && reads().size()==1);
+  s=state.snapshot();
+  CHECK(s->markets.count(E+"-B74.5") && s->events.at(E).markets.size()==3 && s->events.at(E).fetched_ms>first.fetched_ms);
+  std::this_thread::sleep_for(std::chrono::milliseconds(110));
+  fake.clear_wire_log();
+  CHECK(state.refresh_once() && reads().empty());   // the next listing agrees with it
+  // another bracket, and that read fails: the row the listing shows to be short is left out, and
+  // read first at the next poll
+  fake.with_engine([&](fakex::Engine& e,std::int64_t now) { bracket(e,now,76); });
+  fakex::HttpFault fault; fault.method="GET"; fault.path="/events/"+E;
+  fault.kind=fakex::HttpFault::Kind::DROP_BEFORE_REPLY; fake.add_fault(fault);
+  const auto whole=state.snapshot()->events_ms;
+  std::this_thread::sleep_for(std::chrono::milliseconds(110));
+  CHECK(state.refresh_once());
+  s=state.snapshot();
+  CHECK(s->markets.count(E+"-B76.5") && !s->events.count(E) && s->events_ms==whole);
+  CHECK(s->events_error.find("does not list "+E+"-B76.5")!=std::string::npos);
+  fake.clear_wire_log();
+  CHECK(state.refresh_once() && reads().size()==1);
+  s=state.snapshot();
+  CHECK(s->events.count(E) && s->events.at(E).markets.size()==4 && s->events_error.empty() && s->events_ms>whole);
+  {   // older than event_cache_ms: read again; a failed read keeps the last row, and events_ms waits
+    auto quick=opts; quick.event_cache_ms=100;
+    rest::State st(factory,*endpoint,signer.get(),{},quick);
+    st.set_events({E});
+    CHECK(st.refresh_once() && st.snapshot()->events.count(E));
+    const auto read=st.snapshot()->events.at(E).fetched_ms, done=st.snapshot()->events_ms;
+    std::this_thread::sleep_for(std::chrono::milliseconds(110));
+    fake.add_fault(fault);
+    CHECK(st.refresh_once());
+    s=st.snapshot();
+    CHECK(s->events.count(E) && s->events.at(E).fetched_ms==read && s->events_ms==done && !s->events_error.empty());
+    fake.clear_wire_log();
+    CHECK(st.refresh_once() && reads().size()==1);
+    s=st.snapshot();
+    CHECK(s->events.at(E).fetched_ms>read && s->events_ms>done && s->events_error.empty());
+  }
+  // twenty-one new ones at once: 16 this poll, KXGONE's 404 among them; the next poll reads the
+  // five never read before KXGONE's again
+  state.set_events(many);
+  fake.clear_wire_log();
+  CHECK(state.refresh_once() && reads().size()==16);
+  s=state.snapshot();
+  CHECK(s->events.size()==16 && s->events.count(E) && !s->events.count("KXGONE-26OCT22"));
+  CHECK(s->events_error.find("HTTP 404")!=std::string::npos);
+  const auto partial=s->events_ms;
+  fake.clear_wire_log();
+  CHECK(state.refresh_once() && reads().size()==6);
+  CHECK(reads().size()==6 && reads()[5].find("KXGONE-26OCT22")!=std::string::npos);
+  s=state.snapshot();
+  CHECK(s->events.size()==21 && s->events.count("KXMANY-119") && s->events_ms==partial);
+  // asked for no longer: out of the snapshot at the next poll; asked again while its row is young,
+  // back without a read
+  state.set_events({E});
+  fake.clear_wire_log();
+  CHECK(state.refresh_once() && reads().empty());
+  s=state.snapshot();
+  CHECK(s->events.size()==1 && s->events_error.empty() && s->events_ms>partial);
+  state.set_events(many);
+  fake.clear_wire_log();
+  CHECK(state.refresh_once() && reads().size()==1 && state.snapshot()->events.size()==21);   // KXGONE's alone
+}
 void cash_projection(json& capture) {
   rest::Snapshot s; s.balances={{0,920000},{2,50000}};
   kalshi::PositionRow p; p.ticker="TEST-A"; p.exchange_index=0; p.position=500;
@@ -358,7 +472,7 @@ void cash_projection(json& capture) {
 int main() {
   ::signal(SIGPIPE,SIG_IGN);
   clock_checks(); series_fees(); json capture={{"events",json::array()},{"responses",json::array()}};
-  discovery(capture); reconcile(); incremental(); cash_projection(capture);
+  discovery(capture); reconcile(); incremental(); event_rows(); cash_projection(capture);
   TempDir dir; std::ofstream out(dir.file("capture.json")); out<<capture.dump(); out.close();
   const std::string command="node '"+std::string(DESKD_SOURCE_DIR)+"/tests/deskd/contract_check.cjs' '"+dir.file("capture.json")+"'";
   CHECK(std::system(command.c_str())==0);

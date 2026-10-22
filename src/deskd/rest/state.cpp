@@ -157,6 +157,7 @@ State::State(net::ConnFactory& factory, net::Endpoint endpoint, const KalshiSign
   options_.timeout_ms = std::max(100, options_.timeout_ms);
   options_.page_size = std::clamp(options_.page_size, 1, 1000);
   options_.max_pages = std::clamp(options_.max_pages, 1, 1000);
+  options_.event_reads = std::max(1, options_.event_reads);
 }
 
 std::shared_ptr<const Snapshot> State::snapshot() const { return std::atomic_load(&published_); }
@@ -166,6 +167,10 @@ void State::set_live(std::set<std::string> live) { controls(false, std::move(liv
 void State::set_held(std::set<std::string> held) {
   std::lock_guard<std::mutex> lock(controls_mu_);
   held_ = std::move(held);
+}
+void State::set_events(std::set<std::string> event_tickers) {
+  std::lock_guard<std::mutex> lock(controls_mu_);
+  events_ = std::move(event_tickers);
 }
 
 void State::controls(bool pins, std::set<std::string> values) {
@@ -496,6 +501,7 @@ bool State::refresh(Worker* worker) {
     }
   }
   metadata(next,worker);
+  events(next, worker);
   incentives(next, worker);
   next.ts_ms = now_ms();
   if (next.account_ready && commit_ && !commit_(fence)) {
@@ -558,6 +564,82 @@ void State::incentives(Snapshot& next, Worker* worker) {
   }
   next.lip = std::move(lip);
   next.lip_ms = now;
+}
+
+// The rows of the events asked for (set_events), from GET /events/{t} with the markets nested: at
+// most event_reads a poll, the one read longest ago first. A row is read again event_cache_ms after
+// it was read, and first of all when a listing newer than it shows a market of its event that it
+// lacks (a bracket added since). A failed read keeps the last row. A row that lacks a market the
+// listing shows is left out of the snapshot until a read lists it: that market can pay YES in a
+// state the row cannot show (a ladder proven exhaustive without it is not), so until then gw counts
+// the event market by market. A row read after the listing that still lacks the market is read
+// again only after the next listing: a venue whose two reads disagree costs a read a listing, not
+// one a poll.
+void State::events(Snapshot& next, Worker* worker) {
+  next.events_error.clear();
+  std::set<std::string> wanted;
+  {
+    std::lock_guard<std::mutex> lock(controls_mu_);
+    wanted = events_;
+  }
+  std::map<std::string, std::vector<std::string>> listed;   // event -> its markets the listing shows
+  for (const auto& [ticker, m] : next.markets) if (wanted.count(event(m))) listed[event(m)].push_back(ticker);
+  auto lacks = [&listed](const kalshi::EventRow& row) -> std::string {   // the first one it lacks, else ""
+    const auto it = listed.find(row.event_ticker);
+    if (it == listed.end()) return "";
+    for (const auto& ticker : it->second) {
+      const auto in = [&ticker](const kalshi::MarketRow& m) { return m.ticker == ticker; };
+      if (std::none_of(row.markets.begin(), row.markets.end(), in)) return ticker;
+    }
+    return "";
+  };
+  auto young = [this](std::int64_t at) { return at > 0 && now_ms() >= at && now_ms() - at < options_.event_cache_ms; };
+  struct Due { std::string event; bool behind; std::int64_t attempted_ms; };
+  std::vector<Due> due;
+  for (const auto& name : wanted) {
+    const auto it = event_rows_.find(name);
+    if (it == event_rows_.end()) { due.push_back({name, false, 0}); continue; }
+    const auto& row = it->second.row;
+    const bool behind = row.fetched_ms && row.fetched_ms < next.listing_ms && !lacks(row).empty();
+    if (behind || !young(row.fetched_ms)) due.push_back({name, behind, it->second.attempted_ms});
+  }
+  std::sort(due.begin(), due.end(), [](const Due& a, const Due& b) {
+    if (a.behind != b.behind) return a.behind;
+    return a.attempted_ms != b.attempted_ms ? a.attempted_ms < b.attempted_ms : a.event < b.event;
+  });
+  int tried = 0;
+  for (const auto& d : due) {
+    if (tried++ == options_.event_reads || (worker && worker->stopping())) break;
+    auto& cached = event_rows_[d.event];
+    cached.attempted_ms = now_ms();
+    std::string body, why;
+    if (!get(kalshi::build_get_event(d.event), &body, &why, worker)) { next.events_error = why; continue; }
+    auto row = kalshi::parse_event(body, &why);
+    if (!row) { next.events_error = "invalid event row for " + d.event + ": " + why; continue; }
+    if (row->event_ticker != d.event) { next.events_error = "GET event " + d.event + " answered another event"; continue; }
+    row->fetched_ms = now_ms();
+    cached.row = std::move(*row);
+  }
+  next.events.clear();
+  bool whole = true;
+  for (const auto& name : wanted) {
+    const auto it = event_rows_.find(name);
+    if (it == event_rows_.end() || !it->second.row.fetched_ms) { whole = false; continue; }
+    const auto& row = it->second.row;
+    if (const auto missing = lacks(row); !missing.empty()) {
+      next.events_error = "the row of event " + name + " does not list " + missing + ", which the listing shows";
+      whole = false;
+      continue;
+    }
+    if (!young(row.fetched_ms)) whole = false;   // its read failed or waits: the last row stays
+    next.events[name] = row;
+  }
+  if (whole) next.events_ms = now_ms();
+  // a row no longer asked for goes once it would be read again
+  for (auto it = event_rows_.begin(); it != event_rows_.end();) {
+    if (!wanted.count(it->first) && !young(it->second.row.fetched_ms)) it = event_rows_.erase(it);
+    else ++it;
+  }
 }
 
 void State::request_trades(const std::string& ticker, std::int64_t since_ms) {
