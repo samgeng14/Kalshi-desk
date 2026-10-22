@@ -1,11 +1,14 @@
 // deskd: the event-driven desk (docs: the implementation plan, section 2).
 //
 //   deskd [--config FILE] [--data-dir DIR] [--ui-dir DIR] [--port N] [--live]
-//         [--sim https://127.0.0.1:PORT --sim-ca FILE]
+//         [--sim https://127.0.0.1:PORT --sim-ca FILE [--espn-url http://127.0.0.1:PORT]]
 //
 // --sim points every venue connection at the fake exchange (tests/fake_exchange, fake-kalshi)
 // on a loopback address, its test CA trusted for loopback only: a paper-trading sandbox with
 // no network and the browser tests' venue. Never with --live; a non-loopback URL is refused.
+// The sandbox reads no scores (ESPN and NCAA.com off) unless --espn-url names a loopback
+// stand-in for ESPN's scoreboards (tools/deskd_sim.py --nba scripts an NBA game on one): only
+// with --sim, only loopback, so the sandbox never reaches ESPN.
 //
 // Starts non-live (paper: the demo account): production venue hosts are refused unless --live is
 // given AND the production account's lock is held (net/guard.h). --live is the live desk: the
@@ -57,6 +60,7 @@ void usage() {
                "  --live          the live desk: production hosts, a production credential (env prod), the prod lock\n"
                "  --sim URL       the fake exchange on loopback (https://127.0.0.1:PORT, as fake-kalshi prints it)\n"
                "  --sim-ca FILE   its test CA (fake-kalshi --tls DIR writes DIR/ca.pem), trusted for loopback only\n"
+               "  --espn-url URL  with --sim only: a loopback stand-in for ESPN's scoreboards (tools/deskd_sim.py --nba)\n"
                "The account lock is <lock dir>/kalshi-prod.lock with --live, else kalshi-demo.lock;\n"
                "lock dir: the config's deskd.lock_dir, else $HOME/%s\n",
                DESKD_SOURCE_DIR, deskd::AccountLock::kDirUnderHome);
@@ -69,7 +73,7 @@ int main(int argc, char** argv) {
   std::string config_path, data_dir, ui_dir;
   int port = -1;
   bool live = false;
-  std::string sim_url, sim_ca;
+  std::string sim_url, sim_ca, espn_url;
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
     auto value = [&](const char* flag) -> std::string {
@@ -94,6 +98,7 @@ int main(int argc, char** argv) {
     } else if (a == "--live") live = true;
     else if (a == "--sim") sim_url = value("--sim");
     else if (a == "--sim-ca") sim_ca = value("--sim-ca");
+    else if (a == "--espn-url") espn_url = value("--espn-url");
     else if (a == "-h" || a == "--help") {
       usage();
       return 0;
@@ -152,6 +157,17 @@ int main(int argc, char** argv) {
     options.factory.loopback_ca_file = expand_home(sim_ca);
     options.espn_url = options.ncaa_url = "";   // no network in the sandbox
     DLOG_WARN("--sim: every venue connection goes to the fake exchange at %s", base.c_str());
+  }
+  if (!espn_url.empty()) {
+    // ESPN's stand-in: the sandbox's only, on loopback (the real ESPN is a network host)
+    std::string why;
+    const auto ep = net::Endpoint::parse(espn_url, &why);
+    if (sim_url.empty() || !ep || (ep->host != "127.0.0.1" && ep->host != "localhost" && ep->host != "::1")) {
+      std::fprintf(stderr, "deskd: --espn-url takes a loopback URL and only with --sim (the sandbox's stand-in for ESPN)\n");
+      return 2;
+    }
+    options.espn_url = espn_url;
+    DLOG_WARN("--sim: ESPN's scoreboards come from the stand-in at %s", espn_url.c_str());
   }
 
   // A write to a closed socket is an error to handle, never a reason to end the desk: TLS

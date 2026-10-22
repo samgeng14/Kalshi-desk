@@ -3,7 +3,8 @@
 //   - a second deskd on the same account is refused (exit 3) while the first holds the lock: from
 //     the same data dir, and from another working directory with a relative --data-dir (the
 //     review's case: until 2026-10-06 the lock sat in the data dir, and both came up)
-//   - a missing data dir is refused and not created; "live" in a config file is refused
+//   - a missing data dir is refused and not created; "live" in a config file is refused; the
+//     sandbox's ESPN stand-in (--espn-url) only with --sim and only on loopback
 //   - the heartbeat file appears; deskctl status reads the workers; deskctl kill KILLs through
 //     the screen's route with its token
 //   - deskctl lane-reset is refused while deskd holds the account's lock; with deskd stopped it
@@ -202,6 +203,18 @@ int main() {
   CHECK(run({DESKD_BIN, "--config", d.file("live.json"), "--data-dir", d.path}, d, "livecfg", &out, &err) == 2);
   CHECK(err.find("command-line flag only") != std::string::npos);
   CHECK(run({DESKD_BIN, "--bogus"}, d, "bogus") == 2);
+  // --espn-url, the sandbox's stand-in for ESPN's scoreboards (tools/deskd_sim.py --nba): only with
+  // --sim and only on loopback, refused before the lock; a loopback one with --sim gets as far as
+  // the lock (the first deskd holds it)
+  const std::string sim_ca = d.file("no-ca.pem");
+  CHECK(run({DESKD_BIN, "--data-dir", d.path, "--espn-url", "http://127.0.0.1:9"}, d, "espn-nosim", &out, &err) == 2);
+  CHECK(err.find("--espn-url takes a loopback URL and only with --sim") != std::string::npos);
+  CHECK(run({DESKD_BIN, "--data-dir", d.path, "--sim", "https://127.0.0.1:9", "--sim-ca", sim_ca, "--espn-url",
+             "https://site.api.espn.com"}, d, "espn-far", &out, &err) == 2);
+  CHECK(err.find("--espn-url takes a loopback URL and only with --sim") != std::string::npos);
+  CHECK(run({DESKD_BIN, "--data-dir", d.path, "--sim", "https://127.0.0.1:9", "--sim-ca", sim_ca, "--espn-url",
+             "http://127.0.0.1:9", "--port", std::to_string(free_port())}, d, "espn-sim", &out, &err) == 3);
+  CHECK(err.find("held by another process") != std::string::npos);
 
   // the heartbeat file, written while gw, md-k and priv-k move
   bool beat = false;
