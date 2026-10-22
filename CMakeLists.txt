@@ -499,7 +499,8 @@ endif()
 #                duplicate client ids, netting and cash per shard, order groups, the socket's
 #                message fields, the street, its pull of the touch and tape debts, the archive
 #                reader on recorded frames and the synthetic fixture, scenarios, the fixture
-#                played to its end, and 5,000 resting orders
+#                played to its end, 5,000 resting orders, and Polymarket US's fee mode (per fill,
+#                to the cent half to even, the rebate credited) and no self-trade prevention
 #   fake-wire    over loopback: every REST route and shape, cursor paging, auth (a real RSA-PSS
 #                signature), rate limits per shard, the socket's commands, sids and seq, every
 #                channel, and each fault (drops, 5xx, a cut body, chunked, 429, stalls, socket

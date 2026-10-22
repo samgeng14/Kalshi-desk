@@ -1,6 +1,7 @@
 // The fake Kalshi without sockets: its wire formats, grids and fees, the matching engine and
 // account, order groups, the street (its pull of the touch, its tape debts), and the tape and
-// scenario readers.
+// scenario readers. Also the engine as the fake Polymarket US runs it: FeeType::POLY's fees and
+// rebate fill by fill, and our own orders crossing with Stp::NONE.
 //
 // Expected numbers are worked by hand from the venue's documents (docs.kalshi.com, fetched
 // 2026-10-06): fees from the formula in redesign_all kalshi K6 and the worked example in
@@ -183,6 +184,33 @@ void test_grids_and_fees() {
   // a sale's positive change is floored too
   acc = 0;
   CHECK(charge_fee(1800000, 69250, 100, acc) == 69300);
+
+  // Polymarket US: a taker pays 0.06 x C x P x (1 - P), a maker is paid 0.0125 x ..., each fill
+  // to the cent, half to even. One contract at 50c pays 1.5c -> 2c; three pay 4.5c -> 4c
+  CHECK(poly_fee(60000, 12500, true, 100, 5000) == 20000);
+  CHECK(poly_fee(60000, 12500, true, 300, 5000) == 40000);
+  CHECK(poly_fee(69500, 12500, true, 100, 5000) == 20000);  // core.js's 0.0695: 1.7375c
+  CHECK(poly_fee(60000, 12500, true, 300, 5050) == 40000);  // 3 at 50.5c: 4.49955c
+  // the rebate's worked rows (gw/fees.h): at 50c one earns 0.3125c, nothing, two 0.625c, 1c; at
+  // 90c four earn 0.45c, nothing, five 0.5625c, 1c
+  CHECK(poly_fee(60000, 12500, false, 100, 5000) == 0);
+  CHECK(poly_fee(60000, 12500, false, 200, 5000) == -10000);
+  CHECK(poly_fee(60000, 12500, false, 400, 9000) == 0);
+  CHECK(poly_fee(60000, 12500, false, 500, 9000) == -10000);
+  // half to even on the rebate: 1.6 contracts at 50c earn exactly 0.5c, nothing; 4.8 earn 1.5c, 2c
+  CHECK(poly_fee(60000, 12500, false, 160, 5000) == 0);
+  CHECK(poly_fee(60000, 12500, false, 480, 5000) == -20000);
+  CHECK(poly_fee(60000, 12500, true, 100, 0) == 0 && poly_fee(60000, 12500, true, 100, kDollar) == 0);
+  CHECK(poly_fee(60000, 12500, true, 0, 5000) == 0 && poly_fee(0, 0, true, 100, 5000) == 0);
+  CHECK(poly_fee(60000, 0, false, 10000, 5000) == 0);
+  // a million contracts at 50c: $15,000 to the taker, $3,125 to the maker (no 64-bit overflow)
+  CHECK(poly_fee(60000, 12500, true, 100000000, 5000) == 15000 * D);
+  CHECK(poly_fee(60000, 12500, false, 100000000, 5000) == -3125 * D);
+  // Kalshi's model has no POLY schedule; the names
+  CHECK(model_fee(FeeType::POLY, 1000, true, 100, 5000) == 0 && model_fee(FeeType::POLY, 1000, false, 100, 5000) == 0);
+  CHECK(std::string(fee_type_name(FeeType::POLY)) == "poly");
+  CHECK(std::string(stp_name(Stp::NONE)) == "none" && std::string(stp_name(Stp::MAKER)) == "maker" &&
+        std::string(stp_name(Stp::TAKER_AT_CROSS)) == "taker_at_cross");
 }
 
 // ---- matching ------------------------------------------------------------------------------------
@@ -356,6 +384,106 @@ void test_self_trade() {
   CHECK(e.create(fok, T0 + 5).fill_count == 0);
   fok.stp = Stp::MAKER;  // ours goes, and the street's 5 suffice
   CHECK(e.create(fok, T0 + 5).fill_count == 300);
+
+  // NONE (Polymarket US lists no prevention): ours trades with ours, and fill_or_kill counts it
+  const auto again = e.create(ord(T, Side::ASK, 4700, 100), T0 + 6);  // ours at 0.47, the street's 2 behind
+  fok.stp = Stp::TAKER_AT_CROSS;
+  CHECK(e.create(fok, T0 + 6).fill_count == 0);
+  fok.stp = Stp::NONE;
+  const auto none = e.create(fok, T0 + 7);
+  CHECK(!none.err && none.fill_count == 300 && e.order(none.order_id)->status == OrdStatus::EXECUTED);
+  const Order* mine = e.order(again.order_id);
+  CHECK(mine->status == OrdStatus::EXECUTED && mine->filled == 100 && mine->reason == "Trade");
+  // one trade, both sides ours: a maker fill and a taker fill share its id
+  const auto& f = e.fills();
+  CHECK(f.size() >= 3 && f[f.size() - 3].trade_id == f[f.size() - 2].trade_id);
+  CHECK(f[f.size() - 3].order_id == again.order_id && !f[f.size() - 3].taker);
+  CHECK(f[f.size() - 2].order_id == none.order_id && f[f.size() - 2].taker && f[f.size() - 2].yes_px == 4700);
+  CHECK(f.back().order_id == none.order_id && f.back().yes_px == 4800 && f.back().count == 200);
+  // ... and an IOC with NONE crosses ours as well, where MAKER would have cancelled it
+  const auto rest = e.create(ord(T, Side::ASK, 4900, 100), T0 + 8);
+  NewOrder ioc = ord(T, Side::BID, 4900, 100, Tif::IOC);
+  ioc.stp = Stp::NONE;
+  CHECK(e.create(ioc, T0 + 9).fill_count == 100 && e.order(rest.order_id)->status == OrdStatus::EXECUTED);
+}
+
+// Polymarket US on the same engine: FeeType::POLY's fees fill by fill, the rebate credited, the
+// taker's collateral, and our own orders crossing with Stp::NONE
+void test_polymarket() {
+  const std::string P = "aec-nba-bos-nyk-2026-10-22";  // a game market on its 0.5c grid
+  const std::string Q = "aec-nba-lal-gsw-2026-10-22";
+  Engine e;
+  e.config().balance_precision = 10000;  // a Kalshi account at $0.01 would align every change
+  MarketSpec s = spec(P, 0, FeeType::POLY);
+  s.ticks = {{50, 9950, 50}};
+  CHECK(s.poly_coeff_micro == 60000 && s.poly_rebate_micro == 12500);  // 0.06 and 0.0125
+  e.add_market(s, T0);
+  e.add_market(spec(Q, 0, FeeType::POLY), T0);
+  e.street_add(P, true, 5000, 100, T0);  // two street YES asks at 0.50 x1, one at 0.505 x1
+  e.street_add(P, true, 5000, 100, T0);
+  e.street_add(P, true, 4950, 100, T0);
+
+  // a take holds its cost at its limit and the PM taker fee: 3 at 0.505 is $1.515 and 4.49955c,
+  // 4c, so $1.555 (Kalshi's 0.07 would hold $0.052495)
+  const NewOrder take = ord(P, Side::BID, 5050, 300, Tif::IOC);
+  e.set_cash(0, 0, 1554999, T0);
+  CHECK(e.create(take, T0).err.code == "insufficient_balance");
+  e.set_cash(0, 0, 1555000, T0);
+  CHECK(e.create(take, T0).fill_count == 300);
+  CHECK(e.cash(0, 0) == 0);  // $1.505 paid and 5c in fees, below
+
+  // each fill pays its own fee, to the cent, half to even: 1.5c -> 2c twice and 1.49985c -> 1c,
+  // 5c where the order's exact 4.49985c would round to 4c
+  e.set_cash(0, 0, 10 * D, T0);
+  e.street_add(P, true, 5000, 100, T0);
+  e.street_add(P, true, 5000, 100, T0);
+  e.street_add(P, true, 4950, 100, T0);
+  const auto t = e.create(ord(P, Side::BID, 5050, 300, Tif::IOC), T0 + 1);
+  CHECK(!t.err && t.fill_count == 300 && t.fill_cost == 1505000 && t.fees == 50000);
+  const auto& f = e.fills();
+  CHECK(f.size() == 6 && f[3].fee == 20000 && f[4].fee == 20000 && f[5].fee == 10000 && f[5].yes_px == 5050);
+  // ... and none of Kalshi's alignment: the half cent of the 0.505 fill stays in the cash
+  CHECK(e.cash(0, 0) == 10 * D - 1505000 - 50000);
+  const Order* T1 = e.order(t.order_id);
+  CHECK(T1 && T1->taker_fees == 50000 && T1->fee_acc == 0);
+
+  // a maker is paid: 2 at 0.50 earn 0.625c, 1c, credited; one more earns 0.3125c, nothing
+  const Micros c0 = e.cash(0, 0);
+  NewOrder post = ord(P, Side::BID, 5000, 300);
+  post.post_only = true;
+  const auto mk = e.create(post, T0 + 2);
+  CHECK(!mk.err && e.order(mk.order_id)->status == OrdStatus::RESTING);
+  CHECK(e.street_take(P, Side::ASK, 5000, 200, T0 + 3) == 200);
+  CHECK(!e.fills().back().taker && e.fills().back().fee == -10000);
+  CHECK(e.cash(0, 0) == c0 - 1000000 + 10000);
+  CHECK(e.street_take(P, Side::ASK, 5000, 100, T0 + 4) == 100);
+  CHECK(e.fills().back().fee == 0 && e.cash(0, 0) == c0 - 1500000 + 10000);
+  const Order* M = e.order(mk.order_id);
+  CHECK(M && M->status == OrdStatus::EXECUTED && M->maker_fees == -10000 && M->maker_cost == 1500000);
+  // 9 YES: 3 taken twice over, 3 made; the fees net of the rebate
+  const Position& p = e.positions().at({0, P});
+  CHECK(p.pos == 900 && p.cost == 1505000 * 2 + 1500000 && p.fees == 50000 + 50000 - 10000);
+  CHECK(p.pos_fees == p.fees);
+
+  // no self-trade prevention: our IOC bid trades with our own resting ask. The pair nets to
+  // nothing; the desk pays the taker's 0.06 x 2 x 0.25 = 3c and is paid the maker's 1c
+  NewOrder ask = ord(Q, Side::ASK, 5000, 200);
+  ask.post_only = true;
+  const auto own = e.create(ask, T0 + 5);
+  CHECK(!own.err);
+  const Micros c1 = e.cash(0, 0);
+  NewOrder cross = ord(Q, Side::BID, 5000, 200, Tif::IOC);
+  cross.stp = Stp::NONE;
+  const auto x = e.create(cross, T0 + 6);
+  CHECK(!x.err && x.fill_count == 200 && x.fees == 30000);
+  CHECK(e.order(own.order_id)->status == OrdStatus::EXECUTED && e.order(own.order_id)->maker_fees == -10000);
+  const auto& g = e.fills();
+  CHECK(g[g.size() - 2].trade_id == g.back().trade_id && !g[g.size() - 2].taker && g.back().taker);
+  const auto q = e.positions().find({0, Q});
+  CHECK(q != e.positions().end() && q->second.pos == 0 && q->second.cost == 0 && q->second.realized == 0 &&
+        q->second.fees == 20000);
+  CHECK(e.cash(0, 0) == c1 - 20000);
+  CHECK(e.levels(Q, false).empty() && e.levels(Q, true).empty());
 }
 
 void test_pause_and_close() {
@@ -1069,6 +1197,7 @@ int main() {
   test_grids_and_fees();
   test_matching();
   test_self_trade();
+  test_polymarket();
   test_pause_and_close();
   test_account();
   test_groups();

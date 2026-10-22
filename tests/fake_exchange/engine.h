@@ -50,6 +50,16 @@
 //   - Kalshi nets one position per market: buying YES while holding NO closes pairs, each worth
 //     $1 at once (plan section 4, "Kalshi nets one position per market").
 //
+// For the fake Polymarket US, two settings the Kalshi routes never set. A market whose fee_type is
+// POLY charges a taker coeff x C x P x (1 - P), coeff the market's own feeCoefficient, and pays a
+// maker 0.0125 x C x P x (1 - P). Each fill is rounded to the cent, half to even, and charged or
+// credited as it is: none of Kalshi's balance alignment or accumulator (ui/desk/js/core.js
+// Desk.fees.pmFill, as deskd's gw/fees.h has it; core.js also caps an order's taker fills at its
+// rounded exact total, which the fake does not). The venue has confirmed none of this: the
+// coefficient, the rate, the rounding, or per fill against per order. The venue lists no
+// self-trade prevention ("Self-trade n/a", plan section 3), so its orders carry Stp::NONE: an
+// order of ours that crosses our own resting order trades with it.
+//
 // The fake's own choices where the venue documents nothing, so deskd must not rely on them: the
 // error `code` strings other than invalid_order and the 429 body; the collateral rule (an order
 // reserves the cost of the part its opposite position cannot close, plus the worst taker fee
@@ -98,12 +108,18 @@ std::vector<PriceRange> linear_cent();
 std::vector<PriceRange> tapered_deci_cent();
 bool on_grid(const std::vector<PriceRange>& g, Px p);
 
-enum class FeeType { QUADRATIC, QUADRATIC_WITH_MAKER_FEES, QUADRATIC_WITH_COMBO_MAKER_FEES };
+// POLY: a Polymarket US market (poly_fee), never a Kalshi series
+enum class FeeType { QUADRATIC, QUADRATIC_WITH_MAKER_FEES, QUADRATIC_WITH_COMBO_MAKER_FEES, POLY };
 const char* fee_type_name(FeeType t);
 
 // The model fee for one fill, rounded up to $0.000001. mult_milli: the series' fee_multiplier in
-// thousandths (1000 = 1, 500 = 0.5, 0 = fee-free).
+// thousandths (1000 = 1, 500 = 0.5, 0 = fee-free). Kalshi's types only: 0 for POLY.
 Micros model_fee(FeeType type, int mult_milli, bool taker, Qty q, Px yes_px);
+
+// Polymarket US's fee for one fill: a taker pays coeff x C x P x (1 - P), a maker is paid
+// rate x C x P x (1 - P) (a negative fee), rounded to the cent, half to even. coeff_micro and
+// rate_micro in millionths (0.06 = 60,000).
+Micros poly_fee(int coeff_micro, int rate_micro, bool taker, Qty q, Px yes_px);
 
 // fee_rounding.md for one fill: `revenue` is the fill's cash change before fees, `trade_fee` the
 // model fee. Returns what the fill is charged (trade fee + rounding fee - rebate) and updates the
@@ -119,6 +135,9 @@ struct MarketSpec {
   std::string price_level_structure = "linear_cent";
   FeeType fee_type = FeeType::QUADRATIC;
   int fee_mult_milli = 1000;
+  // POLY only, in millionths: the taker feeCoefficient the market lists (0.06 in the old desk's
+  // fixtures and docs/polymarket.md, 0.0695 in core.js) and the maker rebate rate
+  int poly_coeff_micro = 60000, poly_rebate_micro = 12500;
   std::int64_t close_ms = 0;    // 0: never closes on its own
   bool fractional = false;      // fractional_trading_enabled (listed only; the engine does not refuse)
   std::int64_t open_ms = 0;     // open_time; 0: left out
@@ -142,7 +161,7 @@ struct EventSpec {
 
 enum class Side { BID, ASK };  // the order's book side, YES terms
 enum class Tif { FOK, GTC, IOC };
-enum class Stp { TAKER_AT_CROSS, MAKER };
+enum class Stp { TAKER_AT_CROSS, MAKER, NONE };  // NONE: Polymarket's, ours trade with ours
 enum class OrdStatus { RESTING, CANCELED, EXECUTED };
 enum class StreetCancel { BACK_FIRST, FRONT_FIRST };
 enum class PostOnlyCross { REFUSE_400, CANCEL };
