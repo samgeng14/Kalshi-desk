@@ -31,8 +31,8 @@ cost in micro-dollars, times in ms. The fee is gw/fees.h's (decisions 13: one fe
 The decision (decide(inp, params)): inp is take.h's TakeInput, a dict with integer units
 
   a, b          the two markets, each {ticker, bid, bid_qty, ask, ask_qty (None: no such side),
-                stale (True also for no book at all), fee_mult (None: not known), fractional,
-                position, bid_since_ms, ask_since_ms}
+                stale, book (optional; False: no book at all, which stale True also stands for),
+                fee_mult (None: not known), fractional, position, bid_since_ms, ask_since_ms}
   state, src, score_why, fetched_ms, first_seen_ms, start_ms, a_score, b_score, t_left_s (None:
   no clock), ot, points, set_end_ms, p0, fair, fair_why, espn, espn_seen_ms (A's side; p0, fair
   and espn are Px or None), now_ms, last_take_ms, game_used (micro-dollars), game_takes, fired
@@ -44,13 +44,17 @@ or {'pull': CODE, 'why', 'edge' (the pulled route's, or None), 'dir' (-1: the ga
 'route' (the pulled route's order once it had a count, else None)}, edge rounded down to Money a
 contract and dir 0 for A's team, 1 for B's. has_edge(decision, mode) is TakeEngine's rule for a
 signal run: the decision took, or a route got past its edge (FAV_PREGAME: into its band).
+fixture_cases(path) reads a take_cases file in deskd's units and run_cases(path) runs every case
+of one (the gate tools' self-tests and --check).
 
 Standard library only. Import it (sys.path.insert(0, <tools dir>); import take_rule).
 
 Usage:
   python3 tools/take_rule.py --self-test
+  python3 tools/take_rule.py --check FILE.json [FILE.json ...]   # any take_cases file
 """
 import argparse
+import importlib.util
 import json
 import math
 import os
@@ -195,6 +199,8 @@ def decide(i, P):
     if not i['private_up']:
         return _pull('PRIVATE_DOWN', 'the private feed is down')
     for l in legs:
+        if not l.get('book', True):
+            return _pull('STALE_BOOK', l['ticker'] + ' has no book')
         if l['stale']:
             return _pull('STALE_BOOK', l['ticker'] + "'s book is stale or missing")
         if l['bid'] is not None and l['ask'] is not None and l['bid'] >= l['ask']:
@@ -260,7 +266,7 @@ def decide(i, P):
     if P['max_takes'] > 0 and i['game_takes'] >= P['max_takes']:
         return _pull('TAKES', '%d takes in the game' % i['game_takes'])
     if P['game_cap'] > 0 and i['game_used'] >= P['game_cap']:
-        return _pull('GAME_CAP', "the game's worst case $%.4f is at its cap" % (i['game_used'] / 1e6))
+        return _pull('GAME_CAP', "the game's worst case $%s is at its cap" % _price(i['game_used'] // 100))
 
     # ---- the routes: A BUY, A SELL (of B), B BUY, B SELL (of A)
     room = P['game_cap'] - i['game_used']
@@ -303,9 +309,10 @@ def decide(i, P):
             if fav and want <= 0:
                 return fail('HELD', 'holds %d of %s' % (held // CT, own['ticker']))
             if by_room <= 0:
-                return fail('GAME_CAP', "the game's room buys no contract at " + _price(r['team_px']))
+                return fail('GAME_CAP', "the game's room $%s buys no contract at %s" % (_price(room // 100),
+                                                                                   _price(r['team_px'])))
             if want <= 0:
-                return fail('CLIP', 'the clip buys no contract at ' + _price(r['team_px']))
+                return fail('CLIP', 'the clip $%s buys no contract at %s' % (_price(P['clip']), _price(r['team_px'])))
             return fail('SIZE', 'the touch is under one contract')
         r['stage'] += 1
         r['fee'] = kalshi_fee_order_cent(r['team_px'], r['count'], mult)
@@ -468,7 +475,36 @@ def fixture_cases(path):
     return out
 
 
+def run_cases(path):
+    """Every case of one take_cases file: (cases run, [(name, got, want)] that differ or pull
+    without a why, [modes whose params are not take_params' defaults])."""
+    with open(path, encoding='utf-8') as fh:
+        f = json.load(fh)
+    if f.get('kind') != 'take_cases' or f.get('v') != 1:
+        raise ValueError('%s is not a take_cases file (v 1)' % path)
+    bad_params = [m for m in f['params'] if params_of(f['params'][m], m) != params(m)]
+    cases, bad = fixture_cases(path), []
+    for name, mode, i, p, want in cases:
+        d = decide(i, p)
+        got = got_of(d)
+        if got != want or ('pull' in d and not d['why']):
+            bad.append((name, got, want))
+    return len(cases), bad, bad_params
+
+
 # ---------------------------------------------------------------- self-test
+
+def research_fee():
+    """research/espn_leadlag.py's taker_fee (the float fee the old study used), None when that
+    script is not in the tree."""
+    src = os.path.join(ROOT, 'research', 'espn_leadlag.py')
+    if not os.path.exists(src):
+        return None
+    spec = importlib.util.spec_from_file_location('espn_leadlag', src)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.taker_fee
+
 
 def self_test():
     fails = []
@@ -478,41 +514,74 @@ def self_test():
         if not ok:
             fails.append(name)
 
-    # gw/fees.h's cent rule (deskd-fees' examples)
+    # gw/fees.h's cent rule (deskd-fees' examples), the micro-dollar ceiling first
     check('fee: 5 contracts at 40c, mult 1: 8.4c rounds up to $0.09', kalshi_fee_order_cent(4000, 500, 1.0) == 900)
     check('fee: 1 at 50c: 1.75c -> $0.02', kalshi_fee_order_cent(5000, 100, 1.0) == 200)
-    check('fee: mult 0.5 halves the raw fee before rounding (4 at 45c: 3.465c -> $0.04)',
-          kalshi_fee_order_cent(4500, 400, 0.5) == 400 and kalshi_model_fee(0.5, 4500, 400) == 34650)
+    check('fee: exactly 7c stays 7c (4 at 50c); 5 at 50c ($0.0875) is 9c',
+          kalshi_fee_order_cent(5000, 400, 1) == 700 and kalshi_fee_order_cent(5000, 500, 1) == 900)
+    check('fee: mult 0.5 halves the raw fee before rounding (4 at 45c: 3.465c -> $0.04; 5 at 40c: $0.05)',
+          kalshi_fee_order_cent(4500, 400, 0.5) == 400 and kalshi_model_fee(0.5, 4500, 400) == 34650
+          and kalshi_fee_order_cent(4000, 500, 0.5) == 500)
+    check('fee: 0.07 x 0.5 x 0.5 is 17,500 micro-dollars; 0.1c of a contract rounds up to one',
+          kalshi_model_fee(1, 5000, 100) == 17500 and kalshi_model_fee(1, 10, 1) == 1)
     check('fee: the multiplier in thousandths, rounded up with 1e-6 slack', fee_milli(0.1 * 3) == 300
           and fee_milli(0.0001) == 1 and fee_milli(float('nan')) == 0 and fee_milli(-1) == 0 and fee_milli(None) == 0)
     check('fee: none at 0 or $1, or without a multiplier', kalshi_fee_order_cent(0, 500, 1) == 0
           and kalshi_fee_order_cent(ONE, 500, 1) == 0 and kalshi_fee_order_cent(4000, 500, 0) == 0)
-    check('clip_count: $2 at 48c buys 4 ($1.92 and a 7c fee)', clip_count(2 * ONE, 4800, 1.0) == 400)
-    check('clip_count: fractions in 0.01 steps; 0 when none fits', clip_count(2 * ONE, 4500, 1.0, 0, False) == 426
+    old = research_fee()
+    if old is None:
+        print('     research/espn_leadlag.py: not present, its taker_fee check skipped')
+    else:   # the old study's float fee, which x1_backtest's numbers are compared with
+        worst = max(abs(kalshi_fee_order_cent(c * 100, n * CT, m) / ONE - old(c / 100, n, m))
+                    for c in range(1, 100) for n in range(1, 21) for m in (0.5, 1.0))
+        check("research/espn_leadlag.py's taker_fee agrees at every cent price, 1 to 20 contracts", worst < 1e-12,
+              worst)
+
+    # clip_count (test_take.cpp's clip_counts)
+    check('clip_count: $2 at 48c buys 4 ($1.92 and a 7c fee), at 97c 2; $1 at 99c 1; $0.50 at 60c none',
+          clip_count(2 * ONE, 4800, 1.0) == 400 and clip_count(2 * ONE, 9700, 1.0) == 200
+          and clip_count(ONE, 9900, 1.0) == 100 and clip_count(5000, 6000, 1.0) == 0)
+    check('clip_count: fractions in 0.01 steps; max_count; the multiplier; 0 when none fits',
+          clip_count(2 * ONE, 4500, 1.0, 0, False) == 426 and clip_count(2 * ONE, 3000, 1.0, 0, False) == 633
+          and clip_count(2 * ONE, 3000, 1.0) == 600 and clip_count(2 * ONE, 3000, 1.0, 450) == 400
+          and clip_count(2 * ONE, 4800, 0.5) == 400 and clip_count(2 * ONE, 4800, 0, 0, False) == 416
           and clip_count(4000, 4500, 1.0) == 0)
+    check('clip_count: no price, no clip', clip_count(2 * ONE, 0, 1) == 0 and clip_count(2 * ONE, ONE, 1) == 0
+          and clip_count(0, 4800, 1) == 0 and clip_count(-2 * ONE, 4800, 1) == 0)
+    largest = all(px * c + 100 * kalshi_fee_order_cent(px, c, 1) <= clip * 100
+                  and px * (c + step) + 100 * kalshi_fee_order_cent(px, c + step, 1) > clip * 100
+                  for px in (100, 1700, 4500, 5000, 8300, 9900) for clip in (ONE, 2 * ONE, 5 * ONE)
+                  for step in (CT, 1) for c in (clip_count(clip, px, 1, 0, step == CT),))
+    check('clip_count: the count is the largest that fits, one more step never does', largest)
+
+    # the defaults
     check('params: COLLEGE is 20c net, $2, $10 a game, thin under 20k, stale touches only',
           params('COLLEGE')['edge'] == 2000 and params('COLLEGE')['clip'] == 20000
           and params('COLLEGE')['game_cap'] == 10000000 and params('COLLEGE')['max_volume'] == 2000000
           and params('COLLEGE')['stale_only'] is True)
+    n = params('MODEL')
+    check("params: MODEL is nba.json's (10c, 4 contracts, 4 takes 10 s apart, 30 s, 3c, 5-95c, no OT, 2:00)",
+          (n['edge'], n['max_count'], n['max_takes'], n['signal_ms'], n['cool_ms'], n['max_spread'], n['min_px'],
+           n['max_px'], n['trade_ot'], n['min_t_left_s']) == (1000, 400, 4, 30000, 10000, 300, 500, 9500, False, 120.0))
+    check('params: FOLLOW and FADE are MODEL with their own mode; $10 a game for every lane',
+          dict(params('ESPN_FOLLOW'), mode='MODEL') == n == dict(params('ESPN_FADE'), mode='MODEL')
+          and all(params(m)['game_cap'] == 10000000 for m in MODES))
     check('the pull codes: 31, each once', len(PULL_CODES) == 31 == len(set(PULL_CODES)))
 
-    # every hand-worked case of the fixtures deskd-take asserts
-    for name in FIXTURES:
+    # every hand-worked case of the fixtures deskd-take asserts, and their params are take_params'
+    total = 0
+    for name, least in zip(FIXTURES, (40, 25, 35)):
         path = os.path.join(ROOT, 'tests', 'deskd', 'fixtures', name)
         if not os.path.exists(path):
             check('%s is present' % name, False, path)
             continue
-        cases = fixture_cases(path)
-        bad = []
-        for cname, mode, i, p, want in cases:
-            got = got_of(decide(i, p))
-            if got != want:
-                bad.append('%s: got %s, want %s' % (cname, got, want))
-        with open(path, encoding='utf-8') as fh:
-            f = json.load(fh)
-        defaults = all(params_of(f['params'][m], m) == params(m) for m in f['params'])
-        check('%s: all %d cases give the recorded decision' % (name, len(cases)), cases and not bad, '; '.join(bad[:3]))
-        check("%s: its params are take_params' defaults" % name, defaults)
+        cases, bad, bad_params = run_cases(path)
+        total += cases
+        for b in bad[:5]:
+            print('     %s %s: got %s, want %s' % (name, b[0], b[1], b[2]))
+        check('%s: all %d cases give the recorded decision' % (name, cases), cases >= least and not bad,
+              '%d differ' % len(bad))
+        check("%s: its params are take_params' defaults" % name, not bad_params, bad_params)
     # what the gate tools read besides the take itself
     cases = {c[0]: c for c in fixture_cases(os.path.join(ROOT, 'tests', 'deskd', 'fixtures', FIXTURES[0]))}
     _, mode, i, p, _ = cases['buy_a_at_the_ask']
@@ -528,17 +597,51 @@ def self_test():
     check('has_edge: no for NO_EDGE, the game checks and FAV_PREGAME before its band',
           not has_edge(d, mode) and not has_edge(_pull('SCORE_OLD', ''), mode)
           and has_edge(_pull('SIZE', '', None, 0), 'FAV_PREGAME') and not has_edge(_pull('SIZE', '', None, 0), mode))
-    print('take_rule self-test: %s' % ('ok' if not fails else 'FAILED (%d)' % len(fails)))
+    # the same game listed the other way round is the same take, for the other team (mirrored())
+    _, mode, base, p, _ = cases['buy_a_at_the_ask']
+    m = dict(base, a=base['b'], b=base['a'], a_score=base['b_score'], b_score=base['a_score'],
+             p0=ONE - base['p0'], fair=ONE - base['fair'])
+    d, e = decide(base, p).get('take'), decide(m, p).get('take')
+    check('mirrored: the same order for the other team', d is not None and e is not None and d['dir'] == 0
+          and e['dir'] == 1 and all(d[k] == e[k] for k in ('ticker', 'side', 'price', 'count', 'fee', 'edge')))
+    f = decide(dict(m, fired=[False, True]), p)
+    check('mirrored: a pull names the mirrored team', f.get('pull') == 'FIRED' and f['dir'] == 1
+          and 'AAA' in f['why'], f.get('why'))
+    g = decide(dict(base, a=dict(base['a'], book=False)), p)
+    check('no book at all is STALE_BOOK', g.get('pull') == 'STALE_BOOK' and 'has no book' in g['why'], g.get('why'))
+    # the band is inclusive at both ends: N1's game, thr 1c, A at 0.95 and B's team at 0.05
+    with open(os.path.join(ROOT, 'tests', 'deskd', 'fixtures', FIXTURES[2]), encoding='utf-8') as fh:
+        nb = input_of(json.load(fh)['base']['MODEL'])
+    pn = dict(params('MODEL'), edge=100)
+    hi = decide(dict(nb, fair=9900, a=dict(nb['a'], bid=9400, ask=9500), b=dict(nb['b'], bid=400, ask=600)), pn)
+    lo = decide(dict(nb, fair=100, a=dict(nb['a'], bid=9400, ask=9600), b=dict(nb['b'], bid=300, ask=500)), pn)
+    check('the band [min_px, max_px] is inclusive: BUY A at 0.95, BUY B at 0.05',
+          'take' in hi and (hi['take']['side'], hi['take']['price'], hi['take']['dir']) == ('BUY', 9500, 0)
+          and 'take' in lo and (lo['take']['side'], lo['take']['price'], lo['take']['dir']) == ('BUY', 500, 1),
+          (hi.get('pull'), lo.get('pull')))
+    print('take_rule self-test: %s (%d fixture cases)' % ('ok' if not fails else 'FAILED (%d)' % len(fails), total))
     return 1 if fails else 0
 
 
 def run(argv):
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     ap.add_argument('--self-test', action='store_true')
+    ap.add_argument('--check', nargs='+', metavar='FILE', help='run every case of these take_cases files')
     a = ap.parse_args(argv)
-    if not a.self_test:
+    if a.self_test:
+        return self_test()
+    if not a.check:
         ap.error('nothing to do: this module is imported; --self-test runs its checks')
-    return self_test()
+    rc = 0
+    for path in a.check:
+        cases, bad, bad_params = run_cases(path)
+        for name, got, want in bad:
+            print('%s %s: got %s, want %s' % (os.path.basename(path), name, got, want))
+        for mode in bad_params:
+            print("%s: params.%s are not take_params' defaults" % (os.path.basename(path), mode))
+        print('%s: %d cases, %d differ' % (os.path.basename(path), cases, len(bad)))
+        rc = rc or (1 if bad or bad_params else 0)
+    return rc
 
 
 if __name__ == '__main__':
