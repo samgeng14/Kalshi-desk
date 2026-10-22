@@ -16,6 +16,7 @@
 #include "deskd/priv/kalshi_private.h"
 #include "deskd/ref/pyth.h"
 #include "deskd/strat/fair.h"
+#include "deskd/strat/game_fair.h"
 #include "deskd/ref/espn.h"
 #include "deskd/strat/maker.h"
 #include "deskd/strat/markouts.h"
@@ -161,6 +162,7 @@ bool Deskd::start(std::string* err) {
   // fair before the makers that read it. An engine with work in flight registers with paced().
   StratSteps steps;
   steps.every(250, [this] { if (fair_ && rest_) fair_->step(*rest_->snapshot(), now_ms()); });
+  steps.every(250, [this] { if (game_fair_) game_fair_->step(now_ms()); });
   steps.every(250, [this] { if (lip_) lip_->step(now_ms()); });
   steps.every(250, [this] { if (band_) band_->step(now_ms()); });
   steps.every(250, [this] { if (paper_) paper_->step(now_ms()); });
@@ -308,6 +310,7 @@ json Deskd::status() const {
   result["probe"] = probe_ ? probe_->status() : json(nullptr);
   result["wcbb"] = {{"path", cfg_.wcbb_model}, {"loaded", wcbb_.has_value()}, {"why", wcbb_why_},
                     {"version", wcbb_ ? wcbb_->version : 0}};
+  result["game_fair"] = game_fair_ ? game_fair_->status() : json(nullptr);
   result["markouts"] = markouts_ ? markouts_->status() : json(nullptr);
   if (const auto l = gw_->latency()) {
     auto ms = [](const std::optional<int>& v) { return v ? json(*v) : json(nullptr); };

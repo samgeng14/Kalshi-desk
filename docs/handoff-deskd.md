@@ -59,10 +59,13 @@ partial, 141 missing) set this round's order: what protects money before LIVE fi
   fits the logistic (pure Python; held-out Brier against the Kalshi mid, Stern's model and p0;
   never overwrites a model without `--force`) and writes `models/wcbb_logit_v1.json` with 10
   golden rows. deskd loads it at start (`deskd.wcbb_model`), refuses it unless its golden rows
-  reproduce to 1e-6, keeps each game's pregame mid while ESPN says "pre", and shows the model's
-  p as `book.ref.fair` while the game is on (possession unknown: 0). No model ships: train it on
-  the Mac from the WCBB panel; `deskd-wcbb` checks the C++ side against a synthetic file the
-  trainer wrote. Systematic use waits for the plan's gate (150+ settled games, held-out Brier at
+  reproduce to 1e-6, and hands it to the game fair (`strat/game_fair.h`, one for WCBB, NBA and
+  volleyball): each game's pregame price is the effective mid of its two markets while ESPN says
+  "pre", before the start and at 15c or less (kept in `data_dir/game_p0.json` for 12 h), and the
+  model's p for the home team's market (1 - p for the other) is `book.ref.fair` while the game is
+  on (possession unknown: 0). No model ships: train it on the Mac from the WCBB panel;
+  `deskd-wcbb` and `deskd-bball` check the C++ side against synthetic files the trainer wrote,
+  `deskd-game_fair` the game fair, and `deskd-runtime_manual`'s wcbb_overlay the ladder end to end. Systematic use waits for the plan's gate (150+ settled games, held-out Brier at
   least the mid's, positive overlay markouts).
 - **More safety and hygiene (later the same day):**
   - The equity floor's HALT (plan section 4, limit 5) lasts until a Start with the account's

@@ -6,8 +6,8 @@
 //   gw               the gateway: run state, inbox lanes and deletions
 //   send-k1          Manual's sender; send-k2, send-k3 Systematic's (week 0: placeholders)
 //   send-cx          cancels and KILL, on its own path
-//   strat            the fair, the makers, the LIP meter and the markouts, each engine at its own
-//                    cadence (strat/strat.h)
+//   strat            the fairs (financial and game), the makers, the LIP meter and the markouts,
+//                    each engine at its own cadence (strat/strat.h)
 //   store            the only writer of ops.sqlite
 //   pub              the screen's streams, hb, hdr, snapshots
 //   ops              heartbeat file, disk, preflight rows
@@ -58,6 +58,7 @@ class KalshiMd;
 class KalshiPrivate;
 class KalshiPyth;
 class FinancialFair;
+class GameFair;
 class EspnFeed;
 class MakerEngine;
 class Markouts;
@@ -83,6 +84,7 @@ struct RuntimeOptions {
   std::int64_t fair_watch_since_ms = 0;
   // ESPN's public scoreboards for the watched game markets (ref/espn.h); "" = off.
   std::string espn_url = "https://site.api.espn.com";
+  int espn_scoreboard_ms = 0;   // a scoreboard's pacing; 0 = the feed's default (20 s); tests shorten it
   // gw checks the ledger's bounds after every message (plan section 8); tests and the soak
   bool check_each_message = false;
 };
@@ -139,11 +141,11 @@ class Deskd {
   LipMeter lip_meter_;                   // our LIP share each second (strat thread), read by status
   void lip_step(std::int64_t now_ms);    // strat thread
   std::string calendar_why_;
-  // the WCBB model (read once at start; const after) and each game market's pregame YES price,
-  // captured while ESPN says the game has not started (md thread)
+  // the WCBB model (read once at start; const after), and the game markets' pregame prices and
+  // fairs from it (strat thread; its board read by ref_json on md)
   std::optional<WcbbModel> wcbb_;
   std::string wcbb_why_;
-  std::map<std::string, double> wcbb_p0_;
+  std::unique_ptr<GameFair> game_fair_;
   FillModel fill_model_;                 // each market's trade tape: how likely an order is to fill
   std::map<std::string, std::set<std::string>> strat_want_;   // under live_mu_: by lane, the markets it quotes
   std::string key_error_;

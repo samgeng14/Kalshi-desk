@@ -7,6 +7,7 @@
 #include <sys/stat.h>
 #include <atomic>
 #include <csignal>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <thread>
@@ -379,6 +380,92 @@ void financial_fair() {
   CHECK(fs["replication"]["natgas"]["checked"]==2 && fs["replication"]["natgas"]["matched"]==1);
   CHECK(fs["markets"][W]["fair"].is_string() && fs["markets"][BAD]["fair"].is_null());
   CHECK(r.d->status()["pyth"]["underlyings"][NG]["messages"].get<int>()>=3600);
+}
+// The WCBB model's fair on a women's college game's ladders, end to end (strat/game_fair.h): a
+// local stand-in for ESPN lists the game before its start and the two markets' books give its
+// pregame price; once ESPN says it is on, both ladders carry the model's fair from the home team's
+// side, summing to 1; a restart in play brings the price back from game_p0.json, and the fair with it.
+void wcbb_overlay() {
+  const auto start = now_ms() + 3600000;
+  char date[16], iso[32];
+  {   // the event's date as Kalshi writes it (Eastern: four hours behind UTC until November)
+    static const char* kMon[] = {"JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"};
+    std::time_t et = (start - 4 * 3600000) / 1000, utc = start / 1000;
+    std::tm a{}, b{};
+    gmtime_r(&et, &a); gmtime_r(&utc, &b);
+    std::snprintf(date, sizeof date, "%02d%s%02d", a.tm_year % 100, kMon[a.tm_mon], a.tm_mday);
+    std::strftime(iso, sizeof iso, "%Y-%m-%dT%H:%MZ", &b);
+  }
+  const std::string EV = std::string("KXNCAAWBGAME-") + date + "UCLAUSC", UCLA = EV + "-UCLA", USC = EV + "-USC";
+  std::string why;
+  const auto model = load_wcbb_model(std::string(DESKD_SOURCE_DIR) + "/tests/deskd/fixtures/wcbb_synthetic.json", &why);
+  CHECK(model.has_value());
+  if (!model) return;
+  // ESPN: UCLA at USC, before the start, then Q3 4:12 at 70-74
+  std::atomic<bool> on{false};
+  httplib::Server espn;
+  espn.Get("/apis/site/v2/sports/basketball/womens-college-basketball/scoreboard", [&](const httplib::Request&, httplib::Response& res) {
+    auto side = [&](const char* ha, const char* abbr, const char* name, int score) {
+      return json{{"homeAway", ha}, {"score", std::to_string(on ? score : 0)}, {"team", {{"abbreviation", abbr}, {"displayName", name}}}};
+    };
+    json c = {{"status", {{"period", on ? 3 : 0}, {"displayClock", on ? "4:12" : "0:00"}, {"type", {{"state", on ? "in" : "pre"}, {"shortDetail", "-"}}}}},
+              {"competitors", {side("away", "UCLA", "UCLA Bruins", 70), side("home", "USC", "USC Trojans", 74)}}};
+    res.set_content(json{{"events", {{{"id", "401900"}, {"date", iso}, {"competitions", {c}}}}}}.dump(), "application/json");
+  });
+  const int espn_port = espn.bind_to_any_port("127.0.0.1");
+  std::thread espn_th([&] { espn.listen_after_bind(); });
+  {
+    Run r(false, [&](fakex::Engine& e, std::int64_t now) {
+      for (const auto& tk : {UCLA, USC}) { auto spec = fx::spec(tk, 0); spec.close_ms = (now / 1000 + 4 * 3600) * 1000; e.add_market(spec, now); }
+      e.street_add(USC, false, 6000, 500, now); e.street_add(USC, true, 3400, 500, now);     // USC 0.60 / 0.66
+      e.street_add(UCLA, false, 3300, 500, now); e.street_add(UCLA, true, 5900, 500, now);   // UCLA 0.33 / 0.41
+    }, false, [&](DeskdConfig& c, RuntimeOptions& o) {
+      c.wcbb_model = std::string(DESKD_SOURCE_DIR) + "/tests/deskd/fixtures/wcbb_synthetic.json";
+      o.espn_url = "http://127.0.0.1:" + std::to_string(espn_port);
+      o.espn_scoreboard_ms = 300;
+    });
+    auto watch = [&] {
+      CHECK(r.until([&] { return r.d->status()["rest"]["ready"] == true; }, 15000));
+      for (const auto& tk : {UCLA, USC}) {
+        auto w = r.post("/api/watch", {{"v", "K"}, {"tk", tk}, {"on", true}});
+        CHECK(w && w->status == 200);
+      }
+    };
+    watch();
+    // before the start: UCLA's effective book is 0.34 / 0.40 (USC's 0.60 / 0.66 the other way)
+    const bool captured = r.until([&] { return r.d->status()["game_fair"]["p0"].contains(EV); }, 20000);
+    if (!captured) std::fprintf(stderr, "game_fair: %s\nespn: %s\n", r.d->status()["game_fair"].dump().c_str(), r.d->status()["espn"].dump().c_str());
+    CHECK(captured);
+    const auto p0 = r.d->status()["game_fair"]["p0"][EV];
+    CHECK(p0["ticker"] == UCLA && p0["p0"] == 0.37);
+    CHECK(r.d->status()["game_fair"]["markets"][USC]["fair"].is_null());
+    Stream st(r.d->port(), "rt-wcbb-1");
+    CHECK(r.until([&] { return !st.envelopes().empty(); }));
+    auto sub = r.post("/api/subscribe", {{"sid", "rt-wcbb-1"}, {"ladders", {{{"v", "K"}, {"tk", UCLA}}, {{"v", "K"}, {"tk", USC}}}}, {"tops", json::array()}});
+    CHECK(sub && sub->status == 200);
+    // the game is on: the home team's fair, and 1 - it on the other ladder
+    on = true;
+    const double home = *wcbb_live_p(*model, "in", 3, 252, 4, 1 - 0.37);
+    const std::string usc_fair = price_str(static_cast<Px>(std::llround(home * kOneDollar)));
+    const std::string ucla_fair = price_str(static_cast<Px>(std::llround((1 - home) * kOneDollar)));
+    auto shown = [&](const std::string& tk, const std::string& fair) {
+      for (const auto& e : of(st, "book")) if (e["data"]["tk"] == tk && e["data"]["ref"]["fair"] == fair) return true;
+      return false;
+    };
+    const bool both = r.until([&] { return shown(USC, usc_fair) && shown(UCLA, ucla_fair); }, 20000);
+    if (!both) std::fprintf(stderr, "game_fair: %s (want %s / %s)\n", r.d->status()["game_fair"].dump().c_str(), usc_fair.c_str(), ucla_fair.c_str());
+    CHECK(both);
+    CHECK(r.d->status()["game_fair"]["models"]["KXNCAAWBGAME"]["sha256"] == model->sha256);
+    // a restart in play: no pregame book to read, the saved price instead
+    r.restart();
+    CHECK(r.d->status()["game_fair"]["p0"][EV]["p0"] == 0.37);
+    watch();
+    const bool again = r.until([&] { return r.d->status()["game_fair"]["markets"][USC]["fair"] == usc_fair; }, 20000);
+    if (!again) std::fprintf(stderr, "after restart: %s\n", r.d->status()["game_fair"].dump().c_str());
+    CHECK(again);
+  }
+  espn.stop();
+  espn_th.join();
 }
 // Systematic on the fake: an order group per lane and shard, a lane switched on, Start, an S order
 // in its lane's group, gw's refusals (lane off, wrong owner, inventory, not running), Stop
@@ -1251,6 +1338,6 @@ void equity_floor() {
 
 int main() {
   std::signal(SIGPIPE,SIG_IGN);
-  off_by_default(); orders_cancel_kill(); stop_reasons(); financial_fair(); systematic(); systematic_maker(); systematic_band(); systematic_paper(); systematic_races(); systematic_group_trigger(); systematic_book(); takeover(); shard_preflight(); foreign_cancels(); systematic_foreign(); duplicate_fills(); stop_keeps_manual(); live_mode(); fill_estimates(); equity_floor();
+  off_by_default(); orders_cancel_kill(); stop_reasons(); financial_fair(); wcbb_overlay(); systematic(); systematic_maker(); systematic_band(); systematic_paper(); systematic_races(); systematic_group_trigger(); systematic_book(); takeover(); shard_preflight(); foreign_cancels(); systematic_foreign(); duplicate_fills(); stop_keeps_manual(); live_mode(); fill_estimates(); equity_floor();
   return finish("deskd-runtime-manual");
 }

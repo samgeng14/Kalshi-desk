@@ -11,6 +11,7 @@
 #include "deskd/priv/kalshi_private.h"
 #include "deskd/ref/pyth.h"
 #include "deskd/strat/fair.h"
+#include "deskd/strat/game_fair.h"
 #include "deskd/ref/espn.h"
 #include "deskd/strat/maker.h"
 #include "deskd/strat/markouts.h"
@@ -108,6 +109,8 @@ bool Deskd::init_venue(std::string* err) {
   if (!options_.espn_url.empty()) {
     std::string why;
     if (auto ep = net::Endpoint::parse(options_.espn_url, &why)) {
+      EspnFeed::Options eo;
+      if (options_.espn_scoreboard_ms > 0) eo.scoreboard_ms = options_.espn_scoreboard_ms;
       // the watched game markets, with the other team's market of each game
       espn_ = std::make_unique<EspnFeed>(*ep, [this] {
         std::vector<kalshi::MarketRow> out;
@@ -119,10 +122,21 @@ bool Deskd::init_venue(std::string* err) {
         }
         for (const auto& [tk, m] : s->markets) if (events.count(m.event_ticker)) out.push_back(m);
         return out;
-      });
+      }, eo);
     } else {
       DLOG_WARN("ESPN off: %s", why.c_str());
     }
+  }
+  // the game markets' pregame prices and fairs (strat/game_fair.h), on each series with a loaded
+  // model: the WCBB model's KXNCAAWBGAME
+  if (espn_ && wcbb_) {
+    GameFair::Env env;
+    env.snapshot = [this] { return rest_->snapshot(); };
+    env.books = [this] { return std::atomic_load(&books_); };
+    env.espn = [this] { return espn_->board(); };
+    game_fair_ = std::make_unique<GameFair>(std::move(env),
+                                            std::map<std::string, GameModel>{{bball_league(wcbb_->league)->series, *wcbb_}});
+    if (!cfg_.data_dir.empty()) game_fair_->persist(cfg_.data_dir + "/game_p0.json");   // p0 outlives a restart mid-game
   }
   rest_->set_reconcile_guard([this] { return private_->fence(); },
                             [this](std::uint64_t fence) { return private_->reconcile(fence); });
@@ -638,13 +652,12 @@ json Deskd::ref_json(const std::string& ticker) const {
       ref["game"] = {{"per",e->second.per},{"clock",e->second.clock},{"score",e->second.score},{"src","ESPN"}};
       if (e->second.espn) ref["espn"] = price_str(*e->second.espn);
       if (e->second.espn && e->second.espn_ts_ms) ref["espn_ts_ms"] = e->second.espn_ts_ms;
-      // the WCBB model's fair while the game is on, from the pregame price captured before tip
-      const auto p0 = wcbb_p0_.find(ticker);
-      if (wcbb_ && p0 != wcbb_p0_.end() && ticker.rfind("KXNCAAWBGAME-", 0) == 0)
-        if (const auto p = wcbb_live_p(*wcbb_, e->second.state, e->second.period, e->second.clock_s,
-                                       e->second.yes_score - e->second.opp_score, p0->second))
-          ref["fair"] = price_str(static_cast<Px>(std::llround(*p * kOneDollar)));
     }
+  }
+  if (game_fair_) {   // a game model's fair while the game is on, from its pregame price
+    const auto board = game_fair_->board();
+    const auto g = board->find(ticker);
+    if (g != board->end() && g->second.shown()) ref["fair"] = price_str(static_cast<Px>(std::llround(*g->second.p * kOneDollar)));
   }
   return ref;
 }
@@ -659,19 +672,8 @@ void Deskd::republish_refs() {
 }
 
 void Deskd::on_book(const MdBook& b) {
-  // a women's college game's pregame YES price: the mid of a 15c-or-tighter book before its
-  // scheduled tip, as the model was trained (docs/wcbb_model.md: "the Kalshi mid at the scheduled
-  // tip"); kept once it passes. ESPN says "in" 40-60 s after the real tip, so "pre" alone would
-  // let in-play mids in and count the opening run twice (in p0 and in the margin); a ladder first
-  // opened after the tip gets no p0 and so no fair.
-  if (wcbb_ && espn_ && b.ticker.rfind("KXNCAAWBGAME-", 0) == 0 && !b.stale && !b.bids.empty() && !b.asks.empty() &&
-      b.asks.front().px - b.bids.front().px <= 1500) {
-    const auto board = espn_->board();
-    const auto e = board->find(b.ticker);
-    if (e != board->end() && e->second.state == "pre" && e->second.start_ms > 0 && now_ms() < e->second.start_ms)
-      wcbb_p0_[b.ticker] = (b.bids.front().px + b.asks.front().px) / 2.0 / kOneDollar;
-  }
-  // gw reads the latest book of each market, stale ones included, so a gap blocks orders.
+  // gw reads the latest book of each market, stale ones included, so a gap blocks orders; the game
+  // fair takes its pregame prices from the same board (strat/game_fair.h), stale books left out.
   {
     auto next = std::make_shared<std::map<std::string, MdBook>>();
     if (auto old = std::atomic_load(&books_)) *next = *old;
