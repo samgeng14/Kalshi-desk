@@ -53,6 +53,7 @@ import argparse
 import calendar
 import datetime
 import json
+import os
 import re
 import sys
 from collections import namedtuple
@@ -60,6 +61,7 @@ from dataclasses import dataclass
 
 # ---------------------------------------------------------------- ET days and ESPN's times
 
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DAY_MS = 24 * 3600000
 _EPOCH = datetime.date(1970, 1, 1)
 
@@ -243,6 +245,9 @@ LEAGUES = (   # ref/espn.cpp espn_leagues(), in its order
     EspnLeague('KXNCAAWBGAME', 'basketball', 'womens-college-basketball', ('50',), 4, 'Q'),
     EspnLeague('KXMLBGAME', 'baseball', 'mlb', (), 9, ''),
     EspnLeague('KXNHLGAME', 'hockey', 'nhl', (), 3, 'P'),
+    # TO CONFIRM, as in the C++: ESPN's path for it, and whether its linescores carry the current
+    # set's points live; the score is sets won
+    EspnLeague('KXNCAAWVMATCH', 'volleyball', 'womens-college-volleyball', (), 5, 'S'),
 )
 
 
@@ -518,6 +523,13 @@ def self_test():
     lg = espn_league_for('KXNCAAWBGAME-26NOV05UCONNSC-UCONN')
     check('espn_league_for', lg is not None and lg.league == 'womens-college-basketball'
           and espn_league_for('KXNBAGAMEX-1') is None and espn_league_for('KXHIGHNY-26OCT10-B70') is None)
+    wvb = espn_league_for('KXNCAAWVMATCH-26OCT10UCLAUSC-UCLA')
+    check('espn_league_for: volleyball (sets won as the score, a set a period)', wvb is not None
+          and wvb.sport == 'volleyball' and wvb.league == 'womens-college-volleyball' and wvb.periods == 5)
+    src = open(os.path.join(ROOT, 'src', 'deskd', 'ref', 'espn.cpp'), encoding='utf-8').read()
+    cpp = [m.group(1) for m in re.finditer(r'\{"(KX\w+)", "\w+", "[\w-]+", \{[^}]*\}, \d+, "\w*"\}', src)]
+    check("the leagues are deskd's, in its order (ref/espn.cpp espn_leagues)", cpp == [lg.series for lg in LEAGUES],
+          cpp if cpp != [lg.series for lg in LEAGUES] else '')
     now = 1791676700000
     sb = {'events': [_event('401', '2026-10-10T23:30Z', 'in', 3, '4:12', _team('away', 'LAL', 'Los Angeles Lakers', 70),
                             _team('home', 'BOS', 'Boston Celtics', 74), 'p9'),
