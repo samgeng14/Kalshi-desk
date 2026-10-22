@@ -52,6 +52,7 @@ Usage:
 import argparse
 import calendar
 import datetime
+import functools
 import json
 import os
 import re
@@ -183,6 +184,13 @@ def _alnum(c):
 
 
 def team_tokens(name):
+    return list(_tokens(name))
+
+
+@functools.lru_cache(maxsize=None)
+def _tokens(name):
+    """team_tokens as a tuple, remembered: a season's matching asks for the same few hundred names
+    hundreds of thousands of times."""
     s = _lower(name)
     p = s.find("a's")
     while p >= 0:
@@ -196,11 +204,11 @@ def team_tokens(name):
         elif cur:
             out.extend(_CITY.get(cur, [cur]))
             cur = ''
-    return out
+    return tuple(out)
 
 
 def team_name_overlap(a, b):
-    ta, tb = team_tokens(a), team_tokens(b)
+    ta, tb = _tokens(a), _tokens(b)
     if not ta or not tb:
         return 0.0
     small, big = (ta, tb) if len(ta) <= len(tb) else (tb, ta)
