@@ -32,6 +32,7 @@ std::string secs(double v) {
   std::snprintf(b, sizeof b, "%.1f s", v);
   return b;
 }
+std::string qty_text(Qty q) { return json(qty_to_number(q)).dump(); }   // 20.0, 2.5: as gw's
 
 // A route's edge a contract, num / den Money (den > 0)
 struct Edge {
@@ -103,6 +104,7 @@ TakeParams take_params(TakeMode m) {
   switch (m) {
     case TakeMode::COLLEGE:   // college.json's TakeParams; the gate may raise edge, never below 10c
       p.edge = 2000;
+      p.inventory = 20 * kOneContract;
       p.cool_ms = 5000;
       p.max_volume = 20000 * kOneContract;
       p.stale_only = true;
@@ -112,6 +114,7 @@ TakeParams take_params(TakeMode m) {
     case TakeMode::ESPN_FADE:
       p.edge = 1000;
       p.max_count = 4 * kOneContract;
+      p.inventory = (m == TakeMode::MODEL ? 10 : 4) * kOneContract;   // N1's; X1's
       p.max_takes = 4;
       p.signal_ms = 30000;
       p.cool_ms = 10000;
@@ -125,6 +128,7 @@ TakeParams take_params(TakeMode m) {
       p.edge = 0;
       p.clip = 0;
       p.fixed_count = 5 * kOneContract;
+      p.inventory = 5 * kOneContract;
       p.max_score_age_ms = 60000;
       p.cool_ms = 10000;
       p.max_spread = 1000;
@@ -137,8 +141,8 @@ const std::vector<std::string>& take_pull_codes() {
   static const std::vector<std::string> codes = {
       "NOT_TRADABLE", "PRIVATE_DOWN", "STALE_BOOK", "NO_FEE", "NO_SCORE", "SCORE_OLD", "STATE", "WINDOW",
       "NO_P0", "NO_FAIR", "NO_ESPN", "NO_MID", "NO_POINTS", "SET_WINDOW", "OVERTIME", "LATE", "SIGNAL_OLD",
-      "VOLUME", "SPREAD", "COOL_DOWN", "TAKES", "GAME_CAP", "NO_TOUCH", "HELD", "CLIP", "SIZE", "NO_EDGE",
-      "BAND", "TOUCH_AFTER_SCORE", "TRAILER", "FIRED"};
+      "VOLUME", "SPREAD", "COOL_DOWN", "TAKES", "GAME_CAP", "NO_TOUCH", "HELD", "INVENTORY", "CLIP", "SIZE",
+      "NO_EDGE", "BAND", "TOUCH_AFTER_SCORE", "TRAILER", "FIRED"};
   return codes;
 }
 
@@ -256,11 +260,20 @@ TakeDecision take_decide(const TakeInput& in, const TakeParams& p) {
     const Qty held = std::max<Qty>(0, own.position) + std::max<Qty>(0, -other.position);
     const Qty want = fav ? (p.fixed_count - held) / step * step : fit(p.clip * 100, r.team_px, mult, step, p.max_count);
     const Qty by_room = p.game_cap > 0 ? fit(room, r.team_px, mult, step, 0) : std::numeric_limits<Qty>::max();
+    // gw's inventory (gateway.cpp place_sys): Systematic's position in the market sent to, pos in
+    // the order's direction, with its working orders on the side, ends at most inventory from flat
+    // or no further from it than pos
+    const Qty pos = (buy ? 1 : -1) * r.leg->sys_position, working = buy ? r.leg->sys_buying : r.leg->sys_selling;
+    const Qty by_inv = p.inventory > 0 ? std::max<Qty>(0, std::max(p.inventory, std::abs(pos)) - pos - working) / step * step
+                                       : std::numeric_limits<Qty>::max();
     const Qty touch = side.front().qty / step * step;
-    r.count = std::min({want, by_room, touch});
+    r.count = std::min({want, by_room, by_inv, touch});
     if (r.count <= 0) {
       if (fav && want <= 0) return fail("HELD", "holds " + std::to_string(held / kOneContract) + " of " + team);
       if (by_room <= 0) return fail("GAME_CAP", "the game's room $" + money_str(room / 100) + " buys no contract at " + price_str(r.team_px));
+      if (by_inv <= 0)
+        return fail("INVENTORY", "the inventory room in " + r.leg->ticker + " buys no contract: " + qty_text(r.leg->sys_position) +
+                                     " held, " + qty_text(working) + " working, limit " + qty_text(p.inventory));
       if (want <= 0) return fail("CLIP", "the clip $" + money_str(p.clip) + " buys no contract at " + price_str(r.team_px));
       return fail("SIZE", "the touch is under one contract");
     }
@@ -354,7 +367,8 @@ Px to_px(double p) { return static_cast<Px>(std::llround(std::min(1.0, std::max(
 // into its band) before a later check pulled it
 bool has_edge(const TakeDecision& d, TakeMode m) {
   static const std::vector<std::string> past_edge = {"BAND", "TOUCH_AFTER_SCORE", "TRAILER", "FIRED"};
-  static const std::vector<std::string> past_band = {"HELD", "GAME_CAP", "CLIP", "SIZE", "TOUCH_AFTER_SCORE", "TRAILER", "FIRED"};
+  static const std::vector<std::string> past_band = {"HELD", "GAME_CAP", "INVENTORY", "CLIP", "SIZE", "TOUCH_AFTER_SCORE",
+                                                      "TRAILER", "FIRED"};
   if (d.take) return true;
   if (d.dir < 0) return false;
   const auto& past = m == TakeMode::FAV_PREGAME ? past_band : past_edge;
@@ -499,6 +513,11 @@ void TakeEngine::game(const std::string& ev, const kalshi::MarketRow& ma, const 
     l.fractional = m[i]->fractional.value_or(false);
     const auto pos = v.positions.find(lane_ + "|" + l.ticker);
     l.position = pos == v.positions.end() ? 0 : pos->second;
+    // as gw's inventory counts: every lane's position, and Systematic's orders not ended by side
+    for (const auto& [key, q] : v.positions)
+      if (key.substr(key.find('|') + 1) == l.ticker) l.sys_position += q;
+    for (const auto& [cid, o] : v.orders)
+      if (o.ticker == l.ticker && !o.terminal) (o.side == Side::BUY ? l.sys_buying : l.sys_selling) += o.left;
     const auto t = touch_.find(l.ticker);
     if (t != touch_.end()) {
       l.bid_since_ms = t->second.bid_ms;

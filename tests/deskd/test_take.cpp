@@ -2,11 +2,13 @@
 // defaults; every case of the three hand-worked fixtures the Python gate tools share
 // (college_take_cases.json for C1, x1_golden.json for X1, n1_golden.json for N1 and N2), which
 // between them reach every pull; a game seen from the other market is the same take; the order's
-// own fields; the reasons in words; no game cap and a huge clip stay bounded by the touch.
+// own fields; the reasons in words; no game cap, no inventory limit and a huge clip stay bounded
+// by the touch; the inventory room is gw's, on either side of flat.
 // TakeEngine against a fake Env (gw a stub inbox): one IOC a run with every field, gw's answer
 // awaited and a refusal's back-off, the signal runs, what blocks a post and the shadow rows, PULL
-// rows, the inputs it builds (fair on the board's state, worst case, books, volume, clock, set
-// ends, ESPN's number), which games, the signals' markouts and LaneMarkout to gw.
+// rows, the inputs it builds (fair on the board's state, worst case, Systematic's positions and
+// working orders, books, volume, clock, set ends, ESPN's number), which games, the signals'
+// markouts and LaneMarkout to gw.
 #include <algorithm>
 #include <cmath>
 #include <fstream>
@@ -14,6 +16,7 @@
 #include <map>
 #include <set>
 #include <sstream>
+#include <tuple>
 #include <variant>
 
 #include <nlohmann/json.hpp>
@@ -21,6 +24,7 @@
 #include "check.h"
 #include "deskd/build_paths.h"
 #include "deskd/gw/fees.h"
+#include "deskd/gw/sys_book.h"
 #include "deskd/rest/state.h"
 #include "deskd/strat/take.h"
 
@@ -60,6 +64,7 @@ TakeParams params_of(const json& j, TakeMode mode) {
   p.max_count = qty_of(j.at("max_count"));
   p.fixed_count = qty_of(j.at("fixed_count"));
   p.game_cap = money_of(j.at("game_cap")) * 100;
+  p.inventory = qty_of(j.at("inventory"));
   p.max_takes = j.at("max_takes").get<int>();
   p.max_score_age_ms = j.at("max_score_age_ms").get<std::int64_t>();
   p.signal_ms = j.at("signal_ms").get<std::int64_t>();
@@ -82,7 +87,7 @@ TakeParams params_of(const json& j, TakeMode mode) {
 }
 bool same_params(const TakeParams& x, const TakeParams& y) {
   return x.mode == y.mode && x.edge == y.edge && x.clip == y.clip && x.max_count == y.max_count &&
-         x.fixed_count == y.fixed_count && x.game_cap == y.game_cap && x.max_takes == y.max_takes &&
+         x.fixed_count == y.fixed_count && x.game_cap == y.game_cap && x.inventory == y.inventory && x.max_takes == y.max_takes &&
          x.max_score_age_ms == y.max_score_age_ms && x.signal_ms == y.signal_ms && x.cool_ms == y.cool_ms &&
          x.max_volume == y.max_volume && x.stale_only == y.stale_only && x.leader_only == y.leader_only &&
          x.points_required == y.points_required && x.set_window_ms == y.set_window_ms && x.max_spread == y.max_spread &&
@@ -115,6 +120,9 @@ void leg_of(const json& j, TakeLeg* l, MdBook* b) {
   if (!j.at("fee_mult").is_null()) l->fee_mult = j.at("fee_mult").get<double>();
   l->fractional = j.at("fractional").get<bool>();
   l->position = qty_of(j.at("position"));
+  l->sys_position = qty_of(j.at("sys_position"));
+  l->sys_buying = qty_of(j.at("sys_buying"));
+  l->sys_selling = qty_of(j.at("sys_selling"));
   l->bid_since_ms = j.at("bid_since_ms").get<std::int64_t>();
   l->ask_since_ms = j.at("ask_since_ms").get<std::int64_t>();
   l->book = b;
@@ -261,12 +269,27 @@ void defaults() {
         c.max_volume == 20000 * kOneContract && !c.leader_only && c.points_required && c.set_window_ms == 120000 && c.max_spread == 0);
   CHECK(n.edge == 1000 && n.max_count == 400 && n.max_takes == 4 && n.signal_ms == 30000 && n.cool_ms == 10000 &&
         n.max_spread == 300 && n.min_px == 500 && n.max_px == 9500 && !n.trade_ot && n.min_t_left_s == 120 && !n.stale_only);
-  CHECK(same_params(take_params(TakeMode::ESPN_FOLLOW), [] { auto p = take_params(TakeMode::MODEL); p.mode = TakeMode::ESPN_FOLLOW; return p; }()));
+  CHECK(same_params(take_params(TakeMode::ESPN_FOLLOW), [] {
+    auto p = take_params(TakeMode::MODEL);
+    p.mode = TakeMode::ESPN_FOLLOW;
+    p.inventory = 400;   // X1's 4 contracts a market, N1's 10
+    return p;
+  }()));
   CHECK(f.fixed_count == 500 && f.fav_lo == 9000 && f.fav_hi == 9500 && f.fav_from_ms == 3600000 && f.fav_to_ms == 120000 &&
         f.max_spread == 1000 && f.edge == 0);
+  // each lane's inventory is the one gw holds it to
+  for (const auto& [m, lane] : std::vector<std::pair<TakeMode, std::string>>{{TakeMode::COLLEGE, "C1"},
+                                                                            {TakeMode::MODEL, "N1"},
+                                                                            {TakeMode::ESPN_FOLLOW, "X1"},
+                                                                            {TakeMode::ESPN_FADE, "X1"},
+                                                                            {TakeMode::FAV_PREGAME, "N2"}}) {
+    const auto l = std::find_if(default_lanes().begin(), default_lanes().end(), [&lane = lane](const LaneSpec& s) { return s.id == lane; });
+    CHECK(l != default_lanes().end() && take_params(m).inventory == l->inventory);
+  }
+  CHECK(c.inventory == 2000 && n.inventory == 1000 && f.inventory == 500);
   // every code once, in the checks' order
   const auto& codes = take_pull_codes();
-  CHECK(std::set<std::string>(codes.begin(), codes.end()).size() == codes.size() && codes.size() == 31);
+  CHECK(std::set<std::string>(codes.begin(), codes.end()).size() == codes.size() && codes.size() == 32);
 }
 
 void fixtures() {
@@ -373,16 +396,85 @@ void routes() {
   CHECK(take_decide(g.in, p).pull == "SCORE_OLD" && !take_decide(g.in, p).route);
 }
 
-// With no game cap and a clip far past the book, the touch is the bound
+// With no game cap, no inventory limit and a clip far past the book, the touch is the bound
 void unbounded() {
   TakeParams p = take_params(TakeMode::COLLEGE);
   p.game_cap = 0;
+  p.inventory = 0;
   p.clip = 900000000;   // $90,000
   Game g = college_game();
   g.book_a.asks = {{4500, 123456 * kOneContract}};
   const TakeDecision d = take_decide(g.in, p);
   CHECK(d.take && d.take->count == 123456 * kOneContract && d.take->fee == kalshi_fee_order_cent(4500, 123456 * kOneContract, 1));
   CHECK(clip_count(900000000, 1, 1, 0, false) == 1000000 * kOneContract);   // at most a million contracts
+}
+
+// gw's inventory check (gateway.cpp place_sys): an order is refused when Systematic's position in
+// the market, with its working orders on the side and the order, ends past the lane's limit and
+// further from flat than it was
+bool gw_refuses(Qty pos, Qty working, Side side, Qty count, Qty limit) {
+  const Qty after = pos + (side == Side::BUY ? 1 : -1) * (working + count);
+  return std::abs(after) > limit && std::abs(after) > std::abs(pos);
+}
+
+// The inventory room is gw's own: over Systematic's position in the market sent to, on either side
+// of flat and past the limit, and its working orders on the side, a take is never one gw refuses
+// for inventory, one step more would be whenever the room held the count down, and with no room
+// the pull is INVENTORY. The other side's working orders and the other market's position do not
+// count; inventory 0 is no cap.
+void inventory() {
+  TakeParams p = take_params(TakeMode::COLLEGE);
+  p.game_cap = 0;
+  p.clip = 1000000;   // $100: the room binds, not the clip
+  for (const bool buy : {true, false}) {
+    Game g = college_game();   // one route only: BUY A at 0.45, or SELL B at 0.52 (A's team at 0.48)
+    g.book_a.bids.clear();
+    g.book_b.asks.clear();
+    (buy ? g.book_b.bids : g.book_a.asks).clear();
+    (buy ? g.book_a.asks : g.book_b.bids).front().qty = 1000 * kOneContract;
+    TakeLeg& leg = buy ? g.in.a : g.in.b;
+    TakeLeg& other = buy ? g.in.b : g.in.a;
+    const Side side = buy ? Side::BUY : Side::SELL;
+    TakeParams free = p;
+    free.inventory = 0;
+    leg.sys_position = 500 * kOneContract;
+    const TakeDecision f = take_decide(g.in, free);
+    CHECK(f.take && f.take->count > 100 * kOneContract);
+    if (!f.take) continue;
+    const Qty most = f.take->count;   // what the clip buys
+    other.sys_position = buy ? -50 * kOneContract : 50 * kOneContract;   // the other market's: not this one's
+    (buy ? leg.sys_selling : leg.sys_buying) = 50 * kOneContract;        // the other side's: not this one's
+    int capped = 0, none = 0;
+    for (Qty pos = -45 * kOneContract; pos <= 45 * kOneContract; pos += 50)   // half contracts too
+      for (const Qty w : {Qty{0}, Qty{100}, Qty{350}, Qty{2500}}) {
+        leg.sys_position = pos;
+        (buy ? leg.sys_buying : leg.sys_selling) = w;
+        const TakeDecision d = take_decide(g.in, p);
+        bool ok;
+        if (d.take) {
+          ok = d.take->ticker == leg.ticker && d.take->side == side && !gw_refuses(pos, w, side, d.take->count, p.inventory) &&
+               (d.take->count == most || gw_refuses(pos, w, side, d.take->count + kOneContract, p.inventory));
+          capped += d.take->count < most;
+        } else {
+          ok = d.pull == "INVENTORY" && d.dir == 0 && !d.edge && gw_refuses(pos, w, side, kOneContract, p.inventory);
+          ++none;
+        }
+        if (!ok) std::fprintf(stderr, "inventory %s, %.2f held, %.2f working: %s\n", buy ? "BUY" : "SELL", qty_to_number(pos),
+                              qty_to_number(w), said(d).c_str());
+        CHECK(ok);
+      }
+    CHECK(capped > 100 && none > 100);
+  }
+  // the reason says what gw would (B's team has no touch: A's routes go furthest)
+  Game g = college_game();
+  g.book_a.bids.clear();
+  g.book_b.asks.clear();
+  g.in.a.sys_position = 2000;
+  g.in.b.sys_position = -1500;
+  g.in.b.sys_selling = 600;
+  const TakeDecision d = take_decide(g.in, take_params(TakeMode::COLLEGE));
+  CHECK(d.pull == "INVENTORY" && d.dir == 0 &&
+        d.why == "the inventory room in KXNCAAWBGAME-26NOV14AAABBB-AAA buys no contract: 20.0 held, 0.0 working, limit 20.0");
 }
 
 void coverage() {
@@ -747,7 +839,8 @@ void engine_pulls() {
 }
 
 // The inputs the engine builds: GameFair's fair only on the board's score state; its worst case in
-// the game from SysView::worst; everyone else's book; the in-game volume; the basketball clock;
+// the game from SysView::worst; Systematic's position and working orders in each market, as gw's
+// inventory counts them; everyone else's book; the in-game volume; the basketball clock;
 // volleyball's set ends; ESPN's number and its date
 void engine_inputs() {
   {   // GameFair a step behind the board: no fair this step; no row at all: no p0
@@ -780,6 +873,37 @@ void engine_inputs() {
     g.view->worst = {{"C1|" + TA, 8500000}, {"M1|" + TA, 5000000}};   // $1.50 of room: 3 at 0.45 and a 6c fee
     e.step(T0 + 3450);
     CHECK(g.places().size() == 1 && g.places()[0]->count == 300);
+  }
+  {   // gw's inventory measure: every lane's position in the market, and what is left of Systematic's
+      // orders there not ended, on the side: 15 (C1) + 3 (M1) of A held and 1 working leave 1 of
+      // C1's 20, so BUY A at 0.45 x1 (edge 0.2300) over SELL B (0.2025); B's position and the
+      // other side's order are not A's buy side
+    Rig g;
+    TakeEngine e("C1", {"KXNCAAWBGAME"}, g.env(), take_params(TakeMode::COLLEGE));
+    g.view->positions = {{"C1|" + TA, 1500}, {"M1|" + TA, 300}, {"M1|" + TB, -500}};
+    for (const auto& [cid, side, left, state] : std::vector<std::tuple<std::string, Side, Qty, OrdState>>{
+             {"SM1-a", Side::BUY, 100, OrdState::WORK}, {"SM1-b", Side::BUY, 500, OrdState::CXL}, {"SM1-c", Side::SELL, 500, OrdState::WORK}}) {
+      Gateway::SysOrder o;
+      o.cid = cid;
+      o.lane = "M1";
+      o.ticker = TA;
+      o.side = side;
+      o.price = 3000;   // off the touches: everyone else's book is the same
+      o.count = o.left = left;
+      o.state = state;
+      o.terminal = state == OrdState::CXL;
+      g.view->orders[cid] = o;
+    }
+    g.score(T0 - 60000, T0 - 1000, 0.50);
+    e.step(T0);
+    g.score(T0 + 3000, T0 + 3000, 0.70);
+    e.step(T0 + 3200);
+    CHECK(g.places().size() == 1 && g.places()[0]->ticker == TA && g.places()[0]->side == Side::BUY && g.places()[0]->count == 100);
+    g.answer(0, OrderReply{});
+    g.view->positions["C1|" + TA] = 1600;   // its fill: A is full, so A's team goes through B (5 short there)
+    g.score(T0 + 9000, T0 + 9000, 0.70);
+    e.step(T0 + 9100);
+    CHECK(g.places().size() == 2 && g.places()[1]->ticker == TB && g.places()[1]->side == Side::SELL && g.places()[1]->count == 400);
   }
   {   // Systematic's working order at A's ask is not everyone else's: A's team through B's bid
     Rig g;
@@ -988,6 +1112,7 @@ int main() {
   whys();
   routes();
   unbounded();
+  inventory();
   coverage();
   engine_takes();
   engine_runs();

@@ -27,8 +27,12 @@
 // COLLEGE and MODEL differ only in their defaults (take_params).
 //
 // Size: the most contracts whose cost and fee (kalshi_fee_order_cent, gw/fees.h's cent rule) fit
-// the clip, at most max_count, the touch's size and the game's room (game_cap less the lane's
-// worst case in the game); whole contracts unless the market trades fractions. The edge is taken
+// the clip, at most max_count, the touch's size, the game's room (game_cap less the lane's worst
+// case in the game) and the market's inventory room, gw's own (SYS_CEILING "inventory"): with x
+// Systematic's position in the market sent to, every lane's, in the order's direction
+// (sys_position for a BUY, -sys_position for a SELL) and w its working orders on that side,
+// max(inventory, |x|) - x - w, so the position ends at most inventory from flat or no further
+// from it than it was; whole contracts unless the market trades fractions. The edge is taken
 // at that count, so a smaller take pays more fee a contract. All of it is integer arithmetic: a
 // route's edge is ((ref - price) x count - fee x 100) / count, in micro-dollars over Qty, which is
 // Money a contract, compared with edge exactly and reported rounded down; FADE's is
@@ -60,9 +64,10 @@
 //   GAME_CAP      the lane's worst case in the game at game_cap
 // Then each route, in the order A BUY, A SELL, B BUY, B SELL, is checked in this order:
 //   NO_TOUCH           no ask (BUY) or bid (SELL) to take
-//   HELD, GAME_CAP, CLIP, SIZE
+//   HELD, GAME_CAP, INVENTORY, CLIP, SIZE
 //                      no count: FAV_PREGAME already holds fixed_count of the team; the game's
-//                      room or the clip buys no contract; the touch is under one contract
+//                      room, the market's inventory room or the clip buys no contract; the
+//                      touch is under one contract
 //   NO_EDGE            the edge under edge (not FAV_PREGAME)
 //   BAND               the team's price outside [min_px, max_px]; FAV_PREGAME's band
 //                      [fav_lo, fav_hi) comes second instead, before the count
@@ -108,6 +113,7 @@ struct TakeParams {
   Qty max_count = 0;                    // a take's contracts at most (0: no cap)
   Qty fixed_count = 0;                  // FAV_PREGAME: the team held up to this
   Micros game_cap = 10000000;           // the lane's worst case in one game, working included (0: none)
+  Qty inventory = 0;                    // gw's per-market limit (LaneSpec::inventory) on Systematic's position (0: none)
   int max_takes = 0;                    // takes a game (0: no cap)
   std::int64_t max_score_age_ms = 5000; // plan 5(d): "a score feed at most 5 s old"
   std::int64_t signal_ms = 0;           // the signal first seen at most this long ago (0: any)
@@ -124,12 +130,13 @@ struct TakeParams {
   Px fav_lo = 9000, fav_hi = 9500;      // FAV_PREGAME's band, [lo, hi)
   std::int64_t fav_from_ms = 3600000, fav_to_ms = 120000;   // FAV_PREGAME: from start - from to start - to
 };
-// Each lane's rule as its spec set it: COLLEGE C1 (20c net, $2 clips, $10 a game, 5 s scores,
-// 5 s apart, thin games under 20k contracts, a touch older than the score); MODEL N1 (10c, $2 up
-// to 4 contracts, 4 takes 10 s apart, the state at most 30 s old, spreads of 3c or less, 5-95c,
-// no overtime nor the last 2 minutes); ESPN_FOLLOW and ESPN_FADE X1 (as N1, ESPN's number 30 s
-// old at most); FAV_PREGAME N2 (90-95c from 60 to 2 minutes before the start, 5 contracts,
-// spreads of 10c or less, the score 60 s old at most).
+// Each lane's rule as its spec set it: COLLEGE C1 (20c net, $2 clips, $10 a game, 20 contracts a
+// market, 5 s scores, 5 s apart, thin games under 20k contracts, a touch older than the score);
+// MODEL N1 (10c, $2 up to 4 contracts, 10 a market, 4 takes 10 s apart, the state at most 30 s
+// old, spreads of 3c or less, 5-95c, no overtime nor the last 2 minutes); ESPN_FOLLOW and
+// ESPN_FADE X1 (as N1 but 4 a market, ESPN's number 30 s old at most); FAV_PREGAME N2 (90-95c
+// from 60 to 2 minutes before the start, 5 contracts, 5 a market, spreads of 10c or less, the
+// score 60 s old at most). The inventories are default_lanes()' (gw/sys_book.h).
 TakeParams take_params(TakeMode m);
 
 struct TakeLeg {
@@ -138,6 +145,9 @@ struct TakeLeg {
   std::optional<double> fee_mult;       // the market's fee_multiplier (none: not known yet)
   bool fractional = false;              // the market takes 0.01-contract steps
   Qty position = 0;                     // the lane's, signed (YES > 0)
+  // gw's inventory measure: Systematic's position here, every lane's, signed; and what is left of
+  // its working orders here, by side
+  Qty sys_position = 0, sys_buying = 0, sys_selling = 0;
   std::int64_t bid_since_ms = 0, ask_since_ms = 0;   // when the touch's price was first seen (0: not known)
 };
 
@@ -218,6 +228,9 @@ Qty clip_count(Money clip, Px px, double fee_mult, Qty max_count, bool whole_onl
 //                   reading; with none read, the whole volume (it can only overstate)
 //           lane    its positions, its worst case in the game (SysView::worst over both markets,
 //                   gw's event cap measure), its takes there and the run's fired teams
+//           sys     Systematic's position in each market, every lane's (SysView::positions),
+//                   and what is left of its orders there not ended, by side (SysView::orders):
+//                   what gw's inventory limit counts
 //           books   everyone else's: Systematic's working orders taken out
 // A take goes to gw as one IOC PlaceIntent (cid S<lane>-<ms>-<n>, owner SYS, the touch as its
 // price, ttl 0, reduce_only and override_guard off, touch and fair for the order row) when the

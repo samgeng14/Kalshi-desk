@@ -3,17 +3,17 @@
   "kind": "take_cases",
   "about": "N1's take rule (the NBA model's fair, plan 5(f) generalised) and N2's (pregame 90-95c favourites, the sports hunt's forward test), hand-worked: deskd's take_decide (include/deskd/strat/take.h, which says the rule in full) and tools/nba_gate.py (n1 and n2) must both give every 'want' here, so the replay measures the rule the lane trades. Synthetic games and tickers; no account data.",
   "how": "A case's input is base[mode] with the case's 'in' laid over it, and its params are params[mode] with the case's 'params' laid over them: an object is merged key by key (recursively), any other value replaces (null clears it). 'want' is either {'take': {ticker, side, price, count, fee, edge, dir}} or {'pull': CODE, 'edge': the pulled route's edge or null, 'dir': 'A', 'B' or null (the game's own checks)}.",
-  "units": "Prices and money are the contract's decimal strings in dollars (exactly 4 decimals); sizes are contracts (0.01 steps); times are ms on one clock; game_used and game_cap are dollars; fee_mult is the market's fee_multiplier. A team's price is the ask it buys at, or 1 - the other market's bid it sells at. fee = 0.07 x mult x count x price x (1 - price), rounded up to $0.000001 and then up to the cent (gw/fees.h kalshi_fee_order_cent). MODEL: edge = the fair for the team - its price - fee / count, rounded down to $0.0001 for 'want'. FAV_PREGAME has no edge (0): its band is the rule.",
+  "units": "Prices and money are the contract's decimal strings in dollars (exactly 4 decimals); sizes are contracts (0.01 steps); times are ms on one clock; game_used and game_cap are dollars; fee_mult is the market's fee_multiplier. A team's price is the ask it buys at, or 1 - the other market's bid it sells at. fee = 0.07 x mult x count x price x (1 - price), rounded up to $0.000001 and then up to the cent (gw/fees.h kalshi_fee_order_cent). MODEL: edge = the fair for the team - its price - fee / count, rounded down to $0.0001 for 'want'. FAV_PREGAME has no edge (0): its band is the rule. A leg's position is the lane's own, signed (YES > 0); sys_position is Systematic's in the market, every lane's, signed, and sys_buying and sys_selling what is left of its working orders there on each side; inventory is the lane's limit a market, in contracts (gw's SYS_CEILING inventory). A route's count is also at most max(inventory, |x|) - x - w, in whole steps, where x is the market sent to's sys_position for a BUY (-sys_position for a SELL) and w its sys_buying (sys_selling): none, and the route stops at INVENTORY, after GAME_CAP and before CLIP.",
   "params": {
     "MODEL": {
-      "edge": "0.1000", "clip": "2.0000", "max_count": 4, "fixed_count": 0, "game_cap": "10.0000", "max_takes": 4,
+      "edge": "0.1000", "clip": "2.0000", "max_count": 4, "fixed_count": 0, "game_cap": "10.0000", "inventory": 10, "max_takes": 4,
       "max_score_age_ms": 5000, "signal_ms": 30000, "cool_ms": 10000, "max_volume": 0,
       "stale_only": false, "leader_only": false, "points_required": true, "set_window_ms": 120000,
       "max_spread": "0.0300", "min_px": "0.0500", "max_px": "0.9500", "trade_ot": false, "min_t_left_s": 120,
       "fav_lo": "0.9000", "fav_hi": "0.9500", "fav_from_ms": 3600000, "fav_to_ms": 120000
     },
     "FAV_PREGAME": {
-      "edge": "0.0000", "clip": "0.0000", "max_count": 0, "fixed_count": 5, "game_cap": "10.0000", "max_takes": 0,
+      "edge": "0.0000", "clip": "0.0000", "max_count": 0, "fixed_count": 5, "game_cap": "10.0000", "inventory": 5, "max_takes": 0,
       "max_score_age_ms": 60000, "signal_ms": 0, "cool_ms": 10000, "max_volume": 0,
       "stale_only": false, "leader_only": false, "points_required": true, "set_window_ms": 120000,
       "max_spread": "0.1000", "min_px": "0.0000", "max_px": "1.0000", "trade_ot": true, "min_t_left_s": 0,
@@ -24,9 +24,11 @@
     "MODEL": {
       "now_ms": 10000000,
       "a": {"ticker": "KXNBAGAME-26NOV14EEEFFF-EEE", "bid": "0.5500", "bid_qty": 50, "ask": "0.5600", "ask_qty": 50,
-            "stale": false, "fee_mult": 1.0, "fractional": false, "position": 0, "bid_since_ms": 9000000, "ask_since_ms": 9000000},
+            "stale": false, "fee_mult": 1.0, "fractional": false, "position": 0, "sys_position": 0, "sys_buying": 0, "sys_selling": 0,
+            "bid_since_ms": 9000000, "ask_since_ms": 9000000},
       "b": {"ticker": "KXNBAGAME-26NOV14EEEFFF-FFF", "bid": "0.4300", "bid_qty": 50, "ask": "0.4500", "ask_qty": 50,
-            "stale": false, "fee_mult": 1.0, "fractional": false, "position": 0, "bid_since_ms": 9000000, "ask_since_ms": 9000000},
+            "stale": false, "fee_mult": 1.0, "fractional": false, "position": 0, "sys_position": 0, "sys_buying": 0, "sys_selling": 0,
+            "bid_since_ms": 9000000, "ask_since_ms": 9000000},
       "state": "in", "src": "ESPN", "score_why": "", "fetched_ms": 9999000, "first_seen_ms": 9990000, "start_ms": 3000000,
       "a_score": 70, "b_score": 64, "t_left_s": 1500, "ot": false, "points": true, "set_end_ms": 0,
       "p0": "0.6000", "fair": "0.7000", "fair_why": "", "espn": null, "espn_seen_ms": 0,
@@ -36,9 +38,11 @@
     "FAV_PREGAME": {
       "now_ms": 10000000,
       "a": {"ticker": "KXNBAGAME-26NOV14GGGHHH-GGG", "bid": "0.9200", "bid_qty": 50, "ask": "0.9300", "ask_qty": 50,
-            "stale": false, "fee_mult": 1.0, "fractional": false, "position": 0, "bid_since_ms": 9000000, "ask_since_ms": 9000000},
+            "stale": false, "fee_mult": 1.0, "fractional": false, "position": 0, "sys_position": 0, "sys_buying": 0, "sys_selling": 0,
+            "bid_since_ms": 9000000, "ask_since_ms": 9000000},
       "b": {"ticker": "KXNBAGAME-26NOV14GGGHHH-HHH", "bid": "0.0700", "bid_qty": 50, "ask": "0.0800", "ask_qty": 50,
-            "stale": false, "fee_mult": 1.0, "fractional": false, "position": 0, "bid_since_ms": 9000000, "ask_since_ms": 9000000},
+            "stale": false, "fee_mult": 1.0, "fractional": false, "position": 0, "sys_position": 0, "sys_buying": 0, "sys_selling": 0,
+            "bid_since_ms": 9000000, "ask_since_ms": 9000000},
       "state": "pre", "src": "ESPN", "score_why": "", "fetched_ms": 9999000, "first_seen_ms": 9000000, "start_ms": 11800000,
       "a_score": 0, "b_score": 0, "t_left_s": null, "ot": false, "points": true, "set_end_ms": 0,
       "p0": null, "fair": null, "fair_why": "not started", "espn": null, "espn_seen_ms": 0,
@@ -115,6 +119,15 @@
      "want": {"pull": "STATE", "edge": null, "dir": null}, "note": ""},
     {"name": "model_private_down", "mode": "MODEL", "in": {"private_up": false},
      "want": {"pull": "PRIVATE_DOWN", "edge": null, "dir": null}, "note": ""},
+    {"name": "model_third_take_sized_to_the_inventory", "mode": "MODEL",
+     "in": {"fair": "0.5000", "a": {"bid": "0.2900", "ask": "0.3000", "position": 8, "sys_position": 8}, "b": {"bid": "0.6900", "ask": "0.7100"},
+            "game_used": "2.4000", "game_takes": 2, "last_take_ms": 9000000},
+     "want": {"take": {"ticker": "KXNBAGAME-26NOV14EEEFFF-EEE", "side": "BUY", "price": "0.3000", "count": 2, "fee": "0.0300", "edge": "0.1850", "dir": "A"}},
+     "note": "model_max_count_4 after N1 took its 4 of A twice: a third 4 would hold 12, past N1's 10 a market, and gw would refuse the take: 10 - 8 = 2 fit. fee 0.03 (0.0294), edge 0.50 - 0.30 - 0.015 = 0.1850. SELL B at 0.69 (A at 0.31): 4, edge 0.1750, less."},
+    {"name": "model_every_lane_and_working_order_counts", "mode": "MODEL",
+     "in": {"a": {"sys_position": 5, "sys_buying": 3, "sys_selling": 4}},
+     "want": {"take": {"ticker": "KXNBAGAME-26NOV14EEEFFF-EEE", "side": "BUY", "price": "0.5600", "count": 2, "fee": "0.0400", "edge": "0.1200", "dir": "A"}},
+     "note": "N1 holds none of A, but Systematic holds 5 (X1's) and works 3 more to buy: gw counts every lane's position and the working orders on the order's side, so 10 - 5 - 3 = 2 fit; the 4 working to sell do not count for a buy. fee 0.04 (0.034496), edge 0.70 - 0.56 - 0.02 = 0.1200. SELL B (A at 0.57): 3, edge 0.1100."},
     {"name": "fav_buy", "mode": "FAV_PREGAME", "in": {},
      "want": {"take": {"ticker": "KXNBAGAME-26NOV14GGGHHH-GGG", "side": "BUY", "price": "0.9300", "count": 5, "fee": "0.0300", "edge": "0.0000", "dir": "A"}},
      "note": "30 minutes to the start, A's team at 0.93 in [0.90, 0.95): 5 contracts, fee 0.022785 -> 0.03, 4.68 in all. SELL B at 0.07 is A at 0.93 too: the same cost, so BUY. B's team at 0.08 is out of the band."},
@@ -149,6 +162,10 @@
     {"name": "fav_score_60001ms", "mode": "FAV_PREGAME", "in": {"fetched_ms": 9939999},
      "want": {"pull": "SCORE_OLD", "edge": null, "dir": null}, "note": "The pregame score is read every 20 s; 60 s is the limit."},
     {"name": "fav_spread_11c", "mode": "FAV_PREGAME", "in": {"a": {"bid": "0.8200"}},
-     "want": {"pull": "SPREAD", "edge": null, "dir": null}, "note": "A at 0.82/0.93: 11c is over 10c."}
+     "want": {"pull": "SPREAD", "edge": null, "dir": null}, "note": "A at 0.82/0.93: 11c is over 10c."},
+    {"name": "fav_other_lanes_fill_the_market", "mode": "FAV_PREGAME",
+     "in": {"a": {"sys_position": 5}, "b": {"sys_position": -5}},
+     "want": {"pull": "INVENTORY", "edge": null, "dir": "A"},
+     "note": "N2 holds none (not HELD), but other lanes hold 5 of A's YES and 5 of B's NO: each market is at N2's 5, so neither of A's routes has room. B's team at 0.08 stops earlier, at the band."}
   ]
 }
