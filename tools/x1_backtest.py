@@ -62,7 +62,7 @@ When ESPN's number is visible (--align):
               ESPN feed's: a recovered row does not name its league)
   wallclock   (--data only) a play at the running maximum of its game's play wallclocks + --lag-s
               (41.5 s), a play whose wallclock falls under that maximum dropped
---delay-s D shifts everything ESPN showed D seconds later against the books.
+--delay-s D shifts everything ESPN showed D seconds later against the books (a sensitivity).
 
 Entries. A take fills at the touch it saw (an IOC; the DB's touch is taken as deep enough), the
 quote at or before the decision. The conservative variant, which the verdict uses: the worse of
@@ -86,7 +86,9 @@ and a mean settlement P&L >= 0 (plan 5(e)'s "a reading that is not negative"), e
 The gate file (--write-gate FILE, refuses an existing one without --force), as deskd's
 load_lane_gate(path, "X1", "", {"direction", "thr"}) reads it: lane X1, verdict PASS or FAIL (with
 why), stage live or shadow, params {direction: follow or fade, thr: dollars}, no model_sha256
-(X1 has no model), the numbers in evidence.
+(X1 has no model), the numbers in evidence (the recorder's fee multiplier among them). It measures
+X1 as deskd trades it, so --write-gate refuses a --delay-s other than 0 (a negative one looks
+ahead) and a --stake other than take_params' $2 clip: the params X1 reads carry neither.
 
 Prints the games by league first (the NBA is expected to be 0 in the DB), the grid on train, the
 choice, its test and the verdict; --json the whole result.
@@ -858,7 +860,7 @@ def backtest_data(data, league='nba', align='first_seen', lag_s=LAG_S, delay_s=0
                   rule=None, grid=GRID):
     games, book, counts = read_data(data, league, align, lag_s, delay_s, fee_mult)
     out = {'source': os.path.basename(os.path.normpath(data)), 'league': league, 'align': align,
-           'lag_s': lag_s if align == 'wallclock' else None, 'counts': counts}
+           'lag_s': lag_s if align == 'wallclock' else None, 'fee_mult': fee_mult, 'counts': counts}
     everything = {g.date for g in games.values()}
     rules = [rule] if rule else [(d, thr) for d in DIRECTIONS for thr in grid]
     out['rules'] = []
@@ -907,8 +909,8 @@ def gate_json(res, computed):
                         for k, b in d['best'].items()}
     if res['nba'] is not None:
         n = res['nba']
-        ev['nba'] = {'source': n['source'], 'align': n['align'], 'lag_s': n['lag_s'], 'counts': n['counts'],
-                     'stats': _brief(n['rules'][0]['stats']), 'why': n.get('why')}
+        ev['nba'] = {'source': n['source'], 'align': n['align'], 'lag_s': n['lag_s'], 'fee_mult': n['fee_mult'],
+                     'counts': n['counts'], 'stats': _brief(n['rules'][0]['stats']), 'why': n.get('why')}
     return {'lane': 'X1', 'stage': v['stage'], 'verdict': 'PASS' if v['pass'] else 'FAIL',
             'why': None if v['pass'] else v['why'], 'computed': computed, 'tool': 'tools/x1_backtest.py',
             'params': {'direction': v['rule']['direction'], 'thr': v['rule']['thr']} if v['rule'] else {},
@@ -1132,6 +1134,9 @@ def run(argv):
         return fail('--direction/--thr freeze a rule for --data alone; with --db the train dates choose it')
     if a.write_gate and not a.db:
         return fail('--write-gate needs --db: the rule is chosen on its train dates')
+    if a.write_gate and (a.delay_s != 0 or a.stake != STAKE):
+        return fail("--write-gate measures X1 as deskd trades it: --delay-s 0 (ESPN when first seen; a negative delay "
+                    "looks ahead) and --stake %g (take_params' clip), which the gate's params cannot change" % STAKE)
     if a.write_gate and os.path.exists(a.write_gate) and not a.force:
         return fail('%s exists; --force replaces it' % a.write_gate)
     if a.stake <= 0 or a.lag_s < 0:
@@ -1512,6 +1517,12 @@ def self_test(write_fixture=False):
         check('no source is refused, and so is a missing one', quiet([])[0] == 2
               and quiet(['--db', os.path.join(d, 'none.sqlite')])[0] == 2)
         check('--write-gate writes X1.json', quiet(['--db', db, '--write-gate', gate])[0] == 0 and os.path.exists(gate))
+        other = os.path.join(d, 'other', 'X1.json')
+        check("--write-gate refuses a --delay-s (-40 s looks ahead, +10 s) or a --stake other than take_params' $2 "
+              "clip, and writes nothing",
+              all(quiet(['--db', db, '--write-gate', other] + x)[0] == 2
+                  for x in (['--delay-s', '-40'], ['--delay-s', '10'], ['--stake', '1']))
+              and not os.path.exists(other))
         with open(gate, encoding='utf-8') as fh:
             g = json.load(fh)
         check("the gate loads as deskd's load_lane_gate(path, 'X1', '', {direction, thr}): stage shadow",
@@ -1571,8 +1582,9 @@ def self_test(write_fixture=False):
         rc, text = quiet(['--db', db, '--data', data, '--write-gate', gate, '--force'])
         with open(gate, encoding='utf-8') as fh:
             gl = json.load(fh)
-        check('its gate file opens X1 (live PASS) and carries the NBA evidence', rc == 0 and
-              gate_why(gl, 'X1', '', GATE_PARAMS) == '' and gl['evidence']['nba']['counts']['recorded'] == 32)
+        check("its gate file opens X1 (live PASS) and carries the NBA evidence, the replication's fee multiplier too",
+              rc == 0 and gate_why(gl, 'X1', '', GATE_PARAMS) == '' and gl['evidence']['nba']['counts']['recorded'] == 32
+              and gl['evidence']['nba'].get('fee_mult') == FEE_MULT)
         # the late-inserted play and the outage
         lg = list(nba)[7]
         gms, bk2, _ = read_data(data)
