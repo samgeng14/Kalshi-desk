@@ -353,6 +353,7 @@ add_library(deskd_core STATIC
   src/deskd/gw/kalshi_wire.cpp
   src/deskd/gw/reject.cpp
   src/deskd/gw/fees.cpp
+  src/deskd/gw/event_risk.cpp
   src/deskd/strat/strat.cpp
   src/deskd/strat/terminal_price.cpp
   src/deskd/strat/fair.cpp
@@ -553,6 +554,8 @@ deskd_pure_test(game_fair)
 deskd_pure_test(take)
 # ncaa: ref/ncaa, NCAA.com's scoreboards (the recorder's fixture, a loopback feed, the data guard), and ref/scores' merge of ESPN's and NCAA's score
 deskd_pure_test(ncaa)
+# event_risk: gw/event_risk, an event's settlement states from its flag and strikes, and a book's worst case by state (parity with the old risk.cpp)
+deskd_pure_test(event_risk)
 deskd_fake_test(net)
 deskd_fake_test(wire)
 deskd_fake_test(md)
@@ -611,6 +614,7 @@ add_test(NAME deskd-no-legacy-includes COMMAND ${CMAKE_COMMAND} -DROOT=${CMAKE_S
 # One suite a line, as above.
 foreach(t
     deskd-bus
+    deskd-event_risk
     deskd-http
     deskd-lane_gate
     deskd-manual_admission

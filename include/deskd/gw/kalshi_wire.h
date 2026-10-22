@@ -290,6 +290,15 @@ struct MarketRow {
   std::optional<double> fee_multiplier;
   std::int64_t fee_ms = 0;
 };
+// An event (GET /events/{event_ticker}): the markets that settle on one outcome (a city's high on
+// one day, one game). gw/event_risk.h reads how they settle together from the flag and their strikes.
+struct EventRow {
+  std::string event_ticker, series_ticker, title, sub_title, category;
+  std::optional<bool> mutually_exclusive;   // absent stays unknown: never read as known
+  std::string collateral_return_type;       // shown only; never relied on for cash
+  std::vector<MarketRow> markets;           // every market of the event, any status
+  std::int64_t fetched_ms = 0;
+};
 struct SeriesRow {
   std::string ticker, category, fee_type;
   double fee_multiplier = 0;
