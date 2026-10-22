@@ -5,7 +5,7 @@
     python3 tools/desk.py setup live             # once, for LIVE (key ~/.kalshi/prod.json, or --key FILE)
     python3 tools/desk.py                        # the desk: PAPER, and LIVE too after you type LIVE
     python3 tools/desk.py paper | live           # one of them alone
-    python3 tools/desk.py sim                    # the fake exchange, no network, no key
+    python3 tools/desk.py sim [--minutes N]      # the fake exchange, no network, no key (sim --help)
     python3 tools/desk.py status                 # both, through deskctl
     python3 tools/desk.py report [paper|live]    # what went wrong: status, KILLs, refusals, the log's tail
     python3 tools/desk.py kill paper|live        # KILL, as the screen's button
@@ -324,6 +324,11 @@ def deskctl(args):
     return subprocess.call([binary('deskctl')] + args)
 
 
+def sim(args):
+    """tools/deskd_sim.py with these arguments as typed: its own --port, --minutes and --keep."""
+    os.execv(sys.executable, [sys.executable, os.path.join(ROOT, 'tools', 'deskd_sim.py')] + args)
+
+
 def lane_reset(which, lane):
     """deskctl lane-reset on this desk's own config and data dir: the lane's life (trades, markouts,
     retirement) cleared from its saved book. Not while the desk runs (one on another port holds the
@@ -404,6 +409,11 @@ def report(which):
 
 
 def main():
+    # sim's arguments are deskd_sim.py's, passed on untouched: the parser below would take the 30 of
+    # `sim --minutes 30` for `which` and leave deskd_sim.py a bare --minutes
+    args = sys.argv[1:]
+    if args[:1] == ['sim']:
+        sim(args[1:])
     ap = argparse.ArgumentParser(description=__doc__.split('\n\n')[0], usage=__doc__.split('\n\n')[1])
     ap.add_argument('cmd', nargs='?', default='up',
                     choices=['up', 'setup', 'paper', 'live', 'sim', 'status', 'kill', 'report', 'lane-reset'])
@@ -412,7 +422,7 @@ def main():
     ap.add_argument('--key', help='setup: the key file (default ~/.kalshi/demo.json, ~/.kalshi/prod.json)')
     ap.add_argument('--port', type=int, help='paper and live: the web port (default 8788 paper, 8789 live)')
     ap.add_argument('--no-open', action='store_true', help='do not open the browser')
-    a, rest = ap.parse_known_args()
+    a, _ = ap.parse_known_args()
     if a.cmd == 'setup':
         which = a.which or 'paper'
         if which not in DESKS:
@@ -435,9 +445,9 @@ def main():
             confirm_live(spec, optional=False)
         sys.exit(launch([spec], not a.no_open))
     elif a.cmd == 'sim':
-        if a.port:
-            rest += ['--port', str(a.port)]
-        os.execv(sys.executable, [sys.executable, os.path.join(ROOT, 'tools', 'deskd_sim.py')] + rest)
+        # desk.py's options before the word (desk.py --port 8791 sim): all of it but the word, as typed
+        args.remove('sim')
+        sim(args)
     elif a.cmd == 'status':
         code = 0
         for which in ('paper', 'live'):
