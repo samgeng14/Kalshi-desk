@@ -1,7 +1,8 @@
 // Fees (gw/fees.h). Kalshi's taker fee against the fake exchange's own model (fakex::model_fee
 // and charge_fee, and its engine filling IOC orders) at the fake's balance precision, which is
 // not deskd's $0.01 default; the order bound against charge_fee's accumulator over random fills;
-// the take engines' cent rule; Polymarket US's per-fill rounding and its worked rows.
+// the take engines' cent rule; Polymarket US's per-fill rounding and its worked rows, and its fee
+// and rebate against the fake's FeeType::POLY.
 #include <cstdio>
 #include <random>
 
@@ -221,9 +222,49 @@ void polymarket() {
   CHECK(bad == 0);
   CHECK(min_rebate_size(1) == 400100);   // 0.01c: 4,001 contracts
 }
+
+void poly_parity() {
+  // the fake's FeeType::POLY (fakex::poly_fee) one fill at a time: every price, whole and
+  // fractional sizes, the old desk's and core.js's coefficients
+  int bad = 0;
+  for (Px p = 1; p < kOneDollar; ++p)
+    for (const Qty q : {Qty{1}, Qty{100}, Qty{160}, Qty{500}, Qty{2000}})
+      for (const int coeff : {60000, 69500}) {
+        if (fakex::poly_fee(coeff, 12500, true, q, p) != poly_taker_fee_fill(p, q, coeff / 1e6)) ++bad;
+        if (fakex::poly_fee(coeff, 12500, false, q, p) != poly_maker_rebate_fill(p, q)) ++bad;
+      }
+  CHECK(bad == 0);
+  // ... and its engine: a take and a resting bid's fill on a POLY market, at the 0.5c grid
+  const std::string P = "aec-nba-bos-nyk-2026-10-22";
+  for (const Px p : {Px{50}, Px{1000}, Px{5000}, Px{5050}, Px{9000}, Px{9950}})
+    for (const Qty q : kQty) {
+      fakex::Engine e;
+      fakex::MarketSpec s;
+      s.ticker = P;
+      s.fee_type = fakex::FeeType::POLY;
+      s.ticks = {{50, 9950, 50}};
+      s.poly_coeff_micro = 69500;
+      e.add_market(s, 0);
+      e.set_cash(0, 0, 1000000 * fakex::kMicrosPerDollar, 0);
+      e.street_add(P, true, kOneDollar - p, q, 0);   // a YES ask at p
+      fakex::NewOrder n;
+      n.ticker = P;
+      n.side = fakex::Side::BID;
+      n.tif = fakex::Tif::IOC;
+      n.count = q;
+      n.price = p;
+      const auto take = e.create(n, 1);
+      CHECK(take.fill_count == q && take.fees == poly_taker_fee_fill(p, q, 0.0695));
+      n.tif = fakex::Tif::GTC;
+      n.post_only = true;
+      const auto made = e.create(n, 2);
+      CHECK(e.street_take(P, fakex::Side::ASK, p, q, 3) == q);
+      CHECK(e.order(made.order_id)->maker_fees == poly_maker_rebate_fill(p, q));
+    }
+}
 }  // namespace
 
 int main() {
-  kalshi_parity(); kalshi_rounding(); order_bound(); fake_engine(); cent_rule(); polymarket();
+  kalshi_parity(); kalshi_rounding(); order_bound(); fake_engine(); cent_rule(); polymarket(); poly_parity();
   return finish("deskd-fees");
 }

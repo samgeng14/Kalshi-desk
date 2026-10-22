@@ -576,7 +576,7 @@ deskd_fake_test(runtime_nba)
 # runtime_arb: S1 in the whole process (scan logs and sends nothing; trade: a basket, a missed leg completed and one unwound, an UNKNOWN leg, KILL and Stop mid-basket, the legging pause)
 deskd_fake_test(runtime_arb)
 deskd_fake_test(pyth)
-# fees: gw/fees.h against the fake's model_fee and charge_fee, at the fake's own balance precision
+# fees: gw/fees.h against the fake's model_fee and charge_fee, at the fake's own balance precision, and its Polymarket fee and rebate
 deskd_fake_test(fees)
 # sys_gate: gw's lane gates, retirement (LaneMarkout, why RETIRED, deskctl lane-reset) and event cap
 deskd_fake_test(sys_gate)
