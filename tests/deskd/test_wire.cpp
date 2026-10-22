@@ -19,7 +19,8 @@
 //     duplicate cid, triggered group), a bad signature, and the faults that make a write UNKNOWN
 //   - the demo probe binary (tools/kalshi_demo_probe.cpp) run against the fake over TLS through
 //     its real command line: handshakes, the reads, the order check, the dumps, no key material
-//     in its output; a production base and a non-demo key file refused before any socket
+//     in its output; S1's events check and arb check (two NO legs, the cash, bought back flat);
+//     a production base, --live and a non-demo key file refused before any socket
 #include <openssl/evp.h>
 #include <openssl/pem.h>
 #include <signal.h>
@@ -1023,8 +1024,8 @@ static void round_trip(const std::string& key_type) {
 // naming a key made for this test, the fake over TLS as the venue (its CA trusted for loopback
 // only), the handshake figures, the reads, the order check (a post-only bid at $0.01 placed, read
 // back, cancelled, read back, gone from the resting list) and the dumps. Its output never carries
-// key material, the key id or a signature. A production base, a key file for another environment
-// and a key type that does not match the PEM are each refused before any socket opens.
+// key material, the key id or a signature. A production base, --live, a key file for another
+// environment and a key type that does not match the PEM are each refused before any socket opens.
 static void test_probe_binary() {
   std::string err;
   const std::string pem = new_key_pem("ED25519");
@@ -1160,9 +1161,98 @@ static void test_probe_binary() {
     return e.groups().empty() && resting == 0;
   }));
 
+  {   // --events-check and --arb-check (S1): today's event of three brackets the venue flags mutually
+      // exclusive, each with a street bid and ask (spreads 3c, 2c and 1c), yesterday's settled one, and
+      // an event whose flag the venue leaves out
+    v.f->with_engine([](fakex::Engine& e, std::int64_t now) {
+      const auto bracket = [&](const std::string& tk, const char* type, std::optional<double> lo, std::optional<double> hi,
+                               fakex::Px bid, fakex::Px spread) {
+        fakex::MarketSpec s = fx::spec(tk, 0);
+        s.strike_type = type;
+        s.floor_strike = lo;
+        s.cap_strike = hi;
+        e.add_market(s, now);
+        e.street_add(tk, false, bid, 1000, now);
+        e.street_add(tk, true, fakex::kDollar - bid - spread, 1000, now);
+      };
+      bracket("KXHIGHTST-26OCT22-T78", "less", std::nullopt, 79, 3000, 200);
+      bracket("KXHIGHTST-26OCT22-B79.5", "between", 79, 80, 4000, 300);
+      bracket("KXHIGHTST-26OCT22-T80", "greater", 80, std::nullopt, 2500, 100);
+      fakex::EventSpec ev;
+      ev.event_ticker = "KXHIGHTST-26OCT22";
+      ev.title = "Highest temperature in Testville?";
+      ev.mutually_exclusive = true;
+      ev.collateral_return_type = "MECNET";
+      e.add_event(ev);
+      bracket("KXHIGHTST-26OCT21-B79.5", "between", 79, 80, 4000, 200);
+      e.settle_market("KXHIGHTST-26OCT21-B79.5", false, now);
+      ev.event_ticker = "KXHIGHTST-26OCT21";
+      ev.collateral_return_type.clear();
+      e.add_event(ev);
+      bracket("KXFLAG-26OCT22-A", "", std::nullopt, std::nullopt, 4000, 100);
+      bracket("KXFLAG-26OCT22-B", "", std::nullopt, std::nullopt, 5000, 100);
+      fakex::EventSpec unflagged;
+      unflagged.event_ticker = "KXFLAG-26OCT22";
+      e.add_event(unflagged);
+    });
+    const std::string ev = run(demo_key, "--base " + v.ep().url() + " --handshakes 1 --events-check --arb-check --arb-series KXHIGHTST" +
+                                             " --dump " + d.path, &rc);
+    CHECK(rc == 0);
+    if (rc != 0) std::fprintf(stderr, "probe output:\n%s\n", ev.c_str());
+    auto in_ev = [&](const std::string& s) { return ev.find(s) != std::string::npos; };
+    auto line = [&](const std::string& check, const std::string& verdict, const std::string& seen) {
+      const auto at = ev.find("  " + check + " ");
+      return at != std::string::npos && ev.find(verdict, at) < ev.find('\n', at) && ev.find(seen, at) < ev.find('\n', at);
+    };
+    // the events check: today's (nested only, as the fake sends it) and yesterday's settled one
+    CHECK(in_ev("mutually_exclusive true, collateral_return_type MECNET, 3 markets nested (3 naming the event), 0 beside"));
+    CHECK(in_ev("read by parse_event: 3 active; deskd's shape: exclusive, exhaustive on steps of 1, 3 states\n"));
+    CHECK(in_ev("    read and parsed: 2 of 2 events (2 read)\n") && in_ev("    mutually_exclusive present: 2 of 2\n"));
+    CHECK(in_ev("    collateral_return_type: MECNET\n") && in_ev("fills the markets beside the event too: 0 of 2\n"));
+    CHECK(in_ev("    without it: 3 markets beside the event, 0 in it (KXHIGHTST-26OCT22); parse_event reads it\n"));
+    CHECK(in_ev("    nested markets naming their event: 4 of 4\n") && in_ev("    a settled event's markets: listed (1 settled)\n"));
+    // the arb check: NO on the two narrowest (T80, then T78), the fake holding each leg's cost
+    CHECK(in_ev("create (NO leg 1, IOC sell at 0.2500)") && in_ev("create (NO leg 2, IOC sell at 0.3000)"));
+    CHECK(line("collateral_netting", "SEEN", "the legs cost $1.4779 with fees and the cash fell $1.4779: not netted"));
+    CHECK(in_ev("create (buy back 1, IOC reduce_only at 0.2600)") && in_ev("create (buy back 2, IOC reduce_only at 0.3200)"));
+    CHECK(line("bought_back", "OK", "flat in both; the round trip cost $0.0867 of play money"));
+    CHECK(line("ioc_201", "OK", "4 IOCs: each 201's fill_count is its order's"));
+    CHECK(line("fee_precision", "SEEN", "$0.0001 (direct member): 4 fills at multiplier 1"));   // the fake's precision
+    CHECK(in_ev("\nok\n") && !in_ev("NOT OK") && !in_ev("probe-key"));
+    for (const char* n : {"event_KXHIGHTST-26OCT22", "event_KXHIGHTST-26OCT21", "event_KXHIGHTST-26OCT22_beside",
+                          "events_check", "arb_check", "arb_positions"})
+      CHECK(std::filesystem::exists(d.file(std::string("kalshi_demo_") + n + ".json")));
+    // four IOCs of 1 contract, Systematic's self-trade setting, the last two reduce_only; flat after
+    CHECK(v.f->with_engine([](fakex::Engine& e, std::int64_t) {
+      int n = 0;
+      for (const auto* o : e.user_orders())
+        if (o->client_order_id.rfind("P-arb-", 0) == 0)
+          n += o->tif == fakex::Tif::IOC && o->initial == 100 && o->stp == fakex::Stp::TAKER_AT_CROSS &&
+               o->reduce_only == (o->side == fakex::Side::BID);
+      for (const auto& [k, p] : e.positions())
+        if (k.second.rfind("KXHIGHTST-", 0) == 0 && p.pos != 0) return -1;
+      return n;
+    }) == 4);
+    // an event without the flag: read and parsed (its flag unknown), and no leg is sent in it
+    const std::size_t orders_before = v.orders();
+    const std::string nf = run(demo_key, "--base " + v.ep().url() + " --handshakes 1 --events-check --arb-check --event KXFLAG-26OCT22", &rc);
+    CHECK(rc == 1 && nf.find("mutually_exclusive ABSENT, collateral_return_type absent, 2 markets nested") != std::string::npos);
+    CHECK(nf.find("deskd's shape: none: ") != std::string::npos);
+    CHECK(nf.find("not measured: no event fits (the last tried: KXFLAG-26OCT22 is not flagged mutually exclusive)") !=
+          std::string::npos);
+    CHECK(v.orders() == orders_before);
+  }
+
   // a production base: the guard refuses it before any socket, exit 2, no handshake section
   const std::string prod = run(demo_key, "--base https://api.elections.kalshi.com/trade-api/v2 --handshakes 1", &rc);
   CHECK(rc == 2 && prod.find("is a production host") != std::string::npos && prod.find("handshakes (") == std::string::npos);
+  // the arb check too; and --live is refused before the key file is read or anything connects
+  const std::string prod_arb = run(demo_key, "--base https://api.elections.kalshi.com/trade-api/v2 --arb-check", &rc);
+  CHECK(rc == 2 && prod_arb.find("is a production host") != std::string::npos && prod_arb.find("arb check (") == std::string::npos);
+  const auto accepted = v.f->connections_accepted();
+  const std::string live = run(demo_key, "--base " + v.ep().url() + " --arb-check --live", &rc);
+  CHECK(rc == 2 && live.find("--live is refused") != std::string::npos && live.find("key: ") == std::string::npos);
+  CHECK(v.f->connections_accepted() == accepted);
   // a key file for another environment, and a key type that does not match the PEM
   const std::string wrong_env = run(key_file("prod.json", "prod", "ed25519"), "--base " + v.ep().url(), &rc);
   CHECK(rc == 2 && wrong_env.find("only ever touches the demo exchange") != std::string::npos);

@@ -8,6 +8,7 @@
 //   kalshi-demo-probe [--key FILE] [--base URL] [--ws URL] [--handshakes N] [--loopback-ca FILE]
 //                     [--order-check] [--group-check] [--venue-checks] [--order-ticker T] [--dump DIR]
 //                     [--feeds-check [--feeds-seconds N] [--lip-series A,B] [--band-series A,B]]
+//                     [--events-check] [--arb-check] [--arb-series A,B] [--event T]
 //
 //   --key FILE        the key file (default ~/.kalshi/demo.json): {env, key_id, private_key_path,
 //                     key_type}, or a deskd config's {env, key_id, pem_path, key_type}. The key is
@@ -43,15 +44,35 @@
 //                     then --feeds-seconds (default 15) of the socket's pyth_value relay (which
 //                     underlyings, how often, and which 15-minute series' reference among them)
 //                     and the order_group_updates subscription. Reads only.
+//   --events-check    what S1 reads of an event (plan 5(c)): GET /events/{t}?with_nested_markets=true
+//                     for --event, or each --arb-series' open events (two a series, the soonest to
+//                     close) and one whose markets have settled; each read by deskd's parse_event
+//                     and shaped by gw/event_risk, with what the venue sent: mutually_exclusive,
+//                     collateral_return_type, the markets nested and beside, their statuses, and
+//                     the same event without with_nested_markets. Each body is dumped, the docs-
+//                     shaped fixture's replacement (tests/deskd/fixtures/kalshi_event_docs.json).
+//                     Reads only.
+//   --arb-check       what S1's NO_SET basket does to the account's cash: 1 contract of NO (an IOC
+//                     sell of YES at the bid) on two markets of one event the venue flags mutually
+//                     exclusive, the shard's cash read before and after each, then both bought
+//                     back (IOC, reduce_only, at the ask). Does the venue give back the $1 one of
+//                     them must pay (collateral_return_type MECNET), or hold each leg's cost?
+//                     Also: each IOC's 201 against its order read after (S1 sizes a basket's other
+//                     legs from the first leg's 201), and which balance precision the fills' fees
+//                     were rounded to (deskd.fee_precision). About a spread and two fees a leg of
+//                     play money on demo; production is refused, and so is --live.
+//   --arb-series A,B  the series both look in (default deskd.arb_series: band_series)
+//   --event T         the event both use instead
 //   --ws URL          the socket (default: --base with /trade-api/v2 -> /trade-api/ws/v2)
 //   --dump DIR        the raw reply bodies, for tests/deskd/fixtures (look them over for account
 //                     ids before committing one)
 //
 // Exit 0 when every request got a whole 2xx reply (a GET order's 404 right after its 201 is not
 // counted: demo answered 404 for about 0.7 s on 2026-10-07), the order and group checks, if asked
-// for, behaved and left nothing resting, and the feeds check found markets for both lanes and
-// values on pyth_value; 1 otherwise; 2 on bad arguments, a key that does not load, or a base the
-// guard refuses.
+// for, behaved and left nothing resting, the feeds check found markets for both lanes and values
+// on pyth_value, the events check read and parsed every event it found, and the arb check
+// measured its two legs, each 201 agreed with its order and nothing was left held; 1 otherwise;
+// 2 on bad arguments (--live among them), a key that does not load, or a base the guard refuses.
 #include <signal.h>
 
 #include <algorithm>
@@ -65,6 +86,7 @@
 #include <nlohmann/json.hpp>
 #include <optional>
 #include <random>
+#include <set>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -72,6 +94,8 @@
 
 #include "deskd/app/config.h"
 #include "deskd/app/log.h"
+#include "deskd/gw/event_risk.h"
+#include "deskd/gw/fees.h"
 #include "deskd/gw/kalshi_sign.h"
 #include "deskd/gw/kalshi_wire.h"
 #include "deskd/gw/manual_book.h"
@@ -96,9 +120,12 @@ struct Args {
   std::string loopback_ca;
   std::string ws;
   bool order_check = false, group_check = false, feeds_check = false, venue_checks = false;
+  bool events_check = false, arb_check = false;
   int feeds_seconds = 15;
   std::vector<std::string> lip_series = DeskdConfig{}.lip_series, band_series = DeskdConfig{}.band_series;
-  std::string order_ticker;
+  // deskd's: arb_series, or band_series when it names none
+  std::vector<std::string> arb_series = DeskdConfig{}.arb_series.empty() ? DeskdConfig{}.band_series : DeskdConfig{}.arb_series;
+  std::string order_ticker, event;
   std::string dump;
 };
 
@@ -115,7 +142,8 @@ int usage() {
   std::fprintf(stderr,
                "usage: kalshi-demo-probe [--key FILE] [--base URL] [--ws URL] [--handshakes N] [--loopback-ca FILE]\n"
                "                         [--order-check] [--group-check] [--venue-checks] [--order-ticker T] [--dump DIR]\n"
-               "                         [--feeds-check [--feeds-seconds N] [--lip-series A,B] [--band-series A,B]]\n");
+               "                         [--feeds-check [--feeds-seconds N] [--lip-series A,B] [--band-series A,B]]\n"
+               "                         [--events-check] [--arb-check] [--arb-series A,B] [--event T]\n");
   return 2;
 }
 
@@ -218,7 +246,7 @@ struct DemoProbe {   // not Probe: bus/msg.h has a message of that name
     return o;
   }
 
-  void dump(const char* name, const std::string& body) const {
+  void dump(const std::string& name, const std::string& body) const {
     if (a.dump.empty()) return;
     std::ofstream(a.dump + "/kalshi_demo_" + name + ".json") << body;
   }
@@ -685,7 +713,7 @@ struct DemoProbe {   // not Probe: bus/msg.h has a message of that name
   // the live touch from the market's book (the listing's is too old for the checks that need it)
   struct Touch {
     std::optional<Px> bid, ask;
-    Qty bid_qty = 0;
+    Qty bid_qty = 0, ask_qty = 0;
   };
   std::optional<Touch> touch(const std::string& tk) {
     std::string why;
@@ -697,7 +725,10 @@ struct DemoProbe {   // not Probe: bus/msg.h has a message of that name
       t.bid = ob->yes.back().first;
       t.bid_qty = ob->yes.back().second;
     }
-    if (!ob->no.empty()) t.ask = kOneDollar - ob->no.back().first;
+    if (!ob->no.empty()) {
+      t.ask = kOneDollar - ob->no.back().first;
+      t.ask_qty = ob->no.back().second;
+    }
     return t;
   }
 
@@ -862,6 +893,528 @@ struct DemoProbe {   // not Probe: bus/msg.h has a message of that name
     std::printf("  this check's orders resting: %zu\n", left);
     if (!a.dump.empty()) std::ofstream(a.dump + "/kalshi_demo_venue_checks.json") << checks.dump(1);
     return checks_ok && left == 0 && listed;
+  }
+
+  // ---- --events-check and --arb-check (S1, plan 5(c)) -------------------------------------------
+  // The events both look at: --event's alone; else each --arb-series' open events, the soonest to
+  // close first, two a series, and the latest event of settled markets in the first series that
+  // lists one (is a settled market still listed in its event?); with no open one there, the
+  // events of the markets page read at the start, four at most.
+  struct Candidate {
+    std::string event;
+    bool settled = false;
+  };
+  static std::string event_of(const MarketRow& m) {
+    return !m.event_ticker.empty() ? m.event_ticker : m.ticker.substr(0, m.ticker.rfind('-'));
+  }
+  std::vector<Candidate> candidates(const std::vector<MarketRow>& page) {
+    std::vector<Candidate> out;
+    const auto add = [&out](const std::string& ev, bool settled) {
+      if (std::none_of(out.begin(), out.end(), [&ev](const Candidate& c) { return c.event == ev; })) out.push_back({ev, settled});
+    };
+    if (!a.event.empty()) {
+      add(a.event, false);
+      return out;
+    }
+    bool settled = false;
+    for (const auto& name : a.arb_series)
+      for (const std::string status : {"open", "settled"}) {
+        if (status == "settled" && settled) continue;
+        MarketsQuery q;
+        q.limit = 200;
+        q.status = status;
+        q.series_ticker = name;
+        std::string why;
+        net::Exchange x = send(build_get_markets(q), "markets " + name + " (" + status + ")", false);
+        auto page_of = ok2xx(x) ? parse_markets(x.res.body, &why) : std::nullopt;
+        if (!page_of || page_of->rows.empty()) continue;
+        auto rows = page_of->rows;
+        const bool open = status == "open";
+        std::sort(rows.begin(), rows.end(), [open](const MarketRow& l, const MarketRow& r) {
+          return open ? l.close_ms.value_or(INT64_MAX) < r.close_ms.value_or(INT64_MAX) : l.close_ms.value_or(0) > r.close_ms.value_or(0);
+        });
+        if (!open) {
+          add(event_of(rows.front()), true);
+          settled = true;
+          continue;
+        }
+        std::set<std::string> two;
+        for (const auto& m : rows)
+          if (two.size() < 2 && two.insert(event_of(m)).second) add(event_of(m), false);
+      }
+    if (std::none_of(out.begin(), out.end(), [](const Candidate& c) { return !c.settled; }))
+      for (const auto& m : page)
+        if (out.size() < 4 + (settled ? 1u : 0u)) add(event_of(m), false);
+    return out;
+  }
+
+  // --events-check: each event read as rest's events step reads it (with_nested_markets=true),
+  // what the venue sent in it, and what deskd makes of it: parse_event, then event_shape on the
+  // event's own markets with deskd.arb_lattice's step for its series. Once, the same event with
+  // its markets left beside it (the docs' deprecated default).
+  bool events_check(const std::vector<MarketRow>& page) {
+    std::printf("\nevents check (%s):\n", base.host.c_str());
+    const auto evs = candidates(page);
+    if (evs.empty()) {
+      std::printf("  no event in the series asked for or on the markets page: nothing to read\n");
+      return false;
+    }
+    json report = json::array();
+    bool ok = true;
+    int read = 0, parsed = 0, flagged = 0, also_beside = 0;
+    std::size_t nested = 0, carried = 0;
+    std::set<std::string> crts;
+    std::string settled_listed = "no settled event read";
+    for (const auto& c : evs) {
+      net::Exchange x = send(build_get_event(c.event), std::string(c.settled ? "settled event " : "event ") + c.event);
+      json r{{"event", c.event}, {"settled", c.settled}};
+      if (x.fate == net::Exchange::Fate::REPLIED) r["http"] = x.res.status;
+      if (!ok2xx(x)) {
+        if (x.fate == net::Exchange::Fate::REPLIED) {
+          const ApiError e = parse_error(x.res.status, x.res.body);
+          std::printf("    %d %s %s %s\n", e.http, e.code.c_str(), e.message.c_str(), e.details.c_str());
+        }
+        ok = false;
+        report.push_back(r);
+        continue;
+      }
+      ++read;
+      dump("event_" + c.event, x.res.body);
+      // what the venue sent, as sent
+      const json raw = json::parse(x.res.body, nullptr, false);
+      const json ev = raw.is_object() && raw.contains("event") && raw["event"].is_object() ? raw["event"] : json::object();
+      const json in = ev.contains("markets") && ev["markets"].is_array() ? ev["markets"] : json::array();
+      const json by = raw.is_object() && raw.contains("markets") && raw["markets"].is_array() ? raw["markets"] : json::array();
+      const bool flag = ev.contains("mutually_exclusive") && !ev["mutually_exclusive"].is_null();
+      const std::string crt = str_of(ev, "collateral_return_type");
+      std::size_t with_event = 0;
+      for (const auto& m : in)
+        if (m.is_object() && !str_of(m, "event_ticker").empty()) ++with_event;
+      flagged += flag;
+      also_beside += !in.empty() && !by.empty();
+      nested += in.size();
+      carried += with_event;
+      if (!crt.empty()) crts.insert(crt);
+      r["mutually_exclusive"] = flag ? ev["mutually_exclusive"] : json("absent");
+      r["collateral_return_type"] = crt.empty() ? json(nullptr) : json(crt);
+      r["nested"] = in.size();
+      r["nested_with_event_ticker"] = with_event;
+      r["beside"] = by.size();
+      std::printf("    mutually_exclusive %s, collateral_return_type %s, %zu markets nested (%zu naming the event), %zu beside\n",
+                  flag ? ev["mutually_exclusive"].dump().c_str() : "ABSENT", crt.empty() ? "absent" : crt.c_str(), in.size(),
+                  with_event, by.size());
+      // what deskd makes of it
+      std::string why;
+      const auto row = parse_event(x.res.body, &why);
+      if (!row) {
+        std::printf("    deskd's parse_event REFUSES it: %s\n", why.c_str());
+        r["parse_event"] = why;
+        ok = false;
+        report.push_back(r);
+        continue;
+      }
+      ++parsed;
+      std::map<std::string, int> statuses;
+      std::map<std::string, MarketRow> listing;
+      for (const auto& m : row->markets) {
+        ++statuses[m.status.empty() ? "(no status)" : m.status];
+        listing[m.ticker] = m;
+      }
+      std::string st;
+      for (const auto& [s, n] : statuses) st += (st.empty() ? "" : ", ") + std::to_string(n) + " " + s;
+      if (c.settled) settled_listed = row->markets.empty() ? "NOT listed: the event lists no market" : "listed (" + st + ")";
+      const double lattice = arb_lattice_step(DeskdConfig{}, row->series_ticker);
+      const auto sh = event_shape(*row, listing, lattice, &why);
+      char step[32];
+      std::snprintf(step, sizeof step, "%g", lattice);
+      const std::string shaped =
+          sh ? std::string(sh->exclusive ? "exclusive" : "not exclusive") + ", " + (sh->exhaustive ? "exhaustive" : "not exhaustive") +
+                   (lattice > 0 ? " on steps of " + std::string(step) : " on the real line") + ", " +
+                   std::to_string(sh->states.size()) + " states" + (sh->spans ? "" : " (the flag alone: no strikes)")
+             : "none: " + why;
+      r["parse_event"] = "ok";
+      r["statuses"] = statuses;
+      r["shape"] = sh ? json{{"exclusive", sh->exclusive}, {"exhaustive", sh->exhaustive}, {"lattice", lattice},
+                             {"states", sh->states.size()}, {"spans", sh->spans}}
+                      : json(why);
+      std::printf("    read by parse_event: %s; deskd's shape: %s\n", st.empty() ? "no markets" : st.c_str(), shaped.c_str());
+      report.push_back(r);
+    }
+    // the same event with its markets beside it, once
+    std::string plain = "not read";
+    for (const auto& c : evs) {
+      if (c.settled) continue;
+      net::Exchange x = send(build_get_event(c.event, false), "event " + c.event + " (no nesting)");
+      if (!ok2xx(x)) break;
+      dump("event_" + c.event + "_beside", x.res.body);
+      const json raw = json::parse(x.res.body, nullptr, false);
+      const json ev = raw.is_object() && raw.contains("event") && raw["event"].is_object() ? raw["event"] : json::object();
+      const std::size_t by = raw.is_object() && raw.contains("markets") && raw["markets"].is_array() ? raw["markets"].size() : 0;
+      const std::size_t in = ev.contains("markets") && ev["markets"].is_array() ? ev["markets"].size() : 0;
+      std::string why;
+      plain = std::to_string(by) + " markets beside the event, " + std::to_string(in) + " in it (" + c.event + "); parse_event " +
+              (parse_event(x.res.body, &why) ? "reads it" : "REFUSES it: " + why);
+      break;
+    }
+    std::string crt;
+    for (const auto& s : crts) crt += (crt.empty() ? "" : ", ") + s;
+    std::printf("  for deskd (gw/kalshi_wire parse_event, rest's events step, gw/event_risk):\n");
+    std::printf("    read and parsed: %d of %zu events (%d read)\n", parsed, evs.size(), read);
+    std::printf("    mutually_exclusive present: %d of %d\n", flagged, read);
+    std::printf("    collateral_return_type: %s\n", crt.empty() ? "never sent" : crt.c_str());
+    std::printf("    with_nested_markets=true fills the markets beside the event too: %d of %d\n", also_beside, read);
+    std::printf("    without it: %s\n", plain.c_str());
+    std::printf("    nested markets naming their event: %zu of %zu\n", carried, nested);
+    std::printf("    a settled event's markets: %s\n", settled_listed.c_str());
+    if (!a.dump.empty())
+      std::ofstream(a.dump + "/kalshi_demo_events_check.json")
+          << json{{"events", report}, {"collateral_return_type", crts}, {"without_nesting", plain},
+                  {"settled_listed", settled_listed}}.dump(1);
+    return ok && parsed > 0;
+  }
+
+  // ---- --arb-check -------------------------------------------------------------------------------
+  // An IOC sent and what came of it: the 201, the order read after it, its fills.
+  struct Taken {
+    WriteOutcome w;
+    Qty ack_filled = 0;
+    std::optional<OrderRow> row;
+    std::vector<FillRow> fills;
+    Qty filled() const {
+      Qty n = 0;
+      for (const auto& f : fills) n += f.count;
+      return n;
+    }
+  };
+  // what a fill paid on the side it bought (YES at its price, NO at 1 - it), its fee aside
+  static Micros paid(const FillRow& f) {
+    return (f.side == BookSide::BID ? f.yes_price : kOneDollar - f.yes_price) * f.count;
+  }
+  static std::string usd(Micros m) { return (m < 0 ? "-$" : "$") + money_str((m < 0 ? -m : m) / 100); }
+  // An IOC in S1's shape: Systematic's self-trade setting (taker_at_cross), 1 contract a leg.
+  CreateOrder ioc_order(const MarketRow& m, BookSide side, Px px, Qty count, bool reduce_only) {
+    CreateOrder o;
+    o.ticker = m.ticker;
+    o.exchange_index = m.exchange_index.value_or(0);
+    o.side = side;
+    o.count = count;
+    o.price = px;
+    o.tif = TimeInForce::IOC;
+    o.reduce_only = reduce_only;
+    o.stp = Stp::TAKER_AT_CROSS;
+    o.client_order_id = "P-arb-" + hex16().substr(0, 8);
+    return o;
+  }
+  // the order's fills, read until they come to `want` (3 s at most)
+  std::vector<FillRow> fills_of(const std::string& order_id, Qty want) {
+    std::string why;
+    ListQuery q;
+    q.order_id = order_id;
+    q.limit = 100;
+    std::vector<FillRow> got;
+    for (int i = 0; i < 15; ++i) {
+      if (i) std::this_thread::sleep_for(std::chrono::milliseconds(200));
+      net::Exchange x = send(build_get_fills(q), "fills of the order", false);
+      auto page = ok2xx(x) ? parse_fills(x.res.body, &why) : std::nullopt;
+      if (!page) continue;
+      got = page->rows;
+      Qty n = 0;
+      for (const auto& f : got) n += f.count;
+      if (n >= want) break;
+    }
+    return got;
+  }
+  Taken ioc(const CreateOrder& o, const std::string& label) {
+    Taken t;
+    const Placed p = place(o, label);
+    t.w = p.w;
+    if (!p.ack) {
+      std::printf("    outcome %s\n", shape(p.w).c_str());
+      return t;
+    }
+    t.ack_filled = p.ack->fill_count;
+    t.row = read_order(p.order_id);
+    if (t.ack_filled > 0) t.fills = fills_of(p.order_id, t.ack_filled);
+    Micros cost = 0, fee = 0;
+    for (const auto& f : t.fills) {
+      cost += paid(f);
+      fee += f.fee;
+    }
+    std::printf("    201 filled %s, remaining %s; the order reads %s, filled %s; %zu fill(s): %s paid, fee %s\n",
+                count_wire(p.ack->fill_count).c_str(), count_wire(p.ack->remaining).c_str(),
+                t.row ? order_status_name(t.row->status) : "UNREAD", t.row ? count_wire(t.row->filled).c_str() : "-",
+                t.fills.size(), usd(cost).c_str(), micros_str(fee).c_str());
+    return t;
+  }
+  // The shard's cash: its balance_breakdown row, else the balance; nullopt when unread.
+  std::optional<Money> cash(int shard) {
+    std::string why;
+    net::Exchange x = send(build_get_balance(), "balance", false);
+    auto b = ok2xx(x) ? parse_balance(x.res.body, &why) : std::nullopt;
+    if (!b) return std::nullopt;
+    for (const auto& [s, m] : b->by_shard)
+      if (s == shard) return m;
+    return b->available;
+  }
+  // After a fill: read until the cash has left `was` and two reads agree, 3 s at most.
+  std::optional<Money> cash_after(int shard, Money was) {
+    std::optional<Money> last;
+    for (const std::int64_t until = net::mono_us() + 3000000;;) {
+      const auto c = cash(shard);
+      if (c && last && *c == *last && *c != was) return c;
+      if (c) last = c;
+      if (net::mono_us() >= until) return last;
+      std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+  }
+  // The account's positions in the event (count_filter position: the flat ones left out), and
+  // the venue's event_positions row for it as sent; nullopt when unread.
+  std::optional<std::map<std::string, Qty>> positions(const std::string& event, const std::string& label, json* event_row) {
+    std::string why;
+    ListQuery q;
+    q.event_ticker = event;
+    q.count_filter = "position";
+    net::Exchange x = send(build_get_positions(q), label, false);
+    auto page = ok2xx(x) ? parse_positions(x.res.body, &why) : std::nullopt;
+    if (!page) return std::nullopt;
+    std::map<std::string, Qty> out;
+    for (const auto& r : page->rows)
+      if (r.position) out[r.ticker] = r.position;
+    if (event_row) {
+      *event_row = nullptr;
+      const json raw = json::parse(x.res.body, nullptr, false);
+      if (raw.is_object() && raw.contains("event_positions") && raw["event_positions"].is_array())
+        for (const auto& e : raw["event_positions"])
+          if (e.is_object() && str_of(e, "event_ticker") == event) *event_row = e;
+      dump("arb_positions", x.res.body);
+    }
+    return out;
+  }
+
+  // The event the arb check trades: the venue flags it mutually exclusive, the account holds and
+  // rests nothing in it, and two of its open markets on one shard, closing over two minutes out,
+  // show a YES bid and a YES ask; the two with the narrowest spreads. nullopt with *why if none.
+  struct ArbPick {
+    EventRow e;
+    std::vector<std::pair<MarketRow, Touch>> legs;
+  };
+  std::optional<ArbPick> arb_pick(const std::vector<MarketRow>& page, std::string* why) {
+    std::string last = "no event to try";
+    for (const auto& c : candidates(page)) {
+      if (c.settled) continue;
+      std::string w;
+      net::Exchange x = send(build_get_event(c.event), "event " + c.event, false);
+      auto e = ok2xx(x) ? parse_event(x.res.body, &w) : std::nullopt;
+      if (!e) {
+        last = c.event + (ok2xx(x) ? ": parse_event refuses it: " + w : ": not read");
+        continue;
+      }
+      if (e->mutually_exclusive != true) {
+        last = c.event + " is not flagged mutually exclusive";
+        continue;
+      }
+      const auto held = positions(c.event, "positions in " + c.event, nullptr);
+      if (!held || !held->empty()) {
+        last = c.event + (held ? ": the account holds a position in it" : ": positions not read");
+        continue;
+      }
+      ListQuery rq;
+      rq.event_ticker = c.event;
+      rq.status = "resting";
+      x = send(build_get_orders(rq), "resting orders in " + c.event, false);
+      const auto resting = ok2xx(x) ? parse_orders(x.res.body, &w) : std::nullopt;
+      if (!resting || !resting->rows.empty()) {
+        last = c.event + (resting ? ": the account has an order resting in it" : ": resting orders not read");
+        continue;
+      }
+      std::vector<std::pair<MarketRow, Touch>> fit;
+      const std::int64_t now = now_ms();
+      for (const auto& m : e->markets) {
+        if ((m.status != "active" && m.status != "open") || !m.exchange_index) continue;
+        if (m.close_ms && *m.close_ms < now + 120 * 1000) continue;
+        const auto t = touch(m.ticker);
+        if (t && t->bid && t->ask && t->bid_qty >= kOneContract && t->ask_qty >= kOneContract) fit.push_back({m, *t});
+      }
+      std::stable_sort(fit.begin(), fit.end(), [](const auto& l, const auto& r) {
+        return *l.second.ask - *l.second.bid < *r.second.ask - *r.second.bid;
+      });
+      for (std::size_t i = 0; i < fit.size(); ++i)
+        for (std::size_t j = i + 1; j < fit.size(); ++j)
+          if (fit[i].first.exchange_index == fit[j].first.exchange_index) return ArbPick{*e, {fit[i], fit[j]}};
+      last = c.event + ": fewer than two of its open markets on one shard show a YES bid and ask";
+    }
+    *why = "no event fits (the last tried: " + last + ")";
+    return std::nullopt;
+  }
+
+  bool arb_check(const std::vector<MarketRow>& page) {
+    std::printf("\narb check (%s): NO on two markets of one mutually exclusive event, 1 contract each, then bought back\n",
+                base.host.c_str());
+    std::string why;
+    const auto pick = arb_pick(page, &why);
+    if (!pick) {
+      std::printf("  not measured: %s\n", why.c_str());
+      return false;
+    }
+    const auto& legs = pick->legs;
+    const std::string& event = pick->e.event_ticker;
+    const int shard = legs[0].first.exchange_index.value_or(0);
+    std::printf("  %s (collateral_return_type %s), shard %d\n", event.c_str(),
+                pick->e.collateral_return_type.empty() ? "absent" : pick->e.collateral_return_type.c_str(), shard);
+    for (const auto& [m, t] : legs)
+      std::printf("    %s: bid %s x%s, ask %s x%s\n", m.ticker.c_str(), price_wire(*t.bid).c_str(), count_wire(t.bid_qty).c_str(),
+                  price_wire(*t.ask).c_str(), count_wire(t.ask_qty).c_str());
+    // the series' fee multiplier, for the fees' precision
+    std::optional<double> mult;
+    {
+      net::Exchange x = send(build_get_series(pick->e.series_ticker), "series " + pick->e.series_ticker, false);
+      if (auto s = ok2xx(x) ? parse_series(x.res.body, &why) : std::nullopt) mult = s->fee_multiplier;
+    }
+    json verdicts = json::array();
+    bool ok = true;
+    const auto say = [&](const char* name, const char* v, const std::string& seen) {
+      std::printf("  %-22s %-7s %s\n", name, v, seen.c_str());
+      verdicts.push_back({{"check", name}, {"verdict", v}, {"seen", seen}});
+      if (std::string(v) == "NOT OK") ok = false;
+    };
+    const auto before = cash(shard);
+    if (!before) {
+      say("collateral_netting", "NOT OK", "not measured: the balance cannot be read");
+      return false;
+    }
+    std::printf("    cash on shard %d: $%s\n", shard, money_str(*before).c_str());
+
+    // the two NO legs: an IOC sell of YES at the live bid each, the cash read after each
+    std::vector<Taken> sent;
+    std::vector<Qty> held(legs.size(), 0);
+    std::vector<Money> after;
+    Micros cost = 0;   // what the NO legs paid, fees included
+    Money was = *before;
+    for (std::size_t k = 0; k < legs.size(); ++k) {
+      const MarketRow& m = legs[k].first;
+      const auto t = touch(m.ticker);
+      if (!t || !t->bid) {
+        std::printf("    %s shows no YES bid now: no leg %zu\n", m.ticker.c_str(), k + 1);
+        break;
+      }
+      sent.push_back(ioc(ioc_order(m, BookSide::ASK, *t->bid, kOneContract, false),
+                         "create (NO leg " + std::to_string(k + 1) + ", IOC sell at " + price_wire(*t->bid) + ")"));
+      held[k] = sent.back().filled();
+      for (const auto& f : sent.back().fills) cost += paid(f) + f.fee;
+      if (held[k] <= 0) {
+        std::printf("    leg %zu holds nothing: the bid went first, or its fills were not read\n", k + 1);
+        break;
+      }
+      const auto c = cash_after(shard, was);
+      if (!c) break;
+      std::printf("    cash after leg %zu: $%s\n", k + 1, money_str(*c).c_str());
+      after.push_back(*c);
+      was = *c;
+    }
+    json event_row;
+    const auto mid = positions(event, "positions after the legs", &event_row);
+    if (mid) {
+      std::string pos;
+      for (const auto& [tk, q] : *mid) pos += (pos.empty() ? "" : ", ") + tk + " " + count_wire(q);
+      std::printf("    positions: %s; the venue's event row: %s\n", pos.empty() ? "none" : pos.c_str(),
+                  event_row.is_null() ? "none" : event_row.dump().c_str());
+    }
+    json report{{"event", event}, {"shard", shard}, {"collateral_return_type", pick->e.collateral_return_type},
+                {"cash_before", money_str(*before)}, {"event_position", event_row}};
+    if (after.size() == legs.size()) {
+      const Micros fell = (*before - after.back()) * 100;
+      const Micros back = cost - fell;
+      const Micros pays = kOneDollar * std::min(held[0], held[1]);   // what one NO of the pair must pay
+      std::string what;
+      if (std::llabs(back) <= 10000) what = "not netted: each NO leg holds its own cost";
+      else if (std::llabs(back - pays) <= 10000) what = "netted: the venue gave back the " + usd(pays) + " one of them must pay";
+      else what = "UNEXPLAINED: neither $0 nor " + usd(pays) + " back (another order or fill on the shard?)";
+      say("collateral_netting", "SEEN", "the legs cost " + usd(cost) + " with fees and the cash fell " + usd(fell) + ": " + what);
+      report["netting"] = {{"cost", usd(cost)}, {"cash_fell", usd(fell)}, {"given_back", usd(back)}};
+    } else {
+      say("collateral_netting", "NOT OK", "not measured: both legs did not fill, or the cash was not read");
+    }
+
+    // both bought back: what each holds (the larger of its fills and the positions read), at the
+    // live ask, reduce_only so it never buys past flat; three tries a leg
+    for (std::size_t k = 0; k < legs.size(); ++k) {
+      const MarketRow& m = legs[k].first;
+      Qty left = held[k];
+      if (mid)
+        if (const auto it = mid->find(m.ticker); it != mid->end()) left = std::max(left, -it->second);
+      for (int tries = 0; left > 0 && tries < 3; ++tries) {
+        const auto t = touch(m.ticker);
+        if (!t || !t->ask) {
+          std::printf("    %s shows no ask: again in 1 s\n", m.ticker.c_str());
+          std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+          continue;
+        }
+        sent.push_back(ioc(ioc_order(m, BookSide::BID, *t->ask, left, true),
+                           "create (buy back " + std::to_string(k + 1) + ", IOC reduce_only at " + price_wire(*t->ask) + ")"));
+        left -= sent.back().filled();
+      }
+    }
+    std::optional<std::map<std::string, Qty>> end;
+    for (int i = 0; i < 15; ++i) {
+      if (i) std::this_thread::sleep_for(std::chrono::milliseconds(200));
+      end = positions(event, "positions after the buy back", nullptr);
+      if (end && std::none_of(legs.begin(), legs.end(), [&end](const auto& l) { return end->count(l.first.ticker) > 0; })) break;
+    }
+    std::string left;
+    if (end)
+      for (const auto& [tk, q] : *end)
+        if (tk == legs[0].first.ticker || tk == legs[1].first.ticker) left += (left.empty() ? "" : ", ") + count_wire(q) + " " + tk;
+    const auto final_cash = cash(shard);
+    if (!end) say("bought_back", "NOT OK", "the positions were not read after the buy back: look at the account on demo");
+    else if (!left.empty()) say("bought_back", "NOT OK", "STILL HELD: " + left + "; close it by hand on demo");
+    else
+      say("bought_back", "OK",
+          "flat in both; the round trip cost " + (final_cash ? usd((*before - *final_cash) * 100) : std::string("(cash unread)")) +
+              " of play money");
+
+    // each IOC's 201 against its order read after it
+    int agree = 0, unread = 0;
+    std::string differ;
+    for (const auto& d : sent) {
+      if (d.w.kind != WriteOutcome::Kind::ACK) continue;
+      if (!d.row) ++unread;
+      else if (d.row->status != OrderStatus::RESTING && d.row->filled == d.ack_filled) ++agree;
+      else
+        differ += (differ.empty() ? "" : "; ") + d.row->ticker + ": 201 " + count_wire(d.ack_filled) + ", then " +
+                  order_status_name(d.row->status) + " " + count_wire(d.row->filled);
+    }
+    if (!differ.empty()) say("ioc_201", "NOT OK", "a 201's fill_count differs from its order: " + differ);
+    else if (unread || !agree) say("ioc_201", "SEEN", std::to_string(agree) + " agree, " + std::to_string(unread) + " not read back");
+    else say("ioc_201", "OK", std::to_string(agree) + " IOCs: each 201's fill_count is its order's, ended at the 201");
+
+    // the precision each fill's fee was rounded to (gw/fees.h kalshi_taker_fee, a first fill)
+    if (!mult) {
+      say("fee_precision", "SEEN", "not judged: the series' fee multiplier was not read");
+    } else {
+      int n = 0, fine = 0, coarse = 0;
+      std::string fees;
+      for (const auto& d : sent)
+        for (const auto& f : d.fills) {
+          const Px px = f.side == BookSide::BID ? f.yes_price : kOneDollar - f.yes_price;
+          const Micros at_fine = kalshi_taker_fee(*mult, px, f.count, 100), at_coarse = kalshi_taker_fee(*mult, px, f.count, 10000);
+          ++n;
+          fine += f.fee == at_fine;
+          coarse += f.fee == at_coarse;
+          fees += (fees.empty() ? "" : ", ") + micros_str(f.fee) + " (" + micros_str(at_fine) + " / " + micros_str(at_coarse) + ")";
+        }
+      char m[32];
+      std::snprintf(m, sizeof m, "%g", *mult);
+      const std::string seen = std::to_string(n) + " fills at multiplier " + m + ", charged (model at $0.0001 / $0.01): " + fees;
+      if (!n) say("fee_precision", "SEEN", "not judged: no fill was read");
+      else if (fine == n && coarse < n) say("fee_precision", "SEEN", "$0.0001 (direct member): " + seen);
+      else if (coarse == n && fine < n) say("fee_precision", "SEEN", "$0.01: " + seen);
+      else if (fine == n) say("fee_precision", "SEEN", "not told apart at these prices: " + seen);
+      else say("fee_precision", "SEEN", "NEITHER precision explains every fee: " + seen);
+    }
+    report["checks"] = verdicts;
+    if (final_cash) report["cash_after"] = money_str(*final_cash);
+    if (!a.dump.empty()) std::ofstream(a.dump + "/kalshi_demo_arb_check.json") << report.dump(1);
+    return ok;
   }
 
   // ---- the socket (--feeds-check, --group-check) ---------------------------------------------
@@ -1260,8 +1813,15 @@ int main(int argc, char** argv) {
     else if (s == "--lip-series" && (v = value())) a.lip_series = split_list(v);
     else if (s == "--band-series" && (v = value())) a.band_series = split_list(v);
     else if (s == "--order-ticker" && (v = value())) a.order_ticker = v;
+    else if (s == "--events-check") a.events_check = true;
+    else if (s == "--arb-check") a.arb_check = true;
+    else if (s == "--arb-series" && (v = value())) a.arb_series = split_list(v);
+    else if (s == "--event" && (v = value())) a.event = v;
     else if (s == "--dump" && (v = value())) a.dump = v;
-    else return usage();
+    else if (s == "--live") {
+      std::fprintf(stderr, "kalshi-demo-probe: --live is refused: this probe never trades production, only Kalshi's demo exchange\n");
+      return 2;
+    } else return usage();
   }
   std::string err, desc;
   std::unique_ptr<KalshiSigner> signer;
@@ -1328,6 +1888,8 @@ int main(int argc, char** argv) {
   if (a.group_check && !p.group_check(rows)) order_ok = false;
   if (a.venue_checks && !p.venue_checks(rows)) order_ok = false;
   if (a.feeds_check && !p.feeds_check()) order_ok = false;
+  if (a.events_check && !p.events_check(rows)) order_ok = false;
+  if (a.arb_check && !p.arb_check(rows)) order_ok = false;
   p.summary();
   p.sign_time();
   p.pool->stop();
