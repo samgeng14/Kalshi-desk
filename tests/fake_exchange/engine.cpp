@@ -147,6 +147,13 @@ const Market* Engine::market(const std::string& t) const {
   return it == markets_.end() ? nullptr : &it->second;
 }
 
+const EventSpec& Engine::add_event(EventSpec spec) {
+  if (spec.series_ticker.empty()) spec.series_ticker = spec.event_ticker.substr(0, spec.event_ticker.find('-'));
+  EventSpec& e = event_specs_[spec.event_ticker];
+  e = std::move(spec);
+  return e;
+}
+
 std::vector<std::pair<Px, Qty>> Engine::levels(const std::string& ticker, bool no_side) const {
   std::vector<std::pair<Px, Qty>> out;
   const Market* m = market(ticker);

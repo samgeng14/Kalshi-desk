@@ -27,7 +27,7 @@
 //                                                      ?subaccount&exchange_index (default 0): 200 {}
 //   POST   /portfolio/intra_exchange_instance_transfer moves cash between shards (src/client.cpp's body)
 //   GET    /markets (paged by ticker), /markets/{ticker}, /markets/{ticker}/orderbook,
-//          /exchange/status                                                     (no auth)
+//          /events/{event_ticker}?with_nested_markets, /exchange/status        (no auth)
 // Errors are {"error":{"code","message","details"?}} (what the venue sent the old desk:
 // src/executor.cpp kalshi_error_body; the docs' ErrorResponse is the inner object), except a 429,
 // whose body is {"error": "too many requests"} (getting_started/rate_limits.md).

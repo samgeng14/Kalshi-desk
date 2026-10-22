@@ -592,8 +592,36 @@ json market_json(const Engine& e, const Market& m) {
   if (!m.spec.strike_type.empty()) j["strike_type"] = m.spec.strike_type;
   if (m.spec.floor_strike) j["floor_strike"] = *m.spec.floor_strike;
   if (m.spec.cap_strike) j["cap_strike"] = *m.spec.cap_strike;
+  if (!m.spec.yes_sub_title.empty()) j["yes_sub_title"] = m.spec.yes_sub_title;
   if (m.settled) j["result"] = m.result;
   return j;
+}
+
+// GET /events/{event_ticker} (get-event.md): {event} with its markets nested in it when
+// with_nested_markets=true, else {event, markets} with them beside it (the default, documented as
+// deprecated); its markets are the listed ones naming it, by ticker, any status. 404 not_found for
+// an event the fake has not been given.
+RestReply get_event(const Engine& e, const net::Request& r, const std::string& event_ticker) {
+  const std::string nested = qstr(r, "with_nested_markets");
+  if (!nested.empty() && nested != "true" && nested != "false") return bad("with_nested_markets must be true or false");
+  const auto it = e.events().find(event_ticker);
+  if (it == e.events().end()) return rest_error(404, "not_found", "event not found");
+  const EventSpec& s = it->second;
+  json ev{{"event_ticker", s.event_ticker},
+          {"series_ticker", s.series_ticker},
+          {"title", s.title},
+          {"sub_title", s.sub_title},
+          {"category", s.category}};
+  if (s.mutually_exclusive) ev["mutually_exclusive"] = *s.mutually_exclusive;
+  if (!s.collateral_return_type.empty()) ev["collateral_return_type"] = s.collateral_return_type;
+  json markets = json::array();
+  for (const auto& [ticker, m] : e.markets())   // std::map: by ticker
+    if (m.spec.event_ticker == s.event_ticker) markets.push_back(market_json(e, m));
+  if (nested == "true") {
+    ev["markets"] = markets;
+    return ok(200, json{{"event", ev}});
+  }
+  return ok(200, json{{"event", ev}, {"markets", markets}});
 }
 
 // GET /markets (get-markets.md): limit 1-1000 (default 100), cursor, tickers (comma-separated),
@@ -755,6 +783,7 @@ RestReply rest_route(Engine& e, const net::Request& r, const std::string& path, 
     }
     return rest_error(404,"not_found","series not found");
   }
+  if (seg[0] == "events" && r.method == "GET" && seg.size() == 2) return get_event(e, r, seg[1]);
   if (seg[0] == "markets" && r.method == "GET" && seg.size() == 1) return list_markets(e, r, now);
   // GET /markets/trades (get-trades.md): public prints, newest first; ticker, min_ts / max_ts in
   // Unix seconds, limit 1-1000 (default 100), cursor

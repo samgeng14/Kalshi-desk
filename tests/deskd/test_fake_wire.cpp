@@ -410,6 +410,80 @@ void test_rest() {
   ::close(fd);
 }
 
+// ---- events (get-event.md): GET /events/{event_ticker} ------------------------------------------
+
+void test_events() {
+  Venue v;
+  CHECK(v.ok);
+  const std::string E = "KXHIGHTST-26OCT06";
+  v.f.with_engine([&](Engine& e, std::int64_t now) {
+    MarketSpec lo = spec(E + "-T79", 0), mid = spec(E + "-B79.5", 0), hi = spec(E + "-T80", 0);
+    lo.strike_type = "less";
+    lo.cap_strike = 79;
+    lo.yes_sub_title = "78 or below";
+    mid.strike_type = "between";
+    mid.floor_strike = 79;
+    mid.cap_strike = 80;
+    hi.strike_type = "greater";
+    hi.floor_strike = 80;
+    for (const MarketSpec& s : {hi, lo, mid}) e.add_market(s, now);
+    EventSpec ev;
+    ev.event_ticker = E;
+    ev.title = "Highest temperature in Testville?";
+    ev.sub_title = "On Oct 6, 2026";
+    ev.category = "Climate and Weather";
+    ev.mutually_exclusive = true;
+    ev.collateral_return_type = "MECNET";
+    CHECK(e.add_event(ev).series_ticker == "KXHIGHTST");
+    EventSpec t;   // T's event: no flag, nothing optional
+    t.event_ticker = "KXTEST-26OCT06";
+    e.add_event(t);
+  });
+  HttpConn c(v.port());
+  // nested: {event} alone, its markets in it by ticker, each as GET /markets/{t} lists it; no auth
+  auto r = c.request("GET", V2 + "/events/" + E + "?with_nested_markets=true");
+  CHECK(r.status() == 200 && keys(r.j) == std::set<std::string>({"event"}));
+  const json ev = r.j["event"];
+  CHECK(keys(ev) == std::set<std::string>({"event_ticker", "series_ticker", "title", "sub_title", "category",
+                                           "mutually_exclusive", "collateral_return_type", "markets"}));
+  CHECK(ev["event_ticker"] == E && ev["series_ticker"] == "KXHIGHTST" && ev["mutually_exclusive"] == true &&
+        ev["collateral_return_type"] == "MECNET" && ev["title"] == "Highest temperature in Testville?");
+  CHECK(ev["markets"].size() == 3 && ev["markets"][0]["ticker"] == E + "-B79.5" && ev["markets"][2]["ticker"] == E + "-T80");
+  CHECK(ev["markets"][1] == c.request("GET", V2 + "/markets/" + E + "-T79").j["market"]);
+  CHECK(ev["markets"][1]["yes_sub_title"] == "78 or below" && ev["markets"][1]["strike_type"] == "less" &&
+        ev["markets"][1]["cap_strike"] == 79 && ev["markets"][1]["event_ticker"] == E);
+  CHECK(!ev["markets"][2].contains("yes_sub_title"));   // none given: left out
+  // the default: the markets beside the event
+  r = c.request("GET", V2 + "/events/" + E);
+  CHECK(r.status() == 200 && keys(r.j) == std::set<std::string>({"event", "markets"}) && !r.j["event"].contains("markets") &&
+        r.j["markets"] == ev["markets"]);
+  CHECK(c.request("GET", V2 + "/events/" + E + "?with_nested_markets=false").j["markets"].size() == 3);
+  // no flag given: left out (the docs list it as required: deskd must read it as unknown); only the
+  // event's own markets
+  r = c.request("GET", V2 + "/events/KXTEST-26OCT06?with_nested_markets=true");
+  CHECK(r.status() == 200 && !r.j["event"].contains("mutually_exclusive") && !r.j["event"].contains("collateral_return_type") &&
+        r.j["event"]["series_ticker"] == "KXTEST" && r.j["event"]["markets"].size() == 1 &&
+        r.j["event"]["markets"][0]["ticker"] == T);
+  // unknown: 404 in the venue's error shape, even with markets naming it; a bad flag: 400; GET only
+  r = c.request("GET", V2 + "/events/KXNATGAS15M-26OCT061145");
+  CHECK(r.status() == 404 && r.j["error"]["code"] == "not_found");
+  CHECK(c.request("GET", V2 + "/events/" + E + "?with_nested_markets=yes").status() == 400);
+  CHECK(call(c, "POST", "/events/" + E, json::object()).status() == 404);
+  // a market listed after the event joins it, a closed one stays in it, and the event given again
+  // replaces its spec
+  v.f.with_engine([&](Engine& e, std::int64_t now) {
+    e.add_market(spec(E + "-B81.5", 0), now);
+    e.close(E + "-T80", now);
+    EventSpec again;
+    again.event_ticker = E;
+    again.mutually_exclusive = false;
+    e.add_event(again);
+  });
+  r = c.request("GET", V2 + "/events/" + E + "?with_nested_markets=true");
+  CHECK(r.j["event"]["mutually_exclusive"] == false && r.j["event"]["title"] == "" && r.j["event"]["markets"].size() == 4 &&
+        r.j["event"]["markets"][1]["ticker"] == E + "-B81.5" && r.j["event"]["markets"][3]["status"] == "closed");
+}
+
 // ---- auth -----------------------------------------------------------------------------------------
 
 void test_auth() {
@@ -1395,6 +1469,7 @@ void test_binary() {
 int main() {
   ::signal(SIGPIPE, SIG_IGN);
   test_rest();
+  test_events();
   test_auth();
   test_rate_limits();
   test_ws_protocol();

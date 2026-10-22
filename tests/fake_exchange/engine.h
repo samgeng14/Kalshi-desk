@@ -126,6 +126,18 @@ struct MarketSpec {
   // settles on them
   std::string strike_type;
   std::optional<double> floor_strike, cap_strike;
+  std::string yes_sub_title;    // what YES is (a bracket: "79 to 80"); "": left out
+};
+
+// An event (GET /events/{event_ticker}, get-event.md): its markets are the listed markets whose
+// event_ticker names it. The fake's own choice: a mutually_exclusive left nullopt is left out of the
+// body, though the docs list it as required, so a test can show deskd an event whose flag is unknown.
+struct EventSpec {
+  std::string event_ticker;
+  std::string series_ticker;    // default: the event ticker up to its first '-'
+  std::string title, sub_title, category;
+  std::optional<bool> mutually_exclusive;
+  std::string collateral_return_type;   // "": left out
 };
 
 enum class Side { BID, ASK };  // the order's book side, YES terms
@@ -302,6 +314,11 @@ class Engine {
   // status "settled" with its result.
   void settle_market(const std::string& ticker, bool yes, std::int64_t now_ms);
 
+  // ---- events: a new event, or a new spec for one that exists. Markets join an event by their
+  // own event_ticker, before or after it is added; GET /events/{t} answers 404 until it is.
+  const EventSpec& add_event(EventSpec spec);
+  const std::map<std::string, EventSpec>& events() const { return event_specs_; }
+
   // ---- time: expiries, closes, group windows and tape debts
   void tick(std::int64_t now_ms);
 
@@ -404,6 +421,7 @@ class Engine {
   std::mt19937_64 rng_;
   std::uint64_t next_seq_ = 1;
   std::map<std::string, Market> markets_;
+  std::map<std::string, EventSpec> event_specs_;
   std::unordered_map<std::uint64_t, std::unique_ptr<Order>> pool_;
   std::unordered_map<std::string, Order*> by_id_;
   std::vector<const Order*> user_orders_;
