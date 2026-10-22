@@ -24,13 +24,14 @@ the payouts). Then each lane's rule over all its fills so far:
   trades or -$15): WAIT under 60 trades, or while a position of its is still to settle; then HOLD
   if its settlement P&L is positive, else RETIRE; and at any count once it is down $15.
   S1, the arbitrage baskets (5(c)): its baskets complete, unwound (a missed leg sold back) or
-  missed (the first leg filled nothing), its legging against the $5 pause, and what its locked
-  baskets settled for. PAUSE once its legging since the last reset is down $5, or s1.json could
-  not be read (the engine then sends no new basket until S1 is turned off and on); and once its
-  settled P&L is under what its baskets locked by over a cent (a basket paid less than its
-  settlement states promised: keep S1 off until that is understood). WAIT while it has only
-  scanned, for its first week of scans (the evidence before trade: the events with a lock and the
-  best of them); else HOLD.
+  missed (the first leg filled nothing), its legging against its engine's pause, and what its
+  locked baskets settled for. PAUSE once its legging since the last reset is down that pause
+  (deskd.arb_legging_pause, $5 at most, as s1.json says; $5 for a file without it), s1.json says
+  the engine is paused, or it could not be read (the engine then sends no new basket until S1 is
+  turned off and on); and once its settled P&L is under what its baskets locked by over a cent
+  (a basket paid less than its settlement states promised: keep S1 off until that is
+  understood). WAIT while it has only scanned, for its first week of scans (the evidence before
+  trade: the events with a lock and the best of them); else HOLD.
 
 C1's, N1's and N2's dollars, and C1's and N2's trades, are gw's own count of each lane's life: the
 desk's saved Systematic book, systematic.json beside ops.sqlite (--book; gw/sys_book.h: trades are
@@ -38,10 +39,11 @@ orders with a fill, P&L is realized less fees, settlements included), since ops.
 settlements; C1's 300 s markouts are the ones gw counted there. gw retires each lane on its own
 rule (its loss rule also counts open positions at the mark); a lane-reset clears that life, and so
 this count. S1's baskets and scans are ops.sqlite's baskets and arb_scans rows; its legging since
-the last reset is its engine's, s1.json beside ops.sqlite (--s1; without it, the baskets' sum);
-its settled P&L is S1's life in the book, compared once S1 holds nothing with the edge_real of the
-baskets that ended since that life began, each leg holding the same (a basket's lock to settlement
-plus its round trips: settlement can pay more, never less).
+the last reset, its pause and whether it holds are its engine's, s1.json beside ops.sqlite (--s1;
+without it, the baskets' sum against $5); its settled P&L is S1's life in the book, compared once
+S1 holds nothing with the edge_real of the baskets that ended since that life began, each leg
+holding the same (a basket's lock to settlement plus its round trips: settlement can pay more,
+never less).
 
 The verdict is advice: sizes and lanes are the operator's to change. Read-only.
 
@@ -77,7 +79,7 @@ Z80 = 0.8416   # one-sided 80%: mean - Z80 * sd / sqrt(n)
 LIP_LANES = ('M1', 'P1')
 N1_LOSS, N2_LOSS, N2_TRADES = 20.0, 15.0, 60   # gw's default_lanes: N1 retired once down $20, N2 after 60 trades or $15
 C1_LOSS, C1_TRADES, C1_MARKED = 20.0, 100, 50   # C1 after 100 trades with 50 fills marked at 300 s, or $20 (SysBook::kRetireMarked)
-S1_PAUSE, S1_SCAN_DAYS = 5.0, 7   # S1 pauses new baskets once legging is down $5 (5(c)); a week of scans first
+S1_PAUSE, S1_SCAN_DAYS = 5.0, 7   # S1's pause where s1.json does not say it (5(c), arb_legging_pause's most); a week of scans first
 
 
 def et_day(ms):
@@ -149,8 +151,10 @@ def load_arb(db):
 
 def load_s1(path):
     """S1's engine state (strat/arb.h, <data_dir>/s1.json, v 1): {'legging': dollars since the last
-    reset, 'error': why the file could not be read ('' when it could), 'open': baskets open}; None
-    when there is no such file or it is not one."""
+    reset, 'error': why the file could not be read ('' when it could), 'open': baskets open,
+    'pause': the legging in dollars that pauses it (deskd.arb_legging_pause; None in a file from
+    before the engine wrote it), 'paused': whether that pause holds}; None when there is no such
+    file or it is not one."""
     try:
         with open(path) as fh:
             j = json.load(fh)
@@ -158,7 +162,8 @@ def load_s1(path):
         return None
     if not isinstance(j, dict) or j.get('v') != 1:
         return None
-    return {'legging': j.get('legging', 0) / 1e6, 'error': j.get('error') or '', 'open': len(j.get('baskets') or [])}
+    return {'legging': j.get('legging', 0) / 1e6, 'error': j.get('error') or '', 'open': len(j.get('baskets') or []),
+            'pause': j['pause'] / 1e6 if j.get('pause') else None, 'paused': bool(j.get('paused'))}
 
 
 def mean(xs):
@@ -279,18 +284,22 @@ def s1_rule(arb, book, nums):
              (('complete', 'complete'), ('unwound', 'unwound'), ('missed', 'the first leg'), ('closed', 'its markets have closed'))}
     stuck = sum(1 for b in baskets if b['stuck'])
     legging = state['legging'] if state else sum(b['legging'] or 0 for b in done)
+    pause = state['pause'] if state and state['pause'] else S1_PAUSE   # the engine's: deskd.arb_legging_pause
     locks = [s for s in scans if s['kind']]
     scan_days = len({et_day(s['ts_ms']) for s in scans})
     best = max(locks, key=lambda s: s['edge'] or 0) if locks else None
     nums.update({'baskets': len(baskets), 'open': len(baskets) - len(done), 'stuck': stuck, 'legging': round(legging, 4),
-                 'legging_from': 's1.json' if state else 'baskets', 'scan_days': scan_days,
+                 'legging_from': 's1.json' if state else 'baskets', 'pause': pause, 'scan_days': scan_days,
                  'events_scanned': len({s['event'] for s in scans}), 'events_locked': len({s['event'] for s in locks}),
                  'best_edge': best['edge'] if best else None, 'best_qty': best['qty'] if best else None, **count})
     if state and state['error']:
         return 'PAUSE', 'its engine cannot read s1.json (%s): no new basket until S1 is turned off and on' % state['error'], nums
-    if legging <= -S1_PAUSE:
-        return 'PAUSE', 'legging %s since the last reset, past -$%.0f: no new basket until S1 is turned off and on' % (
-            usd(legging), S1_PAUSE), nums
+    if legging <= -pause:
+        return 'PAUSE', 'legging %s since the last reset, past %s: no new basket until S1 is turned off and on' % (
+            usd(legging), usd(-pause)), nums
+    if state and state['paused']:
+        return 'PAUSE', 'its engine says it is paused (s1.json; legging %s of %s): no new basket until S1 is turned off ' \
+            'and on' % (usd(legging), usd(-pause)), nums
     scanned = 'locks in %d of %d events over %d day(s) of scans%s' % (
         nums['events_locked'], nums['events_scanned'], scan_days,
         ', the best %s on %g' % (usd(best['edge']), best['qty']) if best else '')
@@ -298,10 +307,10 @@ def s1_rule(arb, book, nums):
         if scan_days < S1_SCAN_DAYS:
             return 'WAIT', 'scan only: %s; a week of scans comes first' % scanned, nums
         return 'INFO', 'scan only: %s; trading them is the operator\'s call (deskd.arb_mode)' % scanned, nums
-    how = '%d basket(s): %d complete, %d unwound, %d missed%s%s; legging %s of -$%.0f' % (
+    how = '%d basket(s): %d complete, %d unwound, %d missed%s%s; legging %s of %s' % (
         len(baskets), count['complete'], count['unwound'], count['missed'],
         ', %d ended by its markets\' close' % count['closed'] if count['closed'] else '',
-        ', %d frozen for good (a CRIT alert named each)' % stuck if stuck else '', usd(legging), S1_PAUSE)
+        ', %d frozen for good (a CRIT alert named each)' % stuck if stuck else '', usd(legging), usd(-pause))
     # what the locks settled for: S1's life once it holds nothing, against the baskets of that life
     life = book['lives'].get('S1') if book else None
     held = book['open'].get('S1', 0.0) if book else 0.0
@@ -546,29 +555,40 @@ CREATE TABLE baskets(id TEXT PRIMARY KEY, event TEXT, kind TEXT, state TEXT, leg
     basket(4, 'the first leg filled nothing', (0, 0), 0.0, 0.0, now - 3600000)
     s1_file = s1_path(db)
 
-    def s1_state(legging, error=''):
+    def s1_state(legging, error='', pause=None, paused=None):   # pause None: a file from before the engine wrote it
+        j = {'v': 1, 'seq': 4, 'legging': int(round(legging * 1e6)), 'error': error, 'baskets': []}
+        if pause is not None:
+            j.update({'pause': int(round(pause * 1e6)), 'paused': (bool(error) or legging <= -pause) if paused is None else paused})
         with open(s1_file, 'w') as fh:
-            json.dump({'v': 1, 'seq': 4, 'legging': int(round(legging * 1e6)), 'error': error, 'baskets': []}, fh)
+            json.dump(j, fh)
     tally = '4 basket(s): 2 complete, 1 unwound, 1 missed; legging '
     for life, inv, first_ms, state, want, why, what in (
             ((3, 0.2, 0.05), {'KXHIGHNY-26OCT20-B0': [-200, 1200000]}, 0, None, 'HOLD',
-             tally + '-$0.07 of -$5; 2 contracts still to settle',
+             tally + '-$0.07 of -$5.00; 2 contracts still to settle',
              'S1 holds while its baskets settle (legging from the baskets without s1.json)'),
-            ((3, 0.2, 0.08), None, 0, None, 'HOLD', tally + '-$0.07 of -$5; settled $0.12 on $0.09 locked',
+            ((3, 0.2, 0.08), None, 0, None, 'HOLD', tally + '-$0.07 of -$5.00; settled $0.12 on $0.09 locked',
              'S1 holds once its locks settled for at least what they locked'),
             ((3, 0.13, 0.08), None, 0, None, 'PAUSE',
-             tally + '-$0.07 of -$5; settled $0.05, under the $0.09 its baskets locked: a basket paid less than its '
+             tally + '-$0.07 of -$5.00; settled $0.05, under the $0.09 its baskets locked: a basket paid less than its '
              'states promised', 'S1 pauses when its settlements fall under its locks'),
             ((2, 0.13, 0.08), None, now - 2 * 3600000 - 1000, None, 'HOLD',
-             tally + '-$0.07 of -$5; settled $0.05 on -$0.05 locked', 'S1 counts the locks of its life since a lane-reset'),
-            ((3, 0.2, 0.08), None, 0, (-0.02, ''), 'HOLD', tally + '-$0.02 of -$5; settled $0.12 on $0.09 locked',
+             tally + '-$0.07 of -$5.00; settled $0.05 on -$0.05 locked', 'S1 counts the locks of its life since a lane-reset'),
+            ((3, 0.2, 0.08), None, 0, (-0.02, ''), 'HOLD', tally + '-$0.02 of -$5.00; settled $0.12 on $0.09 locked',
              'S1\'s legging since the last reset is s1.json\'s'),
             ((3, 0.2, 0.08), None, 0, (-5.1, ''), 'PAUSE',
-             'legging -$5.10 since the last reset, past -$5: no new basket until S1 is turned off and on',
+             'legging -$5.10 since the last reset, past -$5.00: no new basket until S1 is turned off and on',
              'S1 pauses once legging is down $5'),
             ((3, 0.2, 0.08), None, 0, (0.0, 'not a version 1 file'), 'PAUSE',
              'its engine cannot read s1.json (not a version 1 file): no new basket until S1 is turned off and on',
-             'S1 pauses while its engine could not read s1.json')):
+             'S1 pauses while its engine could not read s1.json'),
+            ((3, 0.2, 0.08), None, 0, (-2.5, '', 1.0), 'PAUSE',
+             'legging -$2.50 since the last reset, past -$1.00: no new basket until S1 is turned off and on',
+             'S1 pauses at its engine\'s pause (deskd.arb_legging_pause $1), not at $5'),
+            ((3, 0.2, 0.08), None, 0, (-0.02, '', 2.5), 'HOLD', tally + '-$0.02 of -$2.50; settled $0.12 on $0.09 locked',
+             'S1 holds against its engine\'s pause'),
+            ((3, 0.2, 0.08), None, 0, (-0.02, '', 2.5, True), 'PAUSE',
+             'its engine says it is paused (s1.json; legging -$0.02 of -$2.50): no new basket until S1 is turned off and on',
+             'S1 pauses whenever s1.json says its engine is paused')):
         book({'S1': life}, {'S1': inv} if inv else None, first_ms)
         if state:
             s1_state(*state)
@@ -586,7 +606,7 @@ CREATE TABLE baskets(id TEXT PRIMARY KEY, event TEXT, kind TEXT, state TEXT, leg
     _, rules = report(db, 1, False, now)
     check(rules['S1']['verdict'] == 'HOLD' and rules['S1']['why'] ==
           '6 basket(s): 2 complete, 1 unwound, 1 missed, 1 ended by its markets\' close, 1 frozen for good (a CRIT alert '
-          'named each); legging -$0.07 of -$5; a basket still open', 'S1 names a basket frozen for good')
+          'named each); legging -$0.07 of -$5.00; a basket still open', 'S1 names a basket frozen for good')
     os.remove(book_path(db))
     _, rules = report(db, 1, False, now)
     check(rules['S1']['verdict'] == 'HOLD' and rules['S1']['why'].endswith('no Systematic book (systematic.json, --book): '

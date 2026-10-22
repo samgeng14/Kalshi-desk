@@ -85,8 +85,9 @@ $0 (9 of 703 events ever positive, the best +1.6c): run it to measure, not to ea
      start). `python3 tools/scorecard.py [live]` says how many events locked and the best.
   3. Trade on PAPER: `"arb_mode": "trade", "systematic_orders": true, "event_risk": true`,
      restart, S1 on, Start. The scorecard's S1 rule counts baskets complete, unwound and missed,
-     the legging against -$5 (s1.json), and once S1 holds nothing, whether its settlements paid
-     at least what its baskets locked (PAUSE if not: an event settled outside its shape).
+     the legging against the engine's pause (s1.json says it, `arb_legging_pause`, and whether it
+     holds), and once S1 holds nothing, whether its settlements paid at least what its baskets
+     locked (PAUSE if not: an event settled outside its shape).
 - **Tests**: deskd-event_risk, deskd-arb, deskd-sys_risk, deskd-rest, deskd-wire (the probe's
   checks against the fake), deskd-fake-wire, deskd-fake-engine (PULL_TOUCH) and
   deskd-runtime_arb (the whole process: scan, a basket, a missed leg completed and one unwound,
