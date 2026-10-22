@@ -953,6 +953,21 @@ Qty Engine::street_hit(const std::string& order_id, Qty qty, std::int64_t now_ms
   return q;
 }
 
+Qty Engine::street_pull_touch(const std::string& ticker, Side side, Px yes_limit, Qty qty, std::int64_t now_ms) {
+  Market* m = market(ticker);
+  if (!m || m->state != Market::State::OPEN || qty < 0) return 0;
+  const auto& opp = side == Side::BID ? m->no : m->yes;
+  if (opp.empty()) return 0;
+  const Px touch = opp.rbegin()->first;
+  const Px maker_yes = side == Side::BID ? kDollar - touch : touch;
+  if (side == Side::BID ? maker_yes > yes_limit : maker_yes < yes_limit) return 0;  // it would take nothing
+  Op op;
+  op.now = now_ms;
+  const Qty pulled = remove_street(*m, side == Side::BID, touch, qty ? qty : std::numeric_limits<Qty>::max(), op);
+  flush(op);
+  return pulled;
+}
+
 // ---- order groups -----------------------------------------------------------------------------
 
 Group* Engine::find_group(const std::string& id, int sub, int shard) {
@@ -1087,24 +1102,32 @@ void Engine::street_remove(const std::string& ticker, bool no_side, Px px, Qty q
     if (d->second.first == 0) m->debt.erase(d);
   }
   auto& side = no_side ? m->no : m->yes;
-  auto it = side.find(px);
-  if (it == side.end() || qty <= 0) return;
+  if (!side.count(px) || qty <= 0) return;
   Op op;
   op.now = now_ms;
+  remove_street(*m, no_side, px, qty, op);
+  flush(op);
+}
+
+Qty Engine::remove_street(Market& m, bool no_side, Px px, Qty qty, Op& op) {
+  auto& side = no_side ? m.no : m.yes;
+  auto it = side.find(px);
+  if (it == side.end()) return 0;
   // Street orders only, from the back of the queue (StreetCancel::BACK_FIRST: the queue ahead of
   // ours never moves up for a cancel we cannot place) or from the front.
   std::vector<Order*> street;
   for (Order* o : it->second.q)
     if (o->street) street.push_back(o);
   if (cfg_.street_cancel == StreetCancel::BACK_FIRST) std::reverse(street.begin(), street.end());
+  Qty left = qty;
   for (Order* o : street) {
-    if (qty <= 0) break;
-    const Qty take = std::min(qty, o->remaining);
-    qty -= take;
-    unrest(*m, *o, take, op, "", 0);  // may erase the level: `it` is not used again
+    if (left <= 0) break;
+    const Qty take = std::min(left, o->remaining);
+    left -= take;
+    unrest(m, *o, take, op, "", 0);  // may erase the level: `it` is not used again
     if (o->remaining == 0) erase_street(o);
   }
-  flush(op);
+  return qty - left;
 }
 
 Qty Engine::street_take(const std::string& ticker, Side side, Px yes_limit, Qty qty, std::int64_t now_ms) {

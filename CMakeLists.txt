@@ -497,9 +497,9 @@ endif()
 #   fake-engine  no sockets: units, grids and fees (the venue's worked rounding example), matching
 #                (price-time, IOC, FOK, post-only, expiry, reduce-only, self-trade, pause, close),
 #                duplicate client ids, netting and cash per shard, order groups, the socket's
-#                message fields, the street and tape debts, the archive reader on recorded frames
-#                and the synthetic fixture, scenarios, the fixture played to its end, and 5,000
-#                resting orders
+#                message fields, the street, its pull of the touch and tape debts, the archive
+#                reader on recorded frames and the synthetic fixture, scenarios, the fixture
+#                played to its end, and 5,000 resting orders
 #   fake-wire    over loopback: every REST route and shape, cursor paging, auth (a real RSA-PSS
 #                signature), rate limits per shard, the socket's commands, sids and seq, every
 #                channel, and each fault (drops, 5xx, a cut body, chunked, 429, stalls, socket

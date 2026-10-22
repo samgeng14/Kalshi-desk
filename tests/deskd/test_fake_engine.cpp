@@ -1,5 +1,6 @@
 // The fake Kalshi without sockets: its wire formats, grids and fees, the matching engine and
-// account, order groups, the street and its tape debts, and the tape and scenario readers.
+// account, order groups, the street (its pull of the touch, its tape debts), and the tape and
+// scenario readers.
 //
 // Expected numbers are worked by hand from the venue's documents (docs.kalshi.com, fetched
 // 2026-10-06): fees from the formula in redesign_all kalshi K6 and the worked example in
@@ -728,6 +729,69 @@ void test_street() {
   CHECK(e.levels(T, true) == Levels({{5800, 100}, {5900, 200}}));
 }
 
+// PULL_TOUCH's engine half: the street leaves the best level an order would take, just before it.
+void test_pull_touch() {
+  for (const StreetCancel how : {StreetCancel::BACK_FIRST, StreetCancel::FRONT_FIRST}) {
+    EngineConfig cfg;
+    cfg.street_cancel = how;
+    Engine e(cfg);
+    e.add_market(spec(T), T0);
+    e.set_cash(0, 0, 100 * D, T0);
+    e.street_add(T, true, 5800, 300, T0);     // YES ask 0.42 x3
+    e.street_add(T, true, 5700, 400, T0);     // 0.43 x4
+    e.street_add(T, false, 4000, 500, T0);    // YES bid 0.40 x5
+    e.drain_events();
+    // a bid up to 0.41 would take nothing: nothing leaves
+    CHECK(e.street_pull_touch(T, Side::BID, 4100, 0, T0 + 1) == 0);
+    CHECK(e.levels(T, true) == Levels({{5700, 400}, {5800, 300}}) && e.drain_events().empty());
+    // a bid up to 0.43: the 0.42 ask leaves, the 0.43 stays, and the book says so
+    CHECK(e.street_pull_touch(T, Side::BID, 4300, 0, T0 + 2) == 300);
+    CHECK(e.levels(T, true) == Levels({{5700, 400}}));
+    const auto deltas = of_type(e.drain_events(), "orderbook_delta");
+    CHECK(deltas.size() == 1 && deltas[0].msg["side"] == "no" && deltas[0].msg["price_dollars"] == "0.5800" &&
+          deltas[0].msg["delta_fp"] == "-3.00");
+    // so the order meets the next level
+    const auto r = e.create(ord(T, Side::BID, 4300, 200, Tif::IOC), T0 + 3);
+    CHECK(r.fill_count == 200 && r.fill_cost == notional(4300, 200));
+    // an ask (YES sold, NO bought) pulls from the YES bids; `qty` caps it
+    CHECK(e.street_pull_touch(T, Side::ASK, 4000, 200, T0 + 4) == 200);
+    CHECK(e.levels(T, false) == Levels({{4000, 300}}));
+    // ours stay: only the street's quantity leaves, from the back first or the front as a cancel
+    const auto own = e.create(ord(T, Side::BID, 4000, 100), T0 + 5);
+    e.street_add(T, false, 4000, 200, T0 + 6);
+    CHECK(e.street_pull_touch(T, Side::ASK, 3900, 400, T0 + 7) == 400);
+    CHECK(e.levels(T, false) == Levels({{4000, 200}}) && e.order(own.order_id)->in_book);
+    // BACK_FIRST: the 2 behind ours and 2 of the 3 ahead left, so 1 street contract is ahead;
+    // FRONT_FIRST: the 3 ahead and 1 behind left, so ours is first
+    const Qty ahead = how == StreetCancel::BACK_FIRST ? 100 : 0;
+    if (ahead) e.street_take(T, Side::ASK, 4000, ahead, T0 + 8);
+    CHECK(e.order(own.order_id)->filled == 0);
+    e.street_take(T, Side::ASK, 4000, 100, T0 + 9);
+    CHECK(e.order(own.order_id)->filled == 100);
+    // a touch of ours alone: nothing of the street's to pull
+    e.street_take(T, Side::ASK, 4000, 100, T0 + 10);
+    const auto mine = e.create(ord(T, Side::BID, 3900, 100), T0 + 11);
+    CHECK(e.street_pull_touch(T, Side::ASK, 3900, 0, T0 + 12) == 0 && e.order(mine.order_id)->in_book);
+  }
+
+  // the tape's debts are its own: a pull pays none, so it leaves the whole level, and the tape's
+  // later removal of what we took still meets the debt
+  Engine e;
+  e.add_market(spec(T), T0);
+  e.set_cash(0, 0, 100 * D, T0);
+  e.set_tape_debts(true);
+  e.street_add(T, true, 5800, 500, T0);
+  CHECK(e.create(ord(T, Side::BID, 4200, 200, Tif::IOC), T0 + 1).fill_count == 200);  // owes 2 at 0.42
+  CHECK(e.street_pull_touch(T, Side::BID, 4200, 0, T0 + 2) == 300);
+  CHECK(e.levels(T, true).empty());
+  e.street_add(T, true, 5800, 100, T0 + 3);
+  e.street_remove(T, true, 5800, 200, T0 + 4);  // the tape sees the venue's book lose our 2
+  CHECK(e.levels(T, true) == Levels({{5800, 100}}));
+  // a closed market pulls nothing
+  e.close(T, T0 + 5);
+  CHECK(e.street_pull_touch(T, Side::BID, 9900, 0, T0 + 6) == 0);
+}
+
 // ---- tapes and scenarios --------------------------------------------------------------------------
 
 void test_tickers() {
@@ -1011,6 +1075,7 @@ int main() {
   test_events();
   test_cancel();
   test_street();
+  test_pull_touch();
   test_tickers();
   test_archive_reader();
   test_scenarios();

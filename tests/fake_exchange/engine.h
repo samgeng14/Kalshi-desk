@@ -393,6 +393,11 @@ class Engine {
   // A cancel that loses a race with a fill (plan section 8: "a fill during a cancel"): the street
   // takes `qty` of the order first, then the cancel runs. Used by the server's fault plan.
   Qty street_hit(const std::string& order_id, Qty qty, std::int64_t now_ms);
+  // Liquidity that leaves just before an order reaches it (the server's PULL_TOUCH): the street
+  // pulls `qty` (0: all it has there) from the best level on the other side, if an order on `side`
+  // up to `yes_limit` would take it; returns what left. Ours stay. The tape never saw this pull,
+  // so it pays no tape debt: the tape's own removals later still meet theirs.
+  Qty street_pull_touch(const std::string& ticker, Side side, Px yes_limit, Qty qty, std::int64_t now_ms);
 
  private:
   struct Op;  // one call's bookkeeping: touched orders, positions and markets
@@ -416,6 +421,8 @@ class Engine {
   Qty reducible(int subaccount, const std::string& ticker, Side side) const;
   Group* find_group(const std::string& id, int subaccount, int shard);
   void erase_street(Order* o);
+  // Street quantity leaves one level, by street_cancel's rule; returns what left.
+  Qty remove_street(Market& m, bool no_side, Px side_px, Qty qty, Op& op);
 
   EngineConfig cfg_;
   std::mt19937_64 rng_;
