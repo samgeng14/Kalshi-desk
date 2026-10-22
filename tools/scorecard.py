@@ -23,20 +23,32 @@ the payouts). Then each lane's rule over all its fills so far:
   N2, the pregame favourites' forward test (decisions 2: 5 contracts held to settlement, 60
   trades or -$15): WAIT under 60 trades, or while a position of its is still to settle; then HOLD
   if its settlement P&L is positive, else RETIRE; and at any count once it is down $15.
+  S1, the arbitrage baskets (5(c)): its baskets complete, unwound (a missed leg sold back) or
+  missed (the first leg filled nothing), its legging against the $5 pause, and what its locked
+  baskets settled for. PAUSE once its legging since the last reset is down $5, or s1.json could
+  not be read (the engine then sends no new basket until S1 is turned off and on); and once its
+  settled P&L is under what its baskets locked by over a cent (a basket paid less than its
+  settlement states promised: keep S1 off until that is understood). WAIT while it has only
+  scanned, for its first week of scans (the evidence before trade: the events with a lock and the
+  best of them); else HOLD.
 
 C1's, N1's and N2's dollars, and C1's and N2's trades, are gw's own count of each lane's life: the
 desk's saved Systematic book, systematic.json beside ops.sqlite (--book; gw/sys_book.h: trades are
 orders with a fill, P&L is realized less fees, settlements included), since ops.sqlite keeps no
 settlements; C1's 300 s markouts are the ones gw counted there. gw retires each lane on its own
 rule (its loss rule also counts open positions at the mark); a lane-reset clears that life, and so
-this count.
+this count. S1's baskets and scans are ops.sqlite's baskets and arb_scans rows; its legging since
+the last reset is its engine's, s1.json beside ops.sqlite (--s1; without it, the baskets' sum);
+its settled P&L is S1's life in the book, compared once S1 holds nothing with the edge_real of the
+baskets that ended since that life began, each leg holding the same (a basket's lock to settlement
+plus its round trips: settlement can pay more, never less).
 
 The verdict is advice: sizes and lanes are the operator's to change. Read-only.
 
 Usage:
   python3 tools/scorecard.py                 the paper desk's ops.sqlite, the last 7 days
   python3 tools/scorecard.py live --days 1   the live desk's
-  python3 tools/scorecard.py --db PATH [--book PATH] --json
+  python3 tools/scorecard.py --db PATH [--book PATH] [--s1 PATH] --json
   python3 tools/scorecard.py --self-test
 """
 import argparse
@@ -65,6 +77,7 @@ Z80 = 0.8416   # one-sided 80%: mean - Z80 * sd / sqrt(n)
 LIP_LANES = ('M1', 'P1')
 N1_LOSS, N2_LOSS, N2_TRADES = 20.0, 15.0, 60   # gw's default_lanes: N1 retired once down $20, N2 after 60 trades or $15
 C1_LOSS, C1_TRADES, C1_MARKED = 20.0, 100, 50   # C1 after 100 trades with 50 fills marked at 300 s, or $20 (SysBook::kRetireMarked)
+S1_PAUSE, S1_SCAN_DAYS = 5.0, 7   # S1 pauses new baskets once legging is down $5 (5(c)); a week of scans first
 
 
 def et_day(ms):
@@ -91,9 +104,10 @@ def load(db, since_ms):
 
 def load_book(path):
     """Each lane's life in deskd's saved Systematic book (gw/sys_book.h to_json, v 1): {'lives':
-    {lane: trades, pnl in dollars (realized less fees), retired, why, marked (fills marked at the
-    lane's retire horizon), mo_sum (their net markout, Money x Qty) and mo_ctrs (their contracts,
-    Qty)}, 'open': {lane: contracts held}}; None when there is no such file or it is not one."""
+    {lane: trades, pnl in dollars (realized less fees), first_ms (its first trade since it began or
+    was reset), retired, why, marked (fills marked at the lane's retire horizon), mo_sum (their net
+    markout, Money x Qty) and mo_ctrs (their contracts, Qty)}, 'open': {lane: contracts held}}; None
+    when there is no such file or it is not one."""
     try:
         with open(path) as fh:
             j = json.load(fh)
@@ -104,13 +118,47 @@ def load_book(path):
     lives = {}
     for lane, x in (j.get('life') or {}).items():
         lives[lane] = {'trades': int(x.get('trades', 0)), 'pnl': (x.get('real', 0) - x.get('fees', 0)) / 1e6,
-                       'retired': bool(x.get('retired')), 'why': x.get('retired_why', ''),
+                       'first_ms': int(x.get('first_ms', 0)), 'retired': bool(x.get('retired')), 'why': x.get('retired_why', ''),
                        'marked': int(x.get('mo_n', 0)), 'mo_sum': int(x.get('mo_sum', 0)),
                        'mo_ctrs': int(x.get('mo_ctrs', 0))}
     held = {}
     for lane, d in (j.get('lanes') or {}).items():   # each open position: [contracts x 100, its cost]
         held[lane] = sum(abs(v[0]) for v in (d.get('inv') or {}).values()) / 100
     return {'lives': lives, 'open': held}
+
+
+def load_arb(db):
+    """S1's rows in ops.sqlite: its baskets (each one's last row; legs parsed, its why and whether it
+    is frozen for good from the row's json) and its finder's scans; [] where the desk has none."""
+    con = sqlite3.connect('file:%s?mode=ro' % db, uri=True)
+    con.row_factory = sqlite3.Row
+    out = {}
+    for name, sql in (('baskets', "SELECT id, event, kind, state, legs, qty, edge_real, legging, t0_ms, t_end_ms, json FROM baskets"),
+                      ('scans', "SELECT ts_ms, event, kind, qty, edge, fired FROM arb_scans")):
+        try:
+            out[name] = [dict(r) for r in con.execute(sql)]
+        except sqlite3.OperationalError:   # an ops.sqlite from before S1's tables
+            out[name] = []
+    con.close()
+    for b in out['baskets']:
+        j = json.loads(b.pop('json') or '{}')
+        b['why'], b['stuck'] = j.get('why') or '', bool(j.get('stuck'))
+        b['legs'] = json.loads(b['legs']) if isinstance(b['legs'], str) else []
+    return out
+
+
+def load_s1(path):
+    """S1's engine state (strat/arb.h, <data_dir>/s1.json, v 1): {'legging': dollars since the last
+    reset, 'error': why the file could not be read ('' when it could), 'open': baskets open}; None
+    when there is no such file or it is not one."""
+    try:
+        with open(path) as fh:
+            j = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(j, dict) or j.get('v') != 1:
+        return None
+    return {'legging': j.get('legging', 0) / 1e6, 'error': j.get('error') or '', 'open': len(j.get('baskets') or [])}
 
 
 def mean(xs):
@@ -143,9 +191,10 @@ def days(fills, windows):
     return rows
 
 
-def rule(lane, fills, windows, book=None):
+def rule(lane, fills, windows, book=None, arb=None):
     """The plan's rule for one lane over all its fills (C1's, N1's and N2's lives from book,
-    load_book's): (verdict, why, numbers)."""
+    load_book's; S1's rows and state from arb, load_arb's with 's1' load_s1's): (verdict, why,
+    numbers)."""
     mine = [f for f in fills if f['lane'] == lane and f['mo'].get('60s') is not None]
     n = len(mine)
     ctrs = sum(f['qty'] or 0 for f in mine)
@@ -206,6 +255,8 @@ def rule(lane, fills, windows, book=None):
             return 'WAIT', '%d trades, %d of %d fills marked at 300 s' % (life['trades'], life['marked'], C1_MARKED), nums
         how = 'net 300 s markout %s over %d marked' % (cents(mo300), life['marked'])
         return ('HOLD', how, nums) if life['mo_sum'] > 0 else ('RETIRE', how + ', not positive', nums)
+    if lane == 'S1':
+        return s1_rule(arb or {}, book, nums)
     if lane in ('X1', 'N1'):
         if lane == 'N1' and life:
             nums['life_pnl'] = life['pnl']
@@ -218,6 +269,59 @@ def rule(lane, fills, windows, book=None):
         return ('HOLD', 'net 60 s markout %.2fc' % (net * 100), nums) if net > 0 else \
                ('RETIRE', 'net 60 s markout %.2fc, not positive' % (net * 100), nums)
     return 'INFO', 'no plan rule for this lane', nums
+
+
+def s1_rule(arb, book, nums):
+    """S1's rule (5(c)) from its baskets, scans and engine state, and its life in book."""
+    baskets, scans, state = arb.get('baskets') or [], arb.get('scans') or [], arb.get('s1')
+    done = [b for b in baskets if b['state'] == 'DONE']
+    count = {k: sum(1 for b in done if b['why'].startswith(w)) for k, w in
+             (('complete', 'complete'), ('unwound', 'unwound'), ('missed', 'the first leg'), ('closed', 'its markets have closed'))}
+    stuck = sum(1 for b in baskets if b['stuck'])
+    legging = state['legging'] if state else sum(b['legging'] or 0 for b in done)
+    locks = [s for s in scans if s['kind']]
+    scan_days = len({et_day(s['ts_ms']) for s in scans})
+    best = max(locks, key=lambda s: s['edge'] or 0) if locks else None
+    nums.update({'baskets': len(baskets), 'open': len(baskets) - len(done), 'stuck': stuck, 'legging': round(legging, 4),
+                 'legging_from': 's1.json' if state else 'baskets', 'scan_days': scan_days,
+                 'events_scanned': len({s['event'] for s in scans}), 'events_locked': len({s['event'] for s in locks}),
+                 'best_edge': best['edge'] if best else None, 'best_qty': best['qty'] if best else None, **count})
+    if state and state['error']:
+        return 'PAUSE', 'its engine cannot read s1.json (%s): no new basket until S1 is turned off and on' % state['error'], nums
+    if legging <= -S1_PAUSE:
+        return 'PAUSE', 'legging %s since the last reset, past -$%.0f: no new basket until S1 is turned off and on' % (
+            usd(legging), S1_PAUSE), nums
+    scanned = 'locks in %d of %d events over %d day(s) of scans%s' % (
+        nums['events_locked'], nums['events_scanned'], scan_days,
+        ', the best %s on %g' % (usd(best['edge']), best['qty']) if best else '')
+    if not baskets:
+        if scan_days < S1_SCAN_DAYS:
+            return 'WAIT', 'scan only: %s; a week of scans comes first' % scanned, nums
+        return 'INFO', 'scan only: %s; trading them is the operator\'s call (deskd.arb_mode)' % scanned, nums
+    how = '%d basket(s): %d complete, %d unwound, %d missed%s%s; legging %s of -$%.0f' % (
+        len(baskets), count['complete'], count['unwound'], count['missed'],
+        ', %d ended by its markets\' close' % count['closed'] if count['closed'] else '',
+        ', %d frozen for good (a CRIT alert named each)' % stuck if stuck else '', usd(legging), S1_PAUSE)
+    # what the locks settled for: S1's life once it holds nothing, against the baskets of that life
+    life = book['lives'].get('S1') if book else None
+    held = book['open'].get('S1', 0.0) if book else 0.0
+    if book is None:
+        return 'HOLD', how + '; no Systematic book (systematic.json, --book): its settlements are there', nums
+    if life is None:
+        return 'HOLD', how + '; the Systematic book has no life of S1\'s yet', nums
+    mine = [b for b in done if (b['t_end_ms'] or 0) >= life['first_ms']]   # this life's: a lane-reset starts another
+    locked = sum(b['edge_real'] or 0 for b in mine)
+    nums.update({'life_pnl': life['pnl'], 'locked': round(locked, 4), 'unsettled': held})
+    if held:
+        return 'HOLD', how + '; %g contracts still to settle' % held, nums
+    if len(baskets) > len(done):
+        return 'HOLD', how + '; a basket still open', nums
+    if any(len({leg.get('filled') for leg in b['legs']}) > 1 for b in mine):   # a leg held more than another
+        return 'HOLD', how + '; settled %s, a basket held an excess to settlement' % usd(life['pnl']), nums
+    if life['pnl'] < locked - 0.01:
+        return 'PAUSE', how + '; settled %s, under the %s its baskets locked: a basket paid less than its states ' \
+            'promised' % (usd(life['pnl']), usd(locked)), nums
+    return 'HOLD', how + '; settled %s on %s locked' % (usd(life['pnl']), usd(locked)), nums
 
 
 def cents(x):
@@ -233,20 +337,32 @@ def book_path(db):
     return os.path.join(os.path.dirname(os.path.abspath(db)), 'systematic.json')
 
 
-def report(db, days_back, as_json, now_ms=None, book=None):
+def s1_path(db):
+    """S1's engine state: s1.json in ops.sqlite's data dir."""
+    return os.path.join(os.path.dirname(os.path.abspath(db)), 's1.json')
+
+
+def report(db, days_back, as_json, now_ms=None, book=None, s1=None):
     now_ms = now_ms or int(datetime.datetime.now(datetime.timezone.utc).timestamp() * 1000)
     since = now_ms - days_back * 86400000
     recent, every, windows = load(db, since)
     rows = days(recent, [w for w in windows if (w['start_ms'] or 0) >= since])
     book = book or book_path(db)
     lives = load_book(book)
-    lanes = sorted({f['lane'] for f in every} | set(lives['lives'] if lives else ()))
-    rules = {lane: dict(zip(('verdict', 'why', 'numbers'), rule(lane, every, windows, lives))) for lane in lanes}
+    s1 = s1 or s1_path(db)
+    arb = load_arb(db)
+    arb['s1'] = load_s1(s1)
+    lanes = sorted({f['lane'] for f in every} | set(lives['lives'] if lives else ()) |
+                   ({'S1'} if arb['baskets'] or arb['scans'] or arb['s1'] else set()))
+    rules = {lane: dict(zip(('verdict', 'why', 'numbers'), rule(lane, every, windows, lives, arb))) for lane in lanes}
     if as_json:
-        print(json.dumps({'db': db, 'book': book if lives else None, 'days': rows, 'rules': rules}, indent=1, default=str))
+        print(json.dumps({'db': db, 'book': book if lives else None, 's1': s1 if arb['s1'] else None, 'days': rows,
+                          'rules': rules}, indent=1, default=str))
         return rows, rules
     print('scorecard: %s, the last %g day(s)%s' % (db, days_back, '' if ET else ' (UTC days: no tz database)'))
     print('lanes\' lives: %s' % (book if lives else 'none (no Systematic book at %s)' % book))
+    if 'S1' in rules:
+        print('S1\'s legging: %s' % (s1 if arb['s1'] else 'its baskets\' sum (no s1.json at %s)' % s1))
     print('%-10s %-4s %6s %8s %8s %8s %8s %8s %9s %9s' % ('day', 'lane', 'fills', 'ctrs', 'fees', 'mo1', 'mo10', 'mo60', 'mo60 $', 'LIP est'))
     for r in rows:
         print('%-10s %-4s %6d %8.2f %8.4f %8s %8s %8s %9.4f %9s' % (
@@ -329,12 +445,14 @@ CREATE TABLE lip_windows(tk TEXT NOT NULL, start_ms INTEGER NOT NULL, end_ms INT
         con.commit()
         con.close()
 
-    def book(life, inv=None):
+    def book(life, inv=None, first_ms=0):
         with open(book_path(db), 'w') as fh:
             json.dump({'v': 1, 'saved_ms': now, 'day_start_ms': now, 'trades': [],
                        'lanes': {lane: {'inv': x} for lane, x in (inv or {}).items()},
-                       'life': {lane: {'trades': t, 'real': int(real * 1e6), 'fees': int(fees * 1e6), 'retired': False,
-                                       'retired_ms': 0, 'retired_why': '', **dict(zip(('mo_n', 'mo_ctrs', 'mo_sum'), mo))}
+                       'life': {lane: {'trades': t, 'real': int(real * 1e6), 'fees': int(fees * 1e6), 'first_ms': first_ms,
+                                       'retired': False,
+                                       'retired_ms': 0, 'retired_why': '',
+                                       **dict(zip(('mo_n', 'mo_ctrs', 'mo_sum'), mo))}
                                 for lane, (t, real, fees, *mo) in life.items()},
                        'halt': None}, fh)
     n1_fills(40, 0)
@@ -389,8 +507,91 @@ CREATE TABLE lip_windows(tk TEXT NOT NULL, start_ms INTEGER NOT NULL, end_ms INT
         book({'C1': life})
         _, rules = report(db, 1, False, now)
         check(rules['C1']['verdict'] == want and rules['C1']['why'] == why, what)
+    # S1 (5(c)): nothing of it in an ops.sqlite from before its tables; then the finder's scans, its
+    # baskets (each one's last row, as the store keeps them), s1.json and its life in the book
+    check('S1' not in rules, 'no S1 without its tables, its rows or s1.json')
+    con = sqlite3.connect(db)
+    con.executescript("""
+CREATE TABLE arb_scans(ts_ms INTEGER NOT NULL, event TEXT NOT NULL, kind TEXT, mode TEXT, legs TEXT, qty REAL, edge REAL,
+  cost REAL, payout_min REAL, fired INTEGER, why TEXT, json TEXT NOT NULL, PRIMARY KEY(event, ts_ms));
+CREATE TABLE baskets(id TEXT PRIMARY KEY, event TEXT, kind TEXT, state TEXT, legs TEXT, qty REAL, edge_plan REAL,
+  edge_real REAL, legging REAL, t0_ms INTEGER, t_end_ms INTEGER, json TEXT NOT NULL);
+""")
+
+    def scans(first_day, n_days):   # a scan a day of two events, NY locking 4c on 2 contracts, CHI never
+        for d in range(first_day, first_day + n_days):
+            for ev, kind, qty, edge in (('KXHIGHNY-26OCT20', 'NO_SET', 2, 0.04), ('KXHIGHCHI-26OCT20', None, None, None)):
+                con.execute("INSERT INTO arb_scans VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                            (now - d * 86400000, ev, kind, 'scan', '[]', qty, edge, None, None, 0, 'scan mode', '{}'))
+        con.commit()
+    scans(0, 3)
+    _, rules = report(db, 1, False, now)
+    check(rules['S1']['verdict'] == 'WAIT' and rules['S1']['why'] ==
+          'scan only: locks in 1 of 2 events over 3 day(s) of scans, the best $0.04 on 2; a week of scans comes first',
+          'S1 waits for a week of scans, the locks they found said')
+    scans(3, 4)
+    _, rules = report(db, 1, False, now)
+    check(rules['S1']['verdict'] == 'INFO' and 'over 7 day(s) of scans' in rules['S1']['why'] and
+          rules['S1']['why'].endswith('trading them is the operator\'s call (deskd.arb_mode)'), 'S1 after a week\'s scans: the operator\'s call')
+
+    def basket(i, why, filled, edge_real, legging, t_end, state='DONE', stuck=False):
+        con.execute("INSERT OR REPLACE INTO baskets VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                    ('S1-b%d' % i, 'KXHIGHNY-26OCT20', 'NO_SET', state,
+                     json.dumps([{'tk': 'KXHIGHNY-26OCT20-B%d' % k, 'filled': f} for k, f in enumerate(filled)]), 2, 0.04,
+                     edge_real, legging, t_end - 2000, t_end, json.dumps({'why': why, 'stuck': stuck})))
+        con.commit()
+    basket(1, 'complete: every leg holds 2.00', (2, 2), 0.08, 0.0, now - 4 * 3600000)
+    basket(2, 'complete: every leg holds 2.00', (2, 2), 0.06, -0.02, now - 3 * 3600000)   # a completion a tick through
+    basket(3, 'unwound: every leg holds 0.00', (0, 0), -0.05, -0.05, now - 2 * 3600000)
+    basket(4, 'the first leg filled nothing', (0, 0), 0.0, 0.0, now - 3600000)
+    s1_file = s1_path(db)
+
+    def s1_state(legging, error=''):
+        with open(s1_file, 'w') as fh:
+            json.dump({'v': 1, 'seq': 4, 'legging': int(round(legging * 1e6)), 'error': error, 'baskets': []}, fh)
+    tally = '4 basket(s): 2 complete, 1 unwound, 1 missed; legging '
+    for life, inv, first_ms, state, want, why, what in (
+            ((3, 0.2, 0.05), {'KXHIGHNY-26OCT20-B0': [-200, 1200000]}, 0, None, 'HOLD',
+             tally + '-$0.07 of -$5; 2 contracts still to settle',
+             'S1 holds while its baskets settle (legging from the baskets without s1.json)'),
+            ((3, 0.2, 0.08), None, 0, None, 'HOLD', tally + '-$0.07 of -$5; settled $0.12 on $0.09 locked',
+             'S1 holds once its locks settled for at least what they locked'),
+            ((3, 0.13, 0.08), None, 0, None, 'PAUSE',
+             tally + '-$0.07 of -$5; settled $0.05, under the $0.09 its baskets locked: a basket paid less than its '
+             'states promised', 'S1 pauses when its settlements fall under its locks'),
+            ((2, 0.13, 0.08), None, now - 2 * 3600000 - 1000, None, 'HOLD',
+             tally + '-$0.07 of -$5; settled $0.05 on -$0.05 locked', 'S1 counts the locks of its life since a lane-reset'),
+            ((3, 0.2, 0.08), None, 0, (-0.02, ''), 'HOLD', tally + '-$0.02 of -$5; settled $0.12 on $0.09 locked',
+             'S1\'s legging since the last reset is s1.json\'s'),
+            ((3, 0.2, 0.08), None, 0, (-5.1, ''), 'PAUSE',
+             'legging -$5.10 since the last reset, past -$5: no new basket until S1 is turned off and on',
+             'S1 pauses once legging is down $5'),
+            ((3, 0.2, 0.08), None, 0, (0.0, 'not a version 1 file'), 'PAUSE',
+             'its engine cannot read s1.json (not a version 1 file): no new basket until S1 is turned off and on',
+             'S1 pauses while its engine could not read s1.json')):
+        book({'S1': life}, {'S1': inv} if inv else None, first_ms)
+        if state:
+            s1_state(*state)
+        elif os.path.exists(s1_file):
+            os.remove(s1_file)
+        _, rules = report(db, 1, False, now)
+        check(rules['S1']['verdict'] == want and rules['S1']['why'] == why, what)
+    os.remove(s1_file)
+    basket(5, 'its markets have closed: what it holds settles', (2, 1), 0.03, 0.0, now - 1800000)
+    book({'S1': (5, 0.2, 0.08)})
+    _, rules = report(db, 1, False, now)
+    check(rules['S1']['verdict'] == 'HOLD' and rules['S1']['why'].endswith('settled $0.12, a basket held an excess to settlement'),
+          'S1 does not judge its locks while a basket held an excess to settlement')
+    basket(6, '10 unwind passes spent, 1.00 KXHIGHNY-26OCT20-B0 over the complete set held', (2, 1), 0.0, 0.0, now, 'FROZEN', True)
+    _, rules = report(db, 1, False, now)
+    check(rules['S1']['verdict'] == 'HOLD' and rules['S1']['why'] ==
+          '6 basket(s): 2 complete, 1 unwound, 1 missed, 1 ended by its markets\' close, 1 frozen for good (a CRIT alert '
+          'named each); legging -$0.07 of -$5; a basket still open', 'S1 names a basket frozen for good')
     os.remove(book_path(db))
     _, rules = report(db, 1, False, now)
+    check(rules['S1']['verdict'] == 'HOLD' and rules['S1']['why'].endswith('no Systematic book (systematic.json, --book): '
+                                                                           'its settlements are there'),
+          'no book: S1 on its baskets alone')
     check(rules['N1']['verdict'] == 'RETIRE' and 'N2' not in rules, 'no book: N1 on its markouts alone')
     check(rules['C1']['verdict'] == 'WAIT' and rules['C1']['why'].startswith('no Systematic book'),
           'no book: C1 waits, its 300 s markouts are gw\'s')
@@ -403,6 +604,7 @@ def main():
     ap.add_argument('desk', nargs='?', choices=('paper', 'live'), default='paper')
     ap.add_argument('--db', help='an ops.sqlite path (default: the desk\'s)')
     ap.add_argument('--book', help='the desk\'s systematic.json (default: beside the ops.sqlite)')
+    ap.add_argument('--s1', help='the desk\'s s1.json, S1\'s engine state (default: beside the ops.sqlite)')
     ap.add_argument('--days', type=float, default=7.0)
     ap.add_argument('--json', action='store_true')
     ap.add_argument('--self-test', action='store_true')
@@ -413,7 +615,7 @@ def main():
     if not os.path.exists(db):
         print('scorecard: no %s (has this desk run with its store on?)' % db, file=sys.stderr)
         return 2
-    report(db, a.days, a.json, book=a.book)
+    report(db, a.days, a.json, book=a.book, s1=a.s1)
     return 0
 
 
