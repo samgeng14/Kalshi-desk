@@ -3,8 +3,9 @@
 // the start and at 15c or less, the last such capture kept and never an in-play mid; the fair
 // from the home team's side and 1 - it for the other market (so they sum to 1 under a model that
 // is not symmetric); NBA overtime without the ot feature; volleyball from the linescores; the
-// captures kept in game_p0.json, written at most once a minute, dropped after 12 h; an NCAA board
-// behind ESPN's; a model on another sport's series refused.
+// captures kept in game_p0.json, written at most once a minute, dropped after 12 h; the score
+// board's rows from either source, and a row whose sources disagree; a model on another sport's
+// series refused.
 #include <cmath>
 #include <fstream>
 #include <sstream>
@@ -63,8 +64,7 @@ EspnRef score(const std::string& state, bool yes_home, int period = 0, double cl
 struct World {
   std::shared_ptr<rest::Snapshot> snap = std::make_shared<rest::Snapshot>();
   std::map<std::string, MdBook> books;
-  EspnBoard espn, ncaa;
-  bool with_ncaa = false;
+  EspnBoard scores;   // the score board (deskd's is ScoreMerge's: ESPN's and NCAA.com's)
   void list(const std::string& event, const std::vector<std::string>& tickers) {
     for (const auto& tk : tickers) {
       kalshi::MarketRow m;
@@ -77,15 +77,14 @@ struct World {
   // a game in play or before it, both markets' sides of one score
   void game(const std::string& b_home, const std::string& b_away, const std::string& state, int period = 0, double clock_s = -1,
             int home = 0, int away = 0) {
-    espn[b_home] = score(state, true, period, clock_s, home, away);
-    espn[b_away] = score(state, false, period, clock_s, away, home);
+    scores[b_home] = score(state, true, period, clock_s, home, away);
+    scores[b_away] = score(state, false, period, clock_s, away, home);
   }
   GameFair::Env env() {
     GameFair::Env e;
     e.snapshot = [this] { return std::shared_ptr<const rest::Snapshot>(snap); };
     e.books = [this] { return std::make_shared<const std::map<std::string, MdBook>>(books); };
-    e.espn = [this] { return std::make_shared<const EspnBoard>(espn); };
-    if (with_ncaa) e.ncaa = [this] { return std::make_shared<const EspnBoard>(ncaa); };
+    e.scores = [this] { return std::make_shared<const EspnBoard>(scores); };
     return e;
   }
 };
@@ -249,8 +248,8 @@ void volleyball() {
   // set 3, UCLA 10-8 up, a set each (UCLA 25-20, USC 25-22)
   auto set3 = [&](std::vector<int> usc, std::vector<int> ucla, int usc_sets, int ucla_sets) {
     w.game(USC, UCLA, "in", 3, -1, usc_sets, ucla_sets);
-    w.espn[USC].yes_lines = w.espn[UCLA].opp_lines = usc;
-    w.espn[USC].opp_lines = w.espn[UCLA].yes_lines = ucla;
+    w.scores[USC].yes_lines = w.scores[UCLA].opp_lines = usc;
+    w.scores[USC].opp_lines = w.scores[UCLA].yes_lines = ucla;
   };
   set3({20, 25, 8}, {25, 22, 10}, 1, 1);
   g.step(T + 3600000);
@@ -319,22 +318,20 @@ void persistence() {
   CHECK(quiet.board()->at(BOS).p0 == 0.64 && quiet.status()["path"] == "");
 }
 
+// The score board's rows, whichever source each is from (ref/scores.h merged them)
 void sources() {
   World w;
-  w.with_ncaa = true;
   w.list(E, {BOS, LAL});
   w.game(BOS, LAL, "pre");
-  w.ncaa[BOS] = score("in", true, 2, 100, 40, 30);   // ESPN shows the game: its score is used
-  w.ncaa[BOS].src = "NCAA";
   const std::string E3 = "KXNBAGAME-26OCT27DENPHX", PHX = E3 + "-PHX", DEN = E3 + "-DEN";
   w.list(E3, {PHX, DEN});
   for (auto [tk, home] : {std::pair{PHX, true}, std::pair{DEN, false}}) {
-    w.ncaa[tk] = score("pre", home);
-    w.ncaa[tk].src = "NCAA";
+    w.scores[tk] = score("pre", home);
+    w.scores[tk].src = "NCAA";
   }
   w.books[PHX] = book(PHX, 5500, 5700);
-  w.espn["KXNBAGAME-26OCT27XXXYYY-XXX"] = score("pre", true);   // on a board, not in the listing
-  w.espn["KXNFLGAME-26OCT27KCBUF-KC"] = score("pre", true);      // a series without a model
+  w.scores["KXNBAGAME-26OCT27XXXYYY-XXX"] = score("pre", true);   // on the board, not in the listing
+  w.scores["KXNFLGAME-26OCT27KCBUF-KC"] = score("pre", true);      // a series without a model
   GameFair g(w.env(), {{"KXNBAGAME", nba()}});
   g.step(T - 60000);
   auto b = g.board();
@@ -342,9 +339,22 @@ void sources() {
   CHECK(b->at(PHX).src == "NCAA" && b->at(DEN).p0 == 0.44 && b->at(PHX).p0 && std::fabs(*b->at(PHX).p0 - 0.56) < 1e-15 &&
         b->at(DEN).src == "NCAA");
   CHECK(b->at("KXNBAGAME-26OCT27XXXYYY-XXX").why == "not in the listing" && !b->count("KXNFLGAME-26OCT27KCBUF-KC"));
+  // ESPN and NCAA.com disagree (the merged board's rows): no score, so no new capture though the
+  // book moved, no fair, and the row says why
+  w.books[PHX] = book(PHX, 6000, 6200);
+  for (const auto& tk : {PHX, DEN}) {
+    EspnRef none;
+    none.src = "";
+    none.why = "ESPN has pre 0-0 (period 0) and NCAA in 2-0 (period 1)";
+    w.scores[tk] = none;
+  }
+  g.step(T - 55000);
+  b = g.board();
+  CHECK(b->at(PHX).state.empty() && b->at(PHX).src.empty() && !b->at(PHX).p && b->at(PHX).p0 &&
+        std::fabs(*b->at(PHX).p0 - 0.56) < 1e-15 && b->at(PHX).why == "no score: ESPN has pre 0-0 (period 0) and NCAA in 2-0 (period 1)");
   // three markets in one event are not a game
   w.list(E, {BOS, LAL, E + "-TIE"});
-  w.espn[E + "-TIE"] = score("pre", false);
+  w.scores[E + "-TIE"] = score("pre", false);
   g.step(T - 50000);
   b = g.board();
   CHECK(has(b->at(BOS).why, "3 markets in the event") && !b->at(BOS).p);

@@ -530,6 +530,7 @@ void TakeEngine::game(const std::string& ev, const kalshi::MarketRow& ma, const 
   if (r) {
     in.state = r->state;
     in.src = r->src;
+    in.score_why = r->why;
     in.fetched_ms = r->fetched_ms;
     in.first_seen_ms = r->first_seen_ms;
     in.start_ms = r->start_ms;
@@ -563,7 +564,7 @@ void TakeEngine::game(const std::string& ev, const kalshi::MarketRow& ma, const 
   }
   // volleyball: when the sets total went up
   const auto* lg = espn_league_for(ma.ticker);
-  if (r && lg && lg->sport == "volleyball") {
+  if (r && !r->state.empty() && lg && lg->sport == "volleyball") {
     const int sets = r->yes_score + r->opp_score;
     if (g.sets >= 0 && sets > g.sets) g.set_end_ms = r->first_seen_ms > 0 ? std::min(now, r->first_seen_ms) : now;
     g.sets = sets;
@@ -585,8 +586,8 @@ void TakeEngine::game(const std::string& ev, const kalshi::MarketRow& ma, const 
   in.game_takes = g.takes;
   in.private_up = env_.private_up && env_.private_up();
   in.not_tradable = not_tradable;
-  // a new score state starts a new signal run
-  if (in.first_seen_ms != g.run_state) {
+  // a new score state starts a new signal run; no score (none, or the sources at odds) is none
+  if (!in.state.empty() && in.first_seen_ms != g.run_state) {
     g.run_state = in.first_seen_ms;
     g.fired[0] = g.fired[1] = g.noted[0] = g.noted[1] = false;
   }

@@ -133,7 +133,7 @@ bool Deskd::init_venue(std::string* err) {
     GameFair::Env env;
     env.snapshot = [this] { return rest_->snapshot(); };
     env.books = [this] { return std::atomic_load(&books_); };
-    env.espn = [this] { return espn_->board(); };
+    env.scores = [this] { return espn_->board(); };
     game_fair_ = std::make_unique<GameFair>(std::move(env),
                                             std::map<std::string, GameModel>{{bball_league(wcbb_->league)->series, *wcbb_}});
     if (!cfg_.data_dir.empty()) game_fair_->persist(cfg_.data_dir + "/game_p0.json");   // p0 outlives a restart mid-game

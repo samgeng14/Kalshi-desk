@@ -687,6 +687,33 @@ void engine_runs() {
   CHECK(g.places().size() == 2 && g.rows.back()["action"] == "TAKE" && g.rows.back()["id"] != g.rows.front()["id"]);
 }
 
+// The score board's row when ESPN and NCAA.com disagree (ref/scores.h): no score, with the
+// sources' why; it neither starts a signal run nor ends one, so when they agree again on the state
+// before, the team that run took is not taken again
+void engine_scores() {
+  Rig g;
+  TakeEngine e("C1", {"KXNCAAWBGAME"}, g.env(), take_params(TakeMode::COLLEGE));
+  g.score(T0 - 60000, T0 - 1000, 0.50);
+  e.step(T0);
+  g.score(T0 + 3000, T0 + 3000, 0.70);
+  e.step(T0 + 3200);
+  CHECK(g.places().size() == 1);
+  g.answer(0, OrderReply{});
+  const std::string why = "ESPN has in 60-48 (period 2) and NCAA in 58-48 (period 2)";
+  for (const auto& tk : {TA, TB}) {
+    EspnRef none;
+    none.src = "";
+    none.why = why;
+    g.scores[tk] = none;
+  }
+  e.step(T0 + 8300);   // past the cool-down
+  CHECK(g.places().size() == 1 && game_status(e)["pull"] == "NO_SCORE" && game_status(e)["why"] == "no score: " + why &&
+        game_status(e)["state"] == "");
+  g.score(T0 + 3000, T0 + 8500, 0.70);
+  e.step(T0 + 8600);
+  CHECK(g.places().size() == 1 && game_status(e)["pull"] == "FIRED" && game_status(e)["dir"] == "A");
+}
+
 // gw's refusal: the row says so and the game backs off 10 s; an inbox that is full is one too; an
 // answer that never comes is waited for 30 s
 void engine_refused() {
@@ -1116,6 +1143,7 @@ int main() {
   coverage();
   engine_takes();
   engine_runs();
+  engine_scores();
   engine_refused();
   engine_blocked();
   engine_pulls();

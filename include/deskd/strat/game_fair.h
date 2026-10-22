@@ -22,10 +22,11 @@
 // the linescores (volley_state); a set whose points were not read gives a P with the set at 0-0,
 // which the board keeps (the lanes decide on it) but the ladder does not show.
 //
-// The score is ESPN's board, or an NCAA board's (ref-ncaa, C3) for a market ESPN does not show. A
-// model is used only on its own sport's series: a basketball model on its league's series, the
-// volleyball model on a volleyball series; any other pairing is refused at construction and said
-// in status.
+// The score is the merged board's (ref/scores.h: ESPN's and NCAA.com's, by the rule the college
+// gate measures), the one the game lanes read; a market whose sources disagree has no score, and
+// its row says why. A model is used only on its own sport's series: a basketball model on its
+// league's series, the volleyball model on a volleyball series; any other pairing is refused at
+// construction and said in status.
 //
 // Threading: step() runs on strat; board() and status() are read from any thread.
 #include <cstdint>
@@ -77,8 +78,7 @@ class GameFair {
   struct Env {
     std::function<std::shared_ptr<const rest::Snapshot>()> snapshot;   // the listing: each market's event
     std::function<std::shared_ptr<const std::map<std::string, MdBook>>()> books;
-    std::function<std::shared_ptr<const EspnBoard>()> espn;
-    std::function<std::shared_ptr<const EspnBoard>()> ncaa;   // empty: ESPN alone (until C3's NcaaFeed)
+    std::function<std::shared_ptr<const EspnBoard>()> scores;   // ScoreMerge::board() (or a feed's own)
   };
   GameFair(Env env, std::map<std::string, GameModel> by_series);
   // Keep the captures in this file (call it before the first step()): read now (absent: none yet;

@@ -213,10 +213,11 @@ Qty clip_count(Money clip, Px px, double fee_mult, Qty max_count, bool whole_onl
 //           wants their books (Env::want) while the lane is on or it shadows (only tradable
 //           series' unless it shadows), and leaves a game the score board calls final.
 //   input   take_decide's, from A's side:
-//           score   the score board's row (Env::scores): state, source, last poll, the state's
-//                   first sighting, start, scores, the basketball clock (bball_t_left), and
-//                   ESPN's number (the summary's dated by its play's first sighting, else the
-//                   scoreboard's dated by the score state's)
+//           score   the score board's row (Env::scores, ref/scores.h's merge of ESPN and
+//                   NCAA.com): state, source, last poll, the state's first sighting, start,
+//                   scores, why there is none (the sources disagree), the basketball clock
+//                   (bball_t_left), and ESPN's number (the summary's dated by its play's first
+//                   sighting, else the scoreboard's dated by the score state's)
 //           fair    GameFair's row (Env::fairs): p0; and p and points only when the row was
 //                   priced on the score state the board shows, since GameFair one step behind
 //                   would price a new score at the old fair: the game waits the step instead
@@ -241,7 +242,8 @@ Qty clip_count(Money clip, Px px, double fee_mult, Qty max_count, bool whole_onl
 //
 // A signal run (take_decide's fired): each new score state (the board's first sighting) starts a
 // game's run, and a decision that finds no edge run_quiet_ms after the last that found one ends
-// it; a game check that hides the edge (the cool-down, an old score) neither ends nor extends it.
+// it; a game check that hides the edge (the cool-down, an old score, no score at all: none, or
+// the sources at odds) neither ends nor extends it.
 // In a run each team is taken, or recorded, once.
 //
 // Signals go to the store's "signals" table, a row per team and signal (store/store.h):
@@ -276,7 +278,7 @@ class TakeEngine {
     std::function<std::shared_ptr<const rest::Snapshot>()> snapshot;
     std::function<std::optional<MdBook>(const std::string&)> book;
     std::function<std::shared_ptr<const GameBoard>()> fairs;        // GameFair::board()
-    std::function<std::shared_ptr<const EspnBoard>()> scores;       // the score board (ESPN's)
+    std::function<std::shared_ptr<const EspnBoard>()> scores;       // the score board (ScoreMerge::board())
     // series -> "" when the lane may trade it, else why not (a series missing: no gate for it)
     std::function<std::map<std::string, std::string>()> tradable;
     std::function<bool()> private_up;

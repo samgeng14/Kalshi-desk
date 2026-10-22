@@ -125,7 +125,8 @@ GameFairRow GameFair::row(const std::string& ev, const std::string& tk, const Es
   const auto c = captures_.find(ev);
   if (c != captures_.end()) w.p0 = c->second.ticker == tk ? c->second.p0 : 1 - c->second.p0;
   if (r.state != "in") {
-    w.why = r.state == "pre" ? "not started" : r.state == "post" ? "final" : "state \"" + r.state + "\"";
+    if (!r.why.empty()) w.why = "no score: " + r.why;   // the merged board's sources disagree
+    else w.why = r.state == "pre" ? "not started" : r.state == "post" ? "final" : "state \"" + r.state + "\"";
     return w;
   }
   if (!w.p0) { w.why = "no pregame price: none was captured before the start"; return w; }
@@ -157,13 +158,12 @@ GameFairRow GameFair::row(const std::string& ev, const std::string& tk, const Es
 void GameFair::step(std::int64_t now) {
   const auto s = env_.snapshot ? env_.snapshot() : nullptr;
   const auto books = env_.books ? env_.books() : nullptr;
-  // the priced markets: on a score board (ESPN's first), of a series with a model, by event
+  // the priced markets: on the score board, of a series with a model, by event
   std::map<std::string, const EspnRef*> score;
-  std::shared_ptr<const EspnBoard> boards[] = {env_.espn ? env_.espn() : nullptr, env_.ncaa ? env_.ncaa() : nullptr};
-  for (const auto& b : boards)
-    if (b)
-      for (const auto& [tk, r] : *b)
-        if (models_.count(series_of(tk))) score.emplace(tk, &r);
+  const auto scores = env_.scores ? env_.scores() : nullptr;
+  if (scores)
+    for (const auto& [tk, r] : *scores)
+      if (models_.count(series_of(tk))) score.emplace(tk, &r);
   auto board = std::make_shared<GameBoard>();
   std::map<std::string, std::vector<std::string>> events;
   for (const auto& [tk, r] : score) {
