@@ -336,6 +336,7 @@ class ArbEngine {
   std::string state_error_;                                // s1.json could not be read: paused until reset
   bool state_found_ = false, orphans_done_ = false;
   bool ready_ = false;                                     // restart_ready held once: gw keeps S1's positions since
+  std::int64_t first_read_ms_ = 0;                         // the first account read begun after boot_ms_ (its account_ms)
   std::int64_t boot_ms_ = 0, next_scan_ms_ = 0;
   int cycle_ = 0;                                          // the reset: 1 seen on while paused, 2 then off
   bool dirty_ = false, pause_alerted_ = false;

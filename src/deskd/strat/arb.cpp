@@ -845,10 +845,12 @@ bool ArbEngine::paused(const Gateway::SysView& v, std::string* why) const {
 }
 
 // After a start S1's positions count once gw has rebuilt Systematic's day from the venue's fills:
-// an account read that began after this engine's first step, fills_wait_ms old. From then on gw
-// keeps them, so it holds for the rest of the run.
+// the first account read that began after this engine's first step, fills_wait_ms old. Reads may
+// come every poll or faster (each private event asks for one), so it is that first read's age, not
+// the latest's. From then on gw keeps them, so it holds for the rest of the run.
 bool ArbEngine::restart_ready(const rest::Snapshot& s, std::int64_t now) {
-  ready_ = ready_ || (s.account_ready && s.account_began_ms >= boot_ms_ && now - s.account_ms >= p_.fills_wait_ms);
+  if (!first_read_ms_ && s.account_ready && s.account_began_ms >= boot_ms_) first_read_ms_ = s.account_ms;
+  ready_ = ready_ || (first_read_ms_ && now - first_read_ms_ >= p_.fills_wait_ms);
   return ready_;
 }
 

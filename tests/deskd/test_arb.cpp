@@ -983,6 +983,23 @@ void engine_cover() {
   CHECK(g.unsaved == 0);
 }
 
+// The start's account read counts once it is 5 s old, while reads keep coming every 700 ms (a
+// fast poll, or a private event's refresh): the newest one never is
+void engine_polls() {
+  Rig g;
+  ArbEngine e("S1", {"KXHIGHNY"}, g.env(), Rig::params());
+  std::int64_t t = NOW;
+  for (; t <= NOW + 5600; t += 700) {   // the read at NOW began before the first step; the next at NOW + 650
+    g.snap->account_began_ms = t - 100;
+    g.snap->account_ms = t - 50;
+    e.step(t);
+  }
+  CHECK(g.posted.empty() && has(g.last("arb_scans")["why"], "wait for an account read after the start"));
+  g.snap->account_began_ms = t - 100;
+  g.snap->account_ms = t - 50;
+  CHECK(e.step(t) == 10 && g.n() == 1);   // NOW + 6300: the read of NOW + 650 is 5 s old
+}
+
 // The first leg fills part: the rest go for as many. Nothing, or a refusal: done, and a cool-down.
 void engine_first() {
   {
@@ -1467,6 +1484,7 @@ int main() {
   sizing_random();
   engine_scan();
   engine_cover();
+  engine_polls();
   engine_first();
   engine_completion();
   engine_unwind();
