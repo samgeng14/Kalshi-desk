@@ -1,4 +1,4 @@
-# deskd handoff (2026-10-07, updated 2026-10-21)
+# deskd handoff (2026-10-07, updated 2026-10-22)
 
 The desk is being rebuilt as `deskd`, an event-driven C++17 trading desk, per `docs/impl_plan.md` (the operator-approved plan; read sections 2-4, 8 and 9 first). This file says where everything is and what to do next.
 
@@ -24,6 +24,83 @@ Rules in code:
   re-arm; Systematic lanes M1 and M2 quoting, Start, Stop cancelling.
 
 The work is on GitHub: `samgeng14/kalshi-desk`, branch `claude/pensive-meitner-8k2wae` (draft PR #1).
+
+## 2026-10-22: the game lanes, C1 (college) and the NBA's X1, N1 and N2
+
+The operator asked for every automatic lane. These four are built end to end, each off by default
+and gated by its own evidence; M1, M2, P1, D1 and Manual trade as before (the one shared change is
+the budget ceiling on turning a lane on, below). The run books are
+`docs/college_lane.md` and `docs/nba_lane.md`: what each lane takes, its switches, its gate file,
+the operator's order of steps, and what is not confirmed. S1 arbitrage and Polymarket are not
+covered here.
+
+- **What they share.**
+  - One gate loader (`strat/lane_gate.h`): `<gates_dir>/<lane>.json` (`deskd.gates_dir`, default
+    `<data_dir>/gates`, so `<data>/demo/gates` on PAPER), written only by the lane's tool and
+    read once at start. Only verdict PASS at stage live opens a lane. A gated lane's LaneSet is
+    refused BAD_REQUEST "lane X is gated: <why>" and its orders LANE_OFF.
+  - One take engine (`strat/take.h`, a TakeEngine per lane on strat): one IOC at the touch through
+    gw in the lane's order group. Its rule is `tools/take_rule.py` in Python, which every gate
+    tool replays (plan 5(e): "the S2 mistake was testing one order type and trading another");
+    the fixtures `college_take_cases.json`, `x1_golden.json` and `n1_golden.json` pin both.
+  - One game fair (`strat/game_fair.h`) for WCBB, NBA and volleyball, on one merged score:
+    `ref/scores.h` ScoreMerge of ESPN and NCAA.com (new: the ref-ncaa thread, data.ncaa.com on its
+    own data-only connection). A final from either source ends a game, a state keeps its first
+    sighting whichever source is fresh, and only C1's, X1's and N1's series are read every 3 s.
+    The volleyball model (`models/volley_markov_v1.json`, `tools/volleyball.py --write`) is
+    committed; no WCBB or NBA model ships yet.
+  - Retirement (`gw/sys_book.h`, decisions 9): each lane's life (trades, P&L, the markouts its
+    rule reads) is kept in systematic.json. A lane whose rule fires is cancelled (why RETIRED),
+    turned off with a CRIT alert, and stays off across restarts until `tools/desk.py lane-reset
+    LANE [live]` with that desk stopped. The loss rule counts a position with no mark at its best
+    (it waits only while that could bring the lane back), and a voided market leaves at its cost.
+  - Budgets (decisions 1): C1 $40, X1 $5, N1 $20, N2 $15. A lane is refused on, and Start fails
+    its CASH check, when the budgets of the lanes on would pass the venue's 70% ceiling; every IOC
+    lane shares the $5 daily fee budget (a rebate never gives it back).
+  - ops.sqlite gains `signals` (each lane's TAKE, REFUSED, SHADOW and PULL with 10, 60 and 300 s
+    markouts) and `scores` (each score state each source saw, first sighting and the poll before);
+    `markouts` has a 300 s row, gross and net of the fee (stored only: the stream keeps 1/10/60 s).
+- **C1 COLLEGE TAKE** (plan 5(d) and 5(f)): `deskd.college` (enabled, series, volley_model, clip,
+  game and lane dollars, max_score_age_s; every key checked, every amount within its range).
+  Stale quotes in thin women's basketball and volleyball games 20c or more net from the model's
+  fair, $2 clips, $10 a game, 20 contracts a market, each team once a score state, scores at most
+  5 s old and the change dated within 10 s. Its gate is `tools/college_gate.py --data DIR
+  --ops-research FILE --write-gate <gates_dir>/C1.json`: 50+ cases a series with a positive net
+  300 s markout and a game-clustered t of 2, plus 5(f)'s gate for basketball (150+ settled games,
+  the model's Brier at least the mid's, 20+ positive overlay clicks); each series names the
+  model's sha256, so a retrained model closes it. gw retires C1 after 100 trades if its net 300 s
+  markout is not positive, or once down $20. C1 watches its games only while on, so turn it on
+  before the day's first tip (its pregame price); turned on mid-game, each game needs one more
+  score change. `/ops/status` `college` says what loaded and why each game waits.
+- **X1, N1, N2** (plan 5(e), decisions 2): `deskd.nba_lanes`, `nba_series`, `nba_model`,
+  `lane_shadow`. X1 follows or fades ESPN's number as its backtest chose (`tools/x1_backtest.py
+  --write-gate`; at most 100 trades); N1 trades the NBA model's fair (`tools/train_bball.py
+  --league nba`, `tools/nba_gate.py n1`, then 14+ days in shadow and `nba_gate.py shadow`; add
+  `--with-x1 X1.json` when X1 is live, so X1's takes count in N1's room as gw counts them); N2
+  buys 5 of a 90-95c favourite before the tip and holds (`nba_gate.py n2`; 60 trades or $15). The
+  evidence says NBA books are efficient: expect X1 and N1 to stay in shadow. `/ops/status` `nba`.
+- **`tools/scorecard.py`** now has every game lane's rule: C1 as gw retires it (the 300 s net
+  markout over 50 fills marked, after 100 trades, or $20 down), X1's 100-trade verdict, N1's
+  and N2's; C1's, N1's and N2's numbers come from the desk's systematic.json (gw's own count).
+- **The sandbox**: `python3 tools/desk.py sim --nba` adds an NBA game (Lakers at Boston) with a
+  loopback stand-in for ESPN (`deskd --sim ... --espn-url`, refused without --sim or off
+  loopback); `--check` runs it in a minute (ctest deskd-sim-nba). There is no college day: the
+  end-to-end check of C1 is deskd-runtime_college.
+- **Tests**: deskd-take, deskd-lane_gate, deskd-ncaa, deskd-game_fair, deskd-volley,
+  deskd-sys_book, deskd-sys_gate, deskd-runtime_college, deskd-runtime_nba and deskd-sim-nba, and
+  the tools' self-tests (take-rule, college-gate, x1-backtest, nba-panel, nba-latency, nba-gate,
+  volleyball, train-bball, scorecard).
+- **To confirm on the VM, the Mac or demo** (no network here): ESPN's volleyball path and whether
+  its line scores carry points live; NCAA.com's scoreboard shapes and period words; ESPN's NBA
+  scoreboard and summary shapes; the college series tickers and every series' fee multiplier;
+  whether demo lists college or NBA games (if not, PAPER only shows the gates loading); depth at
+  the touch; ESPN's real lag; whether a void refunds fees.
+- **Still open**: a pregame watch for C1's series while it is off (today it must be on before the
+  tip); TakeEngine letting N2 buy once it can post after a SHADOW row used its pregame run; gw's
+  Start not marking SysView dirty (RUN shows up to 250 ms late); the NBA X1 grid in shadow while
+  no gate is live; N1's SIGNAL_OLD dated by first sighting alone; the scorecard's SCALE advice
+  for C1's clips (raise to $5 only after 50+ live fills within 3c of the gate's markout);
+  `ui/desk/js/sim.js`'s lane table lacks N1, N2, Q1 and W1.
 
 ## 2026-10-21: a plan audit, order safety, the LIP probe, deskctl's direct KILL, the recorder
 
