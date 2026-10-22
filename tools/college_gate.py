@@ -50,11 +50,15 @@ source's rows become deskd's score states: first_seen is the first row of a run 
 that row's prev_us (the recorder's poll before it; none for the first it saw of the game), deskd's
 prev_poll_ms, which C1's stale_only needs within 10 s of the sighting. A source counts as polled at
 the decision unless its feed was in an outage (then at the outage's start, or its last row since);
-fresh is polled at most --max-score-age-s ago. Both fresh: their state, scores (from A's side) and
-period (when both read one) must agree, else no score (NO_SCORE, the why names both), and agreeing
-they give the earlier first sighting, with its poll before. One fresh: that one. Neither: the
-fresher, which SCORE_OLD then pulls. Between rows a score is taken as polled: the recorder polls a
-game in play every few seconds, and only the gaps table says when it did not.
+fresh is polled at most --max-score-age-s ago. A row saying post, from either source however old,
+is the score (ESPN's when both do): the game is over. Both fresh: their state, scores (from A's
+side) and period (when both read one; NCAA.com's 'HALF', 'OT' and '2OT' read none, as deskd reads
+them) must agree, else no score (NO_SCORE, the why names both). One fresh: that one. Neither: the
+fresher, which SCORE_OLD then pulls. The state is dated by the other source's first sighting, with
+its poll before, when that row, fresh or not, shows the same state and saw it first; and a state
+keeps the date it was first shown with while it lasts, whichever source is fresh (ScoreMerge's held
+date). Between rows a score is taken as polled: the recorder polls a game in play every few
+seconds, and only the gaps table says when it did not.
 
 The fair (GameFair's rules, strat/game_fair.h). p0 is the effective mid of A's YES over both books
 (bid max(bid_A, 1 - ask_B), ask min(ask_A, 1 - bid_B)) at a spread of 15c or less, while the score
@@ -553,15 +557,17 @@ def book_history(data, tickers):
 
 # ---- the score a decision reads (ScoreMerge) ------------------------------------------------------
 def period_of(text):
-    """A score row's period as a number: its leading digits, else 0 (ESPN's '2'; NCAA.com's
-    currentPeriod '2nd', '1', 'OT', 'HALF')."""
-    s = str(text or '').strip()
-    n = 0
-    for c in s:
-        if not c.isdigit():
-            break
-        n = n * 10 + int(c)
-    return n
+    """A score row's period as a number, as deskd's ref/ncaa.cpp period_of reads NCAA.com's
+    currentPeriod: up to three digits alone or with st, nd, rd or th (ESPN's '2'; '2nd', '1') are
+    the number, any other text 0, unread ('HALF', 'OT', '2OT', 'END 1st'), so an overtime is never
+    read as a regulation period."""
+    s = str(text or '').strip().lower()
+    i = 0
+    while i < len(s) and i < 3 and '0' <= s[i] <= '9':
+        i += 1
+    if i == 0 or s[i:] not in ('', 'st', 'nd', 'rd', 'th'):
+        return 0
+    return int(s[:i])
 
 
 def _lines(raw):
@@ -603,12 +609,20 @@ def score_states(rs, src):
 
 
 class Score:
-    """One game's score as deskd would merge it (college.json's ScoreMerge, ref/scores.h): each
-    source's latest state and when it was last polled; a source whose feed is in an outage was last
-    polled at the outage's start (or at its last row since). The fresher of the two, once its last
-    poll is at most max_age old; when both are, and their state, scores and (both read) period
-    differ, no score: the why names both. When they agree, the earlier first sighting, with the
-    poll before it."""
+    """One game's score as deskd merges it (college.json's ScoreMerge, ref/scores.h): each source's
+    latest state and when it was last polled; a source whose feed is in an outage was last polled
+    at the outage's start (or at its last row since). Either source's row saying post, however old
+    its last poll, is the score (ESPN's when both do): the game is over. Else the fresher of the
+    two, once its last poll is at most max_age old; when both are, and their state, scores and (both
+    read) period differ, no score: the why names both. The state is dated by the earlier of the two
+    first sightings, with the poll before it, when the other source's row, fresh or not, shows the
+    same state.
+
+    Then ScoreMerge's held date (every college series is one NCAA.com covers): while the score
+    shows the state it last showed (the state and scores, and the period and linescores where both
+    read them), it keeps the first sighting it was first shown with, whichever source is fresh and
+    through a disagreement; another state is held from its own. at() keeps it from call to call, so
+    the replay asks in time order; an earlier t than the last starts it again."""
 
     def __init__(self, sources, max_age_us):
         self.src = {}   # src -> (states, times, a_home, outages merged: disjoint, sorted)
@@ -621,6 +635,7 @@ class Score:
                     merged.append((a, b))
             self.src[src] = (states, [s['t'] for s in states], a_home, merged)
         self.max_age = max_age_us
+        self.held, self.last_t = None, None   # the state last shown, with its date; at()'s last t
 
     def latest(self, src, t):
         """(state, last poll) of one source at t, or (None, 0)."""
@@ -637,43 +652,78 @@ class Score:
         """Does any source say the game is over by t?"""
         return any((self.latest(src, t)[0] or {}).get('state') == 'post' for src in self.src)
 
+    def side(self, src, st):
+        """A source's state from A's side: (A's score, B's, A's linescores, B's)."""
+        if self.src[src][2]:
+            return st['home_score'], st['away_score'], st['home_lines'], st['away_lines']
+        return st['away_score'], st['home_score'], st['away_lines'], st['home_lines']
+
+    def agree(self, x, y):
+        """The same state, as both sources can show it: (src, state) each; the state, A's and B's
+        scores, and the period when both read one (ref/scores.cpp agree)."""
+        (xs, x), (ys, y) = x, y
+        return x['state'] == y['state'] and self.side(xs, x)[:2] == self.side(ys, y)[:2] and (
+            not x['period'] or not y['period'] or x['period'] == y['period'])
+
     def at(self, t):
         """A's score at t: a dict with state ('' for none), why, src, fetched, first seen and the poll
         before it (us), start_ms, a_home, a_score, b_score, the home side's period, clock_s, scores and
         lines."""
-        got = []
+        if self.last_t is not None and t < self.last_t:
+            self.held = None
+        self.last_t = t
+        got = {}
         for src in ('ESPN', 'NCAA'):
             if src in self.src:
                 st, polled = self.latest(src, t)
                 if st is not None:
-                    got.append((src, st, polled, self.src[src][2]))
+                    got[src] = (st, polled)
         if not got:
+            self.held = None   # off both boards: forgotten
             return {'state': '', 'why': ''}
-        fresh = [g for g in got if t - g[2] <= self.max_age]
-        pick, dated, why = None, None, ''
-        if len(fresh) == 2:
-            (_, e, _, eh), (_, n, _, nh) = fresh
-            ea = (e['home_score'], e['away_score']) if eh else (e['away_score'], e['home_score'])
-            na = (n['home_score'], n['away_score']) if nh else (n['away_score'], n['home_score'])
-            same = e['state'] == n['state'] and ea == na and (
-                not e['period'] or not n['period'] or e['period'] == n['period'])
-            if not same:
-                why = 'ESPN has %s %d-%d (period %d) and NCAA %s %d-%d (period %d)' % (
-                    e['state'], ea[0], ea[1], e['period'], n['state'], na[0], na[1], n['period'])
-                return {'state': '', 'why': why}
-            pick, dated = fresh[0], min((e, n), key=lambda x: x['first_seen'])
+        fresh = [src for src in got if t - got[src][1] <= self.max_age]
+        post = [src for src in got if got[src][0]['state'] == 'post']
+        if post:   # over, whichever source still lags
+            src = post[0]
+        elif len(fresh) == 2:
+            e, n = got['ESPN'][0], got['NCAA'][0]
+            if not self.agree(('ESPN', e), ('NCAA', n)):
+                ea, na = self.side('ESPN', e), self.side('NCAA', n)
+                return {'state': '', 'why': 'ESPN has %s %d-%d (period %d) and NCAA %s %d-%d (period %d)' % (
+                    e['state'], ea[0], ea[1], e['period'], n['state'], na[0], na[1], n['period'])}
+            src = 'ESPN'
         elif fresh:
-            pick = fresh[0]
-        else:
-            pick = max(got, key=lambda g: g[2])   # neither fresh: the fresher, which the age then pulls
-        src, st, polled, a_home = pick
-        dated = dated or st
+            src = fresh[0]
+        else:   # neither fresh: the fresher (ESPN's on a tie), which the age then pulls
+            src = max(got, key=lambda k: got[k][1])
+        st, polled = got[src]
+        first_seen, prev_poll = st['first_seen'], st['prev_poll']
+        # the state's first sighting, and the poll before it: the other source's when that row, fresh
+        # or not, shows the same state and saw it first
+        other = next((k for k in got if k != src), None)
+        if not post and other is not None and self.agree((other, got[other][0]), (src, st)) \
+                and got[other][0]['first_seen'] < first_seen:
+            first_seen, prev_poll = got[other][0]['first_seen'], got[other][0]['prev_poll']
+        # the held date (ScoreMerge keep_first)
+        if st['state']:
+            a, b, a_lines, b_lines = self.side(src, st)
+            h = self.held
+            if h is not None and h['state'] == st['state'] and h['score'] == (a, b) and (
+                    not h['period'] or not st['period'] or h['period'] == st['period']) and (
+                    not h['lines'][0] or not a_lines or h['lines'] == (a_lines, b_lines)):
+                h['period'] = st['period'] or h['period']
+                h['lines'] = (a_lines, b_lines) if a_lines else h['lines']
+                first_seen, prev_poll = h['first_seen'], h['prev_poll']
+            else:
+                self.held = {'state': st['state'], 'score': (a, b), 'period': st['period'],
+                             'lines': (a_lines, b_lines), 'first_seen': first_seen, 'prev_poll': prev_poll}
+        a_home = self.src[src][2]
         hs, as_ = st['home_score'], st['away_score']
-        return {'state': st['state'], 'why': '', 'src': src, 'fetched': polled,
-                'first_seen': dated['first_seen'], 'prev_poll': dated['prev_poll'],
-                'start_ms': st['start_ms'], 'a_home': a_home, 'a_score': hs if a_home else as_,
-                'b_score': as_ if a_home else hs, 'period': st['period'], 'clock_s': st['clock_s'],
-                'home_score': hs, 'away_score': as_, 'home_lines': st['home_lines'], 'away_lines': st['away_lines']}
+        return {'state': st['state'], 'why': '', 'src': src, 'fetched': polled, 'first_seen': first_seen,
+                'prev_poll': prev_poll, 'start_ms': st['start_ms'], 'a_home': a_home,
+                'a_score': hs if a_home else as_, 'b_score': as_ if a_home else hs, 'period': st['period'],
+                'clock_s': st['clock_s'], 'home_score': hs, 'away_score': as_, 'home_lines': st['home_lines'],
+                'away_lines': st['away_lines']}
 
 
 # ---- the fairs (GameFair) -----------------------------------------------------------------------
@@ -1771,38 +1821,79 @@ def self_test_part2(check):
           model is not None and volley is not None and model['sha256'] == hashlib.sha256(
               open(FIXTURE_WCBB, 'rb').read()).hexdigest() and volley['name'] == 'volley_markov')
 
-    # ---- the score a decision reads
-    def st(t, state, hs, as_, period=1, first=None, prev=0):
-        return {'t': t, 'state': state, 'period': period, 'clock_s': 440.0, 'home_score': hs, 'away_score': as_,
-                'home_lines': [], 'away_lines': [], 'start_ms': 0, 'first_seen': first if first is not None else t,
-                'prev_poll': prev}
-    sc = Score({'ESPN': ([st(100, 'in', 0, 0, prev=97), st(200, 'in', 10, 0, prev=197)], True, [(150 * s, 400 * s)]),
-                'NCAA': ([st(110, 'in', 0, 0, prev=107), st(260, 'in', 0, 10, prev=257)], False, [])}, 5 * s)
-    for x in sc.src.values():   # times in seconds above, microseconds below
-        for y in x[0]:
-            y['t'] *= s
-            y['first_seen'] *= s
-            y['prev_poll'] *= s
-        x[1][:] = [y['t'] for y in x[0]]
+    # ---- the score a decision reads (deskd-ncaa's merge and merge_dates cases): rows in seconds
+    def st(t, state, hs, as_, period=1, prev=0, lines=((), ())):
+        return {'t': t * s, 'state': state, 'period': period, 'clock_s': 440.0, 'home_score': hs, 'away_score': as_,
+                'home_lines': list(lines[0]), 'away_lines': list(lines[1]), 'start_ms': 0, 'first_seen': t * s,
+                'prev_poll': prev * s}
+
+    def score(espn=None, ncaa=None, espn_out=(), ncaa_home=False):
+        srcs = {}   # ESPN has A at home, NCAA (by default) away
+        if espn is not None:
+            srcs['ESPN'] = (espn, True, [(a * s, b * s) for a, b in espn_out])
+        if ncaa is not None:
+            srcs['NCAA'] = (ncaa, ncaa_home, [])
+        return Score(srcs, 5 * s)
+    rows_e, rows_n = [st(100, 'in', 0, 0, prev=97), st(200, 'in', 10, 0, prev=197)], \
+        [st(110, 'in', 0, 0, prev=107), st(260, 'in', 0, 10, prev=257)]
+    sc = score(rows_e, rows_n, [(150, 400)])
     r = sc.at(120 * s)
     check('Score: both fresh and agreeing, the earlier first sighting and the poll before it',
           (r['state'], r.get('src'), r.get('first_seen'), r.get('prev_poll'), r['a_score'])
           == ('in', 'ESPN', 100 * s, 97 * s, 0), r)
     r = sc.at(210 * s)
-    check("Score: a source in its outage was last polled at the outage's start: the other, fresh, is used",
-          (r.get('src'), r.get('fetched'), r.get('first_seen'), r.get('prev_poll'))
-          == ('NCAA', 210 * s, 110 * s, 107 * s)
+    check("Score: a source in its outage was last polled at the outage's start: the other, fresh, is used, the "
+          "state shown at 120 s keeping its date", (r.get('src'), r.get('fetched'), r.get('first_seen'),
+                                                     r.get('prev_poll')) == ('NCAA', 210 * s, 100 * s, 97 * s)
           and sc.latest('ESPN', 210 * s)[1] == 200 * s, r)
+    r = score(rows_e, rows_n, [(150, 400)]).at(210 * s)
+    check("Score: ...first shown then, NCAA's own sighting (ESPN's 10-0 is another state)",
+          (r.get('src'), r.get('first_seen'), r.get('prev_poll')) == ('NCAA', 110 * s, 107 * s), r)
     r = sc.at(152 * s)
     check('Score: within the max age of the outage start ESPN is still fresh, and both agree', r.get('src') == 'ESPN'
           and r.get('fetched') == 150 * s, r)
-    sc2 = Score({'ESPN': ([st(200 * s, 'in', 10, 0)], True, []), 'NCAA': ([st(110 * s, 'in', 0, 0)], True, [])}, 5 * s)
-    r = sc2.at(205 * s)
+    r = score([st(200, 'in', 10, 0)], [st(110, 'in', 0, 0)], ncaa_home=True).at(205 * s)
     check('Score: both fresh and different: no score, the why names both', r['state'] == ''
           and r['why'] == 'ESPN has in 10-0 (period 1) and NCAA in 0-0 (period 1)', r)
-    sc3 = Score({'ESPN': ([st(200 * s, 'in', 10, 0)], True, [(201 * s, 900 * s)])}, 5 * s)
-    r = sc3.at(300 * s)
+    r = score([st(200, 'in', 10, 0)], espn_out=[(201, 900)]).at(300 * s)
     check('Score: one source, old: the age pulls it (SCORE_OLD)', r['fetched'] == 201 * s and r['state'] == 'in', r)
+    # a final from either source ends the game, however old its last poll (ESPN's when both say so)
+    fin = [st(100, 'in', 59, 60), st(200, 'post', 61, 60, 4)]
+    r = score(fin, [st(100, 'in', 60, 59), st(150, 'in', 60, 59, 4)], [(200, 900)]).at(212 * s)
+    r2 = score([st(100, 'in', 59, 60)], [st(100, 'in', 60, 59), st(200, 'post', 60, 61, 4)]).at(205 * s)
+    r3 = score(fin, [st(100, 'in', 60, 59), st(201, 'post', 60, 61, 4)]).at(205 * s)
+    check("Score: ESPN's final 12 s old over NCAA's fresh row in play; NCAA's final alone; both, ESPN's",
+          (r['state'], r.get('src'), r.get('a_score'), r2['state'], r2.get('src'), r3['state'], r3.get('src'))
+          == ('post', 'ESPN', 61, 'post', 'NCAA', 'post', 'ESPN'), (r, r2, r3))
+    # the other source's row dates the state, fresh or not
+    r = score([st(200, 'in', 10, 0, prev=197)], [st(100, 'in', 0, 0), st(203, 'in', 0, 10, prev=200)],
+              [(201, 900)]).at(210 * s)
+    check("Score: ESPN's stale row showing the same 10-0 dates NCAA's",
+          (r.get('src'), r.get('first_seen'), r.get('prev_poll')) == ('NCAA', 200 * s, 197 * s), r)
+    # the date held while the state lasts: NCAA's 38-40 first, ESPN's a second later; NCAA's
+    # "HALF" (no period) at 236 s, and alone while ESPN is stale; a glitch (no score); 38-40 again;
+    # the 3rd quarter at the same score is another state
+    sc = score([st(101, 'in', 38, 40, 2, prev=98), st(260, 'in', 38, 40, 3, prev=257)],
+               [st(100, 'in', 40, 38, 2, prev=97), st(236, 'in', 40, 38, 0, prev=233),
+                st(245, 'in', 42, 38, 0, prev=242), st(248, 'in', 40, 38, 0, prev=245),
+                st(261, 'in', 40, 38, 3, prev=258)], [(236, 244)])
+    got = [(r['state'], r.get('src'), r.get('period'), r.get('first_seen', 0) // s, r.get('prev_poll', 0) // s)
+           for r in (sc.at(t * s) for t in (102, 236, 242, 245, 248, 261))]
+    check("Score: a state keeps the date it was first shown with, whichever source is fresh, through a "
+          "disagreement", got == [('in', 'ESPN', 2, 100, 97), ('in', 'ESPN', 2, 100, 97), ('in', 'NCAA', 0, 100, 97),
+                                  ('', None, None, 0, 0), ('in', 'ESPN', 2, 100, 97), ('in', 'ESPN', 3, 260, 257)], got)
+    # volleyball: ESPN alone, each point (linescores) its own date; with NCAA's row (sets, no
+    # points), the set's first sighting
+    pts = [st(t, 'in', 1, 0, 2, prev=t - 3, lines=([25, k], [20, 5])) for t, k in ((600, 3), (603, 4), (606, 5))]
+    alone, both = score(pts), score(pts, [st(590, 'in', 0, 1, 2, prev=587)])
+    got = [(alone.at(t * s)['first_seen'] // s, both.at(t * s)['first_seen'] // s) for t in (600, 603, 606)]
+    check("Score: volleyball's points are ESPN's states alone; NCAA's set sighting dates them",
+          got == [(600, 590), (603, 590), (606, 590)], got)
+    # NCAA.com's "OT" and "2OT" are no period read, so they agree with ESPN's 5 and 6
+    got = [score([st(100, 'in', 80, 80, n)], [st(100, 'in', 80, 80, period_of(text))]).at(101 * s)
+           for n, text in ((5, 'OT'), (6, '2OT'))]
+    check("Score: NCAA's OT and 2OT agree with ESPN's periods 5 and 6",
+          [(r['state'], r.get('src'), r.get('period')) for r in got] == [('in', 'ESPN', 5), ('in', 'ESPN', 6)], got)
     rs = [{'recv_us': 1, 'prev_us': None, 'state': 'in', 'period': '1', 'clock': '9:00', 'home_score': 0,
            'away_score': 0, 'raw': '{}'},
           {'recv_us': 2, 'prev_us': 1, 'state': 'in', 'period': '1', 'clock': '8:30', 'home_score': 0,
@@ -1813,8 +1904,11 @@ def self_test_part2(check):
     check("score_states: a clock row keeps the state's first sighting and the poll before it, a score starts a "
           "new one", [(x['first_seen'], x['prev_poll']) for x in ss] == [(1, 0), (1, 0), (3, 2)]
           and ss[1]['clock_s'] == 510, ss)
-    check('period_of: the leading digits', (period_of('2nd'), period_of('1'), period_of('HALF'), period_of(None))
-          == (2, 1, 0, 0))
+    cases = (('2nd', 2), ('1', 1), ('1st', 1), ('3rd', 3), ('4th', 4), (' 2nd ', 2), ('HALF', 0), ('OT', 0),
+             ('2OT', 0), ('3OT', 0), ('END 1st', 0), ('FINAL', 0), ('', 0), (None, 0), ('1234', 0))
+    got = [(x, period_of(x)) for x, want in cases if period_of(x) != want]
+    check("period_of: an ordinal or a bare number is its number, any other text 0 (deskd-ncaa's periods())",
+          not got, got)
 
     # ---- volleyball's state from the linescores (volley_model.cpp's rules)
     vs = volley_state(2, ([25, 3], [20, 1]), (1, 0))
