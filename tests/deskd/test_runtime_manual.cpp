@@ -387,7 +387,7 @@ void financial_fair() {
 // side, summing to 1; a restart in play brings the price back from game_p0.json, and the fair with it.
 void wcbb_overlay() {
   const auto start = now_ms() + 3600000;
-  char date[16], iso[32];
+  char date[16], iso[32], ymd[16];
   {   // the event's date as Kalshi writes it (Eastern: four hours behind UTC until November)
     static const char* kMon[] = {"JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"};
     std::time_t et = (start - 4 * 3600000) / 1000, utc = start / 1000;
@@ -395,6 +395,7 @@ void wcbb_overlay() {
     gmtime_r(&et, &a); gmtime_r(&utc, &b);
     std::snprintf(date, sizeof date, "%02d%s%02d", a.tm_year % 100, kMon[a.tm_mon], a.tm_mday);
     std::strftime(iso, sizeof iso, "%Y-%m-%dT%H:%MZ", &b);
+    std::strftime(ymd, sizeof ymd, "%Y/%m/%d", &a);   // NCAA.com's scoreboard path
   }
   const std::string EV = std::string("KXNCAAWBGAME-") + date + "UCLAUSC", UCLA = EV + "-UCLA", USC = EV + "-USC";
   std::string why;
@@ -414,6 +415,20 @@ void wcbb_overlay() {
   });
   const int espn_port = espn.bind_to_any_port("127.0.0.1");
   std::thread espn_th([&] { espn.listen_after_bind(); });
+  // NCAA.com: the same game, its score as ESPN's until the test says otherwise
+  std::atomic<int> ncaa_usc{74};
+  httplib::Server ncaa;
+  ncaa.Get(std::string("/casablanca/scoreboard/basketball-women/d1/") + ymd + "/scoreboard.json", [&](const httplib::Request&, httplib::Response& res) {
+    auto side = [&](const char* name, int score) {
+      return json{{"score", on ? std::to_string(score) : ""}, {"names", {{"char6", name}, {"short", name}}}};
+    };
+    const json g = {{"gameID", "6400001"}, {"gameState", on ? "live" : "pre"}, {"currentPeriod", on ? "3rd" : ""},
+                    {"contestClock", on ? "4:12" : ""}, {"startTimeEpoch", std::to_string(start / 1000)},
+                    {"home", side("USC", ncaa_usc)}, {"away", side("UCLA", 70)}};
+    res.set_content(json{{"games", json::array({json{{"game", g}}})}}.dump(), "application/json");
+  });
+  const int ncaa_port = ncaa.bind_to_any_port("127.0.0.1");
+  std::thread ncaa_th([&] { ncaa.listen_after_bind(); });
   {
     Run r(false, [&](fakex::Engine& e, std::int64_t now) {
       for (const auto& tk : {UCLA, USC}) { auto spec = fx::spec(tk, 0); spec.close_ms = (now / 1000 + 4 * 3600) * 1000; e.add_market(spec, now); }
@@ -423,6 +438,8 @@ void wcbb_overlay() {
       c.wcbb_model = std::string(DESKD_SOURCE_DIR) + "/tests/deskd/fixtures/wcbb_synthetic.json";
       o.espn_url = "http://127.0.0.1:" + std::to_string(espn_port);
       o.espn_scoreboard_ms = 300;
+      o.ncaa_url = "http://127.0.0.1:" + std::to_string(ncaa_port);
+      o.ncaa_scoreboard_ms = 300;
     });
     auto watch = [&] {
       CHECK(r.until([&] { return r.d->status()["rest"]["ready"] == true; }, 15000));
@@ -456,6 +473,31 @@ void wcbb_overlay() {
     if (!both) std::fprintf(stderr, "game_fair: %s (want %s / %s)\n", r.d->status()["game_fair"].dump().c_str(), usc_fair.c_str(), ucla_fair.c_str());
     CHECK(both);
     CHECK(r.d->status()["game_fair"]["models"]["KXNCAAWBGAME"]["sha256"] == model->sha256);
+    // ref-ncaa reads the same game; when NCAA.com and ESPN disagree there is no score, so no fair,
+    // and the merged board and the fair say why; when they agree again the fair is back
+    const auto* ref_ncaa = r.d->worker("ref-ncaa");
+    CHECK(ref_ncaa && ref_ncaa->running() && r.d->status()["ncaa"]["markets"].contains(USC));
+    ncaa_usc = 72;
+    const std::string at_odds = "ESPN has in 74-70 (period 3) and NCAA in 72-70 (period 3)";
+    const bool odds = r.until([&] {
+      auto st = r.d->status();
+      return st["scores"]["disagree"].value(USC, "") == at_odds && st["game_fair"]["markets"][USC]["fair"].is_null() &&
+             st["game_fair"]["markets"][USC]["why"] == "no score: " + at_odds;
+    }, 20000);
+    if (!odds) std::fprintf(stderr, "scores: %s\ngame_fair: %s\n", r.d->status()["scores"].dump().c_str(), r.d->status()["game_fair"].dump().c_str());
+    CHECK(odds);
+    ncaa_usc = 74;
+    CHECK(r.until([&] { return r.d->status()["game_fair"]["markets"][USC]["fair"] == usc_fair; }, 20000));
+    {   // each source's score states, as first seen, in ops.sqlite
+      const std::string db = r.dir.path + "/ops.sqlite";
+      const bool kept = r.until([&] {
+        return sql_count(db, "SELECT COUNT(*) FROM scores WHERE src='NCAA' AND league='basketball-women/d1' AND game_id='6400001'") >= 4 &&
+               sql_count(db, "SELECT COUNT(*) FROM scores WHERE src='ESPN' AND league='womens-college-basketball' AND game_id='401900'") >= 2;
+      }, 10000);
+      if (!kept) std::fprintf(stderr, "scores rows: %lld NCAA, %lld ESPN\n", sql_count(db, "SELECT COUNT(*) FROM scores WHERE src='NCAA'"),
+                              sql_count(db, "SELECT COUNT(*) FROM scores WHERE src='ESPN'"));
+      CHECK(kept);
+    }
     // a restart in play: no pregame book to read, the saved price instead
     r.restart();
     CHECK(r.d->status()["game_fair"]["p0"][EV]["p0"] == 0.37);
@@ -466,6 +508,8 @@ void wcbb_overlay() {
   }
   espn.stop();
   espn_th.join();
+  ncaa.stop();
+  ncaa_th.join();
 }
 // Systematic on the fake: an order group per lane and shard, a lane switched on, Start, an S order
 // in its lane's group, gw's refusals (lane off, wrong owner, inventory, not running), Stop

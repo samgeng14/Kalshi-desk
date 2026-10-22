@@ -3,11 +3,14 @@
 //
 //   md-k, priv-k     Kalshi market data and private feed (week 0: placeholders, feeds down)
 //   ref-k            Kalshi's pyth_value reference for the 15-minute financial markets
+//   ref-espn         ESPN's public scoreboards for the game markets, and ref-ncaa NCAA.com's for
+//                    the college ones, each on its own data-only connection
 //   gw               the gateway: run state, inbox lanes and deletions
 //   send-k1          Manual's sender; send-k2, send-k3 Systematic's (week 0: placeholders)
 //   send-cx          cancels and KILL, on its own path
-//   strat            the fairs (financial and game), the makers, the LIP meter and the markouts,
-//                    each engine at its own cadence (strat/strat.h)
+//   strat            the game scores merged (ref/scores.h), the fairs (financial and game), the
+//                    makers, the LIP meter and the markouts, each engine at its own cadence
+//                    (strat/strat.h)
 //   store            the only writer of ops.sqlite
 //   pub              the screen's streams, hb, hdr, snapshots
 //   ops              heartbeat file, disk, preflight rows
@@ -60,6 +63,8 @@ class KalshiPyth;
 class FinancialFair;
 class GameFair;
 class EspnFeed;
+class NcaaFeed;
+class ScoreMerge;
 class MakerEngine;
 class Markouts;
 struct MdBook;
@@ -85,6 +90,9 @@ struct RuntimeOptions {
   // ESPN's public scoreboards for the watched game markets (ref/espn.h); "" = off.
   std::string espn_url = "https://site.api.espn.com";
   int espn_scoreboard_ms = 0;   // a scoreboard's pacing; 0 = the feed's default (20 s); tests shorten it
+  // NCAA.com's public scoreboards for the watched college game markets (ref/ncaa.h); "" = off.
+  std::string ncaa_url = "https://data.ncaa.com";
+  int ncaa_scoreboard_ms = 0;   // a scoreboard's pacing; 0 = the feed's default (30 s); tests shorten it
   // gw checks the ledger's bounds after every message (plan section 8); tests and the soak
   bool check_each_message = false;
 };
@@ -132,6 +140,8 @@ class Deskd {
   std::unique_ptr<KalshiPyth> pyth_;
   std::unique_ptr<FinancialFair> fair_;
   std::unique_ptr<EspnFeed> espn_;
+  std::unique_ptr<NcaaFeed> ncaa_;
+  std::unique_ptr<ScoreMerge> scores_;   // ESPN's and NCAA.com's score for each game market (strat thread)
   std::unique_ptr<MakerEngine> lip_;   // lane M1's quoter, on the strat thread
   std::unique_ptr<MakerEngine> band_;  // lane M2's
   std::unique_ptr<MakerEngine> paper_; // lane D1's (demo only)

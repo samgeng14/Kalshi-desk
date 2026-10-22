@@ -75,7 +75,7 @@ struct Soak {
     RuntimeOptions o;
     const std::string base="https://127.0.0.1:"+std::to_string(venue.port());
     o.rest_url=base+"/trade-api/v2"; o.ws_url=base+"/trade-api/ws/v2"; o.factory=fx::trust_test_ca();
-    o.rest_poll_ms=700; o.rest_gap_ms=0; o.espn_url="";
+    o.rest_poll_ms=700; o.rest_gap_ms=0; o.espn_url=""; o.ncaa_url="";
     o.check_each_message=true;   // plan section 8: the ledger's bounds after every gw message
     std::string err;
     auto lock=AccountLock::acquire(dir.path,"demo","deskd-soak",false,&err);

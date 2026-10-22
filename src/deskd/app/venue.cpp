@@ -13,6 +13,8 @@
 #include "deskd/strat/fair.h"
 #include "deskd/strat/game_fair.h"
 #include "deskd/ref/espn.h"
+#include "deskd/ref/ncaa.h"
+#include "deskd/ref/scores.h"
 #include "deskd/strat/maker.h"
 #include "deskd/strat/markouts.h"
 #include "deskd/gw/sys_book.h"
@@ -106,34 +108,61 @@ bool Deskd::init_venue(std::string* err) {
     else
       DLOG_INFO("no WCBB model (%s): train one with tools/train_wcbb.py", wcbb_why_.c_str());
   }
+  // the watched game markets of the series a scoreboard covers, with the other team's market of
+  // each game; each new score state a feed sees goes to ops.sqlite's scores table
+  auto watched_games = [this](bool (*covers)(const std::string&)) {
+    return [this, covers] {
+      std::vector<kalshi::MarketRow> out;
+      const auto s = rest_->snapshot();
+      std::set<std::string> events;
+      for (const auto& tk : s->live) {
+        const auto it = s->markets.find(tk);
+        if (it != s->markets.end() && covers(tk)) events.insert(it->second.event_ticker);
+      }
+      for (const auto& [tk, m] : s->markets) if (events.count(m.event_ticker)) out.push_back(m);
+      return out;
+    };
+  };
+  const EspnFeed::ScoreChangeFn record_score = [this](const EspnGame& g) {
+    store_.inbox().push(StoreRecord{"scores", score_row(g).dump()});
+  };
   if (!options_.espn_url.empty()) {
     std::string why;
     if (auto ep = net::Endpoint::parse(options_.espn_url, &why)) {
       EspnFeed::Options eo;
       if (options_.espn_scoreboard_ms > 0) eo.scoreboard_ms = options_.espn_scoreboard_ms;
-      // the watched game markets, with the other team's market of each game
-      espn_ = std::make_unique<EspnFeed>(*ep, [this] {
-        std::vector<kalshi::MarketRow> out;
-        const auto s = rest_->snapshot();
-        std::set<std::string> events;
-        for (const auto& tk : s->live) {
-          const auto it = s->markets.find(tk);
-          if (it != s->markets.end() && espn_league_for(tk)) events.insert(it->second.event_ticker);
-        }
-        for (const auto& [tk, m] : s->markets) if (events.count(m.event_ticker)) out.push_back(m);
-        return out;
-      }, eo);
+      espn_ = std::make_unique<EspnFeed>(*ep, watched_games([](const std::string& tk) { return espn_league_for(tk) != nullptr; }), eo);
+      espn_->set_on_change(record_score);
     } else {
       DLOG_WARN("ESPN off: %s", why.c_str());
     }
   }
+  if (!options_.ncaa_url.empty()) {
+    std::string why;
+    if (auto ep = net::Endpoint::parse(options_.ncaa_url, &why)) {
+      NcaaFeed::Options no;
+      if (options_.ncaa_scoreboard_ms > 0) no.scoreboard_ms = options_.ncaa_scoreboard_ms;
+      ncaa_ = std::make_unique<NcaaFeed>(*ep, watched_games([](const std::string& tk) { return ncaa_sport_for(tk) != nullptr; }), no);
+      ncaa_->set_on_change(record_score);
+    } else {
+      DLOG_WARN("NCAA.com off: %s", why.c_str());
+    }
+  }
+  // each game market's one score, ESPN's and NCAA.com's merged (ref/scores.h): what the game fair
+  // and the game lanes read
+  if (espn_ || ncaa_) {
+    ScoreMerge::Env se;
+    if (espn_) se.espn = [this] { return espn_->board(); };
+    if (ncaa_) se.ncaa = [this] { return ncaa_->board(); };
+    scores_ = std::make_unique<ScoreMerge>(std::move(se));
+  }
   // the game markets' pregame prices and fairs (strat/game_fair.h), on each series with a loaded
   // model: the WCBB model's KXNCAAWBGAME
-  if (espn_ && wcbb_) {
+  if (scores_ && wcbb_) {
     GameFair::Env env;
     env.snapshot = [this] { return rest_->snapshot(); };
     env.books = [this] { return std::atomic_load(&books_); };
-    env.scores = [this] { return espn_->board(); };
+    env.scores = [this] { return scores_->board(); };
     game_fair_ = std::make_unique<GameFair>(std::move(env),
                                             std::map<std::string, GameModel>{{bball_league(wcbb_->league)->series, *wcbb_}});
     if (!cfg_.data_dir.empty()) game_fair_->persist(cfg_.data_dir + "/game_p0.json");   // p0 outlives a restart mid-game

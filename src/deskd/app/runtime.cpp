@@ -18,6 +18,8 @@
 #include "deskd/strat/fair.h"
 #include "deskd/strat/game_fair.h"
 #include "deskd/ref/espn.h"
+#include "deskd/ref/ncaa.h"
+#include "deskd/ref/scores.h"
 #include "deskd/strat/maker.h"
 #include "deskd/strat/markouts.h"
 #include "deskd/gw/sys_book.h"
@@ -33,8 +35,8 @@ Deskd::Deskd(DeskdConfig cfg, std::unique_ptr<AccountLock> lock, RuntimeOptions 
   epoch_ = "e-" + std::to_string(started_ms_) + "-" + std::to_string(::getpid());
   token_ = random_token();
   if (lock_) kill_.persist_to(lock_->sibling(".killed"));
-  for (const char* n : {"md-k", "priv-k", "ref-k", "ref-espn", "gw", "send-k1", "send-k2", "send-k3", "send-cx", "strat", "store", "pub",
-                        "rest", "ops", "web"})
+  for (const char* n : {"md-k", "priv-k", "ref-k", "ref-espn", "ref-ncaa", "gw", "send-k1", "send-k2", "send-k3", "send-cx", "strat",
+                        "store", "pub", "rest", "ops", "web"})
     workers_.push_back(std::make_unique<Worker>(n));
 
   // The heartbeat's owners (app/ops.h): the gateway, both Kalshi feeds, KILL's sender, the
@@ -142,6 +144,11 @@ bool Deskd::start(std::string* err) {
       w.beat(); std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
   });
+  by("ref-ncaa")->start([this](Worker& w) {
+    if (ncaa_) ncaa_->run(w); else while (!w.stopping()) {
+      w.beat(); std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+  });
   by("gw")->start([this](Worker& w) { gw_->run(w); });
   const AlertFn alert = [this](const std::string& lvl, const std::string& src, const std::string& msg) {
     pub_->alert(lvl, src, msg);
@@ -159,9 +166,11 @@ bool Deskd::start(std::string* err) {
     if (cx_sender_) cx_sender_->run(w); else run_cancel_sender(w, q_cx_, cx_stats_, kill_, alert);
   });
   // The strat thread's engines, each at its own cadence and in this order when due together: the
-  // fair before the makers that read it. An engine with work in flight registers with paced().
+  // fair before the makers that read it, the merged scores before the game fair. An engine with
+  // work in flight registers with paced().
   StratSteps steps;
   steps.every(250, [this] { if (fair_ && rest_) fair_->step(*rest_->snapshot(), now_ms()); });
+  steps.every(250, [this] { if (scores_) scores_->step(now_ms()); });
   steps.every(250, [this] { if (game_fair_) game_fair_->step(now_ms()); });
   steps.every(250, [this] { if (lip_) lip_->step(now_ms()); });
   steps.every(250, [this] { if (band_) band_->step(now_ms()); });
@@ -304,6 +313,8 @@ json Deskd::status() const {
   result["pyth"] = pyth_ ? pyth_->status(now) : json(nullptr);
   result["fair"] = fair_ ? fair_->status() : json(nullptr);
   result["espn"] = espn_ ? espn_->status() : json(nullptr);
+  result["ncaa"] = ncaa_ ? ncaa_->status() : json(nullptr);
+  result["scores"] = scores_ ? scores_->status() : json(nullptr);
   result["maker"] = lip_ ? lip_->status() : json(nullptr);
   result["band"] = band_ ? band_->status() : json(nullptr);
   result["paper"] = paper_ ? paper_->status() : json(nullptr);

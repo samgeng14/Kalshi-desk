@@ -148,7 +148,7 @@ int main(int argc, char** argv) {
     options.rest_url = base + "/trade-api/v2";
     options.ws_url = base + "/trade-api/ws/v2";
     options.factory.loopback_ca_file = expand_home(sim_ca);
-    options.espn_url = "";   // no network in the sandbox
+    options.espn_url = options.ncaa_url = "";   // no network in the sandbox
     DLOG_WARN("--sim: every venue connection goes to the fake exchange at %s", base.c_str());
   }
 
