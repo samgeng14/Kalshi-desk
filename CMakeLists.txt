@@ -243,6 +243,7 @@ if(PYTHON3_EXE)
   add_test(NAME scorecard COMMAND ${PYTHON3_EXE} ${CMAKE_SOURCE_DIR}/tools/scorecard.py --self-test)
   add_test(NAME nba-panel COMMAND ${PYTHON3_EXE} ${CMAKE_SOURCE_DIR}/tools/nba_panel.py --self-test)
   add_test(NAME nba-latency COMMAND ${PYTHON3_EXE} ${CMAKE_SOURCE_DIR}/tools/nba_latency.py --self-test)
+  add_test(NAME nba-gate COMMAND ${PYTHON3_EXE} ${CMAKE_SOURCE_DIR}/tools/nba_gate.py --self-test)
   # The commodity replay's own proof that it cannot see the future: it builds its data in memory,
   # moves the reference after a chosen instant and checks no earlier probability changed.
   add_test(NAME commodity-replay
