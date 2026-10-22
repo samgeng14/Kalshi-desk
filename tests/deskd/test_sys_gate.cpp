@@ -5,8 +5,9 @@
 //   - a lane whose retire rule fires (its fill from the account read, its markouts from strat as
 //     LaneMarkout) is retired: its working order cancelled with why RETIRED, a CRIT alert, LaneSet
 //     on refused, its orders LANE_OFF; across a restart it stays so, until deskctl lane-reset
-//   - the loss rule after a restart waits for a mark on every position the lane holds and for
-//     the first account read, and retires on a mark that really loses
+//   - the loss rule after a restart counts a position with no mark at its best and waits for
+//     the first account read; it retires on a mark that really loses, and once a voided market
+//     the lane held is given back at its cost
 //   - a lane's event cap (LaneSpec::event_cap) counts what it holds and works in one event, and
 //     never refuses a reducing order
 //   - the budgets of the lanes on may not sum past their venue's 70% ceiling (decisions 1): a
@@ -145,6 +146,14 @@ struct Desk {
     auto s=std::make_shared<rest::Snapshot>(*std::atomic_load(&snap));
     s->balance.available=cash; s->balances[0]=cash; s->account_ready=s->ready=ready;
     s->account_began_ms=now_ms(); s->account_ms=now_ms()+1; ++s->revision;
+    std::atomic_store(&snap,std::shared_ptr<const rest::Snapshot>(s));
+  }
+  // a new account read in which tk is listed with this status and result
+  void market(const std::string& tk,const std::string& status,const std::string& result) {
+    auto s=std::make_shared<rest::Snapshot>(*std::atomic_load(&snap));
+    kalshi::MarketRow m=s->markets.at(fx::T);
+    m.ticker=tk; m.status=status; m.result=result;
+    s->markets[tk]=m; s->account_began_ms=now_ms(); s->account_ms=now_ms()+1; ++s->revision;
     std::atomic_store(&snap,std::shared_ptr<const rest::Snapshot>(s));
   }
   // fn on the gw thread, the one that reads `book`
@@ -405,6 +414,22 @@ void loss_at_boot() {
     Desk d({c1},file);
     CHECK(d.until([&]{ return d.alerts_with("CRIT C1 lane C1 retired: down $20.0000 over its life, its limit $20.0000")==1; }));
     CHECK(d.until([&]{ return d.lane_day("C1")==-30000000; }));   // U worthless in its day
+  }
+  {   // the same 50 in fx::T, and 30 at 0.80 in U: inside its limit while U could win ($14.50
+      // down at best). U is voided: it never settles yes or no, and would have no mark for good.
+      // The account read gives it back at its cost, and C1, down $20.50, retires
+    const std::string file=dir.file("void.json");
+    saved(file,{{fx::T,5000,8200},{U,3000,8000}});
+    Desk d({c1},file);
+    CHECK(d.until([&]{ return d.lane_day("C1")==-44500000; }));
+    std::this_thread::sleep_for(std::chrono::milliseconds(400));
+    CHECK(d.alerts_with("CRIT")==0);
+    d.market(U,"finalized","void");
+    CHECK(d.until([&]{ return d.alerts_with("CRIT C1 lane C1 retired: down $20.5000 over its life, its limit $20.0000")==1; }));
+    CHECK(d.until([&]{ return d.lane_day("C1")==-20500000; }));
+    CHECK(d.until([&]{ std::ifstream in(file); const auto j=json::parse(in,nullptr,false);
+                       return !j.is_discarded() && j["lanes"]["C1"]["inv"].size()==1 && j["lanes"]["C1"]["inv"].contains(fx::T)
+                              && j["life"]["C1"]["real"]==0; }));
   }
 }
 

@@ -1086,7 +1086,9 @@ void Gateway::reconcile_working(const rest::Snapshot& s) {
 // fills"): every fill of today on a Systematic order counts once by trade id, so a fill the
 // private feed lost (a socket gap, a fill before the 201) still moves the lane's position, and
 // the first read after a start rebuilds the day the saved book could not have seen; and a market
-// the lanes hold that has settled realizes their position at its result.
+// the lanes hold that has settled realizes their position at its result; a voided one gives it
+// back at its cost (it never settles yes or no, and left in the book, with no mark after a
+// restart, it would hold the lane's budget and could keep its loss rule undecided for good).
 void Gateway::sys_reconcile(const rest::Snapshot& s) {
   const std::int64_t day0 = sys_->day_start_ms() ? sys_->day_start_ms() : et_midnight_ms(now_ms());
   std::map<std::string, std::string> cid_of;   // order id -> client order id
@@ -1112,6 +1114,12 @@ void Gateway::sys_reconcile(const rest::Snapshot& s) {
   for (const auto& [lane, tk] : sys_->held()) {
     const auto m = s.markets.find(tk);
     if (m == s.markets.end() || m->second.status == "active" || m->second.status == "open") continue;
+    if (m->second.result == "void" && sys_->voided(lane, tk, now_ms())) {
+      DLOG_INFO("%s voided: lane %s's position there goes back at its cost", tk.c_str(), lane.c_str());
+      lanes_dirty_.insert(lane);
+      ++settled;
+      continue;
+    }
     if (m->second.result != "yes" && m->second.result != "no") continue;
     const Micros pnl = sys_->settle(lane, tk, m->second.result == "yes" ? kOneDollar : 0, now_ms());
     DLOG_INFO("%s settled %s: lane %s realizes %s", tk.c_str(), m->second.result.c_str(), lane.c_str(),

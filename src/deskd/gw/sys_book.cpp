@@ -166,6 +166,16 @@ Micros SysBook::settle(const std::string& lane, const std::string& ticker, Px va
   return pnl;
 }
 
+bool SysBook::voided(const std::string& lane, const std::string& ticker, std::int64_t at) {
+  auto dit = days_.find(lane);
+  if (dit == days_.end()) return false;
+  auto it = dit->second.inv.find(ticker);
+  if (it == dit->second.inv.end() || !it->second.pos) return false;
+  dit->second.last_ms = at;
+  dit->second.inv.erase(it);
+  return true;
+}
+
 std::vector<std::pair<std::string, std::string>> SysBook::held() const {
   std::vector<std::pair<std::string, std::string>> out;
   for (const auto& [lane, d] : days_)

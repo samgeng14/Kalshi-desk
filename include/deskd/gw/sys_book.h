@@ -148,6 +148,9 @@ class SysBook {
   // the market settled at value (10000 YES won, 0 NO won): the lane's position there is realized
   // and gone; its realized P&L, or 0 when it held nothing there
   Micros settle(const std::string& lane, const std::string& ticker, Px value, std::int64_t at);
+  // the market was voided: the venue gives the position back at what it cost (or brought in), so
+  // it is gone at no P&L, its fees still paid; false when the lane held nothing there
+  bool voided(const std::string& lane, const std::string& ticker, std::int64_t at);
   // (lane, ticker) of every open position
   std::vector<std::pair<std::string, std::string>> held() const;
   // ET midnight: the counters and real start again; positions stay. day_start is that midnight.

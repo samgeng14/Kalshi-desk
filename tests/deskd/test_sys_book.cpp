@@ -130,7 +130,8 @@ void lane_day() {
 }
 
 // A fill counted once by trade id (it arrives on the private feed and on every REST read); a
-// settlement realizes the position at $1 or $0; the book across a restart.
+// settlement realizes the position at $1 or $0, a void gives it back at its cost; the book across
+// a restart.
 void settle_and_restore() {
   SysBook b;
   const std::int64_t day = 1791000000000, t = day + 3600000;
@@ -145,6 +146,11 @@ void settle_and_restore() {
   CHECK(b.position("M1", "TK-A") == 0 && b.day("M1")->real == -6000000 && b.open_worst("M1") == 0);
   CHECK(b.settle("M1", "TK-A", 0, t + 2) == 0);   // once
   CHECK(b.day_total({}) == -6000000 + (9700 - 10000) * 500 - 3500);   // TK-B unpriced: worst case
+  // TK-C voided: the long of 3 at 0.20 goes back at its cost, no P&L, its fee still paid
+  CHECK(b.fill("M1", "SM1-2", "TK-C", Side::BUY, 300, 2000, 400, t + 3, "trade-3"));
+  CHECK(b.voided("M1", "TK-C", t + 4) && !b.voided("M1", "TK-C", t + 4) && !b.voided("M1", "TK-Z", t + 4));
+  CHECK(b.position("M1", "TK-C") == 0 && b.held().size() == 1 && b.open_worst("M1") == 0);
+  CHECK(b.day("M1")->real == -6000000 && b.life("M1")->real == -6000000 && b.day("M1")->fees == 400);
   // HALTED, saved, and read back on the same day: the day, the trade ids and the HALT
   const SysBook::Halt h{true, t + 5, "daily stop"};
   const json saved = b.to_json(h, t + 6);
