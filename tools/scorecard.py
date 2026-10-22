@@ -14,17 +14,22 @@ the payouts). Then each lane's rule over all its fills so far:
       the LIP windows                                     RETIRE
       otherwise                                           HOLD
   BAND (M2), after 100 fills (5(b)): PAUSE below -1c a contract.
-  X1 and C1, after 100 trades (5(c), 5(e)): RETIRE unless the net 60 s markout is positive.
-  N1, as C1 (nba.json): after 100 trades RETIRE unless the net 60 s markout is positive; and at any
+  X1, after 100 trades (5(e)): RETIRE unless the net 60 s markout is positive.
+  C1, as gw retires it (5(d), gw/sys_book.h's MARKOUT rule): WAIT under 100 trades or while
+  fewer than 50 of its fills are marked at 300 s; then HOLD if their net 300 s markout (contract-
+  weighted, each fill's own fee) is positive, else RETIRE; and at any count once down $20.
+  N1 (nba.json): after 100 trades RETIRE unless the net 60 s markout is positive; and at any
   count once its life is down $20.
   N2, the pregame favourites' forward test (decisions 2: 5 contracts held to settlement, 60
   trades or -$15): WAIT under 60 trades, or while a position of its is still to settle; then HOLD
   if its settlement P&L is positive, else RETIRE; and at any count once it is down $15.
 
-N1's and N2's dollars, and N2's trades, are gw's own count of each lane's life: the desk's saved
-Systematic book, systematic.json beside ops.sqlite (--book; gw/sys_book.h: trades are orders with
-a fill, P&L is realized less fees, settlements included), since ops.sqlite keeps no settlements.
-gw retires each lane on its own rule; a lane-reset clears that life, and so this count.
+C1's, N1's and N2's dollars, and C1's and N2's trades, are gw's own count of each lane's life: the
+desk's saved Systematic book, systematic.json beside ops.sqlite (--book; gw/sys_book.h: trades are
+orders with a fill, P&L is realized less fees, settlements included), since ops.sqlite keeps no
+settlements; C1's 300 s markouts are the ones gw counted there. gw retires each lane on its own
+rule (its loss rule also counts open positions at the mark); a lane-reset clears that life, and so
+this count.
 
 The verdict is advice: sizes and lanes are the operator's to change. Read-only.
 
@@ -59,6 +64,7 @@ DESK_DB = {'paper': os.path.join(DATA, 'demo', 'ops.sqlite'), 'live': os.path.jo
 Z80 = 0.8416   # one-sided 80%: mean - Z80 * sd / sqrt(n)
 LIP_LANES = ('M1', 'P1')
 N1_LOSS, N2_LOSS, N2_TRADES = 20.0, 15.0, 60   # gw's default_lanes: N1 retired once down $20, N2 after 60 trades or $15
+C1_LOSS, C1_TRADES, C1_MARKED = 20.0, 100, 50   # C1 after 100 trades with 50 fills marked at 300 s, or $20 (SysBook::kRetireMarked)
 
 
 def et_day(ms):
@@ -85,8 +91,9 @@ def load(db, since_ms):
 
 def load_book(path):
     """Each lane's life in deskd's saved Systematic book (gw/sys_book.h to_json, v 1): {'lives':
-    {lane: trades, pnl in dollars (realized less fees), retired, why}, 'open': {lane: contracts
-    held}}; None when there is no such file or it is not one."""
+    {lane: trades, pnl in dollars (realized less fees), retired, why, marked (fills marked at the
+    lane's retire horizon), mo_sum (their net markout, Money x Qty) and mo_ctrs (their contracts,
+    Qty)}, 'open': {lane: contracts held}}; None when there is no such file or it is not one."""
     try:
         with open(path) as fh:
             j = json.load(fh)
@@ -97,7 +104,9 @@ def load_book(path):
     lives = {}
     for lane, x in (j.get('life') or {}).items():
         lives[lane] = {'trades': int(x.get('trades', 0)), 'pnl': (x.get('real', 0) - x.get('fees', 0)) / 1e6,
-                       'retired': bool(x.get('retired')), 'why': x.get('retired_why', '')}
+                       'retired': bool(x.get('retired')), 'why': x.get('retired_why', ''),
+                       'marked': int(x.get('mo_n', 0)), 'mo_sum': int(x.get('mo_sum', 0)),
+                       'mo_ctrs': int(x.get('mo_ctrs', 0))}
     held = {}
     for lane, d in (j.get('lanes') or {}).items():   # each open position: [contracts x 100, its cost]
         held[lane] = sum(abs(v[0]) for v in (d.get('inv') or {}).values()) / 100
@@ -135,8 +144,8 @@ def days(fills, windows):
 
 
 def rule(lane, fills, windows, book=None):
-    """The plan's rule for one lane over all its fills (N1's and N2's dollars from book, load_book's):
-    (verdict, why, numbers)."""
+    """The plan's rule for one lane over all its fills (C1's, N1's and N2's lives from book,
+    load_book's): (verdict, why, numbers)."""
     mine = [f for f in fills if f['lane'] == lane and f['mo'].get('60s') is not None]
     n = len(mine)
     ctrs = sum(f['qty'] or 0 for f in mine)
@@ -183,7 +192,21 @@ def rule(lane, fills, windows, book=None):
             return 'WAIT', '%d trades, %g contracts still to settle' % (trades, held), nums
         return ('HOLD', 'settlement P&L %s over %d trades' % (usd(pnl), trades), nums) if pnl > 0 else \
                ('RETIRE', 'settlement P&L %s over %d trades, not positive' % (usd(pnl), trades), nums)
-    if lane in ('X1', 'C1', 'N1'):
+    if lane == 'C1':   # gw's MARKOUT rule on gw's own count: the 300 s markouts it was sent
+        if book is None:
+            return 'WAIT', 'no Systematic book (systematic.json, --book): its trades and 300 s markouts are there', nums
+        life = life or {'trades': 0, 'pnl': 0.0, 'marked': 0, 'mo_sum': 0, 'mo_ctrs': 0}
+        mo300 = life['mo_sum'] / life['mo_ctrs'] / 10000 if life['mo_ctrs'] else None   # Money x Qty / Qty, in dollars
+        nums.update({'trades': life['trades'], 'life_pnl': life['pnl'], 'marked300': life['marked'], 'mo300_net': mo300})
+        if life['pnl'] <= -C1_LOSS:
+            return 'RETIRE', 'down $%.2f over its life, past $%.0f' % (-life['pnl'], C1_LOSS), nums
+        if life['trades'] < C1_TRADES:
+            return 'WAIT', '%d of %d trades' % (life['trades'], C1_TRADES), nums
+        if life['marked'] < C1_MARKED:
+            return 'WAIT', '%d trades, %d of %d fills marked at 300 s' % (life['trades'], life['marked'], C1_MARKED), nums
+        how = 'net 300 s markout %s over %d marked' % (cents(mo300), life['marked'])
+        return ('HOLD', how, nums) if life['mo_sum'] > 0 else ('RETIRE', how + ', not positive', nums)
+    if lane in ('X1', 'N1'):
         if lane == 'N1' and life:
             nums['life_pnl'] = life['pnl']
             if life['pnl'] <= -N1_LOSS:
@@ -311,7 +334,8 @@ CREATE TABLE lip_windows(tk TEXT NOT NULL, start_ms INTEGER NOT NULL, end_ms INT
             json.dump({'v': 1, 'saved_ms': now, 'day_start_ms': now, 'trades': [],
                        'lanes': {lane: {'inv': x} for lane, x in (inv or {}).items()},
                        'life': {lane: {'trades': t, 'real': int(real * 1e6), 'fees': int(fees * 1e6), 'retired': False,
-                                       'retired_ms': 0, 'retired_why': ''} for lane, (t, real, fees) in life.items()},
+                                       'retired_ms': 0, 'retired_why': '', **dict(zip(('mo_n', 'mo_ctrs', 'mo_sum'), mo))}
+                                for lane, (t, real, fees, *mo) in life.items()},
                        'halt': None}, fh)
     n1_fills(40, 0)
     _, rules = report(db, 1, False, now)
@@ -339,9 +363,37 @@ CREATE TABLE lip_windows(tk TEXT NOT NULL, start_ms INTEGER NOT NULL, end_ms INT
         book({'N2': life}, {'N2': inv} if inv else None)
         _, rules = report(db, 1, False, now)
         check(rules['N2']['verdict'] == want and rules['N2']['why'] == why, what)
+    # C1: 120 fills of 3 contracts whose 60 s markout nets +2c (gross +3c, a 1c fee a contract);
+    # gw's rule reads the 300 s markouts it was sent, from the book (marked fills, their contracts
+    # x 100, and their net markout in Money x Qty: 60 fills of 3 at +2.5c is 250 x 18000)
+    con = sqlite3.connect(db)
+    for i in range(120):
+        fid = 'c1-%d' % i
+        con.execute("INSERT INTO fills VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (fid, 'SC1-%d' % i, 'o', 'KXNCAAWBGAME-X', 'BUY', 3, 0.45, 0.03, 1, now - i * 60000, 0, 0, 'SYS', 'C1', '{}'))
+        con.execute("INSERT INTO markouts VALUES(?,?,?,?,?)", (fid, '60s', 0.03, 0.48, '{}'))
+    con.commit()
+    con.close()
+    for life, want, why, what in (
+            ((40, 1.0, 0.4, 20, 6000, 250 * 6000), 'WAIT', '40 of 100 trades', 'C1 waits under 100 trades'),
+            ((120, 2.0, 1.2, 30, 9000, 250 * 9000), 'WAIT', '120 trades, 30 of 50 fills marked at 300 s',
+             'C1 waits for 50 fills marked at 300 s'),
+            ((120, 4.0, 1.2, 60, 18000, 250 * 18000), 'HOLD', 'net 300 s markout +2.50c over 60 marked',
+             'C1 holds on a positive net 300 s markout'),
+            ((120, 1.0, 1.2, 60, 18000, -150 * 18000), 'RETIRE', 'net 300 s markout -1.50c over 60 marked, not positive',
+             'C1 retires on its net 300 s markout, whatever its 60 s one'),
+            ((130, 0.0, 0.0, 60, 18000, 0), 'RETIRE', 'net 300 s markout +0.00c over 60 marked, not positive',
+             'C1 retires on a net 300 s markout of 0, as gw does'),
+            ((30, -19.0, 1.5, 10, 3000, 250 * 3000), 'RETIRE', 'down $20.50 over its life, past $20',
+             'C1 retires down $20 at any count')):
+        book({'C1': life})
+        _, rules = report(db, 1, False, now)
+        check(rules['C1']['verdict'] == want and rules['C1']['why'] == why, what)
     os.remove(book_path(db))
     _, rules = report(db, 1, False, now)
     check(rules['N1']['verdict'] == 'RETIRE' and 'N2' not in rules, 'no book: N1 on its markouts alone')
+    check(rules['C1']['verdict'] == 'WAIT' and rules['C1']['why'].startswith('no Systematic book'),
+          'no book: C1 waits, its 300 s markouts are gw\'s')
     print('self-test: ' + ('OK' if ok else 'FAILED'))
     return 0 if ok else 1
 
