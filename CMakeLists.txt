@@ -328,6 +328,7 @@ add_library(deskd_core STATIC
   src/deskd/ref/pyth.cpp
   src/deskd/ref/espn.cpp
   src/deskd/ref/ncaa.cpp
+  src/deskd/ref/scores.cpp
   src/deskd/net/guard.cpp
   src/deskd/net/http.cpp
   src/deskd/net/ws.cpp
@@ -544,7 +545,7 @@ deskd_pure_test(volley)
 deskd_pure_test(game_fair)
 # take: strat/take, the IOC game lanes' one decision (C1, X1, N1, N2): each mode, every pull, and the hand-worked cases the Python gate tools share
 deskd_pure_test(take)
-# ncaa: ref/ncaa, NCAA.com's scoreboards (the recorder's fixture, a loopback feed, the data guard)
+# ncaa: ref/ncaa, NCAA.com's scoreboards (the recorder's fixture, a loopback feed, the data guard), and ref/scores' merge of ESPN's and NCAA's score
 deskd_pure_test(ncaa)
 deskd_fake_test(net)
 deskd_fake_test(wire)

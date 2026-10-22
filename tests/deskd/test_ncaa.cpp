@@ -1,7 +1,9 @@
 // NCAA.com for the college game markets (ref/ncaa.h): its scoreboard file read as ESPN's games are
 // (the recorder's fixture), the team match, and the feed against a local stand-in for data.ncaa.com:
 // its pacing (a fast series hot at 3 s, else 30 s), each state's first sighting, a date without
-// games (404), a failure (503) and the data-only guard.
+// games (404), a failure (503) and the data-only guard. Then ScoreMerge (ref/scores.h): ESPN's and
+// NCAA's score for a market by tools/college_gate.py's rule (its Score self-test's cases), and the
+// store's scores row.
 #include <httplib.h>
 #include <signal.h>
 #include <atomic>
@@ -13,6 +15,7 @@
 #include "deskd/app/log.h"
 #include "deskd/build_paths.h"
 #include "deskd/ref/ncaa.h"
+#include "deskd/ref/scores.h"
 using namespace deskd;
 using json = nlohmann::json;
 namespace {
@@ -193,10 +196,134 @@ void feed() {
   srv.stop();
   th.join();
 }
+
+// One market's ESPN and NCAA rows as the boards have them
+EspnRef ref(const std::string& src, std::int64_t fetched, std::int64_t first_seen, int yes, int opp, int period = 1,
+            const std::string& state = "in") {
+  EspnRef r;
+  r.src = src;
+  r.state = state;
+  r.fetched_ms = fetched;
+  r.first_seen_ms = first_seen;
+  r.yes_score = yes;
+  r.opp_score = opp;
+  r.period = period;
+  if (src == "ESPN") {   // only ESPN reads linescores
+    r.yes_lines = {yes};
+    r.opp_lines = {opp};
+  }
+  return r;
+}
+
+// college_gate.py's Score cases (times in seconds there, ms here), and the rest of the rule
+void merge() {
+  const std::int64_t s = 1000, age = 5 * s;
+  // both fresh and agreeing: ESPN's row, the earlier first sighting, ESPN's last poll
+  auto e = ref("ESPN", 120 * s, 100 * s, 0, 0), n = ref("NCAA", 119 * s, 110 * s, 0, 0);
+  auto r = merge_score(&e, &n, 120 * s, age);
+  CHECK(r && r->src == "ESPN" && r->state == "in" && r->first_seen_ms == 100 * s && r->fetched_ms == 120 * s && r->why.empty() &&
+        r->yes_lines == std::vector<int>{0});
+  n.first_seen_ms = 90 * s;
+  CHECK(merge_score(&e, &n, 120 * s, age)->first_seen_ms == 90 * s);
+  // ESPN's last poll 10 s ago (an outage): NCAA's, fresh, is used
+  e = ref("ESPN", 200 * s, 200 * s, 10, 0);
+  n = ref("NCAA", 210 * s, 110 * s, 0, 0);
+  r = merge_score(&e, &n, 210 * s, age);
+  CHECK(r && r->src == "NCAA" && r->fetched_ms == 210 * s && r->first_seen_ms == 110 * s && r->yes_score == 0);
+  // within the max age ESPN is still fresh, and both agree (at the edge, too)
+  e = ref("ESPN", 150 * s, 100 * s, 0, 0);
+  r = merge_score(&e, &n, 152 * s, age);
+  CHECK(r && r->src == "ESPN" && r->fetched_ms == 150 * s);
+  CHECK(merge_score(&e, &n, 155 * s, age)->src == "ESPN" && merge_score(&e, &n, 155 * s + 1, age)->src == "NCAA");
+  // both fresh and different: no score, the why names both from the market's side
+  e = ref("ESPN", 205 * s, 200 * s, 10, 0);
+  n = ref("NCAA", 205 * s, 110 * s, 0, 0);
+  r = merge_score(&e, &n, 205 * s, age);
+  CHECK(r && r->state.empty() && r->src.empty() && r->first_seen_ms == 0 && r->fetched_ms == 0 &&
+        r->why == "ESPN has in 10-0 (period 1) and NCAA in 0-0 (period 1)");
+  n = ref("NCAA", 205 * s, 110 * s, 10, 2);              // the other team's score
+  CHECK(merge_score(&e, &n, 205 * s, age)->why == "ESPN has in 10-0 (period 1) and NCAA in 10-2 (period 1)");
+  n = ref("NCAA", 205 * s, 110 * s, 10, 0, 1, "post");   // the state
+  CHECK(merge_score(&e, &n, 205 * s, age)->why == "ESPN has in 10-0 (period 1) and NCAA post 10-0 (period 1)");
+  n = ref("NCAA", 205 * s, 110 * s, 10, 0, 2);           // the period, both read
+  CHECK(merge_score(&e, &n, 205 * s, age)->why == "ESPN has in 10-0 (period 1) and NCAA in 10-0 (period 2)");
+  n = ref("NCAA", 205 * s, 110 * s, 10, 0, 0);           // NCAA's "HALF": no period read, so no difference
+  CHECK(merge_score(&e, &n, 205 * s, age)->src == "ESPN");
+  e.period = 0;
+  n.period = 2;
+  CHECK(merge_score(&e, &n, 205 * s, age)->why.empty());
+  // one source, old: its row, which the age then pulls (SCORE_OLD)
+  e = ref("ESPN", 201 * s, 200 * s, 10, 0);
+  r = merge_score(&e, nullptr, 300 * s, age);
+  CHECK(r && r->fetched_ms == 201 * s && r->state == "in" && r->src == "ESPN");
+  r = merge_score(nullptr, &n, 300 * s, age);
+  CHECK(r && r->src == "NCAA");
+  // neither fresh: the fresher one's row; ESPN's on a tie
+  n = ref("NCAA", 202 * s, 150 * s, 0, 0);
+  CHECK(merge_score(&e, &n, 300 * s, age)->src == "NCAA");
+  n.fetched_ms = 201 * s;
+  CHECK(merge_score(&e, &n, 300 * s, age)->src == "ESPN");
+  CHECK(!merge_score(nullptr, nullptr, 300 * s, age));
+
+  // The merged board, from both feeds' boards: ESPN alone (another league) as it is; a college
+  // game from both; a market only NCAA shows; the sources at odds named in status
+  EspnBoard espn, ncaa;
+  espn["KXNBAGAME-26NOV05LALBOS-LAL"] = ref("ESPN", 10 * s, 1 * s, 50, 48, 3);   // old, and alone: unchanged
+  espn[SC] = ref("ESPN", 100 * s, 90 * s, 31, 34, 2);
+  ncaa[SC] = ref("NCAA", 99 * s, 80 * s, 31, 34, 2);
+  espn[UCONN] = ref("ESPN", 100 * s, 90 * s, 34, 31, 2);
+  ncaa[UCONN] = ref("NCAA", 99 * s, 80 * s, 36, 31, 2);
+  ncaa["KXNCAAWBGAME-26NOV05IOWADRAKE-IOWA"] = ref("NCAA", 99 * s, 80 * s, 0, 0, 0, "pre");
+  bool off = false;
+  ScoreMerge::Env env;
+  env.espn = [&] { return std::make_shared<const EspnBoard>(espn); };
+  env.ncaa = [&] { return off ? nullptr : std::make_shared<const EspnBoard>(ncaa); };
+  ScoreMerge sm(env);
+  CHECK(sm.board()->empty() && sm.status()["max_age_ms"] == ScoreMerge::kMaxAgeMs);
+  sm.step(100 * s);
+  auto b = sm.board();
+  CHECK(b->size() == 4);
+  CHECK(b->at("KXNBAGAME-26NOV05LALBOS-LAL").fetched_ms == 10 * s && b->at("KXNBAGAME-26NOV05LALBOS-LAL").src == "ESPN");
+  CHECK(b->at(SC).src == "ESPN" && b->at(SC).first_seen_ms == 80 * s && b->at(SC).fetched_ms == 100 * s);
+  CHECK(b->at(UCONN).state.empty() && b->at(UCONN).why == "ESPN has in 34-31 (period 2) and NCAA in 36-31 (period 2)");
+  CHECK(b->at("KXNCAAWBGAME-26NOV05IOWADRAKE-IOWA").src == "NCAA");
+  const auto st = sm.status();
+  CHECK(st["rows"]["ESPN"] == 2 && st["rows"]["NCAA"] == 1 && st["disagree"].size() == 1 && st["disagree"][UCONN] == b->at(UCONN).why);
+  off = true;   // NCAA.com off: ESPN's board as it is
+  sm.step(101 * s);
+  b = sm.board();
+  CHECK(b->size() == 3 && b->at(UCONN).src == "ESPN" && b->at(UCONN).yes_score == 34 && b->at(SC).first_seen_ms == 90 * s &&
+        sm.status()["disagree"].empty());
+}
+
+// The store's scores row for a game state: both sides' linescores, no last poll before it as null
+void rows() {
+  EspnGame g;
+  g.src = "NCAA";
+  g.league = "basketball-women/d1";
+  g.id = "6305901";
+  g.state = "in";
+  g.period = 2;
+  g.clock = "04:12";
+  g.home_abbr = "UCONN";
+  g.away_abbr = "S CAR";
+  g.home_score = 34;
+  g.away_score = 31;
+  g.first_seen_ms = 5000;
+  json row = score_row(g);
+  CHECK(row == json({{"src", "NCAA"}, {"league", "basketball-women/d1"}, {"game_id", "6305901"}, {"state", "in"}, {"period", 2},
+                     {"clock", "04:12"}, {"home", "UCONN"}, {"away", "S CAR"}, {"home_score", 34}, {"away_score", 31},
+                     {"lines", json::array({json::array(), json::array()})}, {"first_seen_ms", 5000}, {"prev_poll_ms", nullptr}}));
+  g.home_lines = {18, 16};
+  g.away_lines = {15, 16};
+  g.prev_poll_ms = 2000;
+  row = score_row(g);
+  CHECK(row["lines"] == json::parse("[[18,16],[15,16]]") && row["prev_poll_ms"] == 2000);
+}
 }  // namespace
 
 int main() {
   signal(SIGPIPE, SIG_IGN);
-  parsing(); matching(); feed();
+  parsing(); matching(); feed(); merge(); rows();
   return finish("deskd-ncaa");
 }

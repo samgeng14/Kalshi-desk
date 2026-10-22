@@ -116,6 +116,7 @@ struct EspnRef {
   // that first showed espn's play (0: no espn); fetched_ms is the last poll
   std::int64_t first_seen_ms = 0, wp_seen_ms = 0;
   std::string src = "ESPN";
+  std::string why;   // ref/scores.h's merged board: why there is no score (the state is then "")
 };
 using EspnBoard = std::map<std::string, EspnRef>;   // by market ticker
 // The contract's per and clock for a game ("PRE" with the ET start, "Q3", "OT", "FINAL").
