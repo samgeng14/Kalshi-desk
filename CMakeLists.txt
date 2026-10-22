@@ -355,6 +355,7 @@ add_library(deskd_core STATIC
   src/deskd/strat/bball_model.cpp
   src/deskd/strat/volley_model.cpp
   src/deskd/strat/game_fair.cpp
+  src/deskd/strat/take.cpp
   src/deskd/strat/markouts.cpp
   src/deskd/strat/lane_gate.cpp
   src/deskd/store/store.cpp
@@ -540,6 +541,8 @@ deskd_pure_test(bball)
 deskd_pure_test(volley)
 # game_fair: strat/game_fair, the pregame price and the in-game fair of WCBB, NBA and volleyball markets
 deskd_pure_test(game_fair)
+# take: strat/take, the IOC game lanes' one decision (C1, X1, N1, N2): each mode, every pull, and the hand-worked cases the Python gate tools share
+deskd_pure_test(take)
 deskd_fake_test(net)
 deskd_fake_test(wire)
 deskd_fake_test(md)
