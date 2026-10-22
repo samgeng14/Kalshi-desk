@@ -315,6 +315,7 @@ EspnRef espn_ref(const EspnLeague& lg, const EspnGame& g, bool yes_home, const s
   r.src = g.src;
   r.fetched_ms = g.fetched_ms;
   r.first_seen_ms = g.first_seen_ms;
+  r.prev_poll_ms = g.prev_poll_ms;
   r.score = std::to_string(g.away_score) + "-" + std::to_string(g.home_score);
   r.state = g.state;
   r.start_ms = g.start_ms;

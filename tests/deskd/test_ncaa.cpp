@@ -280,6 +280,30 @@ void merge() {
   CHECK(r && r->state == "post" && r->src == "NCAA" && r->opp_score == 61);
   e.state = "post";   // both: ESPN's
   CHECK(merge_score(&e, &n, 212 * s, age)->src == "ESPN");
+  // the state's first sighting, with the poll before it, is the earlier source's while its row
+  // shows that state, fresh or not: NCAA.com saw 40-38 at 100 s, ESPN at 101.5 s
+  e = ref("ESPN", 104 * s, 101500, 40, 38, 2);
+  e.prev_poll_ms = 98500;
+  n = ref("NCAA", 103 * s, 100 * s, 40, 38, 2);
+  n.prev_poll_ms = 97 * s;
+  r = merge_score(&e, &n, 104 * s, age);
+  CHECK(r && r->src == "ESPN" && r->first_seen_ms == 100 * s && r->prev_poll_ms == 97 * s);
+  r = merge_score(&e, &n, 108500, age);   // NCAA.com's last poll 5.5 s old: ESPN's row, NCAA's date
+  CHECK(r && r->src == "ESPN" && r->fetched_ms == 104 * s && r->first_seen_ms == 100 * s && r->prev_poll_ms == 97 * s);
+  e.fetched_ms = 98 * s;   // ESPN the stale one: NCAA's row, its own date
+  r = merge_score(&e, &n, 106 * s, age);
+  CHECK(r && r->src == "NCAA" && r->first_seen_ms == 100 * s && r->prev_poll_ms == 97 * s);
+  e = ref("ESPN", 104 * s, 99 * s, 40, 38, 0);   // a period unread is the same state
+  e.prev_poll_ms = 96 * s;
+  r = merge_score(&e, &n, 108500, age);
+  CHECK(r && r->src == "ESPN" && r->first_seen_ms == 99 * s && r->prev_poll_ms == 96 * s);
+  n.opp_score = 36;   // a stale row in another state dates nothing
+  r = merge_score(&e, &n, 108500, age);
+  CHECK(r && r->src == "ESPN" && r->first_seen_ms == 99 * s);
+  n = ref("NCAA", 103 * s, 98 * s, 40, 38, 3);
+  CHECK(merge_score(&e, &n, 108500, age)->first_seen_ms == 98 * s);
+  e.period = 2;
+  CHECK(merge_score(&e, &n, 108500, age)->first_seen_ms == 99 * s);
 
   // The merged board, from both feeds' boards: ESPN alone (another league) as it is; a college
   // game from both; a market only NCAA shows; the sources at odds named in status
@@ -312,6 +336,108 @@ void merge() {
         sm.status()["disagree"].empty());
 }
 
+// ScoreMerge keeps a score state's first sighting whichever source is fresh (the review's case):
+// NCAA.com sees UCONN's 38-40 first and goes stale, its row leaves its board and comes back, it
+// moves its own sighting at "HALF" and in a glitch; ESPN publishes a state alone and NCAA.com
+// reports late an earlier sighting of it. A new state (the 3rd quarter, the same score) is dated
+// again, a market off both boards forgotten. ESPN alone keeps ESPN's dates: another league's
+// market, and each volleyball point in ESPN's linescores, which NCAA.com's row would date by the
+// set
+void merge_dates() {
+  const std::int64_t s = 1000;
+  EspnBoard espn, ncaa;
+  ScoreMerge::Env env;
+  env.espn = [&] { return std::make_shared<const EspnBoard>(espn); };
+  env.ncaa = [&] { return std::make_shared<const EspnBoard>(ncaa); };
+  ScoreMerge sm(env);
+  auto row = [](EspnRef r, std::int64_t prev) {
+    r.prev_poll_ms = prev;
+    return r;
+  };
+  auto at = [&](std::int64_t now, const std::string& tk = SC) {
+    sm.step(now);
+    return sm.board()->at(tk);
+  };
+  ncaa[SC] = row(ref("NCAA", 100 * s, 100 * s, 38, 40, 2), 97 * s);
+  espn[SC] = row(ref("ESPN", 101500, 101500, 38, 40, 2), 98500);
+  auto r = at(102 * s);
+  CHECK(r.src == "ESPN" && r.first_seen_ms == 100 * s && r.prev_poll_ms == 97 * s);
+  // NCAA.com a poll late: ESPN alone is fresh, and the date stays (its row still shows the state)
+  espn[SC].fetched_ms = 107 * s;
+  r = at(107 * s);
+  CHECK(r.src == "ESPN" && r.first_seen_ms == 100 * s && r.prev_poll_ms == 97 * s);
+  // NCAA.com off its board (2 minutes without a poll), then back: the same
+  ncaa.erase(SC);
+  espn[SC].fetched_ms = 230 * s;
+  CHECK(at(230 * s).first_seen_ms == 100 * s);
+  ncaa[SC] = row(ref("NCAA", 233 * s, 100 * s, 38, 40, 2), 97 * s);
+  r = at(233 * s);
+  CHECK(r.src == "ESPN" && r.first_seen_ms == 100 * s && r.prev_poll_ms == 97 * s);
+  // NCAA.com's "HALF": no period, so its feed sees a new state; ESPN's halftime is period 2 still
+  ncaa[SC] = row(ref("NCAA", 236 * s, 236 * s, 38, 40, 0), 233 * s);
+  espn[SC].fetched_ms = 236 * s;
+  CHECK(at(236 * s).first_seen_ms == 100 * s);
+  ncaa[SC].fetched_ms = 242 * s;   // and ESPN stale: NCAA.com's row, the same state
+  r = at(242 * s);
+  CHECK(r.src == "NCAA" && r.period == 0 && r.first_seen_ms == 100 * s && r.prev_poll_ms == 97 * s);
+  // a glitch: NCAA.com 38-42 a moment (no score), then 38-40 again, its sighting new
+  ncaa[SC] = row(ref("NCAA", 245 * s, 245 * s, 38, 42, 0), 242 * s);
+  espn[SC].fetched_ms = 245 * s;
+  r = at(245 * s);
+  CHECK(r.state.empty() && r.first_seen_ms == 0 && !r.why.empty());
+  ncaa[SC] = row(ref("NCAA", 248 * s, 248 * s, 38, 40, 0), 245 * s);
+  espn[SC].fetched_ms = 248 * s;
+  CHECK(at(248 * s).first_seen_ms == 100 * s);
+  // the 3rd quarter at the same score is another state
+  espn[SC] = row(ref("ESPN", 260 * s, 260 * s, 38, 40, 3), 257 * s);
+  ncaa[SC] = row(ref("NCAA", 261 * s, 261 * s, 38, 40, 3), 258 * s);
+  r = at(261 * s);
+  CHECK(r.period == 3 && r.first_seen_ms == 260 * s && r.prev_poll_ms == 257 * s);
+  // ESPN shows 41-40 alone (NCAA.com stale on 38-40): ESPN's date. NCAA.com then reports 41-40
+  // first seen before it, from a poll that took long: the published date stays
+  espn[SC] = row(ref("ESPN", 270 * s, 270 * s, 41, 40, 3), 267 * s);
+  r = at(270 * s);
+  CHECK(r.yes_score == 41 && r.first_seen_ms == 270 * s && r.prev_poll_ms == 267 * s);
+  ncaa[SC] = row(ref("NCAA", 269 * s, 269 * s, 41, 40, 3), 261 * s);
+  r = at(271 * s);
+  CHECK(r.src == "ESPN" && r.first_seen_ms == 270 * s && r.prev_poll_ms == 267 * s);
+  // off both boards: forgotten, so the state seen again is dated anew
+  espn.erase(SC);
+  ncaa.erase(SC);
+  sm.step(400 * s);
+  CHECK(!sm.board()->count(SC));
+  espn[SC] = row(ref("ESPN", 401 * s, 401 * s, 41, 40, 3), 0);
+  CHECK(at(401 * s).first_seen_ms == 401 * s);
+
+  // another league, ESPN alone: its own date, whatever came before
+  const std::string NBA = "KXNBAGAME-26NOV05LALBOS-LAL";
+  espn[NBA] = row(ref("ESPN", 500 * s, 490 * s, 50, 48, 3), 487 * s);
+  CHECK(at(500 * s, NBA).first_seen_ms == 490 * s);
+  espn[NBA] = row(ref("ESPN", 503 * s, 503 * s, 50, 48, 3), 500 * s);
+  CHECK(at(503 * s, NBA).first_seen_ms == 503 * s);
+  // volleyball: ESPN alone, each point (linescores) its own date
+  const std::string VB = "KXNCAAWVMATCH-26NOV05UCLAUSC-UCLA";
+  auto point = [&](std::int64_t t, int pts) {
+    EspnRef v = row(ref("ESPN", t, t, 1, 0, 2), t - 3 * s);
+    v.yes_lines = {25, pts};
+    v.opp_lines = {20, 5};
+    return v;
+  };
+  espn[VB] = point(600 * s, 3);
+  CHECK(at(600 * s, VB).first_seen_ms == 600 * s);
+  espn[VB] = point(603 * s, 4);
+  CHECK(at(603 * s, VB).first_seen_ms == 603 * s);
+  // ...and with NCAA.com's row (sets, no points), the set's first sighting, as both fresh have it
+  ncaa[VB] = row(ref("NCAA", 604 * s, 590 * s, 1, 0, 2), 587 * s);
+  espn[VB] = point(606 * s, 5);
+  CHECK(at(606 * s, VB).first_seen_ms == 590 * s);
+  espn[VB] = point(609 * s, 6);
+  ncaa[VB].fetched_ms = 607 * s;
+  CHECK(at(609 * s, VB).first_seen_ms == 590 * s);
+  ncaa[VB].fetched_ms = 603 * s;   // NCAA.com stale: the same
+  CHECK(at(609 * s, VB).first_seen_ms == 590 * s);
+}
+
 // The store's scores row for a game state: both sides' linescores, no last poll before it as null
 void rows() {
   EspnGame g;
@@ -340,6 +466,6 @@ void rows() {
 
 int main() {
   signal(SIGPIPE, SIG_IGN);
-  parsing(); matching(); feed(); merge(); rows();
+  parsing(); matching(); feed(); merge(); merge_dates(); rows();
   return finish("deskd-ncaa");
 }

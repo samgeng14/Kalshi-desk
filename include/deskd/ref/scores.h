@@ -12,15 +12,27 @@
 //   fresh     a source whose last poll (fetched_ms) is at most max_age_ms old
 //   both      fresh: they must agree on the state, the scores (from the market's YES team's side)
 //             and the period when both read one (0 is unread: NCAA.com's "HALF" or "OT"). Then
-//             ESPN's row, which alone has linescores and a win probability, with the earlier of
-//             the two first sightings (ESPN's last poll stays its age). When they differ there
-//             is no score: a row with an empty state and a why naming both ("ESPN has in 10-0
-//             (period 1) and NCAA in 0-0 (period 1)"), so the lanes pull NO_SCORE and the fair
-//             says why
+//             ESPN's row, which alone has linescores and a win probability (ESPN's last poll
+//             stays its age). When they differ there is no score: a row with an empty state and a
+//             why naming both ("ESPN has in 10-0 (period 1) and NCAA in 0-0 (period 1)"), so the
+//             lanes pull NO_SCORE and the fair says why
 //   one       fresh: its row
 //   neither   fresh: the fresher one's row (ESPN's on a tie), which the lanes' score age pulls
-// A market neither shows has no row. ESPN alone (NCAA.com off, or a series it has no scoreboard
-// for) is ESPN's board unchanged.
+// The row's state is dated by the earlier of the two sources' first sightings (first_seen_ms,
+// with the poll before it, prev_poll_ms) when the other source's row, fresh or not, shows the
+// same state: a source a moment past the max age still dates the state it saw first. A market
+// neither shows has no row. ESPN alone (NCAA.com off, or a series it has no scoreboard for) is
+// ESPN's board unchanged.
+//
+// ScoreMerge then keeps each date, for a market NCAA.com covers: while the market's state is the
+// one it last published (the state and scores, and the period and linescores where both that and
+// the new row read them), the row carries the first sighting it was first published with,
+// whichever source is fresh, and through a disagreement; another state starts again from its
+// row; a market off both boards is forgotten. A source going stale and coming back, reporting
+// late a sighting earlier than the one published, or moving its own sighting with no new score
+// (NCAA.com's "2nd" to "HALF", or a glitch and back) never moves it. So a lane's signal run
+// (strat/take.h), keyed on it, is one a score state, and stale_only dates the state as the lane
+// first read it.
 //
 // Threading: step() runs on strat; board() and status() are read from any thread.
 #include <cstdint>
@@ -30,6 +42,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include <nlohmann/json.hpp>
 #include "deskd/ref/espn.h"
@@ -62,6 +75,16 @@ class ScoreMerge {
   std::shared_ptr<const EspnBoard> board_;
   std::map<std::string, int> rows_;              // by source
   std::map<std::string, std::string> disagree_;  // market -> why
+  // A market's score state as last published, with the first sighting (and the poll before it)
+  // it was first published with; a period of 0 or no linescores: none read yet. step()'s only.
+  struct Held {
+    std::string state;
+    int yes = 0, opp = 0, period = 0;
+    std::vector<int> yes_lines, opp_lines;
+    std::int64_t first_seen_ms = 0, prev_poll_ms = 0;
+  };
+  std::map<std::string, Held> held_;             // by market
+  void keep_first(const std::string& tk, EspnRef* r);
 };
 
 }  // namespace deskd

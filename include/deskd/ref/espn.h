@@ -112,9 +112,10 @@ struct EspnRef {
   std::vector<int> yes_lines, opp_lines;
   int possession = 0;
   std::optional<Px> sb_wp;
-  // our own clock: the poll that first showed this state (EspnGame::first_seen_ms) and the one
-  // that first showed espn's play (0: no espn); fetched_ms is the last poll
-  std::int64_t first_seen_ms = 0, wp_seen_ms = 0;
+  // our own clock: the poll that first showed this state (EspnGame::first_seen_ms), the last poll
+  // before it (EspnGame::prev_poll_ms; 0: none, the feed had only begun to read the game) and the
+  // poll that first showed espn's play (0: no espn); fetched_ms is the last poll
+  std::int64_t first_seen_ms = 0, prev_poll_ms = 0, wp_seen_ms = 0;
   std::string src = "ESPN";
   std::string why;   // ref/scores.h's merged board: why there is no score (the state is then "")
 };

@@ -240,10 +240,11 @@ Qty clip_count(Money clip, Px px, double fee_mult, Qty max_count, bool whole_onl
 // or under -mo_floor). The game then waits for gw's answer (answer_ms at most) and, after a
 // refusal, backs off backoff_ms.
 //
-// A signal run (take_decide's fired): each new score state (the board's first sighting) starts a
-// game's run, and a decision that finds no edge run_quiet_ms after the last that found one ends
-// it; a game check that hides the edge (the cool-down, an old score, no score at all: none, or
-// the sources at odds) neither ends nor extends it.
+// A signal run (take_decide's fired): each new score state (the board's first sighting, which
+// ScoreMerge keeps while the state lasts, whichever source is fresh) starts a game's run, and a
+// decision that finds no edge run_quiet_ms after the last that found one ends it; a game check
+// that hides the edge (the cool-down, an old score, no score at all: none, or the sources at
+// odds) neither ends nor extends it.
 // In a run each team is taken, or recorded, once.
 //
 // Signals go to the store's "signals" table, a row per team and signal (store/store.h):

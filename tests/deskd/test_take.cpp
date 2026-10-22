@@ -25,6 +25,7 @@
 #include "deskd/build_paths.h"
 #include "deskd/gw/fees.h"
 #include "deskd/gw/sys_book.h"
+#include "deskd/ref/scores.h"
 #include "deskd/rest/state.h"
 #include "deskd/strat/take.h"
 
@@ -714,6 +715,89 @@ void engine_scores() {
   CHECK(g.places().size() == 1 && game_status(e)["pull"] == "FIRED" && game_status(e)["dir"] == "A");
 }
 
+// The merged board (ref/scores.h) between ESPN's and NCAA.com's: NCAA.com sees A's team go up
+// 60-48 first, ESPN 1.5 s later, and C1 takes A's team. NCAA.com then misses polls past the max
+// age, comes back, and leaves its board: the state's first sighting stays NCAA.com's, so the run is
+// the same and A's team, FIRED, is not taken again past the cool-down. Then ESPN calls the game
+// final and slows down while NCAA.com, lagging in play, is fresh with A's team ahead and the edge:
+// the game is final, nothing is taken
+void engine_merged() {
+  Rig g;
+  EspnBoard espn, ncaa;
+  ScoreMerge::Env se;
+  se.espn = [&] { return std::make_shared<const EspnBoard>(espn); };
+  se.ncaa = [&] { return std::make_shared<const EspnBoard>(ncaa); };
+  ScoreMerge sm(se);
+  TakeEngine::Env env = g.env();
+  env.scores = [&] { return sm.board(); };
+  TakeEngine e("C1", {"KXNCAAWBGAME"}, env, take_params(TakeMode::COLLEGE));
+  // a source's rows for the game, from each team's side
+  auto rows = [&](EspnBoard& b, const std::string& src, std::int64_t fetched, std::int64_t first, std::int64_t prev, int sa,
+                  int sb, const std::string& state = "in") {
+    for (const auto& tk : {TA, TB}) {
+      EspnRef r;
+      r.src = src;
+      r.state = state;
+      r.fetched_ms = fetched;
+      r.first_seen_ms = first;
+      r.prev_poll_ms = prev;
+      r.start_ms = T0 - 3600000;
+      r.yes_score = tk == TA ? sa : sb;
+      r.opp_score = tk == TA ? sb : sa;
+      r.period = 2;
+      r.clock_s = 300;
+      r.yes_home = tk == TA;
+      b[tk] = r;
+    }
+  };
+  // the merge, GameFair priced on its rows (A's p), then the engine: strat's order
+  auto step = [&](std::int64_t now, double p) {
+    sm.step(now);
+    for (const auto& tk : {TA, TB}) {
+      const EspnRef& r = sm.board()->at(tk);
+      GameFairRow& f = g.fairs[tk];
+      f.event = EV;
+      f.model = "wcbb_logit";
+      f.p0 = tk == TA ? 0.55 : 0.45;
+      f.p = tk == TA ? p : 1 - p;
+      f.state = r.state;
+      f.src = r.src;
+      f.first_seen_ms = r.first_seen_ms;
+      f.fetched_ms = r.fetched_ms;
+    }
+    e.step(now);
+  };
+  rows(espn, "ESPN", T0 - 1000, T0 - 60000, T0 - 63000, 58, 48);
+  rows(ncaa, "NCAA", T0 - 2000, T0 - 61000, T0 - 64000, 58, 48);
+  step(T0, 0.50);   // the touches dated
+  CHECK(g.posted.empty() && game_status(e)["pull"] == "NO_EDGE");
+  rows(ncaa, "NCAA", T0 + 3000, T0 + 3000, T0, 60, 48);
+  rows(espn, "ESPN", T0 + 4500, T0 + 4500, T0 + 1500, 60, 48);
+  step(T0 + 4600, 0.70);
+  CHECK(g.places().size() == 1 && sm.board()->at(TA).first_seen_ms == T0 + 3000);
+  if (g.places().size() != 1) return;
+  g.answer(0, OrderReply{});
+  // NCAA.com's polls are late: ESPN's row alone is fresh, past the cool-down
+  for (std::int64_t t = T0 + 8100; t <= T0 + 11000; t += 250) {
+    rows(espn, "ESPN", t, T0 + 4500, T0 + 1500, 60, 48);
+    step(t, 0.70);
+  }
+  CHECK(g.places().size() == 1 && sm.board()->at(TA).src == "ESPN" && sm.board()->at(TA).first_seen_ms == T0 + 3000 &&
+        game_status(e)["pull"] == "FIRED" && game_status(e)["dir"] == "A");
+  rows(ncaa, "NCAA", T0 + 11500, T0 + 3000, T0, 60, 48);   // back
+  step(T0 + 11600, 0.70);
+  CHECK(g.places().size() == 1 && game_status(e)["pull"] == "FIRED");
+  ncaa.clear();   // off its board
+  rows(espn, "ESPN", T0 + 140000, T0 + 4500, T0 + 1500, 60, 48);
+  step(T0 + 140000, 0.70);
+  CHECK(g.places().size() == 1 && game_status(e)["pull"] == "FIRED" && sm.board()->at(TA).first_seen_ms == T0 + 3000);
+  // ESPN: 60-61 final, then 20 s scoreboards; NCAA.com fresh on 60-59, a state it saw after the touch
+  rows(espn, "ESPN", T0 + 150000, T0 + 150000, T0 + 147000, 60, 61, "post");
+  rows(ncaa, "NCAA", T0 + 158000, T0 + 149000, T0 + 146000, 60, 59);
+  step(T0 + 158000, 0.95);
+  CHECK(g.places().size() == 1 && game_status(e)["pull"] == "FINAL" && g.wanted.empty());
+}
+
 // gw's refusal: the row says so and the game backs off 10 s; an inbox that is full is one too; an
 // answer that never comes is waited for 30 s
 void engine_refused() {
@@ -1183,6 +1267,7 @@ int main() {
   engine_takes();
   engine_runs();
   engine_scores();
+  engine_merged();
   engine_refused();
   engine_blocked();
   engine_pulls();
