@@ -15,13 +15,23 @@ the payouts). Then each lane's rule over all its fills so far:
       otherwise                                           HOLD
   BAND (M2), after 100 fills (5(b)): PAUSE below -1c a contract.
   X1 and C1, after 100 trades (5(c), 5(e)): RETIRE unless the net 60 s markout is positive.
+  N1, as C1 (nba.json): after 100 trades RETIRE unless the net 60 s markout is positive; and at any
+  count once its life is down $20.
+  N2, the pregame favourites' forward test (decisions 2: 5 contracts held to settlement, 60
+  trades or -$15): WAIT under 60 trades, or while a position of its is still to settle; then HOLD
+  if its settlement P&L is positive, else RETIRE; and at any count once it is down $15.
+
+N1's and N2's dollars, and N2's trades, are gw's own count of each lane's life: the desk's saved
+Systematic book, systematic.json beside ops.sqlite (--book; gw/sys_book.h: trades are orders with
+a fill, P&L is realized less fees, settlements included), since ops.sqlite keeps no settlements.
+gw retires each lane on its own rule; a lane-reset clears that life, and so this count.
 
 The verdict is advice: sizes and lanes are the operator's to change. Read-only.
 
 Usage:
   python3 tools/scorecard.py                 the paper desk's ops.sqlite, the last 7 days
   python3 tools/scorecard.py live --days 1   the live desk's
-  python3 tools/scorecard.py --db PATH --json
+  python3 tools/scorecard.py --db PATH [--book PATH] --json
   python3 tools/scorecard.py --self-test
 """
 import argparse
@@ -48,6 +58,7 @@ DESK_DB = {'paper': os.path.join(DATA, 'demo', 'ops.sqlite'), 'live': os.path.jo
 
 Z80 = 0.8416   # one-sided 80%: mean - Z80 * sd / sqrt(n)
 LIP_LANES = ('M1', 'P1')
+N1_LOSS, N2_LOSS, N2_TRADES = 20.0, 15.0, 60   # gw's default_lanes: N1 retired once down $20, N2 after 60 trades or $15
 
 
 def et_day(ms):
@@ -70,6 +81,27 @@ def load(db, since_ms):
         "SELECT tk, start_ms, mean_share, est, scored_s, quoted_s FROM lip_windows ORDER BY start_ms")]
     con.close()
     return [f for f in fills if (f['ts_ms'] or 0) >= since_ms], fills, windows
+
+
+def load_book(path):
+    """Each lane's life in deskd's saved Systematic book (gw/sys_book.h to_json, v 1): {'lives':
+    {lane: trades, pnl in dollars (realized less fees), retired, why}, 'open': {lane: contracts
+    held}}; None when there is no such file or it is not one."""
+    try:
+        with open(path) as fh:
+            j = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(j, dict) or j.get('v') != 1:
+        return None
+    lives = {}
+    for lane, x in (j.get('life') or {}).items():
+        lives[lane] = {'trades': int(x.get('trades', 0)), 'pnl': (x.get('real', 0) - x.get('fees', 0)) / 1e6,
+                       'retired': bool(x.get('retired')), 'why': x.get('retired_why', '')}
+    held = {}
+    for lane, d in (j.get('lanes') or {}).items():   # each open position: [contracts x 100, its cost]
+        held[lane] = sum(abs(v[0]) for v in (d.get('inv') or {}).values()) / 100
+    return {'lives': lives, 'open': held}
 
 
 def mean(xs):
@@ -102,8 +134,9 @@ def days(fills, windows):
     return rows
 
 
-def rule(lane, fills, windows):
-    """The plan's rule for one lane over all its fills: (verdict, why, numbers)."""
+def rule(lane, fills, windows, book=None):
+    """The plan's rule for one lane over all its fills (N1's and N2's dollars from book, load_book's):
+    (verdict, why, numbers)."""
     mine = [f for f in fills if f['lane'] == lane and f['mo'].get('60s') is not None]
     n = len(mine)
     ctrs = sum(f['qty'] or 0 for f in mine)
@@ -135,7 +168,26 @@ def rule(lane, fills, windows):
             return 'WAIT', '%d of 100 fills' % n, nums
         return ('PAUSE', '60 s markout %.2fc a contract, under -1c' % (m * 100), nums) if m < -0.01 else \
                ('HOLD', '60 s markout %.2fc a contract' % (m * 100), nums)
-    if lane in ('X1', 'C1'):
+    life = book['lives'].get(lane) if book else None
+    if lane == 'N2':
+        if book is None:
+            return 'WAIT', 'no Systematic book (systematic.json, --book): its trades and settlements are there', nums
+        trades, pnl = (life['trades'], life['pnl']) if life else (0, 0.0)
+        held = book['open'].get(lane, 0.0)
+        nums.update({'trades': trades, 'settled_pnl': pnl, 'unsettled': held})
+        if pnl <= -N2_LOSS:
+            return 'RETIRE', 'down $%.2f, its $%.0f stop' % (-pnl, N2_LOSS), nums
+        if trades < N2_TRADES:
+            return 'WAIT', '%d of %d trades' % (trades, N2_TRADES), nums
+        if held:
+            return 'WAIT', '%d trades, %g contracts still to settle' % (trades, held), nums
+        return ('HOLD', 'settlement P&L %s over %d trades' % (usd(pnl), trades), nums) if pnl > 0 else \
+               ('RETIRE', 'settlement P&L %s over %d trades, not positive' % (usd(pnl), trades), nums)
+    if lane in ('X1', 'C1', 'N1'):
+        if lane == 'N1' and life:
+            nums['life_pnl'] = life['pnl']
+            if life['pnl'] <= -N1_LOSS:
+                return 'RETIRE', 'down $%.2f over its life, past $%.0f' % (-life['pnl'], N1_LOSS), nums
         if n < 100:
             return 'WAIT', '%d of 100 trades' % n, nums
         fees = sum(f['fee'] or 0 for f in mine) / ctrs if ctrs else 0.0
@@ -149,17 +201,29 @@ def cents(x):
     return '-' if x is None else '%+.2fc' % (x * 100)
 
 
-def report(db, days_back, as_json, now_ms=None):
+def usd(x):
+    return ('-$%.2f' if x < 0 else '$%.2f') % abs(x)
+
+
+def book_path(db):
+    """The desk's saved Systematic book: systematic.json in ops.sqlite's data dir."""
+    return os.path.join(os.path.dirname(os.path.abspath(db)), 'systematic.json')
+
+
+def report(db, days_back, as_json, now_ms=None, book=None):
     now_ms = now_ms or int(datetime.datetime.now(datetime.timezone.utc).timestamp() * 1000)
     since = now_ms - days_back * 86400000
     recent, every, windows = load(db, since)
     rows = days(recent, [w for w in windows if (w['start_ms'] or 0) >= since])
-    lanes = sorted({f['lane'] for f in every})
-    rules = {lane: dict(zip(('verdict', 'why', 'numbers'), rule(lane, every, windows))) for lane in lanes}
+    book = book or book_path(db)
+    lives = load_book(book)
+    lanes = sorted({f['lane'] for f in every} | set(lives['lives'] if lives else ()))
+    rules = {lane: dict(zip(('verdict', 'why', 'numbers'), rule(lane, every, windows, lives))) for lane in lanes}
     if as_json:
-        print(json.dumps({'db': db, 'days': rows, 'rules': rules}, indent=1, default=str))
+        print(json.dumps({'db': db, 'book': book if lives else None, 'days': rows, 'rules': rules}, indent=1, default=str))
         return rows, rules
     print('scorecard: %s, the last %g day(s)%s' % (db, days_back, '' if ET else ' (UTC days: no tz database)'))
+    print('lanes\' lives: %s' % (book if lives else 'none (no Systematic book at %s)' % book))
     print('%-10s %-4s %6s %8s %8s %8s %8s %8s %9s %9s' % ('day', 'lane', 'fills', 'ctrs', 'fees', 'mo1', 'mo10', 'mo60', 'mo60 $', 'LIP est'))
     for r in rows:
         print('%-10s %-4s %6d %8.2f %8.4f %8s %8s %8s %9.4f %9s' % (
@@ -229,6 +293,55 @@ CREATE TABLE lip_windows(tk TEXT NOT NULL, start_ms INTEGER NOT NULL, end_ms INT
     con.close()
     _, rules = report(db, 1, True, now)
     check(rules['M1']['verdict'] == 'RETIRE', 'M1 retires on a share under 5% in over half the windows')
+
+    # N1 and N2, with the desk's Systematic book beside ops.sqlite (gw/sys_book.h to_json: dollars
+    # in micro-dollars, positions in hundredths of a contract)
+    def n1_fills(k, first):
+        con = sqlite3.connect(db)
+        for i in range(first, first + k):   # 2 contracts each, a 2c fee: 1c a contract
+            fid = 'n1-%d' % i
+            con.execute("INSERT INTO fills VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (fid, 'SN1-%d' % i, 'o', 'KXNBAGAME-X', 'BUY', 2, 0.5, 0.02, 1, now - i * 60000, 0, 0, 'SYS', 'N1', '{}'))
+            con.execute("INSERT INTO markouts VALUES(?,?,?,?,?)", (fid, '60s', 0.005, 0.5, '{}'))
+        con.commit()
+        con.close()
+
+    def book(life, inv=None):
+        with open(book_path(db), 'w') as fh:
+            json.dump({'v': 1, 'saved_ms': now, 'day_start_ms': now, 'trades': [],
+                       'lanes': {lane: {'inv': x} for lane, x in (inv or {}).items()},
+                       'life': {lane: {'trades': t, 'real': int(real * 1e6), 'fees': int(fees * 1e6), 'retired': False,
+                                       'retired_ms': 0, 'retired_why': ''} for lane, (t, real, fees) in life.items()},
+                       'halt': None}, fh)
+    n1_fills(40, 0)
+    _, rules = report(db, 1, False, now)
+    check(rules['N1']['verdict'] == 'WAIT' and rules['N1']['why'] == '40 of 100 trades', 'N1 waits for 100 trades')
+    check('N2' not in rules, 'no N2 without fills or a book')
+    book({'N1': (40, -20.5, 0.8)})
+    _, rules = report(db, 1, False, now)
+    check(rules['N1']['verdict'] == 'RETIRE' and rules['N1']['why'] == 'down $21.30 over its life, past $20',
+          'N1 retires down $20 at any count (the book: realized less fees)')
+    book({'N1': (110, 1.0, 2.2)})
+    n1_fills(70, 40)   # 110 trades: gross +0.5c, the fee 1c a contract
+    _, rules = report(db, 1, False, now)
+    check(rules['N1']['verdict'] == 'RETIRE' and rules['N1']['why'] == 'net 60 s markout -0.50c, not positive',
+          'N1 retires after 100 trades on a net 60 s markout not positive')
+    # N2: 5 contracts of a 0.92 favourite a trade, held to settlement
+    tk = 'KXNBAGAME-26OCT22LALBOS-BOS'
+    for life, inv, want, why, what in (
+            ((40, 2.0, 0.12), None, 'WAIT', '40 of 60 trades', 'N2 waits under 60 trades'),
+            ((60, 1.6, 1.5), {tk: [500, 4600000]}, 'WAIT', '60 trades, 5 contracts still to settle',
+             'N2 waits while a position is still to settle'),
+            ((60, 4.4, 1.6), None, 'HOLD', 'settlement P&L $2.80 over 60 trades', 'N2 holds on a positive settlement P&L'),
+            ((61, -2.4, 1.6), None, 'RETIRE', 'settlement P&L -$4.00 over 61 trades, not positive',
+             'N2 retires on a negative settlement P&L'),
+            ((22, -14.6, 0.5), None, 'RETIRE', 'down $15.10, its $15 stop', 'N2 retires down $15 at any count')):
+        book({'N2': life}, {'N2': inv} if inv else None)
+        _, rules = report(db, 1, False, now)
+        check(rules['N2']['verdict'] == want and rules['N2']['why'] == why, what)
+    os.remove(book_path(db))
+    _, rules = report(db, 1, False, now)
+    check(rules['N1']['verdict'] == 'RETIRE' and 'N2' not in rules, 'no book: N1 on its markouts alone')
     print('self-test: ' + ('OK' if ok else 'FAILED'))
     return 0 if ok else 1
 
@@ -237,6 +350,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     ap.add_argument('desk', nargs='?', choices=('paper', 'live'), default='paper')
     ap.add_argument('--db', help='an ops.sqlite path (default: the desk\'s)')
+    ap.add_argument('--book', help='the desk\'s systematic.json (default: beside the ops.sqlite)')
     ap.add_argument('--days', type=float, default=7.0)
     ap.add_argument('--json', action='store_true')
     ap.add_argument('--self-test', action='store_true')
@@ -247,7 +361,7 @@ def main():
     if not os.path.exists(db):
         print('scorecard: no %s (has this desk run with its store on?)' % db, file=sys.stderr)
         return 2
-    report(db, a.days, a.json)
+    report(db, a.days, a.json, book=a.book)
     return 0
 
 
