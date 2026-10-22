@@ -15,7 +15,8 @@
 //     with no signal and nothing sent after the re-arm and Start
 //   - the game cap in gw (N1's event cap, $10): an order past it is refused SYS_CEILING
 // and N2 NBA FAV 90-95 (decisions 2), with no NBA model:
-//   - no gate file: LaneSet refused naming it; a gate whose band is not what N2 trades says so
+//   - no gate file: LaneSet refused naming it; a gate whose band or count is not what N2 trades
+//     says so
 //   - tools/nba_gate.py's own gate (tests/deskd/fixtures/n2_gate.json) at stage shadow: the 0.92
 //     favourite half an hour before the start is a SHADOW row of 5 contracts, never an order, and
 //     no NBA scoreboard is read hot for it
@@ -379,6 +380,13 @@ void n2() {
     r.restart();
     CHECK(refused("N2", "lane N2 is gated: " + path + ": the gate's params.fav_hi 0.96 is not what N2 trades (0.9500)"));
     CHECK(n2_status()["gate"]["stage"] == "live" && n2_status()["rule"].is_null() && n2_status()["engine"].is_null());
+    {   // and a count it did not measure, to the hundredth of a contract
+      json g = measured;
+      g["params"]["count"] = 5.4;
+      std::ofstream(path) << g.dump();
+    }
+    r.restart();
+    CHECK(refused("N2", "lane N2 is gated: " + path + ": the gate's params.count 5.4 is not what N2 trades (5 contracts)"));
     // ---- at stage shadow: the favourite in its window is recorded, never sent
     {
       json g = measured;

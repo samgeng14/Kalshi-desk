@@ -282,16 +282,15 @@ std::optional<TakeParams> nba_rule(const LaneGate& g, const LaneSpec& lane, std:
   if (lane.id == "N2") {
     TakeParams p = take_params(TakeMode::FAV_PREGAME);
     p.inventory = lane.inventory;
-    // load_lane_gate refuses a gate without these
-    const std::pair<const char*, std::int64_t> measured[] = {
-        {"count", p.fixed_count / kOneContract}, {"fav_lo", p.fav_lo}, {"fav_hi", p.fav_hi}};
+    // load_lane_gate refuses a gate without these: the count in contracts (to the hundredth, as
+    // Qty), the band in dollars (to the 1/10,000, as Px)
+    const std::pair<const char*, std::int64_t> measured[] = {{"count", p.fixed_count}, {"fav_lo", p.fav_lo}, {"fav_hi", p.fav_hi}};
     for (const auto& [key, trades] : measured) {
       const json& v = g.params.at(key);
       const bool count = std::string(key) == "count";
-      const double scale = count ? 1.0 : 10000.0;
-      if (!v.is_number() || std::llround(v.get<double>() * scale) != trades) {
+      if (!v.is_number() || std::llround(v.get<double>() * (count ? kOneContract : kOneDollar)) != trades) {
         *why = "the gate's params." + std::string(key) + " " + v.dump() + " is not what N2 trades (" +
-               (count ? std::to_string(trades) + " contracts" : price_str(static_cast<Px>(trades))) + ")";
+               (count ? std::to_string(trades / kOneContract) + " contracts" : price_str(static_cast<Px>(trades))) + ")";
         return std::nullopt;
       }
     }
