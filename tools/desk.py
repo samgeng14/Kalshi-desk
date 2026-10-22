@@ -5,7 +5,7 @@
     python3 tools/desk.py setup live             # once, for LIVE (key ~/.kalshi/prod.json, or --key FILE)
     python3 tools/desk.py                        # the desk: PAPER, and LIVE too after you type LIVE
     python3 tools/desk.py paper | live           # one of them alone
-    python3 tools/desk.py sim [--minutes N]      # the fake exchange, no network, no key (sim --help)
+    python3 tools/desk.py sim [--nba]            # the fake exchange, no network, no key (sim --help)
     python3 tools/desk.py status                 # both, through deskctl
     python3 tools/desk.py report [paper|live]    # what went wrong: status, KILLs, refusals, the log's tail
     python3 tools/desk.py kill paper|live        # KILL, as the screen's button

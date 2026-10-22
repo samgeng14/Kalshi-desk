@@ -563,7 +563,7 @@ deskd_fake_test(manual_gw)
 deskd_fake_test(runtime_manual)
 # runtime_college: C1 in the whole process (its gate, one take in its group, KILL, its game cap, retirement across a restart)
 deskd_fake_test(runtime_college)
-# runtime_nba: X1 and N1 in the whole process (their gates, one N1 take in its group, X1 in shadow, Stop, KILL, ESPN silent, the game cap)
+# runtime_nba: X1, N1 and N2 in the whole process (their gates, one N1 take in its group, X1 in shadow, Stop, KILL, ESPN silent, the game cap; N2's pregame favourite)
 deskd_fake_test(runtime_nba)
 deskd_fake_test(pyth)
 # fees: gw/fees.h against the fake's model_fee and charge_fee, at the fake's own balance precision
@@ -583,6 +583,13 @@ if(DESKD_TSAN)
   set_tests_properties(deskd-soak PROPERTIES ENVIRONMENT "TSAN_OPTIONS=suppressions=${CMAKE_SOURCE_DIR}/tests/deskd/tsan.supp")
 endif()
 set_tests_properties(deskd-soak PROPERTIES TIMEOUT 300)
+# The sandbox's NBA game (tools/deskd_sim.py --nba --check): fake-kalshi, deskd --sim reading a
+# loopback stand-in for ESPN (--espn-url), X1, N1 and N2 on the sim's own gates, each recording the
+# game in shadow and sending nothing. The built binaries; about 25 s.
+if(PYTHON3_EXE)
+  add_test(NAME deskd-sim-nba COMMAND ${PYTHON3_EXE} ${CMAKE_SOURCE_DIR}/tools/deskd_sim.py --check --build ${CMAKE_BINARY_DIR})
+  set_tests_properties(deskd-sim-nba PROPERTIES TIMEOUT 300)
+endif()
 
 # tools/kalshi_demo_probe: signed reads (and, asked for, one tiny post-only order and its cancel)
 # against Kalshi's DEMO exchange through deskd's own net/ and signer, with latency figures. Not a
