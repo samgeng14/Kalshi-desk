@@ -1607,17 +1607,21 @@ void Gateway::sys_tick(std::int64_t now) {
   }
   // A lane whose retire rule fires (gw/sys_book.h; plan 5(d) and 5(e)'s kill rules) is retired
   // and off, its working orders cancelled (why RETIRED), and saved at once: it stays off across
-  // restarts until deskctl lane-reset (decisions 9). Checked whether or not Systematic runs.
-  for (const auto& l : sys_->lanes()) {
-    const auto why = sys_->retire_due(l, mk);
-    if (why.empty() || !sys_->retire(l.id, now, why)) continue;
-    const auto id = l.id;
-    const int n = cancel_sys([&id](const std::string& lane) { return lane == id; }, "RETIRED");
-    DLOG_WARN("lane %s retired: %s; %d working order(s) cancelled", id.c_str(), why.c_str(), n);
-    if (path_->alert) path_->alert("CRIT", id, "lane " + id + " retired: " + why + "; off until deskctl lane-reset " + id);
-    lanes_dirty_.insert(id);
-    sys_dirty_ = true;
-    save_sys();
+  // restarts until deskctl lane-reset (decisions 9). Checked whether or not Systematic runs, once
+  // the first account read has rebuilt the day (the fills the saved book missed, the held markets
+  // that settled since).
+  if (sys_rebuilt_) {
+    for (const auto& l : sys_->lanes()) {
+      const auto why = sys_->retire_due(l, mk);
+      if (why.empty() || !sys_->retire(l.id, now, why)) continue;
+      const auto id = l.id;
+      const int n = cancel_sys([&id](const std::string& lane) { return lane == id; }, "RETIRED");
+      DLOG_WARN("lane %s retired: %s; %d working order(s) cancelled", id.c_str(), why.c_str(), n);
+      if (path_->alert) path_->alert("CRIT", id, "lane " + id + " retired: " + why + "; off until deskctl lane-reset " + id);
+      lanes_dirty_.insert(id);
+      sys_dirty_ = true;
+      save_sys();
+    }
   }
   // Order groups: one per lane and shard, created one at a time while Systematic can write;
   // triggered ones are reset once nothing runs (after a Stop or HALT; KILL's at its re-arm).

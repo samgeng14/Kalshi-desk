@@ -197,13 +197,15 @@ Qty SysBook::position(const std::string& lane, const std::string& ticker) const 
   return it == d->inv.end() ? 0 : it->second.pos;
 }
 
-Micros SysBook::unrealized(const std::string& lane, const MarkFn& mark) const {
+Micros SysBook::unrealized(const std::string& lane, const MarkFn& mark, int* unmarked) const {
+  if (unmarked) *unmarked = 0;
   const auto* d = day(lane);
   if (!d) return 0;
   Micros u = 0;
   for (const auto& [tk, inv] : d->inv) {
     if (!inv.pos) continue;
     const auto m = mark ? mark(tk) : std::nullopt;
+    if (!m && unmarked) ++*unmarked;
     // never priced: counted as worthless (a long loses its cost, a short pays $1 a contract)
     const Micros value = (m ? *m : (inv.pos > 0 ? 0 : kOneDollar)) * std::abs(inv.pos);
     u += inv.pos > 0 ? value - inv.cost : inv.cost - value;
@@ -287,10 +289,14 @@ bool SysBook::markout(const std::string& lane, const std::string& fid, const std
 std::string SysBook::retire_due(const LaneSpec& l, const MarkFn& mark) const {
   const auto* f = life(l.id);
   if (f && f->retired) return "";
-  // the loss rule, at any count: realized less fees over its life, its open positions at the mark
+  // the loss rule, at any count: realized less fees over its life, its open positions at the mark.
+  // A retirement lasts, so unlike the daily stop it never counts a position with no mark as
+  // worthless: it waits (after a restart md has no book yet and gw's last mids are gone; a closed
+  // market has none until it settles)
   if (l.retire_loss > 0) {
-    const Micros pnl = (f ? f->real - f->fees : 0) + unrealized(l.id, mark);
-    if (pnl <= -l.retire_loss)
+    int unmarked = 0;
+    const Micros pnl = (f ? f->real - f->fees : 0) + unrealized(l.id, mark, &unmarked);
+    if (!unmarked && pnl <= -l.retire_loss)
       return "down $" + money_str(-pnl / 100) + " over its life, its limit $" + money_str(l.retire_loss / 100);
   }
   if (!f || l.retire_trades <= 0 || f->trades < l.retire_trades) return "";

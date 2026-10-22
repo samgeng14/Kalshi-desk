@@ -304,7 +304,13 @@ void retire_rules() {
   CHECK(l.fill("X1", "SX1-1", "TK-L", Side::BUY, 10000, 3000, 0, t, "l1"));
   CHECK(l.retire_due(*l.lane("X1"), mark_at(1001)).empty());
   CHECK(l.retire_due(*l.lane("X1"), mark_at(1000)) == "down $20.0000 over its life, its limit $20.0000");
-  CHECK(!l.retire_due(*l.lane("X1"), none).empty());   // never priced: worthless
+  // never priced (no book yet after a restart, a closed market until it settles): undecided, not
+  // worthless; and so while any one of its positions is, though the rest are down past the limit
+  CHECK(l.retire_due(*l.lane("X1"), none).empty());
+  CHECK(l.fill("X1", "SX1-2", "TK-M", Side::BUY, 100, 5000, 0, t + 1, "l2"));
+  const SysBook::MarkFn only_l = [](const std::string& tk) { return tk == "TK-L" ? std::optional<Px>(900) : std::nullopt; };
+  CHECK(l.retire_due(*l.lane("X1"), only_l).empty());
+  CHECK(l.retire_due(*l.lane("X1"), mark_at(900)) == "down $21.4100 over its life, its limit $20.0000");
   // over its life, across ET midnight, with its fees: C1 lost $15 and paid $0.50 yesterday, and
   // holds 10 at 0.50 today: down $20 at 0.05, though today alone is down $4.50
   SysBook m(ruled_lanes());

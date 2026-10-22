@@ -41,7 +41,7 @@ A lane its kill rule retired stays off across restarts (the lane row says why, a
 when, and turning it on is refused). With that desk stopped, `build-deskd/deskctl lane-reset C1
 --config ~/.kalshi/deskd-demo.json --data-dir data/demo` gives it a fresh life (for LIVE: the prod
 config, `--data-dir data/prod` and `--live`). Its open positions stay in the book, and its loss limit
-still counts them.
+still counts them at their mark (it waits while one has none, as just after a restart).
 
 Lanes run together only while their budgets fit their venue's 70% ceiling (0.7 x the account's cash
 and positions; a lane on both venues counts on each). Turning one on past it is refused, naming the

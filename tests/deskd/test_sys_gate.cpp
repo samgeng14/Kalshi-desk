@@ -5,6 +5,8 @@
 //   - a lane whose retire rule fires (its fill from the account read, its markouts from strat as
 //     LaneMarkout) is retired: its working order cancelled with why RETIRED, a CRIT alert, LaneSet
 //     on refused, its orders LANE_OFF; across a restart it stays so, until deskctl lane-reset
+//   - the loss rule after a restart waits for a mark on every position the lane holds and for
+//     the first account read, and retires on a mark that really loses
 //   - a lane's event cap (LaneSpec::event_cap) counts what it holds and works in one event, and
 //     never refuses a reducing order
 //   - the budgets of the lanes on may not sum past their venue's 70% ceiling (decisions 1): a
@@ -12,6 +14,7 @@
 //     whose lanes no longer fit is refused PREFLIGHT, its CASH row failing
 // The ord and lane rows gw published, and the replies the web would send, checked by
 // contract.js itself (node): RETIRED is a contract WHY.
+#include <algorithm>
 #include <csignal>
 #include <fstream>
 #include <iterator>
@@ -72,7 +75,8 @@ struct Desk {
   std::mutex mu;
   std::vector<json> rows;               // under mu: {"type": "ord"|"lane", "data": row}, as published
   std::vector<std::string> alerts;      // under mu: "LEVEL SRC msg"
-  Desk(std::vector<LaneSpec> lanes, const std::string& state_file, bool live=false) {
+  // read=false: no account read complete yet (account() brings one)
+  Desk(std::vector<LaneSpec> lanes, const std::string& state_file, bool live=false, bool read=true) {
     CHECK(venue.ok); std::string why;
     signer=KalshiSigner::from_pem("sys-gate-test",pem,"ed25519",&why); CHECK(signer!=nullptr);
     net::PoolConfig cfg; cfg.endpoint=venue.ep(); cfg.name="k1-test"; cfg.connect_timeout_ms=500;
@@ -107,6 +111,7 @@ struct Desk {
     path.live=live;   // only gw's paper_only rule reads it: the venue here is the fake's either way
     path.check_each_message=true;
     gw->attach_manual(path);
+    if(!read) account(1000*10000,false);
     for(auto* p:{pm.get(),pc.get(),ps.get()}) { p->start(); CHECK(p->wait_ready(1,3000)); }
     wm.start([this](Worker& w){manual->run(w);}); wc.start([this](Worker& w){cancel->run(w);});
     ws.start([this](Worker& w){sys->run(w);}); wg.start([this](Worker& w){gw->run(w);});
@@ -141,6 +146,18 @@ struct Desk {
     s->balance.available=cash; s->balances[0]=cash; s->account_ready=s->ready=ready;
     s->account_began_ms=now_ms(); s->account_ms=now_ms()+1; ++s->revision;
     std::atomic_store(&snap,std::shared_ptr<const rest::Snapshot>(s));
+  }
+  // fn on the gw thread, the one that reads `book`
+  template<class F> auto on_gw(F fn) {
+    std::promise<decltype(fn())> p; auto f=p.get_future();
+    CHECK(gw->post(Probe{[&]{ p.set_value(fn()); }})); return f.get();
+  }
+  // gw's view of a lane's day (real - fees + unrl), micro-dollars; built after the retire rules
+  // have looked at the same marks
+  std::optional<std::int64_t> lane_day(const std::string& id) {
+    const auto v=gw->sys_view();
+    if(!v || !v->lane_day.count(id)) return std::nullopt;
+    return v->lane_day.at(id);
   }
   std::set<std::string> lanes_on() {
     const auto v=gw->sys_view();
@@ -332,6 +349,54 @@ void retired() {
   }
 }
 
+// The loss rule after a restart: C1 holds positions from yesterday, md has no book for them yet
+// and gw's last mids went with the old process. A position with no mark leaves the rule
+// undecided (not $24 lost), and the rule waits for the first account read (the fills the saved
+// book missed, the held markets that settled since); then a mark that really loses $20 retires.
+void loss_at_boot() {
+  TempDir dir;
+  const auto& lanes=default_lanes();
+  const LaneSpec c1=*std::find_if(lanes.begin(),lanes.end(),[](const LaneSpec& l) { return l.id=="C1"; });
+  const std::string U="KXTEST-26OCT06-B";   // no book, and not in the account read: never settled
+  // yesterday's book: C1 long n at px in tk, its loss limit $20
+  auto saved=[&](const std::string& file,const std::string& tk,Qty n,Px px) {
+    const std::int64_t yesterday=et_midnight_ms(now_ms())-86400000;
+    SysBook b({c1});
+    b.roll(yesterday);
+    CHECK(b.fill("C1","SC1-held",tk,Side::BUY,n,px,0,yesterday+1,"tr-held"));
+    std::ofstream(file)<<b.to_json(SysBook::Halt{},yesterday+2).dump();
+  };
+  {   // 30 at 0.80 in U: $24 of cost, unmarked
+    const std::string file=dir.file("unmarked.json");
+    saved(file,U,3000,8000);
+    Desk d({c1},file);
+    CHECK(d.until([&]{ return d.lane_day("C1")==-24000000; }));   // its day prices it worthless
+    std::this_thread::sleep_for(std::chrono::milliseconds(400));   // sys_tick has looked, more than once
+    CHECK(d.alerts_with("CRIT")==0 && d.last("lane","id","C1")["why"]=="");
+    // U at 0.41 (fx::T's book, now U's): down $11.70, inside its $20
+    d.on_gw([&]{ d.book.ticker=U; return true; });
+    CHECK(d.until([&]{ return d.lane_day("C1")==-11700000; }));
+    CHECK(d.alerts_with("CRIT")==0);
+    // U at 0.10: down $21
+    d.on_gw([&]{ d.book.bids={{900,500}}; d.book.asks={{1100,300}}; return true; });
+    const std::string why="down $21.0000 over its life, its limit $20.0000";
+    CHECK(d.until([&]{ return d.alerts_with("CRIT C1 lane C1 retired: "+why)==1; }));
+    CHECK(d.until([&]{ return d.last("lane","id","C1")["why"]=="retired: "+why; }));
+    CHECK(d.until([&]{ std::ifstream in(file); const auto j=json::parse(in,nullptr,false);
+                       return !j.is_discarded() && j["life"]["C1"]["retired_why"]==why; }));
+  }
+  {   // 50 at 0.90 in fx::T, marked at 0.41: down $24.50, but no account read yet
+    const std::string file=dir.file("unread.json");
+    saved(file,fx::T,5000,9000);
+    Desk d({c1},file,false,false);
+    CHECK(d.until([&]{ return d.lane_day("C1")==-24500000; }));
+    std::this_thread::sleep_for(std::chrono::milliseconds(400));
+    CHECK(d.alerts_with("CRIT")==0);
+    d.account(1000*10000);
+    CHECK(d.until([&]{ return d.alerts_with("CRIT C1 lane C1 retired: down $24.5000 over its life, its limit $20.0000")==1; }));
+  }
+}
+
 // LaneSpec::event_cap: the lane's worst case in one event, held and working; a reducing order
 // never refused.
 void event_cap() {
@@ -415,6 +480,6 @@ void budgets() {
 
 int main() {
   std::signal(SIGPIPE, SIG_IGN);   // as deskd's runtime does process-wide (app/runtime.h)
-  gated(); retired(); event_cap(); budgets();
+  gated(); retired(); loss_at_boot(); event_cap(); budgets();
   return finish("deskd-sys-gate");
 }
