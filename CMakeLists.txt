@@ -557,6 +557,8 @@ deskd_fake_test(manual_gw)
 deskd_fake_test(runtime_manual)
 # runtime_college: C1 in the whole process (its gate, one take in its group, KILL, its game cap, retirement across a restart)
 deskd_fake_test(runtime_college)
+# runtime_nba: X1 and N1 in the whole process (their gates, one N1 take in its group, X1 in shadow, Stop, KILL, ESPN silent, the game cap)
+deskd_fake_test(runtime_nba)
 deskd_fake_test(pyth)
 # fees: gw/fees.h against the fake's model_fee and charge_fee, at the fake's own balance precision
 deskd_fake_test(fees)
@@ -612,6 +614,7 @@ foreach(t
     deskd-rest
     deskd-runtime_college
     deskd-runtime_manual
+    deskd-runtime_nba
     deskd-sender
     deskd-sys_book
     deskd-sys_gate

@@ -120,19 +120,36 @@ bool Deskd::init_venue(std::string* err) {
     else
       DLOG_INFO("no volleyball model (%s): write one with tools/volleyball.py --write", volley_why_.c_str());
   }
-  // each series' game model (strat/game_fair.h): the WCBB model's league, the volleyball model's
-  // series; C1's gate names the model it measured on each, and its tradable series score hot
+  // the NBA model (tools/train_bball.py --league nba; strat/bball_model.h): its fair on NBA
+  // ladders, and N1's
+  if (!cfg_.nba_model.empty()) {
+    nba_ = load_bball_model(cfg_.nba_model, "nba", &nba_why_);
+    if (nba_)
+      DLOG_INFO("NBA model v%d (%s, %d games, held-out Brier %.4f vs the mid's %.4f)", nba_->version, nba_->trained.c_str(),
+                nba_->n_games, nba_->brier_model, nba_->brier_mid);
+    else if (::access(cfg_.nba_model.c_str(), F_OK) == 0)
+      DLOG_ERR("NBA model refused: %s (no fair on NBA ladders)", nba_why_.c_str());
+    else
+      DLOG_INFO("no NBA model (%s): train one with tools/train_bball.py --league nba", nba_why_.c_str());
+  }
+  // each series' game model (strat/game_fair.h): the WCBB and NBA models' leagues, the volleyball
+  // model's series; C1's gate names the model it measured on each, N1's the NBA model, and the
+  // series of the lanes with an engine score hot
   std::map<std::string, GameModel> models;
   if (wcbb_) models.emplace(bball_league(wcbb_->league)->series, *wcbb_);
+  if (nba_) models.emplace(bball_league(nba_->league)->series, *nba_);
   if (volley_)
     for (const auto& lg : espn_leagues())
       if (lg.sport == "volleyball") models.emplace(lg.series, *volley_);
   std::map<std::string, std::string> model_sha;
   for (const auto& [series, m] : models) model_sha[series] = std::visit([](const auto& x) { return x.sha256; }, m);
   if (college_on()) load_college(model_sha);
+  if (nba_on()) load_nba();
   std::set<std::string> fast;   // the 3 s scoreboards (ESPN's load rule): only an engine's series
   for (const auto& [series, why] : c1_tradable_)
     if (why.empty()) fast.insert(series);
+  const std::set<std::string> ncaa_fast = fast;   // NCAA.com has only the college series
+  if (x1_.rule || n1_.rule) fast.insert(cfg_.nba_series.begin(), cfg_.nba_series.end());
   // the watched game markets of the series a scoreboard covers, with the other team's market of
   // each game; each new score state a feed sees goes to ops.sqlite's scores table
   auto watched_games = [this](bool (*covers)(const std::string&)) {
@@ -168,7 +185,7 @@ bool Deskd::init_venue(std::string* err) {
     if (auto ep = net::Endpoint::parse(options_.ncaa_url, &why)) {
       NcaaFeed::Options no;
       if (options_.ncaa_scoreboard_ms > 0) no.scoreboard_ms = options_.ncaa_scoreboard_ms;
-      no.fast_series = fast;
+      no.fast_series = ncaa_fast;
       ncaa_ = std::make_unique<NcaaFeed>(*ep, watched_games([](const std::string& tk) { return ncaa_sport_for(tk) != nullptr; }), no);
       ncaa_->set_on_change(record_score);
     } else {
@@ -184,7 +201,8 @@ bool Deskd::init_venue(std::string* err) {
     scores_ = std::make_unique<ScoreMerge>(std::move(se), cfg_.college.max_score_age_s * 1000LL);
   }
   // the game markets' pregame prices and fairs (strat/game_fair.h), on each series with a loaded
-  // model: the WCBB model's KXNCAAWBGAME, the volleyball model's KXNCAAWVMATCH
+  // model: the WCBB model's KXNCAAWBGAME, the NBA model's KXNBAGAME, the volleyball model's
+  // KXNCAAWVMATCH
   if (scores_ && !models.empty()) {
     GameFair::Env env;
     env.snapshot = [this] { return rest_->snapshot(); };
@@ -246,6 +264,34 @@ std::optional<TakeParams> college_rule(const LaneGate* g, const std::string& ser
     return std::nullopt;
   }
   p.leader_only = s->second.leader_only;
+  return p;
+}
+
+// X1's or N1's take rule (take_params' ESPN_FOLLOW or ESPN_FADE for X1, by the direction its gate
+// measured, params.direction "follow" or "fade"; MODEL for N1): gw's inventory limit and game cap
+// (LaneSpec::inventory, event_cap), and the gate's thr as the edge (params.thr, dollars a
+// contract); nullopt and why when the gate's params cannot be traded as they were measured
+std::optional<TakeParams> nba_rule(const LaneGate& g, const LaneSpec& lane, std::string* why) {
+  TakeMode mode = TakeMode::MODEL;
+  if (lane.id == "X1") {
+    const json& d = g.params.at("direction");   // load_lane_gate refuses a gate without one
+    if (d == "follow") mode = TakeMode::ESPN_FOLLOW;
+    else if (d == "fade") mode = TakeMode::ESPN_FADE;
+    else {
+      *why = "the gate's direction " + d.dump() + " is neither follow nor fade";
+      return std::nullopt;
+    }
+  }
+  const json& thr = g.params.at("thr");
+  const Money edge = thr.is_number() ? static_cast<Money>(std::llround(thr.get<double>() * 10000.0)) : 0;
+  if (edge <= 0 || edge >= kOneDollar) {
+    *why = "the gate's params.thr " + thr.dump() + " is not a price between 0 and 1 (dollars a contract)";
+    return std::nullopt;
+  }
+  TakeParams p = take_params(mode);
+  p.edge = edge;
+  p.inventory = lane.inventory;
+  p.game_cap = lane.event_cap;
   return p;
 }
 }  // namespace
@@ -318,6 +364,57 @@ json Deskd::college_status() const {
           {"volley_model", {{"path", cfg_.college.volley_model}, {"loaded", volley_.has_value()}, {"why", volley_why_},
                             {"sha256", volley_ ? volley_->sha256 : ""}}},
           {"engine", c1_ ? c1_->status() : json(nullptr)}};
+}
+
+// X1's and N1's gates and the rules they open (strat/lane_gate.h): X1's direction and thr; N1's
+// thr, measured on the NBA model loaded. A gate that loads gives the lane its rule and engine: a
+// live one opens the lane, one at stage shadow only lets the engine record (why says so).
+// Otherwise why is the gate's reason, or the model's for N1.
+void Deskd::load_nba() {
+  const auto& lanes = default_lanes();
+  for (NbaLane* n : {&x1_, &n1_}) {
+    const LaneSpec& spec = *std::find_if(lanes.begin(), lanes.end(), [n](const LaneSpec& l) { return l.id == n->id; });
+    const bool model = n->id == "N1";
+    if (model && !nba_) {
+      n->why = "no NBA model" + (nba_why_.empty() ? std::string() : " (" + nba_why_ + ")");
+    } else {
+      std::string why;
+      n->gate = load_lane_gate(lane_gate_path(gates_dir(), n->id), n->id, model ? nba_->sha256 : "",
+                               model ? std::vector<std::string>{"thr"} : std::vector<std::string>{"direction", "thr"}, &why);
+      n->why = lane_gate_why(n->gate, why);
+      if (n->gate) {
+        n->rule = nba_rule(*n->gate, spec, &why);
+        if (!n->rule) n->why = n->gate->path + ": " + why;
+      }
+    }
+    if (n->rule && n->why.empty())
+      DLOG_INFO("%s's gate opens it: %s, edge %s", n->id.c_str(), take_mode_str(n->rule->mode), money_str(n->rule->edge).c_str());
+    else
+      DLOG_WARN("%s gated: %s", n->id.c_str(), n->why.c_str());
+  }
+}
+
+json Deskd::nba_status() const {
+  auto lane = [](const NbaLane& n) {
+    json gate = nullptr, rule = nullptr;
+    if (n.gate)
+      gate = {{"path", n.gate->path}, {"stage", n.gate->stage}, {"verdict", n.gate->verdict},
+              {"computed", n.gate->computed}, {"tool", n.gate->tool}};
+    if (n.rule) rule = {{"mode", take_mode_str(n.rule->mode)}, {"edge", money_str(n.rule->edge)}};
+    return json{{"why", n.why}, {"gate", gate}, {"rule", rule}, {"engine", n.engine ? n.engine->status() : json(nullptr)}};
+  };
+  std::string why;
+  if (!cfg_.nba_lanes) why = "deskd.nba_lanes is off";
+  else if (!cfg_.systematic_orders) why = "Systematic orders are off (deskd.systematic_orders)";
+  return {{"enabled", cfg_.nba_lanes},
+          {"why", why},
+          {"series", cfg_.nba_series},
+          {"shadow", cfg_.lane_shadow},
+          {"gates_dir", gates_dir()},
+          {"model", {{"path", cfg_.nba_model}, {"loaded", nba_.has_value()}, {"why", nba_why_},
+                     {"version", nba_ ? nba_->version : 0}, {"sha256", nba_ ? nba_->sha256 : ""}}},
+          {"X1", lane(x1_)},
+          {"N1", lane(n1_)}};
 }
 
 void Deskd::attach_manual() {
@@ -403,6 +500,15 @@ void Deskd::attach_manual() {
         l.budget = cfg_.college.budget;
         l.event_cap = cfg_.college.game * 100;   // u to micro-dollars
         if (l.engine) l.thr = c1_rules_.at(l.series.front()).edge;   // the gate's, one for every series
+      }
+      // X1 and N1 (plan 5(e), decisions 2): NBA's series and an engine once the gate gives a rule,
+      // and the gate's reason until it is live (LaneSet and place_sys refuse it)
+      if ((l.id == "X1" || l.id == "N1") && nba_on()) {
+        const NbaLane& n = l.id == "X1" ? x1_ : n1_;
+        l.series = n.rule ? cfg_.nba_series : std::vector<std::string>{};
+        l.engine = n.rule.has_value();
+        l.gate_why = n.why;
+        if (n.rule) l.thr = n.rule->edge;
       }
     }
     if (!cfg_.live && cfg_.paper_lane) p.lanes.push_back(paper_lane());   // D1: the demo account only
@@ -533,6 +639,41 @@ void Deskd::attach_manual() {
         if (l.id == "C1") o.mo_h = l.retire_h;
       c1_ = std::make_unique<TakeEngine>("C1", c1_rules_, std::move(te), o);
     }
+    // X1 ESPN EXP (plan 5(e)) and N1 NBA MODEL (decisions 2): IOC takes in NBA games against
+    // ESPN's number, followed or faded as X1's gate measured, or against the NBA model's fair
+    // (N1), on the merged score; with deskd.lane_shadow, what each would take while it may not
+    // post goes to the signals table. N1 holds new takes while its fills' net 60 s markout
+    // averages at or under 0 after 100 (nba.json's hold, plan 5(d)'s rule); gw retires either
+    // past its trades or its loss.
+    for (NbaLane* n : {&x1_, &n1_}) {
+      if (!nba_on() || !n->rule) continue;
+      const std::string id = n->id;
+      std::map<std::string, std::string> tradable;   // every series on the lane's one gate
+      for (const auto& series : cfg_.nba_series) tradable[series] = n->why;
+      TakeEngine::Env te;
+      te.view = env.view;
+      te.snapshot = env.snapshot;
+      te.book = env.book;
+      te.fairs = [this] { return game_fair_ ? game_fair_->board() : nullptr; };
+      te.scores = [this] { return scores_ ? scores_->board() : nullptr; };
+      te.tradable = [tradable] { return tradable; };
+      te.private_up = env.private_up;
+      te.post = env.post;
+      te.want = want(id);
+      te.markout = [this, id] { const auto m = markouts_->lane_mean(id, "60s"); return std::make_pair(m.fills, m.net); };
+      te.mid_at = [this](const std::string& tk, std::int64_t at) { return markouts_->mid_at(tk, at); };
+      te.record = [this](const std::string& table, std::string row) { return store_.inbox().push(StoreRecord{table, std::move(row)}); };
+      te.alert = env.alert;
+      TakeOptions o;
+      o.shadow = cfg_.lane_shadow;
+      for (const auto& l : p.lanes)
+        if (l.id == id) o.mo_h = l.retire_h;   // none today: gw counts their trades and losses
+      if (id == "N1") {
+        o.mo_after = 100;
+        o.mo_floor = 0;
+      }
+      n->engine = std::make_unique<TakeEngine>(id, cfg_.nba_series, std::move(te), *n->rule, o);
+    }
   }
   p.send = [this](KalshiWriteJob j) { return q_man_.push(std::move(j)); };
   p.refresh = [this] { rest_->request_refresh(); };
@@ -612,6 +753,8 @@ PreflightRow Deskd::shard_row(const rest::Snapshot& s, bool fresh) const {
   std::map<std::string, std::vector<std::string>> series = {{"M1", cfg_.lip_series}, {"P1", cfg_.lip_series}, {"M2", cfg_.band_series}};
   for (const auto& [name, why] : c1_tradable_)
     if (why.empty()) series["C1"].push_back(name);
+  for (const NbaLane* n : {&x1_, &n1_})
+    if (n->rule) series[n->id] = cfg_.nba_series;
   const auto now = now_ms();
   for (const auto& lane : v->lanes_on) {
     const auto it = series.find(lane);
