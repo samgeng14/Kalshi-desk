@@ -258,6 +258,9 @@ Qty clip_count(Money clip, Px px, double fee_mult, Qty max_count, bool whole_onl
 // The markouts of its own fills at TakeOptions::mo_h go to gw as LaneMarkout (C1: "300s", its
 // retire rule's), from the rows the runtime's markouts step hands to markout().
 //
+// Rules: one TakeParams for every series, or one for each series in one mode (C1's gate gives
+// each series its level and leader_only: what it measured there).
+//
 // Threading: step() and markout() on strat; status() from any thread.
 
 // TakeEngine's own rules, outside take_decide
@@ -290,6 +293,8 @@ class TakeEngine {
     std::function<void(const std::string& lvl, const std::string& msg)> alert;
   };
   TakeEngine(std::string lane, std::vector<std::string> series, Env env, TakeParams params, TakeOptions options = {});
+  // each series with its own rule; every rule in one mode (std::invalid_argument otherwise)
+  TakeEngine(std::string lane, std::map<std::string, TakeParams> series, Env env, TakeOptions options = {});
   void step(std::int64_t now_ms);
   void markout(const MarkoutRow& row);    // each markout row, once (the runtime's markouts step)
   nlohmann::json status() const;          // per game: the last decision; the counts of signals and refusals
@@ -333,7 +338,8 @@ class TakeEngine {
   std::string lane_;
   std::vector<std::string> series_;
   Env env_;
-  TakeParams p_;
+  TakeParams p_;                          // the lane's mode (the first series' rule)
+  std::map<std::string, TakeParams> params_;   // each series' rule
   TakeOptions o_;
   std::map<std::string, Game> games_;     // by event ticker
   std::map<std::string, Touch> touch_;    // by market

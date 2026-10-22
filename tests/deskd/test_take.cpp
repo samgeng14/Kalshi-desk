@@ -7,8 +7,8 @@
 // TakeEngine against a fake Env (gw a stub inbox): one IOC a run with every field, gw's answer
 // awaited and a refusal's back-off, the signal runs, what blocks a post and the shadow rows, PULL
 // rows, the inputs it builds (fair on the board's state, worst case, Systematic's positions and
-// working orders, books, volume, clock, set ends, ESPN's number), which games, the signals'
-// markouts and LaneMarkout to gw.
+// working orders, books, volume, clock, set ends, ESPN's number), which games, each series' own
+// rule, the signals' markouts and LaneMarkout to gw.
 #include <algorithm>
 #include <cmath>
 #include <fstream>
@@ -1063,6 +1063,45 @@ void engine_games() {
   CHECK(e.status()["games"].size() == 4);   // the two games, the three-market event and the final one
 }
 
+// Each series its own rule (C1: the gate's level and leader_only, series by series): the same
+// trailing team with the edge is pulled TRAILER in the series measured leader-only and taken in
+// the other; the rules of one lane share its mode
+void engine_series() {
+  const std::string ev = "KXNCAAMBGAME-26NOV14CCCDDD";
+  Rig g, h(ev, ev + "-CCC", ev + "-DDD");
+  g.snap->markets.insert(h.snap->markets.begin(), h.snap->markets.end());
+  g.books.insert(h.books.begin(), h.books.end());
+  g.tradable.insert(h.tradable.begin(), h.tradable.end());
+  TakeParams leader = take_params(TakeMode::COLLEGE);
+  leader.leader_only = true;
+  TakeEngine e("C1", std::map<std::string, TakeParams>{{"KXNCAAWBGAME", leader}, {"KXNCAAMBGAME", take_params(TakeMode::COLLEGE)}},
+               g.env());
+  auto score = [&](std::int64_t first_seen, double p) {   // both games: A's team trails 40-48
+    g.score(first_seen, first_seen, p, 40, 48);
+    h.score(first_seen, first_seen, p, 40, 48);
+    for (const auto& tk : {h.a, h.b}) {
+      g.scores[tk] = h.scores[tk];
+      g.fairs[tk] = h.fairs[tk];
+    }
+  };
+  score(T0 - 1000, 0.50);
+  e.step(T0);
+  CHECK(g.posted.empty() && g.wanted == std::set<std::string>({TA, TB, h.a, h.b}));
+  score(T0 + 3000, 0.70);
+  e.step(T0 + 3200);
+  CHECK(g.places().size() == 1 && g.places()[0]->ticker == h.a && g.places()[0]->cid.rfind("SC1-", 0) == 0);
+  CHECK(game_status(e)["pull"] == "TRAILER" && game_status(e, ev)["pull"] == "");
+  CHECK(g.rows.size() == 2 && g.rows[0]["action"] == "TAKE" && g.rows[0]["tk"] == h.a && g.rows[1]["action"] == "PULL" &&
+        g.rows[1]["tk"] == TA && has(g.rows[1]["why"], "TRAILER: "));
+  bool refused = false;
+  try {
+    TakeEngine x("C1", std::map<std::string, TakeParams>{{"KXNCAAWBGAME", leader}, {"KXNBAGAME", take_params(TakeMode::MODEL)}}, g.env());
+  } catch (const std::invalid_argument& ex) {
+    refused = has(ex.what(), "KXNCAAWBGAME is COLLEGE, KXNBAGAME MODEL: a lane has one mode");
+  }
+  CHECK(refused);
+}
+
 // Signals' markouts: each horizon's mid half a second after it, + in the signal's favour, null
 // with no mid; the row sent again each time. And the fills' markouts at the lane's horizon go to gw.
 void engine_markouts() {
@@ -1149,6 +1188,7 @@ int main() {
   engine_pulls();
   engine_inputs();
   engine_games();
+  engine_series();
   engine_markouts();
   return finish("deskd-take");
 }

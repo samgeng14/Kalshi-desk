@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <initializer_list>
 #include <limits>
+#include <stdexcept>
 
 #include "deskd/app/log.h"
 #include "deskd/gw/fees.h"
@@ -394,7 +395,20 @@ void without_own(MdBook& b, const Gateway::SysView& v, const std::string& tk) {
 }  // namespace
 
 TakeEngine::TakeEngine(std::string lane, std::vector<std::string> series, Env env, TakeParams params, TakeOptions options)
-    : lane_(std::move(lane)), series_(std::move(series)), env_(std::move(env)), p_(params), o_(std::move(options)) {}
+    : lane_(std::move(lane)), series_(std::move(series)), env_(std::move(env)), p_(params), o_(std::move(options)) {
+  for (const auto& s : series_) params_[s] = p_;
+}
+
+TakeEngine::TakeEngine(std::string lane, std::map<std::string, TakeParams> series, Env env, TakeOptions options)
+    : lane_(std::move(lane)), env_(std::move(env)), params_(std::move(series)), o_(std::move(options)) {
+  if (!params_.empty()) p_ = params_.begin()->second;
+  for (const auto& [s, p] : params_) {
+    if (p.mode != p_.mode)
+      throw std::invalid_argument("TakeEngine " + lane_ + ": " + s + " is " + take_mode_str(p.mode) + ", " +
+                                  params_.begin()->first + " " + take_mode_str(p_.mode) + ": a lane has one mode");
+    series_.push_back(s);
+  }
+}
 
 std::string TakeEngine::new_cid(std::int64_t now) {
   // S<lane>-<ms in base 36>-<seq>, as the makers': at most 40 characters, [A-Za-z0-9-]
@@ -581,7 +595,9 @@ void TakeEngine::game(const std::string& ev, const kalshi::MarketRow& ma, const 
     const auto pre = g.pre_volume.find(x->ticker);
     in.volume += *x->volume - (pre == g.pre_volume.end() ? 0 : std::min(pre->second, *x->volume));
   }
-  if (!volume_known && p_.max_volume > 0) in.volume = p_.max_volume;   // unknown is never a thin game
+  const auto rule = params_.find(series_of(ma.ticker));
+  const TakeParams& p = rule == params_.end() ? p_ : rule->second;   // the game's series' rule
+  if (!volume_known && p.max_volume > 0) in.volume = p.max_volume;   // unknown is never a thin game
   in.last_take_ms = g.last_take_ms;
   in.game_takes = g.takes;
   in.private_up = env_.private_up && env_.private_up();
@@ -607,7 +623,7 @@ void TakeEngine::game(const std::string& ev, const kalshi::MarketRow& ma, const 
     return set_last(ev, std::move(st));
   }
   auto decide = [&](const TakeInput& x) {
-    TakeDecision d = take_decide(x, p_);
+    TakeDecision d = take_decide(x, p);
     if (d.pull == "VOLUME" && !volume_known) d.why = "the listing gives no volume: not a thin game";
     return d;
   };
