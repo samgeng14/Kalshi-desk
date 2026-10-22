@@ -149,6 +149,8 @@ bool Deskd::init_venue(std::string* err) {
   for (const auto& [series, why] : c1_tradable_)
     if (why.empty()) fast.insert(series);
   const std::set<std::string> ncaa_fast = fast;   // NCAA.com has only the college series
+  // X1's and N1's games in play; not N2's alone: it takes only before the start, on a score at
+  // most a minute old, which the 20 s scoreboard gives
   if (x1_.rule || n1_.rule) fast.insert(cfg_.nba_series.begin(), cfg_.nba_series.end());
   // the watched game markets of the series a scoreboard covers, with the other team's market of
   // each game; each new score state a feed sees goes to ops.sqlite's scores table
@@ -270,8 +272,31 @@ std::optional<TakeParams> college_rule(const LaneGate* g, const std::string& ser
 // X1's or N1's take rule (take_params' ESPN_FOLLOW or ESPN_FADE for X1, by the direction its gate
 // measured, params.direction "follow" or "fade"; MODEL for N1): gw's inventory limit and game cap
 // (LaneSpec::inventory, event_cap), and the gate's thr as the edge (params.thr, dollars a
-// contract); nullopt and why when the gate's params cannot be traded as they were measured
+// contract). N2's is take_params' FAV_PREGAME as decisions 2 set it (5 contracts of a team priced
+// in [0.90, 0.95), held to settlement) with gw's inventory limit; its gate must have measured
+// exactly that (params.count in contracts, fav_lo and fav_hi in dollars), and its game cap stays
+// take_params' $10, what tools/nba_gate.py n2 replayed (gw has no event cap for N2: its 5
+// contracts a market bound a game). nullopt and why when the gate's params cannot be traded as
+// they were measured.
 std::optional<TakeParams> nba_rule(const LaneGate& g, const LaneSpec& lane, std::string* why) {
+  if (lane.id == "N2") {
+    TakeParams p = take_params(TakeMode::FAV_PREGAME);
+    p.inventory = lane.inventory;
+    // load_lane_gate refuses a gate without these
+    const std::pair<const char*, std::int64_t> measured[] = {
+        {"count", p.fixed_count / kOneContract}, {"fav_lo", p.fav_lo}, {"fav_hi", p.fav_hi}};
+    for (const auto& [key, trades] : measured) {
+      const json& v = g.params.at(key);
+      const bool count = std::string(key) == "count";
+      const double scale = count ? 1.0 : 10000.0;
+      if (!v.is_number() || std::llround(v.get<double>() * scale) != trades) {
+        *why = "the gate's params." + std::string(key) + " " + v.dump() + " is not what N2 trades (" +
+               (count ? std::to_string(trades) + " contracts" : price_str(static_cast<Px>(trades))) + ")";
+        return std::nullopt;
+      }
+    }
+    return p;
+  }
   TakeMode mode = TakeMode::MODEL;
   if (lane.id == "X1") {
     const json& d = g.params.at("direction");   // load_lane_gate refuses a gate without one
@@ -366,31 +391,37 @@ json Deskd::college_status() const {
           {"engine", c1_ ? c1_->status() : json(nullptr)}};
 }
 
-// X1's and N1's gates and the rules they open (strat/lane_gate.h): X1's direction and thr; N1's
-// thr, measured on the NBA model loaded. A gate that loads gives the lane its rule and engine: a
-// live one opens the lane, one at stage shadow only lets the engine record (why says so).
-// Otherwise why is the gate's reason, or the model's for N1.
+// X1's, N1's and N2's gates and the rules they open (strat/lane_gate.h): X1's direction and thr;
+// N1's thr, measured on the NBA model loaded; N2's count and price band, no model. A gate that
+// loads gives the lane its rule and engine: a live one opens the lane, one at stage shadow only
+// lets the engine record (why says so). Otherwise why is the gate's reason, or the model's for N1.
 void Deskd::load_nba() {
   const auto& lanes = default_lanes();
-  for (NbaLane* n : {&x1_, &n1_}) {
+  for (NbaLane* n : {&x1_, &n1_, &n2_}) {
     const LaneSpec& spec = *std::find_if(lanes.begin(), lanes.end(), [n](const LaneSpec& l) { return l.id == n->id; });
     const bool model = n->id == "N1";
+    const std::vector<std::string> params = n->id == "X1"   ? std::vector<std::string>{"direction", "thr"}
+                                            : n->id == "N1" ? std::vector<std::string>{"thr"}
+                                                            : std::vector<std::string>{"count", "fav_lo", "fav_hi"};
     if (model && !nba_) {
       n->why = "no NBA model" + (nba_why_.empty() ? std::string() : " (" + nba_why_ + ")");
     } else {
       std::string why;
-      n->gate = load_lane_gate(lane_gate_path(gates_dir(), n->id), n->id, model ? nba_->sha256 : "",
-                               model ? std::vector<std::string>{"thr"} : std::vector<std::string>{"direction", "thr"}, &why);
+      n->gate = load_lane_gate(lane_gate_path(gates_dir(), n->id), n->id, model ? nba_->sha256 : "", params, &why);
       n->why = lane_gate_why(n->gate, why);
       if (n->gate) {
         n->rule = nba_rule(*n->gate, spec, &why);
         if (!n->rule) n->why = n->gate->path + ": " + why;
       }
     }
-    if (n->rule && n->why.empty())
-      DLOG_INFO("%s's gate opens it: %s, edge %s", n->id.c_str(), take_mode_str(n->rule->mode), money_str(n->rule->edge).c_str());
-    else
+    if (n->rule && n->why.empty()) {
+      const std::string what = n->rule->mode == TakeMode::FAV_PREGAME
+                                   ? "band " + price_str(n->rule->fav_lo) + "-" + price_str(n->rule->fav_hi)
+                                   : "edge " + money_str(n->rule->edge);
+      DLOG_INFO("%s's gate opens it: %s, %s", n->id.c_str(), take_mode_str(n->rule->mode), what.c_str());
+    } else {
       DLOG_WARN("%s gated: %s", n->id.c_str(), n->why.c_str());
+    }
   }
 }
 
@@ -400,7 +431,11 @@ json Deskd::nba_status() const {
     if (n.gate)
       gate = {{"path", n.gate->path}, {"stage", n.gate->stage}, {"verdict", n.gate->verdict},
               {"computed", n.gate->computed}, {"tool", n.gate->tool}};
-    if (n.rule) rule = {{"mode", take_mode_str(n.rule->mode)}, {"edge", money_str(n.rule->edge)}};
+    if (n.rule && n.rule->mode == TakeMode::FAV_PREGAME)   // N2: a price band and a count, no edge
+      rule = {{"mode", take_mode_str(n.rule->mode)}, {"count", qty_to_number(n.rule->fixed_count)},
+              {"band", {price_str(n.rule->fav_lo), price_str(n.rule->fav_hi)}}};
+    else if (n.rule)
+      rule = {{"mode", take_mode_str(n.rule->mode)}, {"edge", money_str(n.rule->edge)}};
     return json{{"why", n.why}, {"gate", gate}, {"rule", rule}, {"engine", n.engine ? n.engine->status() : json(nullptr)}};
   };
   std::string why;
@@ -414,7 +449,8 @@ json Deskd::nba_status() const {
           {"model", {{"path", cfg_.nba_model}, {"loaded", nba_.has_value()}, {"why", nba_why_},
                      {"version", nba_ ? nba_->version : 0}, {"sha256", nba_ ? nba_->sha256 : ""}}},
           {"X1", lane(x1_)},
-          {"N1", lane(n1_)}};
+          {"N1", lane(n1_)},
+          {"N2", lane(n2_)}};
 }
 
 void Deskd::attach_manual() {
@@ -501,14 +537,15 @@ void Deskd::attach_manual() {
         l.event_cap = cfg_.college.game * 100;   // u to micro-dollars
         if (l.engine) l.thr = c1_rules_.at(l.series.front()).edge;   // the gate's, one for every series
       }
-      // X1 and N1 (plan 5(e), decisions 2): NBA's series and an engine once the gate gives a rule,
-      // and the gate's reason until it is live (LaneSet and place_sys refuse it)
-      if ((l.id == "X1" || l.id == "N1") && nba_on()) {
-        const NbaLane& n = l.id == "X1" ? x1_ : n1_;
+      // X1, N1 and N2 (plan 5(e), decisions 2): NBA's series and an engine once the gate gives a
+      // rule, and the gate's reason until it is live (LaneSet and place_sys refuse it); N2's rule
+      // is a price band, not an edge (no thr)
+      if ((l.id == "X1" || l.id == "N1" || l.id == "N2") && nba_on()) {
+        const NbaLane& n = l.id == "X1" ? x1_ : l.id == "N1" ? n1_ : n2_;
         l.series = n.rule ? cfg_.nba_series : std::vector<std::string>{};
         l.engine = n.rule.has_value();
         l.gate_why = n.why;
-        if (n.rule) l.thr = n.rule->edge;
+        if (n.rule && n.rule->mode != TakeMode::FAV_PREGAME) l.thr = n.rule->edge;
       }
     }
     if (!cfg_.live && cfg_.paper_lane) p.lanes.push_back(paper_lane());   // D1: the demo account only
@@ -639,13 +676,14 @@ void Deskd::attach_manual() {
         if (l.id == "C1") o.mo_h = l.retire_h;
       c1_ = std::make_unique<TakeEngine>("C1", c1_rules_, std::move(te), o);
     }
-    // X1 ESPN EXP (plan 5(e)) and N1 NBA MODEL (decisions 2): IOC takes in NBA games against
-    // ESPN's number, followed or faded as X1's gate measured, or against the NBA model's fair
-    // (N1), on the merged score; with deskd.lane_shadow, what each would take while it may not
-    // post goes to the signals table. N1 holds new takes while its fills' net 60 s markout
-    // averages at or under 0 after 100 (nba.json's hold, plan 5(d)'s rule); gw retires either
-    // past its trades or its loss.
-    for (NbaLane* n : {&x1_, &n1_}) {
+    // X1 ESPN EXP (plan 5(e)), N1 NBA MODEL and N2 NBA FAV 90-95 (decisions 2): IOC takes in NBA
+    // games against ESPN's number, followed or faded as X1's gate measured, or against the NBA
+    // model's fair (N1), on the merged score; N2 buys a 90-95c favourite before the start, 5
+    // contracts held to settlement. With deskd.lane_shadow, what each would take while it may
+    // not post goes to the signals table. N1 holds new takes while its fills' net 60 s markout
+    // averages at or under 0 after 100 (nba.json's hold, plan 5(d)'s rule); gw retires each past
+    // its trades or its loss (N2: 60 trades or $15).
+    for (NbaLane* n : {&x1_, &n1_, &n2_}) {
       if (!nba_on() || !n->rule) continue;
       const std::string id = n->id;
       std::map<std::string, std::string> tradable;   // every series on the lane's one gate
@@ -753,7 +791,7 @@ PreflightRow Deskd::shard_row(const rest::Snapshot& s, bool fresh) const {
   std::map<std::string, std::vector<std::string>> series = {{"M1", cfg_.lip_series}, {"P1", cfg_.lip_series}, {"M2", cfg_.band_series}};
   for (const auto& [name, why] : c1_tradable_)
     if (why.empty()) series["C1"].push_back(name);
-  for (const NbaLane* n : {&x1_, &n1_})
+  for (const NbaLane* n : {&x1_, &n1_, &n2_})
     if (n->rule) series[n->id] = cfg_.nba_series;
   const auto now = now_ms();
   for (const auto& lane : v->lanes_on) {

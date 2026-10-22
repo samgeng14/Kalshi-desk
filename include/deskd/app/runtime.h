@@ -9,8 +9,8 @@
 //   send-k1          Manual's sender; send-k2, send-k3 Systematic's (week 0: placeholders)
 //   send-cx          cancels and KILL, on its own path
 //   strat            the game scores merged (ref/scores.h), the fairs (financial and game), the
-//                    makers, C1's, X1's and N1's takes (strat/take.h), the LIP meter and the
-//                    markouts, each engine at its own cadence (strat/strat.h)
+//                    makers, C1's, X1's, N1's and N2's takes (strat/take.h), the LIP meter and
+//                    the markouts, each engine at its own cadence (strat/strat.h)
 //   store            the only writer of ops.sqlite
 //   pub              the screen's streams, hb, hdr, snapshots
 //   ops              heartbeat file, disk, preflight rows
@@ -179,10 +179,11 @@ class Deskd {
   // the NBA model (deskd.nba_model; read once at start, const after): the NBA ladders' fair and N1's
   std::optional<BballModel> nba_;
   std::string nba_why_;
-  // X1 ESPN EXP (plan 5(e)) and N1 NBA MODEL (decisions 2), each read once at start as C1 is: its
-  // gate (<gates_dir>/<lane>.json), the take rule the gate measured (none: no engine), why gw
-  // keeps it off ("" = its gate is live: LaneSpec::gate_why), and its engine on strat (built with
-  // deskd.nba_lanes and Systematic orders once the gate loads; at stage shadow it only records)
+  // X1 ESPN EXP (plan 5(e)), N1 NBA MODEL and N2 NBA FAV 90-95 (decisions 2), each read once at
+  // start as C1 is: its gate (<gates_dir>/<lane>.json), the take rule the gate measured (none: no
+  // engine), why gw keeps it off ("" = its gate is live: LaneSpec::gate_why), and its engine on
+  // strat (built with deskd.nba_lanes and Systematic orders once the gate loads; at stage shadow
+  // it only records)
   struct NbaLane {
     explicit NbaLane(std::string lane) : id(std::move(lane)) {}
     std::string id;
@@ -191,9 +192,9 @@ class Deskd {
     std::string why;
     std::unique_ptr<TakeEngine> engine;
   };
-  NbaLane x1_{"X1"}, n1_{"N1"};
+  NbaLane x1_{"X1"}, n1_{"N1"}, n2_{"N2"};
   bool nba_on() const { return cfg_.nba_lanes && cfg_.systematic_orders; }
-  void load_nba();   // x1_ and n1_: gate, rule, why
+  void load_nba();   // x1_, n1_ and n2_: gate, rule, why
   nlohmann::json nba_status() const;
   FillModel fill_model_;                 // each market's trade tape: how likely an order is to fill
   std::map<std::string, std::set<std::string>> strat_want_;   // under live_mu_: by lane, the markets it quotes

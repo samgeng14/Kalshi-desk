@@ -64,17 +64,17 @@ struct DeskdConfig {
     Money budget = 40 * 10000;     // u, "lane_dollars": the lane's budget (decisions 1); the game to $40
     int max_score_age_s = 5;       // the score's last poll at most this long ago; 1 to 5 (plan 5(d))
   } college;
-  // The NBA lanes: X1 ESPN EXP (plan 5(e)) and N1 NBA MODEL (decisions 2), IOC takes in NBA games.
-  // Their engines are built only with nba_lanes (and systematic_orders), each once its gate
-  // (<gates_dir>/X1.json, N1.json) loads; a lane then trades only once its gate is live, the
-  // operator turns it on and presses Start.
+  // The NBA lanes: X1 ESPN EXP (plan 5(e)), N1 NBA MODEL and N2 NBA FAV 90-95 (decisions 2), IOC
+  // takes in NBA games (N2's before the start). Their engines are built only with nba_lanes (and
+  // systematic_orders), each once its gate (<gates_dir>/X1.json, N1.json, N2.json) loads; a lane
+  // then trades only once its gate is live, the operator turns it on and presses Start.
   bool nba_lanes = false;
-  std::vector<std::string> nba_series = {"KXNBAGAME"};   // the series X1 and N1 trade
+  std::vector<std::string> nba_series = {"KXNBAGAME"};   // the series X1, N1 and N2 trade
   // The NBA model (tools/train_bball.py --league nba): the fair on NBA ladders, and N1's. "" =
   // models/nba_logit_v1.json in the source tree; read as the WCBB model is.
   std::string nba_model;
-  // X1 and N1 record what they would take while they may not post (a gate at stage shadow, the
-  // lane off, Systematic stopped) in ops.sqlite's signals table: N1's last gate reads them. C1
+  // X1, N1 and N2 record what they would take while they may not post (a gate at stage shadow,
+  // the lane off, Systematic stopped) in ops.sqlite's signals table: N1's last gate reads them. C1
   // records none (its gate measures the recorder's data).
   bool lane_shadow = true;
   // Manual orders to the (demo) venue. Off by default: gw still admits and answers, but every

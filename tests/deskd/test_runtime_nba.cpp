@@ -14,6 +14,14 @@
 //   - KILL: N1's group is triggered and gw refuses N1 KILLED; ESPN going silent pulls SCORE_OLD,
 //     with no signal and nothing sent after the re-arm and Start
 //   - the game cap in gw (N1's event cap, $10): an order past it is refused SYS_CEILING
+// and N2 NBA FAV 90-95 (decisions 2), with no NBA model:
+//   - no gate file: LaneSet refused naming it; a gate whose band is not what N2 trades says so
+//   - tools/nba_gate.py's own gate (tests/deskd/fixtures/n2_gate.json) at stage shadow: the 0.92
+//     favourite half an hour before the start is a SHADOW row of 5 contracts, never an order, and
+//     no NBA scoreboard is read hot for it
+//   - the same gate live: on, Start, then the game listed: exactly one SN2- IOC BUY of the
+//     favourite's 5 contracts at its 0.92 ask, in N2's order group, filled, its TAKE row; then it
+//     holds them (HELD) and sends nothing more
 // Every run ends with gw's invariant checks at zero (the harness).
 #include <csignal>
 #include <ctime>
@@ -288,10 +296,154 @@ void nba() {
   espn.stop();
   espn_th.join();
 }
+
+void n2() {
+  const std::int64_t start = now_ms() + 1800000;   // half an hour away: inside N2's window (60 to 2 minutes before)
+  const std::string date = et_date(now_ms());
+  const std::string EV = "KXNBAGAME-" + kalshi_date(date) + "LALBOS", BOS = EV + "-BOS", LAL = EV + "-LAL";
+  // ESPN: the Lakers at Boston, not started; no game at all while `listed` is false
+  std::atomic<bool> listed{true};
+  char iso[32];
+  {
+    const std::time_t t = start / 1000;
+    std::tm b{};
+    gmtime_r(&t, &b);
+    std::strftime(iso, sizeof iso, "%Y-%m-%dT%H:%MZ", &b);
+  }
+  httplib::Server espn;
+  espn.Get("/apis/site/v2/sports/basketball/nba/scoreboard", [&](const httplib::Request&, httplib::Response& res) {
+    auto side = [](const char* ha, const char* abbr, const char* name) {
+      return json{{"homeAway", ha}, {"score", "0"}, {"team", {{"abbreviation", abbr}, {"displayName", name}}}};
+    };
+    json events = json::array();
+    if (listed)
+      events.push_back({{"id", "401902"}, {"date", iso},
+                        {"competitions", {{{"status", {{"period", 0}, {"displayClock", "0:00"}, {"type", {{"state", "pre"}, {"shortDetail", "-"}}}}},
+                                           {"competitors", {side("away", "LAL", "Los Angeles Lakers"), side("home", "BOS", "Boston Celtics")}}}}}});
+    res.set_content(json{{"events", events}}.dump(), "application/json");
+  });
+  const int espn_port = espn.bind_to_any_port("127.0.0.1");
+  std::thread espn_th([&] { espn.listen_after_bind(); });
+  {
+    Run r(false, [&](fakex::Engine& e, std::int64_t now) {
+      for (const auto& tk : {BOS, LAL}) {
+        auto spec = fx::spec(tk, 0);
+        spec.close_ms = (now / 1000 + 4 * 3600) * 1000;
+        e.add_market(spec, now);
+      }
+      // Boston the favourite at 0.91 / 0.92, the Lakers 0.08 / 0.09, 30 deep
+      e.street_add(BOS, false, 9100, 3000, now); e.street_add(BOS, true, 800, 3000, now);
+      e.street_add(LAL, false, 800, 3000, now); e.street_add(LAL, true, 9100, 3000, now);
+    }, true, [&](DeskdConfig& c, RuntimeOptions& o) {
+      c.paper_lane = false;
+      c.nba_lanes = true;   // no NBA model: N2 needs none
+      o.espn_url = "http://127.0.0.1:" + std::to_string(espn_port);
+      o.espn_scoreboard_ms = 300;
+      o.ncaa_url = "";
+    });
+    auto lane_on = [&](const std::string& lane) { return r.post("/api/lane/" + lane, {{"on", true}}); };
+    auto refused = [&](const std::string& lane, const std::string& want) {   // LaneSet on: BAD_REQUEST, saying want
+      auto l = lane_on(lane);
+      const json err = l && l->status == 400 ? json::parse(l->body)["err"] : json::object();
+      if (err.value("code", "") == "BAD_REQUEST" && err.value("msg", "") == want) return true;
+      std::fprintf(stderr, "LaneSet %s: %d %s\nwant %s\n", lane.c_str(), l ? l->status : 0, l ? l->body.c_str() : "", want.c_str());
+      return false;
+    };
+    auto n2_status = [&] { return r.d->status()["nba"]["N2"]; };
+    auto orders = [&] {
+      return r.venue.f->with_engine([](fakex::Engine& e, std::int64_t) {
+        std::vector<fakex::Order> out;
+        for (const fakex::Order* o : e.user_orders())
+          if (o->client_order_id.rfind("SN2-", 0) == 0) out.push_back(*o);
+        return out;
+      });
+    };
+    const std::string path = r.dir.path + "/gates/N2.json", db = r.dir.path + "/ops.sqlite";
+    json measured;   // tools/nba_gate.py's gate for its synthetic season: live, 5 contracts, 0.90-0.95
+    {
+      std::ifstream in(fixture("n2_gate.json"));
+      measured = json::parse(in);
+    }
+    // ---- no gate file
+    CHECK(r.until([&] { return r.d->status()["rest"]["ready"] == true; }, 15000));
+    CHECK(refused("N2", "lane N2 is gated: no gate file " + path));
+    CHECK(n2_status()["why"] == "no gate file " + path && n2_status()["engine"].is_null() && n2_status()["rule"].is_null());
+    CHECK(r.d->status()["nba"]["N1"]["why"] == "no NBA model");
+    // ---- a gate that measured another band than N2 trades
+    std::filesystem::create_directories(r.dir.path + "/gates");
+    {
+      json g = measured;
+      g["params"]["fav_hi"] = 0.96;
+      std::ofstream(path) << g.dump();
+    }
+    r.restart();
+    CHECK(refused("N2", "lane N2 is gated: " + path + ": the gate's params.fav_hi 0.96 is not what N2 trades (0.9500)"));
+    CHECK(n2_status()["gate"]["stage"] == "live" && n2_status()["rule"].is_null() && n2_status()["engine"].is_null());
+    // ---- at stage shadow: the favourite in its window is recorded, never sent
+    {
+      json g = measured;
+      g["stage"] = "shadow";
+      std::ofstream(path) << g.dump();
+    }
+    r.restart();
+    CHECK(refused("N2", "lane N2 is gated: " + path + ": stage shadow (shadow signals only until its gate is live)"));
+    const std::string shadowed = "SELECT count(*) FROM signals WHERE lane='N2' AND mode='FAV_PREGAME' AND action='SHADOW' AND shadow=1 AND tk='" +
+                                 BOS + "' AND side='BUY' AND px=0.92 AND qty=5 AND fair IS NULL AND cid IS NULL";
+    const bool seen = r.until([&] { return sql_count(db, shadowed.c_str()) == 1; }, 30000);
+    if (!seen) std::fprintf(stderr, "no shadow: %s\n", n2_status().dump().c_str());
+    CHECK(seen);
+    CHECK(orders().empty() && r.d->status()["espn"]["fast_series"].empty());   // N2 alone reads no scoreboard hot
+    // ---- live. The game is listed once Systematic runs: a favourite N2 sees while it may not post
+    // is recorded in shadow and uses the pregame's one signal run
+    listed = false;
+    std::ofstream(path) << measured.dump();
+    r.restart();
+    CHECK(r.ready());
+    CHECK(n2_status()["why"] == "" && n2_status()["engine"]["shadow"] == true &&
+          n2_status()["rule"] == json({{"mode", "FAV_PREGAME"}, {"count", 5.0}, {"band", {"0.9000", "0.9500"}}}));
+    auto l = lane_on("N2");
+    CHECK(l && l->status == 200);
+    if (l && l->status == 200) {
+      const auto row = json::parse(l->body)["lane"];
+      CHECK(row["id"] == "N2" && row["on"] == true && row["budget"] == "15.0000" && row["thr"].is_null());
+    }
+    std::string gwhy;
+    CHECK(r.until([&] { return r.d->gw().groups_ready(&gwhy) && gwhy.empty(); }, 20000));
+    httplib::Result st;
+    CHECK(r.until([&] { st = r.post("/api/start", json::object()); return st && st->status == 200; }, 15000));
+    CHECK(r.until([&] { return r.d->gw().sys_view()->run == RunState::RUN; }));
+    listed = true;
+    const bool took = r.until([&] { const auto o = orders(); return o.size() == 1 && o[0].filled > 0; }, 30000);
+    if (!took) std::fprintf(stderr, "no take: %s\n", n2_status().dump().c_str());
+    CHECK(took);
+    if (took) {
+      const fakex::Order o = orders()[0];
+      const bool grouped = r.venue.f->with_engine([&](fakex::Engine& e, std::int64_t) { return e.group(o.order_group_id) != nullptr; });
+      CHECK(o.ticker == BOS && o.side == fakex::Side::BID && o.price == 9200 && o.tif == fakex::Tif::IOC && o.initial == 500 &&
+            o.filled == 500 && !o.order_group_id.empty() && grouped);
+      const std::string take = "SELECT count(*) FROM signals WHERE lane='N2' AND action='TAKE' AND shadow=0 AND tk='" + BOS +
+                               "' AND side='BUY' AND px=0.92 AND qty=5 AND cid='" + o.client_order_id + "'";
+      CHECK(r.until([&] { return sql_count(db, take.c_str()) == 1; }, 10000));
+    }
+    // it holds its 5 to settlement: nothing more while the favourite stays in its band
+    CHECK(r.until([&] {
+      const auto v = r.d->gw().sys_view();
+      const auto it = v->positions.find("N2|" + BOS);
+      return it != v->positions.end() && it->second == 500;
+    }, 10000));
+    const bool held = r.until([&] { return n2_status()["engine"]["games"][EV]["pull"] == "HELD"; }, 20000);
+    if (!held) std::fprintf(stderr, "not held: %s\n", n2_status().dump().c_str());
+    CHECK(held);
+    CHECK(orders().size() == 1);
+  }
+  espn.stop();
+  espn_th.join();
+}
 }  // namespace
 
 int main() {
   std::signal(SIGPIPE, SIG_IGN);
   nba();
+  n2();
   return finish("deskd-runtime-nba");
 }

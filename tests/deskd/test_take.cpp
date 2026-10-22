@@ -8,7 +8,7 @@
 // awaited and a refusal's back-off, the signal runs, what blocks a post and the shadow rows, PULL
 // rows, the inputs it builds (fair on the board's state, worst case, Systematic's positions and
 // working orders, books, volume, clock, set ends, ESPN's number), which games, each series' own
-// rule, the signals' markouts and LaneMarkout to gw.
+// rule, N2's pregame favourite, the signals' markouts and LaneMarkout to gw.
 #include <algorithm>
 #include <cmath>
 #include <fstream>
@@ -1227,6 +1227,60 @@ void engine_series() {
   CHECK(refused);
 }
 
+// N2 (FAV_PREGAME, decisions 2): before the start and inside its window, the 0.90-0.95 favourite is
+// bought once to 5 contracts, at the ask with no fair on the order or its row; too early is
+// WINDOW, what it holds is HELD, the game in play is STATE; off, with shadow, a SHADOW row and no
+// order
+void engine_fav() {
+  const std::string ev = "KXNBAGAME-26NOV14LALBOS", bos = ev + "-BOS", lal = ev + "-LAL";
+  auto pregame = [&](Rig& g, std::int64_t fetched, std::int64_t start, const std::string& state = "pre") {
+    g.score(T0 - 600000, fetched, std::nullopt, 0, 0, state, state == "pre" ? 0 : 1, 720);
+    for (const auto& tk : {bos, lal}) g.scores[tk].start_ms = start;
+  };
+  {
+    Rig g(ev, bos, lal);
+    g.view->lanes_on = {"N2"};
+    g.book(bos, 9100, 9200);   // Boston the 0.92 favourite, the Lakers 0.08 / 0.09
+    g.book(lal, 800, 900);
+    TakeEngine e("N2", {"KXNBAGAME"}, g.env(), take_params(TakeMode::FAV_PREGAME));
+    pregame(g, T0 - 1000, T0 + 5400000);   // an hour and a half before the start: too early
+    e.step(T0);
+    CHECK(g.posted.empty() && g.rows.empty() && game_status(e, ev)["pull"] == "WINDOW" &&
+          game_status(e, ev)["why"] == "5400000 ms before the start: outside 3600000 ms to 120000 ms");
+    pregame(g, T0 + 1000, T0 + 1800000);   // half an hour before: Boston at its ask, 5 contracts
+    e.step(T0 + 1200);
+    CHECK(g.places().size() == 1);
+    if (g.places().size() != 1) return;
+    const PlaceIntent& p = *g.places()[0];
+    CHECK(p.cid.rfind("SN2-", 0) == 0 && p.lane == "N2" && p.ticker == bos && p.side == Side::BUY && p.price == 9200 &&
+          p.count == 500 && p.tif == Tif::IOC && p.ttl_s == 0 && !p.reduce_only && p.touch == Px{9200} && !p.fair);
+    CHECK(g.rows.size() == 1 && g.rows[0]["action"] == "TAKE" && g.rows[0]["mode"] == "FAV_PREGAME" && g.rows[0]["fair"].is_null() &&
+          g.rows[0]["edge"] == "0.0000" && g.rows[0]["qty"] == 5 && g.rows[0]["px"] == "0.9200");
+    g.answer(0, OrderReply{});
+    g.view->positions["N2|" + bos] = 500;   // filled: it holds its 5
+    pregame(g, T0 + 12000, T0 + 1800000);
+    e.step(T0 + 12000);
+    CHECK(g.places().size() == 1 && game_status(e, ev)["pull"] == "HELD" && has(game_status(e, ev)["why"], "holds 5 of " + bos));
+    pregame(g, T0 + 1800000, T0 + 1800000, "in");   // the tip: no more
+    e.step(T0 + 1800500);
+    CHECK(g.places().size() == 1 && game_status(e, ev)["pull"] == "STATE" &&
+          game_status(e, ev)["why"] == "the game is in: only before the start");
+  }
+  {   // off, shadowing: the same favourite is a SHADOW row, nothing posted
+    Rig g(ev, bos, lal);
+    g.view->lanes_on.clear();
+    g.book(bos, 9100, 9200);
+    g.book(lal, 800, 900);
+    TakeOptions o;
+    o.shadow = true;
+    TakeEngine e("N2", {"KXNBAGAME"}, g.env(), take_params(TakeMode::FAV_PREGAME), o);
+    pregame(g, T0 - 1000, T0 + 1800000);
+    e.step(T0);
+    CHECK(g.posted.empty() && g.rows.size() == 1 && g.rows[0]["action"] == "SHADOW" && g.rows[0]["shadow"] == true &&
+          g.rows[0]["why"] == "lane N2 is off" && g.rows[0]["tk"] == bos && g.rows[0]["qty"] == 5 && g.rows[0]["fair"].is_null());
+  }
+}
+
 // Signals' markouts: each horizon's mid half a second after it, + in the signal's favour, null
 // with no mid; the row sent again each time. And the fills' markouts at the lane's horizon go to gw.
 void engine_markouts() {
@@ -1316,6 +1370,7 @@ int main() {
   engine_inputs();
   engine_games();
   engine_series();
+  engine_fav();
   engine_markouts();
   return finish("deskd-take");
 }
