@@ -490,6 +490,8 @@ struct Flow {
   Qty in_q = 0, out_q = 0;
   Micros in_c = 0, out_c = 0, in_f = 0, out_f = 0, slip = 0;
 };
+// t's share for q of n contracts (n > 0), rounded toward zero
+Micros share(Micros t, Qty q, Qty n) { return n > 0 ? static_cast<Micros>(static_cast<__int128>(t) * q / n) : 0; }
 std::vector<Flow> flows(const Basket& b, const Gateway::SysView& v) {
   std::vector<Flow> f(b.plan.legs.size());
   if (b.orphan)
@@ -519,10 +521,20 @@ std::vector<Flow> flows(const Basket& b, const Gateway::SysView& v) {
     // a completion's price past the planned touch: a BUY's above it, a SELL's below
     if (o.role == 'c') x.slip -= (o.side == Side::BUY ? 1 : -1) * (c - b.plan.legs[o.leg].planned * q);
   }
+  // A restored basket's previous-run orders count what s1.json last kept of them: one whose fills
+  // were not booked by then (its answer still to come at the crash, or a 201 ahead of its fills)
+  // kept none, though S1's positions hold them and the unwind closes them. What a leg closed past
+  // what it took in is taken at its planned touch, with its fee bound pro rata, so that round
+  // trip still counts.
+  if (b.restored && !b.orphan)
+    for (std::size_t k = 0; k < f.size(); ++k)
+      if (const Qty q = f[k].out_q - f[k].in_q; q > 0) {
+        f[k].in_q += q;
+        f[k].in_c += b.plan.legs[k].planned * q;
+        f[k].in_f += share(b.plan.legs[k].fee, q, b.plan.qty);
+      }
   return f;
 }
-// t's share for q of n contracts (n > 0), rounded toward zero
-Micros share(Micros t, Qty q, Qty n) { return n > 0 ? static_cast<Micros>(static_cast<__int128>(t) * q / n) : 0; }
 // the unwinds' round trips: each closed contract at the closing order's average less the leg's
 // own, and both orders' fees on it
 Micros round_trips(const Basket& b, const std::vector<Flow>& f) {

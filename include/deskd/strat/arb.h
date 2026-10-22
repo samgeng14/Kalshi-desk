@@ -185,7 +185,8 @@ struct Basket {
 // What legging cost a basket so far (micro-dollars, < 0 a loss): its unwinds' round trips, each
 // leg's own fees on the part it closed and the closing order's fees included, and each completion's
 // price past its leg's planned touch (one cent tick on 4 contracts: -$0.04). Orders the view still
-// shows are read there (SysOrder's executions), the rest from what the basket kept of them.
+// shows are read there (SysOrder's executions), the rest from what the basket kept of them; what a
+// restored basket's leg closed past what its kept orders took in, as taken at its planned touch.
 Micros legging_pnl(const Basket& b, const Gateway::SysView& v);
 // What the basket locks to settlement on the part every leg holds (its least payout a contract
 // times that part, less what that part cost and its fees) plus its round trips; an orphan's

@@ -31,7 +31,8 @@
 //   - the legging pause from s1.json and from this run, sticky across a new engine until the lane
 //     is turned off and on; the lane's day as a backstop
 //   - a restart mid-basket and orphans (no s1.json, or one that cannot be read): unwound from S1's
-//     positions once the start's account read is in
+//     positions once the start's account read is in; a leg s1.json saw no fills of still counts
+//     its round trip in legging
 //   - the finder's limits: the lane's budget by market or by state, the group, the ceiling, the
 //     shard's cash; the write budget; the IOC lanes' cost budget, with room for the basket's fees
 #include <algorithm>
@@ -1323,12 +1324,14 @@ void engine_pause() {
 }
 
 // A restart mid-basket: the open basket comes back from s1.json frozen, its legs never completed;
-// once an account read after the start is 5 s old, the excess over the least held is unwound
+// once an account read after the start is 5 s old, the excess over the least held is unwound.
+// Its legging counts the round trip of a leg whose fills s1.json never saw.
 void engine_restart() {
   TempDir dir;
   const std::string file = dir.file("s1.json");
   Rig g;
   g.state_file = file;
+  Micros t79_fee = 0;   // T79's fee bound on the basket's 10
   {
     ArbEngine e("S1", {"KXHIGHNY"}, g.env(), Rig::params());
     e.step(NOW);
@@ -1336,6 +1339,9 @@ void engine_restart() {
     g.answer(0, 10);
     e.step(T + 10);
     CHECK(g.n() == 3 && read_json(file)["baskets"][0]["st"] == "REST");
+    const json leg = read_json(file)["baskets"][0]["plan"]["legs"][1];
+    CHECK(leg["tk"] == T79() && leg["planned"] == px(.28));
+    t79_fee = leg["fee"].get<Micros>();
   }
   // deskd is gone; gw's rebuild from the venue's fills shows what the legs did
   Rig h;
@@ -1357,6 +1363,11 @@ void engine_restart() {
   h.answer(1, 6, true, .26);
   e.step(T2 + 5010);
   CHECK(h.last("baskets")["why"] == "unwound: every leg holds 4" && read_json(file)["baskets"].empty());
+  // legging: B79.5's 6 bought at .31 (its fills in s1.json) sold at .29, and T79's 6 sold at .26,
+  // whose leg went unanswered: taken at its planned .28, with 6 of its 10's fee bound
+  const Micros legging = -usd(.12) - usd(.12) - t79_fee * 6 / 10;
+  CHECK(t79_fee > 0 && h.last("baskets")["legging"] == money_str(legging / 100) && e.status()["legging"] == money_str(legging / 100) &&
+        read_json(file)["legging"] == legging);
   CHECK(g.unsaved == 0 && h.unsaved == 0);
 }
 
