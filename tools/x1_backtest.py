@@ -40,9 +40,10 @@ languages.
 A game is its two markets, A the first by ticker (as TakeEngine); ESPN's number for A's team is its
 home probability, or 1 minus it. Decisions run as TakeEngine runs them: a new score state starts a
 signal run in which each team is taken once, a decision with no edge 10 s after the last that had
-one ends the run, and the game's takes, cool-down and worst case carry over. A take buys the
-team at its ask or sells the other market at its bid, whichever the rule picks. The fee is
-take_rule.kalshi_fee_order_cent (gw/fees.h, rounded up to the cent per order;
+one ends the run, and the game's takes, cool-down and worst case carry over, as does X1's position
+in each market, which gw's inventory (take_params': 4 contracts a market) caps a take's count by.
+A take buys the team at its ask or sells the other market at its bid, whichever the rule picks.
+The fee is take_rule.kalshi_fee_order_cent (gw/fees.h, rounded up to the cent per order;
 research/espn_leadlag.py's taker_fee gives the same at cent prices); a market's multiplier is its
 series' (the DB; 1.0 where it has none, as that study took it) or --fee-mult (the recorder has no
 series rows: 1.0, TO CONFIRM for KXNBAGAME). A league without a game clock (mlb) cannot apply the
@@ -333,7 +334,7 @@ class Game:
         q = book.at(tk, t, self.max_age_ms)
         leg = {'ticker': tk, 'book': q is not None, 'stale': False, 'bid': None, 'bid_qty': 0, 'ask': None,
                'ask_qty': 0, 'fee_mult': self.fee_mult.get(tk), 'fractional': False, 'position': 0,
-               'bid_since_ms': 0, 'ask_since_ms': 0}
+               'sys_position': 0, 'sys_buying': 0, 'sys_selling': 0, 'bid_since_ms': 0, 'ask_since_ms': 0}
         if q is not None:
             leg.update(bid=q.bid, ask=q.ask, bid_since_ms=q.t, ask_since_ms=q.t,
                        bid_qty=DEEP if q.bid_qty is None else q.bid_qty, ask_qty=DEEP if q.ask_qty is None else q.ask_qty)
@@ -372,8 +373,10 @@ def simulate(game, book, p):
         if inp['first_seen_ms'] != run.run_state:   # a new score state starts a new run
             run.run_state = inp['first_seen_ms']
             run.fired = [False, False]
+        # X1's own takes are Systematic's position in the game's markets as far as this replay knows
+        # (N1 trades them too, and is not replayed), which gw's inventory caps; IOCs leave none working
         for i, k in ((0, 'a'), (1, 'b')):
-            inp[k]['position'] = run.pos[game.tickers[i]]
+            inp[k]['position'] = inp[k]['sys_position'] = run.pos[game.tickers[i]]
         inp.update(fired=list(run.fired), last_take_ms=run.last_take_ms, game_takes=run.takes, game_used=run.used)
         d = tr.decide(inp, p)
         if tr.has_edge(d, p['mode']):
@@ -1405,6 +1408,23 @@ def self_test(write_fixture=False):
         return [x['t'] for x in simulate(g, bk, rule_params('fade', 0.12))]
     check('a signal run ends at a decision without edge 10 s after the last with one (run_quiet_ms)',
           quiet_game(14500) == [1000] and quiet_game(25500) == [1000, 26000], (quiet_game(14500), quiet_game(25500)))
+
+    # gw's inventory, X1's 4 contracts a market, over the position the replay's own takes built
+    # (x1_golden.json's 60c cases): FOLLOW 0.10 with ESPN at 0.75 for A's team, A 0.59/0.60 and B
+    # 0.39/0.41, a new score state every 11 s. $2 buys 3 of A at 0.60 (edge 0.13); the next run
+    # buys the 1 left of A's 4; with A full the third sells B at 0.39 (A at 0.61: 3, edge 0.1233)
+    # and the fourth the 1 left of B's; without the cap all four would buy 3 of A
+    a, b = 'KXNBAGAME-26NOV01AAABBB-AAA', 'KXNBAGAME-26NOV01AAABBB-BBB'
+    g = Game('KXNBAGAME-26NOV01AAABBB', 'nba', '2026-11-01', (a, b), True, {}, {a: 1.0, b: 1.0})
+    bk = Book()
+    bk.add(a, 0, Quote(0, 5900, 5000, 6000, 5000))
+    bk.add(b, 0, Quote(0, 3900, 5000, 4100, 5000))
+    g.points = [(t, 'in', 2000.0, False, 70 + k, 64, 7500, t, t, t) for k, t in enumerate(range(1000, 34001, 11000))]
+    took = [(x['side'], x['ticker'], x['price'], x['count'], x['edge'])
+            for x in simulate(g, bk, rule_params('follow', 0.10))]
+    check("inventory: X1's takes fit its 4 a market, A's then B's, the rest through the other market",
+          took == [('BUY', a, 6000, 300, 1300), ('BUY', a, 6000, 100, 1300), ('SELL', b, 3900, 300, 1233),
+                   ('SELL', b, 3900, 100, 1200)], took)
 
     with tempfile.TemporaryDirectory() as d:
         db = os.path.join(d, 'espn_leadlag.sqlite')

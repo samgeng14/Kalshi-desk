@@ -32,13 +32,18 @@ The decision (decide(inp, params)): inp is take.h's TakeInput, a dict with integ
 
   a, b          the two markets, each {ticker, bid, bid_qty, ask, ask_qty (None: no such side),
                 stale, book (optional; False: no book at all, which stale True also stands for),
-                fee_mult (None: not known), fractional, position, bid_since_ms, ask_since_ms}
+                fee_mult (None: not known), fractional, position (the lane's), sys_position,
+                sys_buying, sys_selling (gw's inventory measure: Systematic's position there,
+                every lane's, and what is left of its working orders there by side; a replay
+                keeps them from its own fills, and an IOC-only one has no working orders),
+                bid_since_ms, ask_since_ms}
   state, src, score_why, fetched_ms, first_seen_ms, start_ms, a_score, b_score, t_left_s (None:
   no clock), ot, points, set_end_ms, p0, fair, fair_why, espn, espn_seen_ms (A's side; p0, fair
   and espn are Px or None), now_ms, last_take_ms, game_used (micro-dollars), game_takes, fired
   ([A, B]), private_up, not_tradable, volume (Qty)
 
-and params is take.h's TakeParams (params(mode) gives take_params' defaults, in the same units).
+and params is take.h's TakeParams (params(mode) gives take_params' defaults, in the same units;
+inventory is the lane's limit a market, default_lanes()' own, which gw's place_sys enforces).
 It returns {'take': {ticker, side, price, count, fee, edge, team_px, ref, cost, dir, touch_since_ms}}
 or {'pull': CODE, 'why', 'edge' (the pulled route's, or None), 'dir' (-1: the game's own checks),
 'route' (the pulled route's order once it had a count, else None)}, edge rounded down to Money a
@@ -75,8 +80,8 @@ FIXTURES = ('college_take_cases.json', 'x1_golden.json', 'n1_golden.json')
 # every pull code, in the order of take.h's checks (take_pull_codes)
 PULL_CODES = ('NOT_TRADABLE', 'PRIVATE_DOWN', 'STALE_BOOK', 'NO_FEE', 'NO_SCORE', 'SCORE_OLD', 'STATE', 'WINDOW',
               'NO_P0', 'NO_FAIR', 'NO_ESPN', 'NO_MID', 'NO_POINTS', 'SET_WINDOW', 'OVERTIME', 'LATE', 'SIGNAL_OLD',
-              'VOLUME', 'SPREAD', 'COOL_DOWN', 'TAKES', 'GAME_CAP', 'NO_TOUCH', 'HELD', 'CLIP', 'SIZE', 'NO_EDGE',
-              'BAND', 'TOUCH_AFTER_SCORE', 'TRAILER', 'FIRED')
+              'VOLUME', 'SPREAD', 'COOL_DOWN', 'TAKES', 'GAME_CAP', 'NO_TOUCH', 'HELD', 'INVENTORY', 'CLIP', 'SIZE',
+              'NO_EDGE', 'BAND', 'TOUCH_AFTER_SCORE', 'TRAILER', 'FIRED')
 
 
 # ---------------------------------------------------------------- the fee (gw/fees.h)
@@ -132,17 +137,19 @@ def params(mode):
     if mode not in MODES:
         raise ValueError('unknown mode %r' % mode)
     p = {'mode': mode, 'edge': 2000, 'clip': 2 * ONE, 'max_count': 0, 'fixed_count': 0, 'game_cap': 10000000,
-         'max_takes': 0, 'max_score_age_ms': 5000, 'signal_ms': 0, 'cool_ms': 5000, 'max_volume': 0,
-         'stale_only': False, 'leader_only': False, 'points_required': True, 'set_window_ms': 120000,
-         'max_spread': 0, 'min_px': 0, 'max_px': ONE, 'trade_ot': True, 'min_t_left_s': 0.0,
-         'fav_lo': 9000, 'fav_hi': 9500, 'fav_from_ms': 3600000, 'fav_to_ms': 120000}
+         'inventory': 0, 'max_takes': 0, 'max_score_age_ms': 5000, 'signal_ms': 0, 'cool_ms': 5000,
+         'max_volume': 0, 'stale_only': False, 'leader_only': False, 'points_required': True,
+         'set_window_ms': 120000, 'max_spread': 0, 'min_px': 0, 'max_px': ONE, 'trade_ot': True,
+         'min_t_left_s': 0.0, 'fav_lo': 9000, 'fav_hi': 9500, 'fav_from_ms': 3600000, 'fav_to_ms': 120000}
     if mode == 'COLLEGE':   # college.json's; the gate may raise edge, never below 10c
-        p.update(edge=2000, cool_ms=5000, max_volume=20000 * CT, stale_only=True)
+        p.update(edge=2000, inventory=20 * CT, cool_ms=5000, max_volume=20000 * CT, stale_only=True)
     elif mode in ('MODEL', 'ESPN_FOLLOW', 'ESPN_FADE'):   # nba.json's (thr 10c until the gate's)
-        p.update(edge=1000, max_count=4 * CT, max_takes=4, signal_ms=30000, cool_ms=10000, max_spread=300,
-                 min_px=500, max_px=9500, trade_ot=False, min_t_left_s=120.0)
+        p.update(edge=1000, max_count=4 * CT, inventory=(10 if mode == 'MODEL' else 4) * CT,   # N1's; X1's
+                 max_takes=4, signal_ms=30000, cool_ms=10000, max_spread=300, min_px=500, max_px=9500,
+                 trade_ot=False, min_t_left_s=120.0)
     else:   # FAV_PREGAME: 5 contracts, hold to settlement
-        p.update(edge=0, clip=0, fixed_count=5 * CT, max_score_age_ms=60000, cool_ms=10000, max_spread=1000)
+        p.update(edge=0, clip=0, fixed_count=5 * CT, inventory=5 * CT, max_score_age_ms=60000, cool_ms=10000,
+                 max_spread=1000)
     return p
 
 
@@ -154,6 +161,11 @@ def _ms(v):
 
 def _price(px):
     return '%.4f' % (px / ONE)
+
+
+def _qty(q):
+    """Contracts as gw writes them (a JSON number: 20.0, 2.5)."""
+    return json.dumps(q / CT)
 
 
 def _floor(e):
@@ -302,8 +314,15 @@ def decide(i, P):
         else:
             want = fit(P['clip'] * 100, r['team_px'], mult, step, P['max_count'])
         by_room = fit(room, r['team_px'], mult, step, 0) if P['game_cap'] > 0 else 1 << 62
+        # gw's inventory (gateway.cpp place_sys): Systematic's position in the market sent to, pos in
+        # the order's direction, with its working orders on the side, ends at most inventory from flat
+        # or no further from it than pos
+        leg = r['leg']
+        pos = leg['sys_position'] if buy else -leg['sys_position']
+        working = leg['sys_buying'] if buy else leg['sys_selling']
+        by_inv = max(0, max(P['inventory'], abs(pos)) - pos - working) // step * step if P['inventory'] > 0 else 1 << 62
         size = (own['ask_qty'] if buy else other['bid_qty']) or 0
-        r['count'] = min(want, by_room, size // step * step)
+        r['count'] = min(want, by_room, by_inv, size // step * step)
         if r['count'] <= 0:
             r['count'] = 0
             if fav and want <= 0:
@@ -311,6 +330,9 @@ def decide(i, P):
             if by_room <= 0:
                 return fail('GAME_CAP', "the game's room $%s buys no contract at %s" % (_price(room // 100),
                                                                                    _price(r['team_px'])))
+            if by_inv <= 0:
+                return fail('INVENTORY', 'the inventory room in %s buys no contract: %s held, %s working, limit %s' % (
+                    leg['ticker'], _qty(leg['sys_position']), _qty(working), _qty(P['inventory'])))
             if want <= 0:
                 return fail('CLIP', 'the clip $%s buys no contract at %s' % (_price(P['clip']), _price(r['team_px'])))
             return fail('SIZE', 'the touch is under one contract')
@@ -375,7 +397,7 @@ def decide(i, P):
 
 
 PAST_EDGE = ('BAND', 'TOUCH_AFTER_SCORE', 'TRAILER', 'FIRED')
-PAST_BAND = ('HELD', 'GAME_CAP', 'CLIP', 'SIZE', 'TOUCH_AFTER_SCORE', 'TRAILER', 'FIRED')
+PAST_BAND = ('HELD', 'GAME_CAP', 'INVENTORY', 'CLIP', 'SIZE', 'TOUCH_AFTER_SCORE', 'TRAILER', 'FIRED')
 
 
 def has_edge(d, mode):
@@ -418,7 +440,7 @@ def params_of(fx, mode):
     p = dict(fx)
     for k in ('edge', 'clip', 'max_spread', 'min_px', 'max_px', 'fav_lo', 'fav_hi'):
         p[k] = _dec(p[k], ONE)
-    for k in ('max_count', 'fixed_count', 'max_volume'):
+    for k in ('max_count', 'fixed_count', 'max_volume', 'inventory'):
         p[k] = _dec(p[k], CT)
     p['game_cap'] = _dec(p['game_cap'], 10 ** 6)
     p['min_t_left_s'] = float(p['min_t_left_s'])
@@ -433,7 +455,7 @@ def input_of(fx):
         l = dict(fx[side])
         for k in ('bid', 'ask'):
             l[k] = _dec(l[k], ONE)
-        for k in ('bid_qty', 'ask_qty', 'position'):
+        for k in ('bid_qty', 'ask_qty', 'position', 'sys_position', 'sys_buying', 'sys_selling'):
             l[k] = _dec(l[k], CT) if l[k] is not None else 0
         i[side] = l
     for k in ('p0', 'fair', 'espn'):
@@ -563,10 +585,13 @@ def self_test():
     check("params: MODEL is nba.json's (10c, 4 contracts, 4 takes 10 s apart, 30 s, 3c, 5-95c, no OT, 2:00)",
           (n['edge'], n['max_count'], n['max_takes'], n['signal_ms'], n['cool_ms'], n['max_spread'], n['min_px'],
            n['max_px'], n['trade_ot'], n['min_t_left_s']) == (1000, 400, 4, 30000, 10000, 300, 500, 9500, False, 120.0))
-    check('params: FOLLOW and FADE are MODEL with their own mode; $10 a game for every lane',
-          dict(params('ESPN_FOLLOW'), mode='MODEL') == n == dict(params('ESPN_FADE'), mode='MODEL')
+    check('params: FOLLOW and FADE are MODEL with their own mode but 4 a market; $10 a game for every lane',
+          dict(params('ESPN_FOLLOW'), mode='MODEL', inventory=1000) == n
+          == dict(params('ESPN_FADE'), mode='MODEL', inventory=1000)
           and all(params(m)['game_cap'] == 10000000 for m in MODES))
-    check('the pull codes: 31, each once', len(PULL_CODES) == 31 == len(set(PULL_CODES)))
+    check("params: each lane's inventory is default_lanes()' (C1 20, N1 10, X1 4, N2 5 contracts)",
+          [params(m)['inventory'] for m in MODES] == [2000, 1000, 400, 400, 500])
+    check('the pull codes: 32, each once', len(PULL_CODES) == 32 == len(set(PULL_CODES)))
 
     # every hand-worked case of the fixtures deskd-take asserts, and their params are take_params'
     total = 0
@@ -619,6 +644,62 @@ def self_test():
           'take' in hi and (hi['take']['side'], hi['take']['price'], hi['take']['dir']) == ('BUY', 9500, 0)
           and 'take' in lo and (lo['take']['side'], lo['take']['price'], lo['take']['dir']) == ('BUY', 500, 1),
           (hi.get('pull'), lo.get('pull')))
+
+    # the inventory room is gw's own (test_take.cpp inventory()): over Systematic's position in the
+    # market sent to, either side of flat and past the limit, and its working orders on the side, a
+    # take is never one gw refuses, one step more would be whenever the room held the count down,
+    # and with no room the pull is INVENTORY; the other side's orders and the other market's
+    # position do not count
+    def gw_refuses(pos, working, buy, count, limit):
+        after = pos + (1 if buy else -1) * (working + count)
+        return abs(after) > limit and abs(after) > abs(pos)
+    pc = dict(params('COLLEGE'), game_cap=0, clip=100 * ONE)   # the room binds, not the clip
+    for buy in (True, False):   # one route only: BUY A at 0.45, or SELL B at 0.52 (A's team at 0.48)
+        g = dict(base, a=dict(base['a'], bid=None, ask=4500 if buy else None, ask_qty=1000 * CT),
+                 b=dict(base['b'], ask=None, bid=None if buy else 5200, bid_qty=1000 * CT))
+        sent, other = ('a', 'b') if buy else ('b', 'a')
+        g[sent]['sys_position'] = 500 * CT
+        most = decide(g, dict(pc, inventory=0)).get('take', {}).get('count', 0)   # what the clip buys
+        g[other]['sys_position'] = -50 * CT if buy else 50 * CT                    # the other market's
+        g[sent]['sys_selling' if buy else 'sys_buying'] = 50 * CT                   # the other side's
+        bad, capped, none = [], 0, 0
+        for pos in range(-45 * CT, 45 * CT + 1, 50):   # half contracts too
+            for w in (0, 100, 350, 2500):
+                g[sent]['sys_position'] = pos
+                g[sent]['sys_buying' if buy else 'sys_selling'] = w
+                d = decide(g, pc)
+                if 'take' in d:
+                    c = d['take']['count']
+                    ok = (d['take']['ticker'] == g[sent]['ticker'] and d['take']['side'] == ('BUY' if buy else 'SELL')
+                          and c % CT == 0 and not gw_refuses(pos, w, buy, c, pc['inventory'])
+                          and (c == most or gw_refuses(pos, w, buy, c + CT, pc['inventory'])))
+                    capped += c < most
+                else:
+                    ok = d['pull'] == 'INVENTORY' and d['dir'] == 0 and d['edge'] is None \
+                        and gw_refuses(pos, w, buy, CT, pc['inventory'])
+                    none += 1
+                if not ok:
+                    bad.append((pos, w, got_of(d)))
+        check('inventory: %s takes fit gw\'s room from -45 to 45 held, working on the side counted' % (
+            'BUY A' if buy else 'SELL B'), most > 100 * CT and not bad and capped > 100 and none > 100,
+            bad[:3] or (most, capped, none))
+    g = dict(base, a=dict(base['a'], bid=None, sys_position=2000), b=dict(base['b'], ask=None, sys_position=-1500,
+                                                                          sys_selling=600))
+    d = decide(g, params('COLLEGE'))
+    check("inventory: the why is gw's (B's team has no touch: A's routes go furthest)",
+          d.get('pull') == 'INVENTORY' and d['dir'] == 0 and d['why'] ==
+          'the inventory room in KXNCAAWBGAME-26NOV14AAABBB-AAA buys no contract: 20.0 held, 0.0 working, limit 20.0',
+          d.get('why'))
+    # when none of them buys a contract, the count's pulls come in take.h's order: the game's room,
+    # then the inventory room, then the clip (BUY A at 0.45 the only route)
+    g = dict(base, a=dict(base['a'], bid=None), b=dict(base['b'], bid=None, ask=None))
+    full, tiny = dict(g, a=dict(g['a'], sys_position=2000)), dict(params('COLLEGE'), clip=40)
+    order_ = [decide(dict(full, game_used=9600000), tiny).get('pull'), decide(full, tiny).get('pull'),
+              decide(g, tiny).get('pull')]
+    check('inventory: GAME_CAP, then INVENTORY, then CLIP', order_ == ['GAME_CAP', 'INVENTORY', 'CLIP'], order_)
+    inv = _pull('INVENTORY', '', None, 0)
+    check('inventory: has_edge counts it past the band for FAV_PREGAME only',
+          has_edge(inv, 'FAV_PREGAME') and not has_edge(inv, mode))
     print('take_rule self-test: %s (%d fixture cases)' % ('ok' if not fails else 'FAILED (%d)' % len(fails), total))
     return 1 if fails else 0
 

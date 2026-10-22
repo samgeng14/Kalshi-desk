@@ -73,16 +73,19 @@ decide() runs at every instant something it reads changed (a book's top, a score
 edge, a market's volume), at each cool-down's end and signal run's quiet end, and at each whole
 minute in play, with TakeEngine's own bookkeeping: a new score state starts a signal run (fired
 clears), and a decision with no edge 10 s after the last that had one ends it; the game's takes,
-last take and worst case (each fill's cost and fee); volleyball's set end (when the sets total
-first went up); the in-game volume (since each market's last reading while the score said pre);
-touch ages from book_history. A take is a case. It is filled at its own limit exec_lag later
-(--exec-lag-s, 2: detection, the network and the venue) if the touch is still there at that price
-or better, up to its size there (taken), else not at all (missed): a missed take still counts as
-the run's and the game's take, as the engine's would. A taken case's net markouts a contract, + in
-its favour: the traded market's two-sided mid 60 s and 300 s after the fill, or its payout once the
-game is over and settled, less the price, less the order's own fee (kalshi_fee_order_cent at its
-filled count) over its contracts; and at settlement. A case also keeps its edge, fair, size shown,
-how long the touch stood, its touch's age, the lead, the volume and which board scored it.
+last take and worst case (each fill's cost and fee); each market's position from the fills, which
+is Systematic's there too (no other lane trades college games) and which gw's inventory, 20
+contracts a market, caps a take's count by (IOCs leave no working orders); volleyball's set end
+(when the sets total first went up); the in-game volume (since each market's last reading while
+the score said pre); touch ages from book_history. A take is a case. It is filled at its own limit
+exec_lag later (--exec-lag-s, 2: detection, the network and the venue) if the touch is still there
+at that price or better, up to its size there (taken), else not at all (missed): a missed take
+still counts as the run's and the game's take, as the engine's would. A taken case's net markouts
+a contract, + in its favour: the traded market's two-sided mid 60 s and 300 s after the fill, or
+its payout once the game is over and settled, less the price, less the order's own fee
+(kalshi_fee_order_cent at its filled count) over its contracts; and at settlement. A case also
+keeps its edge, fair, size shown, how long the touch stood, its touch's age, the lead, the volume
+and which board scored it.
 
 The verdict (decisions 8). Per series, over the taken cases marked at 300 s: at least --min-cases
 (50), a positive contract-weighted mean net markout, and a game-clustered t of at least --min-t (2;
@@ -838,15 +841,16 @@ class Opts:
 
 
 def _leg(g, tk, top, position):
-    """take_rule's leg for one market from its Hist top (None: no book)."""
+    """take_rule's leg for one market from its Hist top (None: no book). C1's position from the
+    replay's own fills is also Systematic's there (no other lane trades college games), which gw's
+    inventory caps; its takes are IOCs, so no working orders."""
     m = g['markets'][tk]
+    own = {'ticker': tk, 'fee_mult': m['fee_mult'], 'fractional': m['fractional'], 'position': position,
+           'sys_position': position, 'sys_buying': 0, 'sys_selling': 0}
     if top is None:
-        return {'ticker': tk, 'stale': True, 'bid': None, 'bid_qty': None, 'ask': None, 'ask_qty': None,
-                'fee_mult': m['fee_mult'], 'fractional': m['fractional'], 'position': position,
-                'bid_since_ms': 0, 'ask_since_ms': 0}
-    return {'ticker': tk, 'stale': False, 'bid': top[0], 'bid_qty': top[1], 'ask': top[2], 'ask_qty': top[3],
-            'fee_mult': m['fee_mult'], 'fractional': m['fractional'], 'position': position,
-            'bid_since_ms': top[4] // 1000, 'ask_since_ms': top[5] // 1000}
+        return dict(own, stale=True, bid=None, bid_qty=None, ask=None, ask_qty=None, bid_since_ms=0, ask_since_ms=0)
+    return dict(own, stale=False, bid=top[0], bid_qty=top[1], ask=top[2], ask_qty=top[3], bid_since_ms=top[4] // 1000,
+                ask_since_ms=top[5] // 1000)
 
 
 def mark_at(hist, score, result, t):
@@ -1295,8 +1299,8 @@ def analyse(data, series=SERIES, control=False, edge=2000, exec_lag_s=2, max_sco
         models[s], model_why[s] = load_model(kind, path)
     models.update({s: STERN for s in CONTROL_SERIES})
     params = {'edge': edge / UNIT, 'exec_lag_s': exec_lag_s, 'max_score_age_s': max_score_age_s, 'clip': clip / UNIT,
-              'game_cap': game_cap / 1e6, 'thin': thin // CT, 'min_cases': min_cases, 'min_t': min_t, 'horizon': '300s',
-              'leader_only': leader_only}
+              'game_cap': game_cap / 1e6, 'inventory': tr.params('COLLEGE')['inventory'] // CT, 'thin': thin // CT,
+              'min_cases': min_cases, 'min_t': min_t, 'horizon': '300s', 'leader_only': leader_only}
     levels = {'KXNCAAWVMATCH': ('point', 'set')}
     t_lo = t_hi = None
     out = {'params': params, 'fee_mult': fee_mult, 'series': {}, 'control': None, 'wcbb_f': None,
@@ -1359,10 +1363,11 @@ def analyse(data, series=SERIES, control=False, edge=2000, exec_lag_s=2, max_sco
 
 def report(res):
     p = res['params']
-    lines = ['college_gate: %s to %s UTC; edge %.2f net, $%.2f clips, $%.0f a game, scores %d s old at most, '
-             'filled %g s after the decision, thin under %d contracts; fee multiplier %g ASSUMED where a market '
-             'row gives none' % (res['data_from'] or '-', res['data_to'] or '-', p['edge'], p['clip'], p['game_cap'],
-                                 p['max_score_age_s'], p['exec_lag_s'], p['thin'], res['fee_mult']),
+    lines = ['college_gate: %s to %s UTC; edge %.2f net, $%.2f clips, $%.0f a game, %d contracts a market, scores '
+             '%d s old at most, filled %g s after the decision, thin under %d contracts; fee multiplier %g ASSUMED '
+             'where a market row gives none' % (res['data_from'] or '-', res['data_to'] or '-', p['edge'], p['clip'],
+                                                p['game_cap'], p['inventory'], p['max_score_age_s'], p['exec_lag_s'],
+                                                p['thin'], res['fee_mult']),
              '%-16s %6s %6s %6s %6s %8s %10s %7s' % ('series', 'events', 'games', 'espn', 'ncaa', 'books_ws',
                                                     'books_rest', 'settled')]
     for ser, s in sorted(res['survey'].items()):
@@ -2022,6 +2027,29 @@ def self_test_part2(check):
                   run(['--data', d, '--edge-c', '9']) == 2)
             check('the report runs, and --json',
                   run(['--data', d, '--control']) == 0 and run(['--data', d, '--json']) == 0)
+
+    # ---- gw's inventory, C1's 20 contracts a market, over the position the replay's own fills built:
+    # a 0.30 ask older than the score and a new score state every 10 s. $2 buys 6 at 0.30 (1.80 and
+    # a 9c fee); three takes hold 18 of A, so the fourth is the 2 that fit (college_take_cases.json's
+    # fourth_take_of_a_30c_team: fee 3c, edge fair - 0.30 - 0.015), with $4.33 of the game's $10
+    # left (13 contracts) and 10 at the touch; the fifth run finds no room (INVENTORY: no case)
+    with tempfile.TemporaryDirectory() as d:
+        sp, fr = Rec(d), Frames()
+        g = Game(sp, fr, 1, 'KXNCAAWBGAME', 'IA', T0)
+        g.book(100, {0.25: 10}, {0.30: 10, 0.52: 10})
+        g.score('ESPN', -3600, 'pre', 0, '0:00', 0, 0)
+        g.score('ESPN', 60, 'in', 1, '10:00', 0, 0)
+        for k, clock in enumerate(('7:20', '7:10', '7:00', '6:50', '6:40')):
+            g.score('ESPN', 200 + 10 * k, 'in', 1, clock, 6 + 2 * k, 0)
+        g.score('ESPN', 7000, 'post', 4, '0:00', 70, 60)
+        fr.flush(sp)
+        res = analyse(d, series=('KXNCAAWBGAME',), wcbb=FIXTURE_WCBB, min_cases=1)
+        cs = res['series']['KXNCAAWBGAME']['cases']['point']
+        got = [(c['ts_ms'] - g.tip // 1000, c['side'], c['price'], c['count'], c['fee'], c['state']) for c in cs]
+        check("inventory: the fourth take of A at 0.30 is the 2 of C1's 20 left, the fifth run none",
+              got == [(200000, 'BUY', 0.3, 6.0, 0.09, 'taken'), (210000, 'BUY', 0.3, 6.0, 0.09, 'taken'),
+                      (220000, 'BUY', 0.3, 6.0, 0.09, 'taken'), (230000, 'BUY', 0.3, 2.0, 0.03, 'taken')]
+              and res['params']['inventory'] == 20 and abs(cs[3]['edge'] - (cs[3]['fair'] - 0.315)) < 1e-9, got)
 
     # ---- deskd's loader rules, as lane_gate.cpp has them
     base = {'lane': 'C1', 'stage': 'live', 'verdict': 'PASS', 'params': {'edge': 0.2}, 'series': {}}

@@ -11,6 +11,7 @@
     "max_score_age_s": 5,
     "clip": 2.0,
     "game_cap": 10.0,
+    "inventory": 20,
     "thin": 20000,
     "min_cases": 50,
     "min_t": 2.0,
