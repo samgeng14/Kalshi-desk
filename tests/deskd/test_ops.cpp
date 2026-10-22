@@ -336,6 +336,30 @@ static void test_config() {
   CHECK(throws(R"({"deskd": {"write_tier": "premier"}})", "write_tier is"));
   // the data-release calendar's path (deskd's command line fills in the repo's)
   CHECK(e.calendar.empty() && load_deskd_config(write(R"({"deskd": {"calendar": "/tmp/cal.json"}})")).calendar == "/tmp/cal.json");
+  // C1 (plan 5(d)): off, its two series, $2 a take, $10 a game, $40, scores at most 5 s old; the
+  // gates in <data_dir>/gates. Every key is known and every amount inside its range.
+  CHECK(!e.college.enabled && e.college.series == (std::vector<std::string>{"KXNCAAWBGAME", "KXNCAAWVMATCH"}) &&
+        e.college.clip == 20000 && e.college.game == 100000 && e.college.budget == 400000 && e.college.max_score_age_s == 5 &&
+        e.college.volley_model.empty() && e.gates_dir.empty());
+  DeskdConfig col = load_deskd_config(write(R"({"deskd": {"gates_dir": "~/gates", "college": {"enabled": true,
+    "series": ["KXNCAAWVMATCH"], "volley_model": "/m/v.json", "clip_dollars": 5, "game_dollars": 15, "lane_dollars": 30,
+    "max_score_age_s": 3}}})"));
+  CHECK(col.college.enabled && col.college.series == std::vector<std::string>{"KXNCAAWVMATCH"} && col.college.clip == 50000 &&
+        col.college.game == 150000 && col.college.budget == 300000 && col.college.max_score_age_s == 3 &&
+        col.college.volley_model == "/m/v.json" && !col.gates_dir.empty() && col.gates_dir.find('~') == std::string::npos);
+  CHECK(throws(R"({"deskd": {"college": {"leader_only": true}}})", "deskd college: unknown key \"leader_only\""));
+  CHECK(throws(R"({"deskd": {"college": {"clip_dollars": 6}}})", "college: clip_dollars is $1.0000 to $5.0000, not $6.0000"));
+  CHECK(throws(R"({"deskd": {"college": {"clip_dollars": 0.5}}})", "clip_dollars is $1.0000 to $5.0000, not $0.5000"));
+  CHECK(throws(R"({"deskd": {"college": {"game_dollars": 20}}})", "game_dollars is $2.0000 to $15.0000, not $20.0000"));
+  CHECK(throws(R"({"deskd": {"college": {"clip_dollars": 5, "game_dollars": 4}}})", "game_dollars is $5.0000 to $15.0000"));
+  CHECK(throws(R"({"deskd": {"college": {"lane_dollars": 50}}})", "lane_dollars is $10.0000 to $40.0000, not $50.0000"));
+  CHECK(throws(R"({"deskd": {"college": {"lane_dollars": -1}}})", "lane_dollars is $10.0000 to $40.0000, not $-1.0000"));
+  CHECK(throws(R"({"deskd": {"college": {"max_score_age_s": 10}}})", "max_score_age_s is 1 to 5, not 10"));
+  CHECK(throws(R"({"deskd": {"college": {"max_score_age_s": 0}}})", "max_score_age_s is 1 to 5, not 0"));
+  CHECK(throws(R"({"deskd": {"college": {"series": ["kxncaawbgame"]}}})", "college: series has \"kxncaawbgame\", not a series ticker"));
+  CHECK(throws(R"({"deskd": {"college": {"series": []}}})", "college: series is empty"));
+  CHECK(throws(R"({"deskd": {"college": {"enabled": "yes"}}})", "\"enabled\" has the wrong type"));
+  CHECK(throws(R"({"deskd": {"college": [1]}})", "deskd college: not an object"));
   CHECK(throws(R"({"deskd": {"lip_series": ["kxgold15m"]}})", "not a series ticker"));
   CHECK(throws(R"({"deskd": {"lip_series": "KXGOLD15M"}})", "wrong type"));
   CHECK(throws(R"({"deskd": {"band_series": ["KX HIGH"]}})", "band_series has"));

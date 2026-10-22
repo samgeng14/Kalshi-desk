@@ -35,6 +35,49 @@ void take(const json& j, const char* key, T& out, const std::string& where) {
     throw std::runtime_error(where + ": \"" + key + "\" has the wrong type (" + it->type_name() + ")");
   }
 }
+// a Kalshi series ticker: upper-case letters and digits
+bool series_ok(const std::string& s) {
+  return !s.empty() && s.size() <= 40 &&
+         std::all_of(s.begin(), s.end(), [](unsigned char ch) { return std::isupper(ch) || std::isdigit(ch); });
+}
+// "college": C1's section, every key known and every amount inside its range
+void take_college(const json& j, DeskdConfig::College& c, const std::string& where) {
+  if (!j.is_object()) throw std::runtime_error(where + ": not an object");
+  static const std::set<std::string> known = {
+      "enabled",
+      "series",
+      "volley_model",
+      "clip_dollars",
+      "game_dollars",
+      "lane_dollars",
+      "max_score_age_s",
+  };
+  for (auto kv = j.begin(); kv != j.end(); ++kv)
+    if (!known.count(kv.key())) throw std::runtime_error(where + ": unknown key \"" + kv.key() + "\"");
+  take(j, "enabled", c.enabled, where);
+  take(j, "series", c.series, where);
+  take(j, "volley_model", c.volley_model, where);
+  take(j, "max_score_age_s", c.max_score_age_s, where);
+  c.volley_model = expand_home(c.volley_model);
+  if (c.series.empty()) throw std::runtime_error(where + ": series is empty");
+  for (const auto& s : c.series)
+    if (!series_ok(s)) throw std::runtime_error(where + ": series has \"" + s.substr(0, 40) + "\", not a series ticker");
+  // dollars: each amount within [lo, hi], written as a number of dollars
+  auto dollars = [&](const char* key, Money& out, Money lo, Money hi) {
+    if (j.contains(key) && !j.at(key).is_null()) {
+      double v = 0;
+      take(j, key, v, where);
+      out = static_cast<Money>(std::llround(v * 10000.0));
+    }
+    if (out < lo || out > hi)
+      throw std::runtime_error(where + ": " + key + " is $" + money_str(lo) + " to $" + money_str(hi) + ", not $" + money_str(out));
+  };
+  dollars("clip_dollars", c.clip, 1 * 10000, 5 * 10000);
+  dollars("game_dollars", c.game, c.clip, 15 * 10000);
+  dollars("lane_dollars", c.budget, c.game, 40 * 10000);
+  if (c.max_score_age_s < 1 || c.max_score_age_s > 5)
+    throw std::runtime_error(where + ": max_score_age_s is 1 to 5, not " + std::to_string(c.max_score_age_s));
+}
 }  // namespace
 
 DeskdConfig load_deskd_config(const std::string& path) {
@@ -85,6 +128,8 @@ DeskdConfig load_deskd_config(const std::string& path) {
       "write_tier",
       "calendar",
       "wcbb_model",
+      "gates_dir",
+      "college",
   };
   for (auto kv = d.begin(); kv != d.end(); ++kv) {
     if (kv.key() == "live")
@@ -108,7 +153,10 @@ DeskdConfig load_deskd_config(const std::string& path) {
   take(d, "write_tier", c.write_tier, where);
   take(d, "calendar", c.calendar, where);
   take(d, "wcbb_model", c.wcbb_model, where);
+  take(d, "gates_dir", c.gates_dir, where);
+  if (d.contains("college") && !d.at("college").is_null()) take_college(d.at("college"), c.college, where + " college");
   c.wcbb_model = expand_home(c.wcbb_model);
+  c.gates_dir = expand_home(c.gates_dir);
   c.calendar = expand_home(c.calendar);
   if (c.write_tier != "basic" && c.write_tier != "advanced")
     throw std::runtime_error(where + ": write_tier is \"basic\" or \"advanced\", not \"" + c.write_tier.substr(0, 40) + "\"");
@@ -116,12 +164,9 @@ DeskdConfig load_deskd_config(const std::string& path) {
     throw std::runtime_error(where + ": peer_url must be http://127.0.0.1:PORT/ or http://localhost:PORT/, not \"" +
                              c.peer_url.substr(0, 80) + "\"");
   for (const auto* list : {&c.lip_series, &c.band_series})
-    for (const auto& s : *list) {
-      const bool ok = !s.empty() && s.size() <= 40 &&
-          std::all_of(s.begin(), s.end(), [](unsigned char ch) { return std::isupper(ch) || std::isdigit(ch); });
-      if (!ok) throw std::runtime_error(where + ": " + (list == &c.lip_series ? "lip_series" : "band_series") +
-                                        " has \"" + s + "\", not a series ticker");
-    }
+    for (const auto& s : *list)
+      if (!series_ok(s)) throw std::runtime_error(where + ": " + (list == &c.lip_series ? "lip_series" : "band_series") +
+                                                  " has \"" + s + "\", not a series ticker");
   double stop = -1;
   take(d, "daily_stop_dollars", stop, where);
   if (stop >= 0) c.daily_stop = static_cast<Money>(std::llround(stop * 10000.0));

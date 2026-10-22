@@ -46,6 +46,24 @@ struct DeskdConfig {
   // fair on KXNCAAWBGAME ladders. "" = models/wcbb_logit_v1.json in the source tree; a missing
   // file runs without it (and says so), one that fails its golden rows is refused and said.
   std::string wcbb_model;
+  // The lanes' evidence gates (strat/lane_gate.h): <gates_dir>/<lane>.json, read once at start.
+  // "" = <data_dir>/gates.
+  std::string gates_dir;
+  // C1 COLLEGE TAKE (plan 5(d)): IOC takes of thin college games' stale quotes against the game
+  // fair. Its engine is built only when enabled (and with systematic_orders); it then trades only
+  // the series its gate (<gates_dir>/C1.json) passed, on the models the gate measured, once the
+  // operator turns C1 on and presses Start. Every amount is a ceiling the operator may lower.
+  struct College {
+    bool enabled = false;
+    std::vector<std::string> series = {"KXNCAAWBGAME", "KXNCAAWVMATCH"};
+    // the volleyball model (tools/volleyball.py --write; strat/volley_model.h): "" =
+    // models/volley_markov_v1.json in the source tree; read as the WCBB model is
+    std::string volley_model;
+    Money clip = 2 * 10000;        // u, "clip_dollars": a take's cost, fee included; $1 to $5
+    Money game = 10 * 10000;       // u, "game_dollars": the lane's worst case in one game (gw's event cap); the clip to $15
+    Money budget = 40 * 10000;     // u, "lane_dollars": the lane's budget (decisions 1); the game to $40
+    int max_score_age_s = 5;       // the score's last poll at most this long ago; 1 to 5 (plan 5(d))
+  } college;
   // Manual orders to the (demo) venue. Off by default: gw still admits and answers, but every
   // order is refused RO and the header stays read-only until the operator turns it on.
   bool manual_orders = false;
