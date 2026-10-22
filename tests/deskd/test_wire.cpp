@@ -9,12 +9,14 @@
 //     venue terms, cancels, batch cancels, cancel-all and the reads' queries
 //   - parsers: the documented shapes (docs.kalshi.com, 2026-10-06/07), a missing or mistyped
 //     required field failing the whole reply, and the shapes Kalshi's demo sent the probe
+//   - events: GET /events/{t} with its markets nested or beside it, the flag unknown when absent,
+//     a docs-shaped body (hand-written) read whole and shaped by gw/event_risk
 //   - classify_write: ACK, REFUSED with its class, UNKNOWN (5xx, 408, a cut, no venue body, an
 //     unreadable 2xx), NOT_SENT
 //   - round trips against the fake over TLS, signed and verified, through the spare pool: create,
 //     get, fills, positions, balance per shard, cancel, a cancel of a gone order, batch cancel,
-//     cancel-all, markets, orderbook, the soft refusals (post-only cross, collateral, duplicate
-//     cid, triggered group), a bad signature, and the faults that make a write UNKNOWN
+//     cancel-all, markets, orderbook, events, the soft refusals (post-only cross, collateral,
+//     duplicate cid, triggered group), a bad signature, and the faults that make a write UNKNOWN
 //   - the demo probe binary (tools/kalshi_demo_probe.cpp) run against the fake over TLS through
 //     its real command line: handshakes, the reads, the order check, the dumps, no key material
 //     in its output; a production base and a non-demo key file refused before any socket
@@ -31,6 +33,7 @@
 
 #include "deskd/app/log.h"
 #include "deskd/build_paths.h"
+#include "deskd/gw/event_risk.h"
 #include "deskd/gw/kalshi_sign.h"
 #include "deskd/gw/kalshi_wire.h"
 #include "deskd/net/pool.h"
@@ -407,6 +410,10 @@ static void test_builders() {
   CHECK(mk.target() == "/trade-api/v2/markets?limit=200&series_ticker=KXNATGAS15M&status=open" && !mk.auth);
   CHECK(build_get_orderbook(fx::T, 5).target() == "/trade-api/v2/markets/KXTEST-26OCT06-A/orderbook?depth=5");
   CHECK(build_get_market(fx::T).path == "/trade-api/v2/markets/KXTEST-26OCT06-A" && !build_get_market(fx::T).auth);
+  const WireRequest ev = build_get_event("KXHIGHNY-26OCT07");
+  CHECK(ev.method == "GET" && ev.path == "/trade-api/v2/events/KXHIGHNY-26OCT07" &&
+        ev.query == "with_nested_markets=true" && !ev.auth && !ev.write && ev.op == WireOp::OTHER);
+  CHECK(build_get_event("KXHIGHNY-26OCT07", false).target() == "/trade-api/v2/events/KXHIGHNY-26OCT07");
   CHECK(build_get_exchange_status().path == "/trade-api/v2/exchange/status");
 
   // the bytes: auth headers, Accept, Content-Type with a body, Connection: close for a write
@@ -614,6 +621,82 @@ static void test_demo_shapes() {
       "start":"0.9900","step":"0.0001"}],"yes_bid_dollars":"0.0000","yes_ask_dollars":"1.0000"}})", &why);
   CHECK(mve && mve->price_ranges.size() == 3 && mve->price_ranges[0].step == 1 && mve->price_ranges[1].step == 10 &&
         mve->exchange_index == 1);
+}
+
+// ---- events: GET /events/{event_ticker} -----------------------------------------------------------
+// The docs' shape (tests/deskd/fixtures/kalshi_event_docs.json, hand-written until kalshi-demo-probe
+// captures demo's) read whole and shaped by gw/event_risk, the markets nested in the event or beside
+// it, the flag unknown when absent, and each body that fails.
+static void test_events() {
+  const std::string dir = std::string(DESKD_SOURCE_DIR) + "/tests/deskd/fixtures/";
+  std::ifstream in(dir + "kalshi_event_docs.json");
+  const std::string docs((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  std::string why;
+  auto e = parse_event(docs, &why);
+  CHECK(e && e->event_ticker == "KXHIGHNY-26OCT07" && e->series_ticker == "KXHIGHNY" && e->mutually_exclusive == true &&
+        e->collateral_return_type == "MECNET" && e->category == "Climate and Weather" && e->sub_title == "On Oct 7, 2026" &&
+        e->markets.size() == 4 && e->fetched_ms == 0);
+  if (!e) std::fprintf(stderr, "  docs event: %s\n", why.c_str());
+  if (e && e->markets.size() == 4) {
+    const MarketRow& b = e->markets[1];
+    CHECK(b.ticker == "KXHIGHNY-26OCT07-B58.5" && b.event_ticker == e->event_ticker && b.strike_type == "between" &&
+          b.floor_strike == 58.0 && b.cap_strike == 59.0 && b.yes_sub_title == "58\xc2\xb0 to 59\xc2\xb0" &&
+          b.yes_bid == 3100 && b.yes_ask == 3300 && b.exchange_index == 0 && b.close_ms && b.price_ranges.size() == 1);
+    CHECK(e->markets[0].strike_type == "less" && !e->markets[0].floor_strike && e->markets[0].cap_strike == 58.0);
+    // what gw/event_risk makes of it: exclusive, and exhaustive on KXHIGH's whole degrees only
+    std::map<std::string, MarketRow> listing;
+    for (const auto& m : e->markets) listing[m.ticker] = m;
+    auto line = event_shape(*e, listing, 0, &why), degrees = event_shape(*e, listing, 1, &why);
+    CHECK(line && line->exclusive && !line->exhaustive);
+    CHECK(degrees && degrees->exclusive && degrees->exhaustive && degrees->tickers.front() == "KXHIGHNY-26OCT07-T58" &&
+          degrees->tickers.back() == "KXHIGHNY-26OCT07-T61");
+  }
+
+  // the markets beside the event (with_nested_markets left out), the flag false: read as given
+  const std::string head = R"("event_ticker":"E-1","series_ticker":"E","title":"t")";
+  const std::string a = R"({"ticker":"E-1-A","event_ticker":"E-1","status":"active","strike_type":"less","cap_strike":5})";
+  const std::string b = R"({"ticker":"E-1-B","status":"closed","strike_type":"greater_or_equal","floor_strike":5})";
+  auto beside = parse_event("{\"event\":{" + head + R"(,"mutually_exclusive":false},"markets":[)" + a + "," + b + "]}", &why);
+  CHECK(beside && beside->mutually_exclusive == false && beside->markets.size() == 2 && beside->markets[1].ticker == "E-1-B" &&
+        beside->markets[1].status == "closed" && beside->markets[1].event_ticker == "E-1" /* the event's, when left out */);
+  // no flag, or a null one: unknown, never false
+  auto unknown = parse_event("{\"event\":{" + head + ",\"markets\":[" + a + "]}}", &why);
+  CHECK(unknown && !unknown->mutually_exclusive && unknown->markets.size() == 1 && unknown->sub_title.empty());
+  auto null_flag = parse_event("{\"event\":{" + head + R"(,"mutually_exclusive":null,"markets":[)" + a + "]}}", &why);
+  CHECK(null_flag && !null_flag->mutually_exclusive);
+  // nested and beside both filled: the same markets in any order, or the body fails
+  auto both = parse_event("{\"event\":{" + head + ",\"markets\":[" + a + "," + b + "]},\"markets\":[" + b + "," + a + "]}", &why);
+  CHECK(both && both->markets.size() == 2 && both->markets[0].ticker == "E-1-A");
+  CHECK(!parse_event("{\"event\":{" + head + ",\"markets\":[" + a + "," + b + "]},\"markets\":[" + a + "]}", &why) &&
+        why == "event.markets and markets list different markets");
+  // nested empty: the ones beside it; none anywhere: an event with none (event_shape refuses it)
+  auto empty_nested = parse_event("{\"event\":{" + head + ",\"markets\":[]},\"markets\":[" + b + "]}", &why);
+  CHECK(empty_nested && empty_nested->markets.size() == 1 && empty_nested->markets[0].ticker == "E-1-B");
+  auto none = parse_event("{\"event\":{" + head + "},\"markets\":null}", &why);
+  CHECK(none && none->markets.empty());
+
+  // each body that fails, and why
+  auto fails_with = [&](const std::string& body, const std::string& expect) {
+    std::string w;
+    const bool failed = !parse_event(body, &w);
+    if (!failed || w.find(expect) != 0)
+      std::fprintf(stderr, "  parse_event: expected \"%s\", got \"%s\"\n", expect.c_str(), w.c_str());
+    return failed && w.find(expect) == 0;
+  };
+  CHECK(fails_with("<html>", "not JSON"));
+  CHECK(fails_with(R"({"markets":[]})", "event: missing or not an object"));
+  CHECK(fails_with(R"({"event":[]})", "event: missing or not an object"));
+  CHECK(fails_with(R"({"event":{"series_ticker":"E","markets":[]}})", "event.event_ticker: missing"));
+  CHECK(fails_with(R"({"event":{"event_ticker":"","series_ticker":"E"}})", "event.event_ticker: empty"));
+  CHECK(fails_with(R"({"event":{"event_ticker":"E-1"}})", "event.series_ticker: missing"));
+  CHECK(fails_with("{\"event\":{" + head + R"(,"mutually_exclusive":"yes"}})", "event.mutually_exclusive: not a boolean"));
+  CHECK(fails_with("{\"event\":{" + head + R"(,"markets":{}}})", "event.markets: not an array"));
+  json bad_px = json::parse(a);
+  bad_px["yes_bid_dollars"] = "0.30005";
+  CHECK(fails_with("{\"event\":{" + head + ",\"markets\":[" + b + "," + bad_px.dump() + "]}}", "event.markets[1].yes_bid_dollars"));
+  CHECK(fails_with("{\"event\":{" + head + R"(},"markets":[{"ticker":"E-1-A"}]})", "markets[0].status: missing"));
+  CHECK(fails_with("{\"event\":{" + head + R"(,"markets":[{"ticker":"E-2-A","event_ticker":"E-2","status":"active"}]}})",
+                   "event.markets[0].event_ticker: another event's \"E-2\""));
 }
 
 // ---- what a write's reply means -----------------------------------------------------------------
@@ -871,6 +954,35 @@ static void round_trip(const std::string& key_type) {
   CHECK(book && !book->yes.empty() && book->yes.back().first == 4000);
   CHECK(parse_exchange_status(rt.send(build_get_exchange_status()).res.body, &why).has_value());
 
+  // an event: its markets nested and beside it, the flag as given or unknown, and one not listed
+  v.f->with_engine([](fakex::Engine& e, std::int64_t now) {
+    fakex::MarketSpec hi;
+    hi.ticker = "KXTEST-26OCT06-B";
+    hi.strike_type = "greater";
+    hi.floor_strike = 50;
+    hi.yes_sub_title = "above 50";
+    e.add_market(hi, now);
+    fakex::EventSpec ev;
+    ev.event_ticker = "KXTEST-26OCT06";
+    ev.title = "Test event";
+    ev.mutually_exclusive = true;
+    e.add_event(ev);
+    ev.event_ticker = "KXNATGAS15M-26OCT061145";
+    ev.mutually_exclusive.reset();
+    e.add_event(ev);
+  });
+  auto ev = parse_event(rt.send(build_get_event("KXTEST-26OCT06")).res.body, &why);
+  CHECK(ev && ev->series_ticker == "KXTEST" && ev->mutually_exclusive == true && ev->title == "Test event" &&
+        ev->markets.size() == 2 && ev->markets[0].ticker == fx::T && ev->markets[1].yes_sub_title == "above 50" &&
+        ev->markets[1].strike_type == "greater" && ev->markets[1].floor_strike == 50.0);
+  auto ev_beside = parse_event(rt.send(build_get_event("KXTEST-26OCT06", false)).res.body, &why);
+  CHECK(ev_beside && ev_beside->markets.size() == 2 && ev_beside->markets[1].ticker == "KXTEST-26OCT06-B");
+  auto ev_gas = parse_event(rt.send(build_get_event("KXNATGAS15M-26OCT061145")).res.body, &why);
+  CHECK(ev_gas && !ev_gas->mutually_exclusive && ev_gas->markets.size() == 1 && ev_gas->markets[0].exchange_index == 2);
+  const net::Exchange no_event = rt.send(build_get_event("KXTEST-26OCT07"));
+  CHECK(no_event.res.status == 404 && parse_error(404, no_event.res.body).code == "not_found" &&
+        !parse_event(no_event.res.body, &why));
+
   // a signature from another key, and a stale timestamp: AUTH, never a soft refusal
   auto other = KalshiSigner::from_pem("rt-key", new_key_pem("ED25519"), "ed25519", &err);
   rt.signer = other.get();
@@ -1090,6 +1202,7 @@ int main() {
   test_builders();
   test_parsers();
   test_demo_shapes();
+  test_events();
   test_classify();
   round_trip("ed25519");
   round_trip("rsa");

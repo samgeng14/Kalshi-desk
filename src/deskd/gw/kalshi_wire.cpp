@@ -1,5 +1,6 @@
 #include "deskd/gw/kalshi_wire.h"
 
+#include <algorithm>
 #include <cctype>
 #include <cmath>
 #include <cstdio>
@@ -822,6 +823,9 @@ WireRequest build_get_balance(int exchange_index, int subaccount) {
   return get("/portfolio/balance", s);
 }
 WireRequest build_get_market(const std::string& ticker) { return get("/markets/" + url_encode(ticker), "", false); }
+WireRequest build_get_event(const std::string& event_ticker, bool with_nested_markets) {
+  return get("/events/" + url_encode(event_ticker), with_nested_markets ? "with_nested_markets=true" : "", false);
+}
 WireRequest build_get_series(const std::string& ticker) { return get("/series/" + url_encode(ticker), "", false); }
 WireRequest build_get_markets(const MarketsQuery& q) {
   std::string s;
@@ -1087,6 +1091,70 @@ std::optional<MarketRow> parse_market(const std::string& body, std::string* why)
 }
 std::optional<Page<MarketRow>> parse_markets(const std::string& body, std::string* why) {
   return read_page<MarketRow>(body, "markets", read_market, why);
+}
+
+std::optional<EventRow> parse_event(const std::string& body, std::string* why) {
+  auto j = parse_object(body, why);
+  if (!j) return std::nullopt;
+  auto it = j->find("event");
+  if (it == j->end() || !it->is_object()) {
+    if (why) *why = "event: missing or not an object";
+    return std::nullopt;
+  }
+  Rd r(*it, "event");
+  EventRow e;
+  e.event_ticker = r.str("event_ticker");
+  e.series_ticker = r.str("series_ticker");
+  if (r.ok() && e.event_ticker.empty()) r.fail("event_ticker", "empty");
+  if (r.ok() && e.series_ticker.empty()) r.fail("series_ticker", "empty");
+  e.title = r.str_or_empty("title");
+  e.sub_title = r.str_or_empty("sub_title");
+  e.category = r.str_or_empty("category");
+  e.mutually_exclusive = r.obool("mutually_exclusive");
+  e.collateral_return_type = r.str_or_empty("collateral_return_type");
+  // the markets under `holder`, each read whole; null or absent is none
+  auto markets = [&r](const json& holder, const std::string& where, std::vector<MarketRow>& out) {
+    auto m = holder.find("markets");
+    if (m == holder.end() || m->is_null() || !r.ok()) return;
+    if (!m->is_array()) {
+      r.err = where + ": not an array";
+      return;
+    }
+    for (const auto& row : *m) {
+      Rd x(row, where + "[" + std::to_string(out.size()) + "]");
+      MarketRow mr = read_market(x);
+      if (!x.ok()) {
+        r.err = x.err;
+        return;
+      }
+      out.push_back(std::move(mr));
+    }
+  };
+  std::vector<MarketRow> top;
+  markets(*it, "event.markets", e.markets);
+  markets(*j, "markets", top);
+  if (r.ok() && !e.markets.empty() && !top.empty()) {
+    auto tickers = [](const std::vector<MarketRow>& v) {
+      std::vector<std::string> t;
+      for (const auto& m : v) t.push_back(m.ticker);
+      std::sort(t.begin(), t.end());
+      return t;
+    };
+    if (tickers(e.markets) != tickers(top)) r.err = "event.markets and markets list different markets";
+  }
+  const char* where = "event.markets";
+  if (e.markets.empty()) {
+    e.markets = std::move(top);
+    where = "markets";
+  }
+  for (std::size_t i = 0; r.ok() && i < e.markets.size(); ++i) {
+    MarketRow& m = e.markets[i];
+    if (m.event_ticker.empty()) m.event_ticker = e.event_ticker;
+    else if (m.event_ticker != e.event_ticker)
+      r.err = std::string(where) + "[" + std::to_string(i) + "].event_ticker: another event's \"" +
+              m.event_ticker.substr(0, 40) + "\"";
+  }
+  return done(r, std::move(e), why);
 }
 
 std::optional<Orderbook> parse_orderbook(const std::string& body, std::string* why) {

@@ -171,6 +171,8 @@ WireRequest build_get_fills(const ListQuery& q);
 WireRequest build_get_positions(const ListQuery& q);
 WireRequest build_get_balance(int exchange_index = -1, int subaccount = -1);
 WireRequest build_get_market(const std::string& ticker);
+// GET /events/{event_ticker}[?with_nested_markets=true] (no auth): an event and its markets
+WireRequest build_get_event(const std::string& event_ticker, bool with_nested_markets = true);
 WireRequest build_get_series(const std::string& ticker);
 struct MarketsQuery {
   int limit = 0;                  // 1..1000
@@ -297,7 +299,7 @@ struct EventRow {
   std::optional<bool> mutually_exclusive;   // absent stays unknown: never read as known
   std::string collateral_return_type;       // shown only; never relied on for cash
   std::vector<MarketRow> markets;           // every market of the event, any status
-  std::int64_t fetched_ms = 0;
+  std::int64_t fetched_ms = 0;              // the reader's clock; parse_event leaves it 0
 };
 struct SeriesRow {
   std::string ticker, category, fee_type;
@@ -356,6 +358,12 @@ std::optional<Balance> parse_balance(const std::string& body, std::string* why);
 std::optional<MarketRow> parse_market(const std::string& body, std::string* why);   // {"market":{...}}
 std::optional<SeriesRow> parse_series(const std::string& body, std::string* why);   // {"series":{...}}
 std::optional<Page<MarketRow>> parse_markets(const std::string& body, std::string* why);
+// {"event":{...}} (get-event.md; the old desk read event.mutually_exclusive live, src/client.cpp
+// get_event). The markets come nested in the event (with_nested_markets=true) or in a top-level
+// "markets" array (the default, which the docs mark deprecated); both filled must list the same
+// tickers. Each market is read as parse_market reads one, so a malformed one fails the body, and
+// one naming another event does too. event_ticker and series_ticker are required, the titles not.
+std::optional<EventRow> parse_event(const std::string& body, std::string* why);
 std::optional<Orderbook> parse_orderbook(const std::string& body, std::string* why);
 std::optional<ExchangeStatus> parse_exchange_status(const std::string& body, std::string* why);
 
