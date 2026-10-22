@@ -776,7 +776,11 @@ void ArbEngine::save() {
   const std::string tmp = env_.state_file + ".tmp";
   {
     std::ofstream out(tmp, std::ios::trunc);
-    out << json{{"v", 1}, {"seq", seq_}, {"legging", legging_}, {"error", state_error_}, {"baskets", bs}}.dump();
+    // pause and paused: what the scorecard reads (the lane's day holding new baskets is not kept:
+    // it ends with the day, and status() says it)
+    const bool paused = !state_error_.empty() || legging_ <= -p_.legging_pause;
+    out << json{{"v", 1}, {"seq", seq_}, {"legging", legging_}, {"error", state_error_}, {"pause", p_.legging_pause},
+                {"paused", paused}, {"baskets", bs}}.dump();
     if (!out) { DLOG_WARN("cannot write %s", tmp.c_str()); return; }
   }
   if (std::rename(tmp.c_str(), env_.state_file.c_str()) != 0) DLOG_WARN("cannot replace %s", env_.state_file.c_str());
@@ -788,6 +792,9 @@ int ArbEngine::step(std::int64_t now) {
   const auto snap = env_.snapshot ? env_.snapshot() : nullptr;
   if (!boot_ms_) {
     boot_ms_ = now;
+    // the file read at the start says this run's pause at once (one that could not be read, or
+    // none, waits for the orphans: a file written before them would lose them at the next start)
+    if (state_found_) dirty_ = true;
     if (!state_error_.empty() && env_.alert) env_.alert("CRIT", lane_ + ": " + state_error_ + "; no new basket until the lane is turned off and on");
     else if (legging_ <= -p_.legging_pause && env_.alert)
       env_.alert("CRIT", lane_ + " paused: legging " + arb::usd(legging_) + " (s1.json); no new basket until the lane is turned off and on");

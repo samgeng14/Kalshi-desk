@@ -29,7 +29,8 @@
 //   - Stop, KILL (legs deleted unanswered), the lane off, the private feed down: frozen, then only
 //     unwound; Manual taking a market over: frozen for good
 //   - the legging pause from s1.json and from this run, sticky across a new engine until the lane
-//     is turned off and on; the lane's day as a backstop
+//     is turned off and on; the lane's day as a backstop; s1.json says the pause and whether it
+//     holds, rewritten at a start
 //   - a restart mid-basket and orphans (no s1.json, or one that cannot be read): unwound from S1's
 //     positions once the start's account read is in; a leg s1.json saw no fills of still counts
 //     its round trip in legging
@@ -1272,6 +1273,8 @@ void engine_pause() {
   ArbEngine e("S1", {"KXHIGHNY"}, g.env(), Rig::params());
   e.step(NOW);
   CHECK(g.alerted("CRIT S1 paused: legging -$6.0000"));
+  // the file says the pause and that it holds, for the scorecard
+  CHECK(read_json(file)["pause"] == usd(5) && read_json(file)["paused"] == true && read_json(file)["legging"] == -6000000);
   e.step(T);
   CHECK(g.n() == 0 && has(g.last("arb_scans")["why"], "paused: legging -$6.0000, past -$5.0000; turn S1 off and on to reset"));
   CHECK(e.status()["paused"] == true && e.status()["legging"] == "-6.0000");
@@ -1290,7 +1293,33 @@ void engine_pause() {
   g.view->lanes_on = {"S1"};
   e.step(T + 600);
   CHECK(g.alerted("WARN S1's pause (legging -$6.0000) reset by the lane turned off and on"));
-  CHECK(g.n() == 1 && e.status()["paused"] == false && read_json(file)["legging"] == 0 && read_json(file)["seq"] == 5);
+  CHECK(g.n() == 1 && e.status()["paused"] == false && read_json(file)["legging"] == 0 && read_json(file)["seq"] == 5 &&
+        read_json(file)["paused"] == false);
+  {
+    // a start under another pause ($1: deskd.arb_legging_pause may be anything up to $5) writes it
+    // at once, before any basket: -$2.50 of legging holds new baskets now
+    TempDir d2;
+    const std::string f2 = d2.file("s1.json");
+    std::ofstream(f2) << json{{"v", 1}, {"seq", 1}, {"legging", -2500000}, {"error", ""}, {"pause", 5000000},
+                              {"paused", false}, {"baskets", json::array()}}.dump();
+    Rig h;
+    h.state_file = f2;
+    arb::Params p = Rig::params("scan");
+    p.legging_pause = usd(1);
+    ArbEngine x("S1", {"KXHIGHNY"}, h.env(), p);
+    x.step(NOW);
+    CHECK(read_json(f2)["pause"] == usd(1) && read_json(f2)["paused"] == true && x.status()["paused"] == true);
+  }
+  {
+    // no s1.json: none is written before there is something to keep (the orphans, at the start)
+    TempDir d3;
+    Rig h;
+    h.state_file = d3.file("s1.json");
+    ArbEngine x("S1", {"KXHIGHNY"}, h.env(), Rig::params("scan"));
+    x.step(NOW);
+    x.step(T);
+    CHECK(read_json(h.state_file).is_discarded());
+  }
 
   // legging past the pause in this run: the alert, and no new basket while the unwind goes on
   Rig k;

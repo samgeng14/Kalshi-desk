@@ -264,11 +264,14 @@ namespace deskd {
 // says so either way. The lane's day (SysView::lane_day) down that much also holds new baskets,
 // in case s1.json was lost.
 // s1.json (Env::state_file, tmp + rename): the open baskets, written before each send, and the
-// legging. At a start every open basket is FROZEN until it may send and then unwound from S1's
-// positions, once an account read that began after the start is fills_wait_ms old (gw rebuilds
-// Systematic's day from that read's fills). With no s1.json, S1's positions in an event become
-// an orphan basket, unwound the same way to equal holdings (the excess over the complete set).
-// An s1.json that cannot be read pauses new baskets, as legging does.
+// legging, with the pause it is held against (Params::legging_pause) and whether it holds, for
+// tools/scorecard.py (a file the start read is written again at the first step, so a start under
+// another deskd.arb_legging_pause says so at once). At a start every open basket is FROZEN until
+// it may send and then unwound from S1's positions, once an account read that began after the
+// start is fills_wait_ms old (gw rebuilds Systematic's day from that read's fills). With no
+// s1.json, S1's positions in an event become an orphan basket, unwound the same way to equal
+// holdings (the excess over the complete set). An s1.json that cannot be read pauses new
+// baskets, as legging does.
 // Threading: step() on strat; status() from any thread.
 class ArbEngine {
  public:
