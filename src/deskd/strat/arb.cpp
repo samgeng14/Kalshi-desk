@@ -1006,6 +1006,12 @@ std::string ArbEngine::blocked(const std::string& event, const Plan& p, const Ga
   }
   if (const auto c = cool_until_.find(event); c != cool_until_.end() && now < c->second)
     return "the event cools down " + std::to_string((c->second - now) / 1000) + " s more";
+  // gw takes an IOC lane's order that grows a position only while the fees every IOC lane has
+  // charged today are under the cost budget: the first leg's own fee could spend it and leave the
+  // rest refused, so the whole basket's fee bound must fit
+  if (v.fees + p.fees >= Gateway::kCostBudget * 100)
+    return "the IOC lanes' cost budget: " + arb::usd(v.fees) + " charged today and the basket's fees up to " + arb::usd(p.fees) +
+           " reach " + arb::usd(Gateway::kCostBudget * 100);
   if (!env_.private_up || !env_.private_up()) return "the private feed is down";
   if (!restart_ready(s, now)) return "S1's positions wait for an account read after the start";
   // where each leg starts must be exact: S1's own orders in the event ended, their fills booked

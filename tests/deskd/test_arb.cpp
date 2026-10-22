@@ -33,7 +33,7 @@
 //   - a restart mid-basket and orphans (no s1.json, or one that cannot be read): unwound from S1's
 //     positions once the start's account read is in
 //   - the finder's limits: the lane's budget by market or by state, the group, the ceiling, the
-//     shard's cash; the write budget
+//     shard's cash; the write budget; the IOC lanes' cost budget, with room for the basket's fees
 #include <algorithm>
 #include <cmath>
 #include <fstream>
@@ -1400,7 +1400,8 @@ void engine_orphans() {
 }
 
 // What the finder is given: the lane's budget less what gw counts S1 using (market by market, or
-// by state), the event's group, the shard's cash less its margins; and the write budget
+// by state), the event's group, the shard's cash less its margins; and the write budget and the
+// IOC lanes' cost budget a basket fires within
 void engine_limits() {
   // S1 holds a complete cover of 10 (bought at .28/.31/.33): by market it counts $9.20 of the $15
   const auto holding = [](Rig& g) {
@@ -1466,6 +1467,32 @@ void engine_limits() {
     e.step(NOW);
     e.step(T);
     CHECK(g.n() == 0 && e.status()["events"][DAY]["why"] == "write budget: shard 1 has 25 tokens, 3 legs need 30");
+  }
+  {
+    // the IOC lanes' $5 cost budget: what they charged today and the basket's fee bound must stay
+    // under it, or the first leg's fee could spend it and gw refuse the other legs
+    TempDir dir;
+    Rig g;
+    g.state_file = dir.file("s1.json");
+    ArbEngine e("S1", {"KXHIGHNY"}, g.env(), Rig::params());
+    e.step(NOW);
+    e.step(T);
+    CHECK(g.n() == 1);
+    const Micros fees = read_json(g.state_file)["baskets"][0]["plan"]["fees"].get<Micros>();
+    CHECK(fees > usd(.45) && fees < usd(.50));   // three legs of 10 near 30c, each its model fee and a cent
+    for (const Micros charged : {usd(5) - fees, usd(5) - fees - 100}) {
+      Rig h;
+      h.view->fees = charged;
+      ArbEngine f("S1", {"KXHIGHNY"}, h.env(), Rig::params());
+      f.step(NOW);
+      f.step(T);
+      const bool room = charged < usd(5) - fees;
+      CHECK(h.n() == (room ? 1u : 0u));
+      if (!room)
+        CHECK(f.status()["events"][DAY]["why"] == "the IOC lanes' cost budget: $" + money_str(charged / 100) +
+                                                       " charged today and the basket's fees up to $" + money_str(fees / 100) +
+                                                       " reach $5.0000");
+    }
   }
 }
 

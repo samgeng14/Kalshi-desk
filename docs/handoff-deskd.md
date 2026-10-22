@@ -57,7 +57,10 @@ $0 (9 of 703 events ever positive, the best +1.6c): run it to measure, not to ea
   proven states by state, so a complete basket is about $0 against the lane budget, the 70%
   ceiling and the event's $15 group; off, every leg counts market by market as every lane always
   has. Only S1 counts by state; no other lane's numbers change. Its $15 counts against the 70%
-  ceiling with the other lanes on.
+  ceiling with the other lanes on. S1 shares the IOC lanes' $5 a day of fees with C1, X1, N1, N2
+  and W1: a basket fires only while what they charged today and its own fee bound stay under $5,
+  and past $5 gw refuses only an IOC lane's orders that grow a position, so a basket's unwind
+  still goes.
 - **Switches** (every one checked at load): `arb_mode` (`off`, `scan`, `trade`), `arb_series`
   (default `band_series`), `arb_max_qty` (10 contracts, 1-20), `arb_max_legs` (6, 2-6), `arb_thr`
   ($0.01, $0.005-$0.10), `arb_legging_pause` ($5 at most), `arb_lattice`, `event_risk` (false),

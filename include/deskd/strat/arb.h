@@ -224,7 +224,10 @@ namespace deskd {
 //            arb_scans row an event a minute, or when its result changes.
 //   fire     the best basket of an event, when the mode is trade, Systematic runs, the lane is on,
 //            it is not paused, no basket is in flight, none is open in the event, the event's
-//            cool-down has passed, the private feed is up, S1's positions are rebuilt (below: the
+//            cool-down has passed, the fees the IOC lanes charged today (SysView::fees) and the
+//            basket's fee bound are under gw's cost budget (Gateway::kCostBudget: past it gw
+//            refuses an IOC lane's every order that grows a position, so a basket's other legs
+//            too), the private feed is up, S1's positions are rebuilt (below: the
 //            start's account read), S1's orders in the event have ended with their fills booked (so
 //            where each leg starts is exact), and each leg's shard has 10 write tokens a leg left
 //            (Env::write_room). The plan is from this step's books.
