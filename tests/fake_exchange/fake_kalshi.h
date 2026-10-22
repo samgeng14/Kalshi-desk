@@ -136,10 +136,17 @@ struct HttpFault {
     FILL_DURING_CANCEL,   // cancel: the street takes `qty` first; the reply's reduced_by is the
                           // rest, and the fill and its user_order follow the reply
                           // (private_order EVENTS_FIRST puts them first instead)
+    PULL_TOUCH,           // create: just before it, the street pulls `qty` (0: all of theirs) from
+                          // the other side's best level, if the order's price reaches it (an
+                          // arbitrage leg whose liquidity left first); the book's deltas go out
+                          // ahead of the order's messages
   };
   Kind kind = Kind::STATUS_AFTER_ACCEPT;
   std::string method = "POST";
   std::string path = "/portfolio/events/orders";  // a prefix of the path after /trade-api/v2
+  // Only a request whose JSON body names this ticker (a create's "ticker"); "": any request. A
+  // fault that names one is passed over by requests that name another, or none.
+  std::string ticker;
   int status = 500;
   int stall_ms = 2000;
   std::size_t chunk_bytes = 16;
@@ -248,8 +255,9 @@ class FakeKalshi {
   void stall_ws(int ms);                                       // writers wait, then send it all
 
   // ---- what happened on the wire, in the order it was written: "http 201 POST
-  // /portfolio/events/orders", "http cut ...", "http drop ...", "ws <conn> fill <trade_id>",
-  // "ws <conn> user_order <order_id>", "ws <conn> orderbook_delta <ticker> <seq>" ...
+  // /portfolio/events/orders", "http cut ...", "http drop ...", "http pull-touch <ticker> <qty>",
+  // "ws <conn> fill <trade_id>", "ws <conn> user_order <order_id>",
+  // "ws <conn> orderbook_delta <ticker> <seq>" ...
   std::vector<std::string> wire_log() const;
   void clear_wire_log();
   std::size_t ws_connections() const;
@@ -334,7 +342,8 @@ class FakeKalshi {
   void ws_command_locked(const std::shared_ptr<Session>& s, const std::string& text);
   void ws_command_inner_locked(const std::shared_ptr<Session>& s, const std::string& text);
   void pump_locked(std::int64_t now);
-  bool take_fault_locked(const net::Request& req, HttpFault* f);
+  bool take_fault_locked(const net::Request& req, const json& body, HttpFault* f);
+  void pull_touch_locked(const json& create, Qty qty, std::int64_t now);   // PULL_TOUCH
 
   std::string auth_refusal(const net::Request& req, std::int64_t now) const;
   bool rate_ok_locked(const net::Request& req, const std::string& path, const json& body, std::int64_t now);

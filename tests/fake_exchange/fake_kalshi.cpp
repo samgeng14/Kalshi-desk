@@ -410,17 +410,32 @@ void FakeKalshi::duplicate_ws_messages(const std::string& channel, int n) {
 void FakeKalshi::fragment_ws(std::size_t frame_bytes) { fragment_bytes_ = frame_bytes; }
 void FakeKalshi::stall_ws(int ms) { stall_until_ms_ = steady_ms() + ms; }
 
-bool FakeKalshi::take_fault_locked(const net::Request& req, HttpFault* f) {
+bool FakeKalshi::take_fault_locked(const net::Request& req, const json& body, HttpFault* f) {
   const std::string path = req.path.compare(0, std::char_traits<char>::length(kRestPrefix), kRestPrefix) == 0
                                ? req.path.substr(std::char_traits<char>::length(kRestPrefix))
                                : req.path;
+  const std::string ticker =
+      body.is_object() && body.contains("ticker") && body["ticker"].is_string() ? body["ticker"].get<std::string>() : "";
   for (auto it = faults_.begin(); it != faults_.end(); ++it) {
     if (it->method != req.method || path.compare(0, it->path.size(), it->path) != 0) continue;
+    if (!it->ticker.empty() && it->ticker != ticker) continue;
     *f = *it;
     if (--it->times <= 0) faults_.erase(it);
     return true;
   }
   return false;
+}
+
+void FakeKalshi::pull_touch_locked(const json& create, Qty qty, std::int64_t now) {
+  auto str = [&](const char* k) {
+    return create.is_object() && create.contains(k) && create[k].is_string() ? create[k].get<std::string>() : "";
+  };
+  const std::string ticker = str("ticker"), side = str("side");
+  const std::optional<Px> px = parse_price_req(str("price"));
+  Qty pulled = 0;
+  if (px && (side == "bid" || side == "ask"))   // else the create is refused as it would be anyway
+    pulled = engine_.street_pull_touch(ticker, side == "bid" ? Side::BID : Side::ASK, *px, qty, now);
+  log_wire("http pull-touch " + ticker + " " + qty_str(pulled));
 }
 
 // ---- the wire log -----------------------------------------------------------------------------
@@ -1008,11 +1023,12 @@ void FakeKalshi::serve(int fd) {
     const std::string path = ours ? req.path.substr(plen) : std::string();
     const std::string what = req.method + " " + (ours ? path : req.path);
 
+    const json body = req.body.empty() ? json() : json::parse(req.body, nullptr, false);
     HttpFault f;
     bool faulted;
     {
       std::lock_guard<std::mutex> lk(mu_);
-      faulted = take_fault_locked(req, &f);
+      faulted = take_fault_locked(req, body, &f);
     }
     using K = HttpFault::Kind;
     auto is = [&](K k) { return faulted && f.kind == k; };
@@ -1031,7 +1047,6 @@ void FakeKalshi::serve(int fd) {
     }
     if (is(K::STALL_BEFORE)) std::this_thread::sleep_for(std::chrono::milliseconds(f.stall_ms));
 
-    const json body = req.body.empty() ? json() : json::parse(req.body, nullptr, false);
     Reply rep;
     Targets wait_for;
     std::uint64_t held = 0;  // private messages held until the reply is written (Held)
@@ -1054,6 +1069,8 @@ void FakeKalshi::serve(int fd) {
         // come first among this request's; when they reach the client is private_order's business.
         if (is(K::FILL_DURING_CANCEL) && req.method == "DELETE")
           engine_.street_hit(path.substr(path.rfind('/') + 1), f.qty, now);
+        // A pull of the touch lands first too: the order meets the book without it.
+        if (is(K::PULL_TOUCH) && req.method == "POST") pull_touch_locked(body, f.qty, now);
         rep = route_locked(req, path, body, now, &created);
         if (is(K::HIT_AFTER_REST) && rep.status == 201 && !created.empty()) {
           const Order* o = engine_.order(created);

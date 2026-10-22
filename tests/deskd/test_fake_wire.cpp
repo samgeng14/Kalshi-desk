@@ -1,7 +1,8 @@
 // The fake Kalshi over loopback, seen from a raw client (tests/fake_exchange/client.h): every REST
 // route and its shape, cursor paging, auth with a real RSA-PSS signature, the rate limits, the
-// socket's commands, sids and seq, every channel, each fault the plan names (section 8), the
-// recorded tape over the socket, many clients at once, and the fake-kalshi binary.
+// socket's commands, sids and seq, every channel, each fault the plan names (section 8) and S1's
+// (one market's creates, the touch pulled first), the recorded tape over the socket, many clients
+// at once, and the fake-kalshi binary.
 //
 // Shapes are checked against the venue's documents (docs.kalshi.com, fetched 2026-10-06):
 // api-reference/orders/*.md, portfolio/*.md, order-groups/*.md, websockets/*.md and
@@ -1005,6 +1006,84 @@ void test_faults() {
   CHECK(c.closed_by_server(1000));
 }
 
+// A fault for one market's creates, and the street pulling the touch an order would take: S1's leg
+// whose liquidity left before it arrived (arb.json's missing-leg tests).
+void test_ticker_faults() {
+  Venue v;
+  v.f.with_engine([](Engine& e, std::int64_t now) { e.street_add(T, true, 5700, 400, now); });  // a 0.43 ask x4
+  auto ws = open_ws(v.port());
+  ws->send_json(cmd(1, "subscribe", {{"channels", json::array({"orderbook_delta"})}, {"market_tickers", json::array({T})}}));
+  ws->send_json(cmd(2, "subscribe", {{"channels", json::array({"fill"})}}));
+  ws->drain(200);
+  HttpConn c(v.port());
+  using K = HttpFault::Kind;
+  auto fault = [](K k, const std::string& ticker, Qty qty = 0) {
+    HttpFault f;
+    f.kind = k;
+    f.ticker = ticker;
+    f.qty = qty;
+    return f;
+  };
+
+  // a fault naming G is passed over by T's create, which takes the one behind it; G's takes it
+  v.f.add_fault(fault(K::RATE_LIMIT, G));
+  v.f.add_fault(fault(K::STATUS_AFTER_ACCEPT, ""));
+  CHECK(call(c, "POST", ORDERS, post_only(T, "1", "0.30", "TF-t")).status() == 500 && v.has_cid("TF-t"));
+  CHECK(v.f.faults_pending() == 1);
+  CHECK(call(c, "POST", ORDERS, post_only(G, "1", "0.30", "TF-g")).status() == 429 && !v.has_cid("TF-g"));
+  CHECK(v.f.faults_pending() == 0);
+  // the ticker is the body's: a request with none never takes such a fault, even one about T
+  HttpFault read = fault(K::RATE_LIMIT, T);
+  read.method = "GET";
+  read.path = "/markets";
+  v.f.add_fault(read);
+  CHECK(call(c, "GET", "/markets/" + T).status() == 200 && v.f.faults_pending() == 1);
+  v.f.clear_faults();
+  ws->drain(200);
+
+  {  // the 0.42 ask x3 leaves just before a bid up to 0.43 arrives, which meets the 0.43
+    v.f.add_fault(fault(K::PULL_TOUCH, T));
+    v.f.clear_wire_log();
+    auto r = call(c, "POST", ORDERS, order(T, "bid", "2", "0.43", "immediate_or_cancel", "TF-p1"));
+    CHECK(r.status() == 201 && r.j["fill_count"] == "2.00" && r.j["average_fill_price"] == "0.4300");
+    const auto log = v.f.wire_log();
+    const int pull = log_at(log, {"http pull-touch " + T + " 3.00"});
+    CHECK(pull >= 0 && log_at(log, {"http 201 POST"}) > pull);
+    // the socket: the street's -3 at 0.58, then ours at 0.57, then the fill
+    std::vector<std::string> seen;
+    for (const auto& m : ws->drain(300)) {
+      const std::string type = m.value("type", "");
+      const json& msg = m["msg"];
+      if (type == "orderbook_delta")
+        seen.push_back(msg["price_dollars"].get<std::string>() + " " + msg["delta_fp"].get<std::string>() +
+                       (msg.contains("client_order_id") ? " ours" : ""));
+      if (type == "fill") seen.push_back("fill " + msg["count_fp"].get<std::string>());
+    }
+    CHECK(seen == std::vector<std::string>({"0.5800 -3.00", "0.5700 -2.00 ours", "fill 2.00"}));
+  }
+  {  // again: the 0.43 x2 left leaves too, and nothing is within the bid's price
+    v.f.add_fault(fault(K::PULL_TOUCH, T));
+    auto r = call(c, "POST", ORDERS, order(T, "bid", "1", "0.43", "immediate_or_cancel", "TF-p2"));
+    CHECK(r.status() == 201 && r.j["fill_count"] == "0.00" && v.by_cid("TF-p2")->status == OrdStatus::CANCELED);
+    CHECK(v.f.with_engine([](Engine& e, std::int64_t) { return e.levels(T, true).empty(); }));
+  }
+  {  // an ask pulls from the YES bids, `qty` of them: 3 of the 0.40 x5 leave and it takes the 2 left
+    v.f.add_fault(fault(K::PULL_TOUCH, T, 300));
+    auto r = call(c, "POST", ORDERS, order(T, "ask", "3", "0.40", "immediate_or_cancel", "TF-p3"));
+    CHECK(r.status() == 201 && r.j["fill_count"] == "2.00");
+  }
+  {  // a price short of the touch: nothing leaves, and the order rests as sent
+    v.f.with_engine([](Engine& e, std::int64_t now) { e.street_add(T, true, 5600, 200, now); });  // a 0.44 ask x2
+    v.f.add_fault(fault(K::PULL_TOUCH, T));
+    v.f.clear_wire_log();
+    auto r = call(c, "POST", ORDERS, post_only(T, "1", "0.35", "TF-p4"));
+    CHECK(r.status() == 201 && r.j["remaining_count"] == "1.00");
+    CHECK(log_at(v.f.wire_log(), {"http pull-touch " + T + " 0.00"}) >= 0);
+    CHECK(v.f.with_engine([](Engine& e, std::int64_t) { return e.levels(T, true) == std::vector<std::pair<Px, Qty>>({{5600, 200}}); }));
+  }
+  CHECK(v.f.faults_pending() == 0);
+}
+
 // ---- faults on the socket --------------------------------------------------------------------------
 
 void test_ws_faults() {
@@ -1475,6 +1554,7 @@ int main() {
   test_ws_protocol();
   test_ws_private();
   test_faults();
+  test_ticker_faults();
   test_ws_faults();
   test_cancel_all_echo();
   test_ws_limits();
