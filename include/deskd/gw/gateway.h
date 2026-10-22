@@ -105,12 +105,18 @@ class Gateway {
     OrdState state = OrdState::PEND;
     bool terminal = false, cancel_requested = false;
     std::int64_t done_ms = 0;
+    Qty executed = 0;                         // its fills booked (filled may run ahead of them)
+    std::int64_t exec_cost = 0, fees = 0;     // theirs, micro-dollars
+    std::string why;                          // why it ended (its ord row's why)
   };
   struct SysView {
     RunState run = RunState::STOP;
     std::set<std::string> lanes_on;
     std::map<std::string, SysOrder> orders;           // working ones, and those ended in the last 2 minutes
     std::map<std::string, Qty> positions;             // "lane|ticker" -> the lane's signed position
+    // "lane|ticker" -> the lane's position and what it cost (a long) or brought in (a short),
+    // micro-dollars (SysBook::Inv)
+    std::map<std::string, std::pair<Qty, std::int64_t>> inv;
     // "lane|ticker" -> the lane's worst case there, held and working, micro-dollars: the measure of
     // its budget and event cap (sys_worst), so an engine's game cap counts what gw's does
     std::map<std::string, std::int64_t> worst;
@@ -119,6 +125,7 @@ class Gateway {
     // ceiling and the effective ceiling min(ceiling, used + free)
     std::int64_t day = 0, fees = 0, used = 0, ceiling = 0, eff = 0;
     std::map<std::string, std::int64_t> lane_day;     // each lane's day, micro-dollars
+    std::map<std::string, std::int64_t> lane_real, lane_fees;   // and its realized P&L before fees, and fees
     std::set<std::string> held;                       // markets Manual took over: no lane quotes them
     std::int64_t ts_ms = 0;
   };

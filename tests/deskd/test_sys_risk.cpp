@@ -18,8 +18,9 @@
 //     max(0, their worst case over its states), so a complete basket is about $0 in the lane row,
 //     the header, the budget, the ceiling and the group, and S1 takes a second basket; a leg that
 //     adds nothing passes even past a limit; a missing or contradicted row counts market by market
-//     again and refuses growth; ManualPath::lattice closes KXHIGH's gaps between whole degrees; and
-//     an IOC leg's fills not booked yet count until they are
+//     again and refuses growth; ManualPath::lattice closes KXHIGH's gaps between whole degrees; an
+//     IOC leg's fills not booked yet count until they are; and strat's view carries each order's
+//     executions and each position's cost
 #include <future>
 #include <mutex>
 #include <random>
@@ -602,7 +603,8 @@ void lattice() {
 
 // An IOC leg whose 201 says all 10 filled before its fills arrive (it has ended): by state S1's
 // own measure counts its $3.00 until the fill books the position (the lane budget, the group and
-// the event cap), where market by market only the venue's used and the ceiling do.
+// the event cap), where market by market only the venue's used and the ceiling do. Strat's view
+// then carries what it executed, cost and paid, and the position at its cost.
 void ioc_leg() {
   for (const bool on : {false, true}) {
     Desk d(arb_lanes(), 1000 * 10000, on ? event_risk_on : nullptr, {EV});
@@ -628,6 +630,14 @@ void ioc_leg() {
              d.gw->sys_book()->fill("S1", cid, LO, Side::BUY, 1000, 3000, 70000, now_ms(), "t-leg-1");
     }));
     CHECK(d.used("S1") == 3000000);
+    CHECK(d.until([&] {
+      const auto v = d.gw->sys_view();
+      if (!v || !v->orders.count(cid) || !v->inv.count("S1|" + LO) || !v->lane_fees.count("S1")) return false;
+      const auto& o = v->orders.at(cid);
+      return o.executed == 1000 && o.exec_cost == 3000000 && o.fees == 70000 && o.why.empty() &&
+             v->inv.at("S1|" + LO) == std::pair<Qty, std::int64_t>{1000, 3000000} && v->lane_real.at("S1") == 0 &&
+             v->lane_fees.at("S1") == 70000;
+    }));
   }
 }
 }  // namespace

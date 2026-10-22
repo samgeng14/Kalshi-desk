@@ -1777,15 +1777,24 @@ void Gateway::sys_tick(std::int64_t now) {
       s.cid = cid; s.lane = o.intent.lane; s.ticker = o.intent.ticker; s.side = o.intent.side; s.price = o.intent.price;
       s.count = o.intent.count; s.left = o.left; s.filled = o.filled; s.state = o.state; s.terminal = o.terminal();
       s.cancel_requested = o.cancel_requested; s.done_ms = o.done_ms;
+      s.executed = o.executions; s.exec_cost = o.execution_cost; s.fees = o.fees; s.why = o.why;
       v->orders[cid] = std::move(s);
     }
     for (const auto& l : sys_->lanes())
       if (const auto* d = sys_->day(l.id))
-        for (const auto& [tk, inv] : d->inv) if (inv.pos) v->positions[l.id + "|" + tk] = inv.pos;
+        for (const auto& [tk, inv] : d->inv)
+          if (inv.pos) {
+            v->positions[l.id + "|" + tk] = inv.pos;
+            v->inv[l.id + "|" + tk] = {inv.pos, inv.cost};
+          }
     v->worst = sys_worst();
     v->day = sys_->day_total(mk);
     for (const auto& l : sys_->lanes())
-      if (const auto* dl = sys_->day(l.id)) v->lane_day[l.id] = dl->real - dl->fees + sys_->unrealized(l.id, mk);
+      if (const auto* dl = sys_->day(l.id)) {
+        v->lane_day[l.id] = dl->real - dl->fees + sys_->unrealized(l.id, mk);
+        v->lane_real[l.id] = dl->real;
+        v->lane_fees[l.id] = dl->fees;
+      }
     v->fees = sys_fees();
     v->held = man_held_;
     sys_money(&v->used, &v->ceiling, &v->eff);
