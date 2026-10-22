@@ -38,10 +38,12 @@ only while the lock says "deskd LIVE"). `python3 tools/scorecard.py` (or `scorec
 each lane's day and the plan's lane rules.
 
 A lane its kill rule retired stays off across restarts (the lane row says why, a CRIT alert said
-when, and turning it on is refused). With that desk stopped, `build-deskd/deskctl lane-reset C1
---config ~/.kalshi/deskd-demo.json --data-dir data/demo` gives it a fresh life (for LIVE: the prod
-config, `--data-dir data/prod` and `--live`). Its open positions stay in the book, and its loss limit
-still counts them at their mark (it waits while one has none, as just after a restart).
+when, and turning it on is refused). With that desk stopped, `python3 tools/desk.py lane-reset C1`
+(for LIVE: `lane-reset C1 live`) gives it a fresh life: it runs `build-deskd/deskctl lane-reset` on
+that desk's own config and data directory (`~/Library/Application Support/kalshi-desk/demo` on a
+Mac, `${XDG_DATA_HOME:-~/.local/share}/kalshi-desk/demo` elsewhere; `prod` for LIVE). Its open
+positions stay in the book, and its loss limit still counts them at their mark (it waits while one
+has none, as just after a restart).
 
 Lanes run together only while their budgets fit their venue's 70% ceiling (0.7 x the account's cash
 and positions; a lane on both venues counts on each). Turning one on past it is refused, naming the

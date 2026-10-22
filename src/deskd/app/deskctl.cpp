@@ -303,10 +303,12 @@ int kill_direct(const DirectArgs& a) {
 
 // ---- deskctl lane-reset ------------------------------------------------------------------------
 // A lane its kill rule retired stays off across restarts (gw/sys_book.h) until this clears its
-// life: its entry under "life" in DIR/systematic.json, the book gw saves (deskd --data-dir DIR;
-// tools/desk.py runs the paper desk on data/demo, the live one on data/prod). The next deskd
-// starts the lane with no trades, markouts or retirement, off until the operator turns it on.
-// Its open positions stay in the book, and its loss rule still counts them at the mark.
+// life: its entry under "life" in DIR/systematic.json, the book gw saves (deskd --data-dir DIR).
+// The next deskd starts the lane with no trades, markouts or retirement, off until the operator
+// turns it on. Its open positions stay in the book, and its loss rule still counts them at the mark.
+// tools/desk.py runs the paper desk on <data>/demo and the live one on <data>/prod (<data>:
+// ~/Library/Application Support/kalshi-desk on a Mac, else $XDG_DATA_HOME/kalshi-desk), and
+// `desk.py lane-reset LANE [live]` runs this with that desk's own config and data dir.
 //
 // deskd must be stopped: deskctl takes the account's lock (the config's env and lock_dir, as
 // kill --direct), which a running deskd holds, and rewrites the file as gw does (tmp + rename).

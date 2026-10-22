@@ -9,6 +9,7 @@
     python3 tools/desk.py status                 # both, through deskctl
     python3 tools/desk.py report [paper|live]    # what went wrong: status, KILLs, refusals, the log's tail
     python3 tools/desk.py kill paper|live        # KILL, as the screen's button
+    python3 tools/desk.py lane-reset LANE [live] # a retired lane's fresh life, with its desk stopped
 
 One desk, one browser tab, a PAPER | LIVE toggle in the header. Underneath, each account is its
 own deskd (its own lock, order ledger, venue connections; PAPER on port 8788, LIVE on 8789), so a
@@ -323,6 +324,18 @@ def deskctl(args):
     return subprocess.call([binary('deskctl')] + args)
 
 
+def lane_reset(which, lane):
+    """deskctl lane-reset on this desk's own config and data dir: the lane's life (trades, markouts,
+    retirement) cleared from its saved book. Not while the desk runs (one on another port holds the
+    account lock, which deskctl refuses)."""
+    d = DESKS[which]
+    st = running(d['port'])
+    if st:
+        die('the %s desk is running (pid %s): stop it (Ctrl-C where it runs, or kill %s), then run this again'
+            % (which, st.get('pid'), st.get('pid')))
+    return deskctl(['lane-reset', lane, '--config', os.path.expanduser(d['config']), '--data-dir', d['data']] + d['flags'])
+
+
 # ---- the log and the report ------------------------------------------------------------------
 
 LOG_MAX = 20 * 1024 * 1024
@@ -392,8 +405,10 @@ def report(which):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n\n')[0], usage=__doc__.split('\n\n')[1])
-    ap.add_argument('cmd', nargs='?', default='up', choices=['up', 'setup', 'paper', 'live', 'sim', 'status', 'kill', 'report'])
-    ap.add_argument('which', nargs='?', help='setup, kill and report: paper or live')
+    ap.add_argument('cmd', nargs='?', default='up',
+                    choices=['up', 'setup', 'paper', 'live', 'sim', 'status', 'kill', 'report', 'lane-reset'])
+    ap.add_argument('which', nargs='?', help='setup, kill and report: paper or live; lane-reset: the lane')
+    ap.add_argument('desk', nargs='?', help='lane-reset: paper (default) or live')
     ap.add_argument('--key', help='setup: the key file (default ~/.kalshi/demo.json, ~/.kalshi/prod.json)')
     ap.add_argument('--port', type=int, help='paper and live: the web port (default 8788 paper, 8789 live)')
     ap.add_argument('--no-open', action='store_true', help='do not open the browser')
@@ -438,6 +453,12 @@ def main():
         if a.which not in DESKS:
             die('kill paper or kill live')
         sys.exit(deskctl(['--port', str(DESKS[a.which]['port']), 'kill']))
+    elif a.cmd == 'lane-reset':
+        # lane-reset LANE [paper|live]: the lane comes where the other commands take the desk
+        lane, which = a.which, a.desk or 'paper'
+        if not lane or which not in DESKS:
+            die('lane-reset LANE, or lane-reset LANE live')
+        sys.exit(lane_reset(which, lane))
 
 
 if __name__ == '__main__':
