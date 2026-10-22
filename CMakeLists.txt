@@ -472,6 +472,7 @@ add_library(fake_kalshi STATIC
   tests/fake_exchange/rest.cpp
   tests/fake_exchange/tape.cpp
   tests/fake_exchange/fake_kalshi.cpp
+  tests/fake_exchange/fake_poly.cpp
   tests/fake_exchange/client.cpp
   tests/fake_exchange/tls_pki.cpp)
 target_include_directories(fake_kalshi PUBLIC tests/fake_exchange)
@@ -511,9 +512,16 @@ endif()
 #                limit, command rate), one order's private messages kept in order under
 #                REPLY_FIRST, the fixture tape over the socket, eight clients at once, and the
 #                fake-kalshi binary started and stopped
+#   fake-poly    the fake Polymarket US over loopback: its read routes and shapes (league events,
+#                markets, books, balances, positions, activities, open orders, one order) over the
+#                engine's books, orders and cash, paging, auth with a real Ed25519 signature (a key
+#                made in the test) and the 30 s window, the wire log, TLS, the idle close, and
+#                fake-kalshi --poly
 fake_kalshi_test(engine)
 fake_kalshi_test(wire)
 add_dependencies(deskd-test-fake-wire fake-kalshi)  # it starts the binary once
+fake_kalshi_test(poly)
+add_dependencies(deskd-test-fake-poly fake-kalshi)
 
 # ---- week 1: net/ and the Kalshi wire (plan sections 2-3) ------------------------------------------
 #   http   the strict HTTP/1.1 response parser, no sockets: every split of every reply, chunked with

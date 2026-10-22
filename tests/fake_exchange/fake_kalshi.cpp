@@ -62,18 +62,6 @@ std::string ordered(std::initializer_list<std::pair<const char*, json>> kv) {
   return s + "}";
 }
 json omit() { return json(json::value_t::discarded); }
-
-std::string base64_decode(const std::string& in) {
-  std::string out(in.size() / 4 * 3 + 3, '\0');
-  const int n = EVP_DecodeBlock(reinterpret_cast<unsigned char*>(out.data()),
-                                reinterpret_cast<const unsigned char*>(in.data()), static_cast<int>(in.size()));
-  if (n < 0) return {};
-  std::size_t len = static_cast<std::size_t>(n);
-  if (!in.empty() && in.back() == '=') --len;
-  if (in.size() > 1 && in[in.size() - 2] == '=') --len;
-  out.resize(len);
-  return out;
-}
 }  // namespace
 
 void FakeKalshi::Bucket::refill(std::int64_t now) {
@@ -811,7 +799,7 @@ std::string FakeKalshi::auth_refusal(const net::Request& req, std::int64_t now) 
     return "KALSHI-ACCESS-TIMESTAMP is too far from the exchange clock";
   if (cfg_.auth == AuthMode::VERIFY) {
     const std::string text = ts + req.method + req.path;  // the path without its query
-    const std::string raw = base64_decode(sig);
+    const std::string raw = net::unbase64(sig);
     EVP_MD_CTX* ctx = EVP_MD_CTX_new();
     EVP_PKEY_CTX* pctx = nullptr;
     EVP_PKEY* pk = static_cast<EVP_PKEY*>(pubkey_);
