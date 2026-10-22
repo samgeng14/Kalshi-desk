@@ -16,10 +16,34 @@
 //     account read), a market not scanned; arb_market's view of a market
 //   - sizing: max_qty, the levels, gw's inventory room, the budget, the cash, whole contracts, a
 //     lock only mid-size; and 3,000 random ladders against a size-by-size scan
+// ArbEngine, the leg executor, with a fake Env:
+//   - scan mode logs and sends nothing; off does nothing; a scan row a minute or on a new result
+//   - the scarcest leg alone, the rest in the step its answer arrives, sized to its fill; complete
+//     once the fills are booked; nothing filled or refused: done, and the event cools down
+//   - a short leg completed a tick through within complete_ms (legging: that tick), else unwound
+//   - a 201 that says filled while its fills come late: no unwind until they are booked, so the
+//     hedge is never sold; each excess over the least held closed a tick through the bid, a pass
+//     a second, until frozen for good; refusals, a one-sided or wide book
+//   - EXCHANGE: nothing more in the event until the view shows the order ended; frozen past
+//     uncertain_max_ms
+//   - Stop, KILL (legs deleted unanswered), the lane off, the private feed down: frozen, then only
+//     unwound; Manual taking a market over: frozen for good
+//   - the legging pause from s1.json and from this run, sticky across a new engine until the lane
+//     is turned off and on; the lane's day as a backstop
+//   - a restart mid-basket and orphans (no s1.json, or one that cannot be read): unwound from S1's
+//     positions once the start's account read is in
+//   - the finder's limits: the lane's budget by market or by state, the group, the ceiling, the
+//     shard's cash; the write budget
 #include <algorithm>
 #include <cmath>
+#include <fstream>
+#include <iterator>
+#include <map>
+#include <memory>
 #include <random>
+#include <set>
 #include <string>
+#include <variant>
 #include <vector>
 
 #include "check.h"
@@ -30,6 +54,7 @@
 
 using namespace deskd;
 using namespace deskd::arb;
+using json = nlohmann::json;
 
 namespace {
 constexpr std::int64_t NOW = 1792684800000;   // 2026-10-22 12:00 ET
@@ -722,6 +747,711 @@ void sizing_random() {
   CHECK(found > rounds / 10);   // the random ladders lock often enough to test the search
 }
 
+// ---- ArbEngine against a fake Env: gw a stub inbox whose answers the test gives; the view, the
+// account read and the books in memory, changed by the test; the store a list of rows
+
+std::string read_file(const std::string& path) {
+  std::ifstream in(path);
+  return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+}
+
+constexpr std::int64_t T = NOW + 10000;   // an engine's first step is at NOW, with an account read then: by T it is 5 s old
+
+struct Rig {
+  Scene sc = ladder();   // under 79, 79-80, over 80, flagged exclusive: a cover at .28/.31/.33
+  std::shared_ptr<Gateway::SysView> view = std::make_shared<Gateway::SysView>();
+  std::shared_ptr<rest::Snapshot> snap = std::make_shared<rest::Snapshot>();
+  std::vector<GwMsg> posted;
+  std::vector<std::pair<std::string, json>> rows;
+  std::set<std::string> wanted, wanted_events;
+  std::vector<std::string> alerts;
+  bool private_up = true;
+  double room = 400;
+  std::string state_file;
+  int unsaved = 0;                                        // orders posted before s1.json had them
+  Rig() {
+    view->run = RunState::RUN;
+    view->lanes_on = {"S1"};
+    view->eff = usd(100);
+    snap->markets = sc.listing;
+    snap->events[DAY] = sc.row;
+    snap->listing_ready = snap->account_ready = true;
+    snap->account_began_ms = snap->account_ms = NOW;
+    snap->balances[1] = 1000 * kOneDollar;
+    // B79.5's 12 is the scarcest: it goes first. Spreads of 2c: an unwind may go into them
+    sc.set(T79(), {L(.26, 20)}, {L(.28, 20)});
+    sc.set(B79(), {L(.29, 12)}, {L(.31, 12)});
+    sc.set(T80(), {L(.31, 20)}, {L(.33, 20)});
+  }
+  ArbEngine::Env env() {
+    ArbEngine::Env e;
+    e.view = [this] { return std::shared_ptr<const Gateway::SysView>(view); };
+    e.snapshot = [this] { return std::shared_ptr<const rest::Snapshot>(snap); };
+    e.book = [this](const std::string& tk) {
+      const auto it = sc.books.find(tk);
+      return it == sc.books.end() ? std::nullopt : std::optional<MdBook>(it->second);
+    };
+    e.post = [this](GwMsg m) {
+      // s1.json holds an order before it reaches gw
+      if (const auto* p = std::get_if<PlaceIntent>(&m); p && !state_file.empty())
+        unsaved += read_file(state_file).find("\"" + p->cid + "\"") == std::string::npos;
+      posted.push_back(std::move(m));
+      return true;
+    };
+    e.want = [this](std::set<std::string> w) { wanted = std::move(w); };
+    e.want_events = [this](std::set<std::string> w) { wanted_events = std::move(w); };
+    e.private_up = [this] { return private_up; };
+    e.write_room = [this](int) { return room; };
+    e.lattice = [](const std::string& series) { return series.rfind("KXHIGH", 0) == 0 ? 1.0 : 0.0; };
+    e.record = [this](const std::string& table, std::string row) {
+      rows.emplace_back(table, json::parse(row));
+      return true;
+    };
+    e.alert = [this](const std::string& lvl, const std::string& msg) { alerts.push_back(lvl + " " + msg); };
+    e.state_file = state_file;
+    return e;
+  }
+  static arb::Params params(const std::string& mode = "trade") {
+    arb::Params p;
+    p.mode = mode;
+    return p;
+  }
+  std::vector<PlaceIntent*> places() {
+    std::vector<PlaceIntent*> out;
+    for (auto& m : posted)
+      if (auto* p = std::get_if<PlaceIntent>(&m)) out.push_back(p);
+    return out;
+  }
+  std::size_t n() { return places().size(); }
+  PlaceIntent& place(std::size_t i) { return *places().at(i); }
+  // the view shows order i ended with f filled (the venue's count)
+  void ended(std::size_t i, int f) {
+    const PlaceIntent& p = place(i);
+    Gateway::SysOrder o;
+    o.cid = p.cid;
+    o.lane = "S1";
+    o.ticker = p.ticker;
+    o.side = p.side;
+    o.price = p.price;
+    o.count = p.count;
+    o.filled = ctr(f);
+    o.state = o.filled == p.count ? OrdState::FILL : OrdState::CXL;
+    o.terminal = true;
+    o.done_ms = T;
+    view->orders[p.cid] = o;
+  }
+  // gw's answer to order i: the venue took it and its 201 says f filled. The view shows it ended,
+  // with its fills booked (executions, S1's position) unless they are still to come.
+  void answer(std::size_t i, int f, bool fills = true, std::optional<double> at = std::nullopt) {
+    PlaceIntent& p = place(i);
+    const json ord = {{"cid", p.cid}, {"filled", f}, {"st", ctr(f) == p.count ? "FILL" : "CXL"}};
+    p.reply->set_value(OrderReply{"", "", ord.dump()});
+    ended(i, f);
+    if (fills) book(i, at);
+  }
+  // order i's fills reach gw's book, at the limit or at `at`
+  void book(std::size_t i, std::optional<double> at = std::nullopt) {
+    const PlaceIntent& p = place(i);
+    auto& o = view->orders.at(p.cid);
+    o.executed = o.filled;
+    o.exec_cost = (at ? px(*at) : p.price) * o.filled;
+    view->positions["S1|" + p.ticker] += (p.side == Side::BUY ? 1 : -1) * o.filled;
+  }
+  void refuse(std::size_t i, const std::string& code) { place(i).reply->set_value(OrderReply{code, "refused here", ""}); }
+  Qty pos(const std::string& tk) const {
+    const auto it = view->positions.find("S1|" + tk);
+    return it == view->positions.end() ? 0 : it->second;
+  }
+  // the account read agrees with S1's positions (arb_market keeps an event out until it does)
+  void agree() {
+    snap->positions.clear();
+    for (const auto& [key, q] : view->positions) {
+      kalshi::PositionRow r;
+      r.ticker = key.substr(key.find('|') + 1);
+      r.position = q;
+      snap->positions.push_back(r);
+    }
+  }
+  std::vector<json> of(const std::string& table) const {
+    std::vector<json> out;
+    for (const auto& [t, r] : rows)
+      if (t == table) out.push_back(r);
+    return out;
+  }
+  json last(const std::string& table) const {
+    const auto r = of(table);
+    return r.empty() ? json() : r.back();
+  }
+  bool alerted(const std::string& part) const {
+    return std::any_of(alerts.begin(), alerts.end(), [&part](const std::string& a) { return has(a, part); });
+  }
+};
+bool ends_with(const std::string& s, const std::string& tail) {
+  return s.size() >= tail.size() && s.compare(s.size() - tail.size(), tail.size(), tail) == 0;
+}
+json read_json(const std::string& path) {
+  std::ifstream in(path);
+  return json::parse(in, nullptr, false);
+}
+json basket_status(const ArbEngine& e) {
+  const auto b = e.status()["baskets"];
+  return b.empty() ? json() : b[0];
+}
+
+// scan mode finds and logs and sends nothing; off does nothing
+void engine_scan() {
+  Rig g;
+  ArbEngine e("S1", {"KXHIGHNY"}, g.env(), Rig::params("scan"));
+  CHECK(e.step(NOW) == 250);
+  CHECK((g.wanted == std::set<std::string>{T79(), B79(), T80()}) && (g.wanted_events == std::set<std::string>{DAY}));
+  CHECK(e.step(T) == 250 && g.posted.empty());
+  auto scans = g.of("arb_scans");
+  CHECK(scans.size() == 1);   // the same result: no row again within the minute
+  const json r = scans.back();
+  CHECK(r["event"] == DAY && r["kind"] == "YES_COVER" && r["mode"] == "scan" && r["fired"] == false && r["why"] == "scan mode" &&
+        r["qty"] == 10 && r["cost"] == "9.2000" && r["payout_min"] == "10.0000" && r["legs"].size() == 3 &&
+        r["legs"][0]["tk"] == B79() && r["legs"][0]["side"] == "BUY" && r["legs"][0]["px"] == "0.3100");
+  CHECK(e.status()["mode"] == "scan" && e.status()["events"][DAY]["kind"] == "YES_COVER");
+  // a new result is a row at once; the same one again a minute on
+  g.sc.set(T80(), {L(.31, 20)}, {L(.32, 20)});
+  e.step(T + 300);
+  CHECK(g.of("arb_scans").size() == 2 && g.last("arb_scans")["cost"] == "9.1000");
+  e.step(T + 600);
+  CHECK(g.of("arb_scans").size() == 2);
+  e.step(T + 60300);
+  CHECK(g.of("arb_scans").size() == 3 && g.posted.empty());
+  // nothing locks: one row saying why
+  g.sc.set(T80(), {L(.31, 20)}, {L(.45, 20)});
+  e.step(T + 60600);
+  CHECK(g.of("arb_scans").size() == 4 && g.last("arb_scans")["kind"].is_null() && has(g.last("arb_scans")["why"], "YES_COVER: locks"));
+
+  Rig h;
+  ArbEngine off("S1", {"KXHIGHNY"}, h.env(), Rig::params("off"));
+  CHECK(off.step(NOW) == 250 && off.step(T) == 250 && h.posted.empty() && h.rows.empty() && h.wanted.empty());
+  CHECK(off.status()["mode"] == "off");
+}
+
+// The scarcest leg alone, the rest in the step its answer arrives, each for its fill; complete
+// once every leg's fills are booked; the event then cools down
+void engine_cover() {
+  TempDir dir;
+  Rig g;
+  g.state_file = dir.file("s1.json");
+  ArbEngine e("S1", {"KXHIGHNY"}, g.env(), Rig::params());
+  CHECK(e.step(NOW) == 250 && g.posted.empty());   // the account read is not 5 s old yet
+  CHECK(has(g.last("arb_scans")["why"], "wait for an account read after the start"));
+  CHECK(e.step(T) == 10 && g.n() == 1);
+  if (g.n() != 1) return;
+  const PlaceIntent& p = g.place(0);
+  CHECK(p.cid.rfind("SS1-", 0) == 0 && ends_with(p.cid, "-b1l0") && p.cid.size() <= 40 && p.owner == Owner::SYS &&
+        p.lane == "S1" && p.venue == Venue::K && p.ticker == B79() && p.side == Side::BUY && p.price == px(.31) &&
+        p.count == ctr(10) && p.tif == Tif::IOC && p.ttl_s == 0 && p.slip_ticks == 0 && !p.reduce_only && !p.override_guard &&
+        p.touch == px(.31) && p.t_recv_ms == T && p.reply);
+  CHECK(g.last("arb_scans")["fired"] == true && has(g.last("arb_scans")["why"], "fired S1-"));
+  // the basket was in s1.json before its leg went
+  json f = read_json(g.state_file);
+  CHECK(f["v"] == 1 && f["baskets"].size() == 1 && f["baskets"][0]["orders"][0]["cid"] == p.cid &&
+        f["baskets"][0]["orders"][0]["is"] == "SENT" && f["baskets"][0]["st"] == "FIRST");
+  CHECK(g.last("baskets")["state"] == "FIRST" && g.last("baskets")["kind"] == "YES_COVER");
+  CHECK(e.step(T + 10) == 10 && g.n() == 1);   // its answer to come
+  g.answer(0, 10);
+  CHECK(e.step(T + 20) == 10 && g.n() == 3);
+  for (std::size_t i : {1, 2}) {
+    const PlaceIntent& q = g.place(i);
+    CHECK(q.side == Side::BUY && q.count == ctr(10) && q.slip_ticks == 0 && ends_with(q.cid, "l" + std::to_string(i)));
+  }
+  CHECK(g.place(1).ticker == T79() && g.place(1).price == px(.28) && g.place(2).ticker == T80() && g.place(2).price == px(.33));
+  CHECK(g.last("baskets")["state"] == "REST");
+  // the 201s say filled; the fills are still to come: not done yet
+  g.answer(1, 10, false);
+  g.answer(2, 10, false);
+  CHECK(e.step(T + 30) == 10 && basket_status(e)["state"] == "REST");
+  g.book(1);
+  g.book(2);
+  CHECK(e.step(T + 40) == 250 && g.n() == 3);
+  const json d = g.last("baskets");
+  CHECK(d["state"] == "DONE" && d["why"] == "complete: every leg holds 10" && d["legging"] == "0.0000" &&
+        d["edge_real"] == "0.8000" && d["t_end_ms"] == T + 40 && d["legs"][2]["filled"] == 10);
+  CHECK(read_json(g.state_file)["baskets"].empty() && read_json(g.state_file)["legging"] == 0);
+  CHECK(e.status()["done"] == 1 && e.status()["baskets"].empty() && e.status()["legging"] == "0.0000");
+  // the event cools down, then the next basket fires; a fresh account read holds nothing up
+  g.agree();
+  g.snap->account_began_ms = g.snap->account_ms = T + 30000;
+  e.step(T + 300);
+  CHECK(g.n() == 3 && has(g.last("arb_scans")["why"], "the event cools down"));
+  CHECK(e.step(T + 40 + 30000) == 10 && g.n() == 4 && ends_with(g.place(3).cid, "-b2l0"));
+  CHECK(g.unsaved == 0);
+}
+
+// The first leg fills part: the rest go for as many. Nothing, or a refusal: done, and a cool-down.
+void engine_first() {
+  {
+    Rig g;
+    ArbEngine e("S1", {"KXHIGHNY"}, g.env(), Rig::params());
+    e.step(NOW);
+    e.step(T);
+    g.answer(0, 6);
+    e.step(T + 10);
+    CHECK(g.n() == 3 && g.place(1).count == ctr(6) && g.place(2).count == ctr(6));
+  }
+  {
+    Rig g;
+    ArbEngine e("S1", {"KXHIGHNY"}, g.env(), Rig::params());
+    e.step(NOW);
+    e.step(T);
+    g.answer(0, 0);
+    CHECK(e.step(T + 10) == 250 && g.n() == 1 && g.last("baskets")["state"] == "DONE" &&
+          g.last("baskets")["why"] == "the first leg filled nothing");
+    e.step(T + 300);
+    CHECK(g.n() == 1 && has(g.last("arb_scans")["why"], "the event cools down"));
+  }
+  {
+    Rig g;
+    ArbEngine e("S1", {"KXHIGHNY"}, g.env(), Rig::params());
+    e.step(NOW);
+    e.step(T);
+    g.refuse(0, "SYS_CEILING");
+    CHECK(e.step(T + 10) == 250 && g.n() == 1 && g.last("baskets")["why"] == "the first leg was refused: SYS_CEILING: refused here");
+  }
+}
+
+// A leg short by 4 while its touch is a tick away: one completion for 4 a tick through the planned
+// touch; it fills there, the basket is complete and legging is that tick on 4 contracts
+void engine_completion() {
+  Rig g;
+  ArbEngine e("S1", {"KXHIGHNY"}, g.env(), Rig::params());
+  e.step(NOW);
+  e.step(T);
+  g.answer(0, 10);
+  e.step(T + 10);
+  g.answer(1, 10);
+  g.answer(2, 6);
+  g.sc.set(T80(), {L(.31, 20)}, {L(.34, 20)});   // the ask moved up a tick
+  CHECK(e.step(T + 20) == 10 && g.n() == 4);
+  const PlaceIntent& c = g.place(3);
+  CHECK(c.ticker == T80() && c.side == Side::BUY && c.price == px(.34) && c.count == ctr(4) && c.slip_ticks == 1 &&
+        c.touch == px(.34) && ends_with(c.cid, "l2c") && !c.reduce_only);
+  CHECK(g.last("baskets")["state"] == "COMPLETE");
+  g.answer(3, 4);
+  CHECK(e.step(T + 30) == 250 && g.last("baskets")["state"] == "DONE" && g.last("baskets")["why"] == "complete: every leg holds 10");
+  CHECK(g.last("baskets")["legging"] == "-0.0400" && e.status()["legging"] == "-0.0400");
+  CHECK(g.last("baskets")["edge_real"] == "0.7600");
+
+  // two ticks away: no completion; the excess is unwound
+  Rig h;
+  ArbEngine f("S1", {"KXHIGHNY"}, h.env(), Rig::params());
+  f.step(NOW);
+  f.step(T);
+  h.answer(0, 10);
+  f.step(T + 10);
+  h.answer(1, 10);
+  h.answer(2, 6);
+  h.sc.set(T80(), {L(.31, 20)}, {L(.35, 20)});
+  f.step(T + 20);
+  CHECK(h.n() == 5 && has(h.of("baskets")[h.of("baskets").size() - 2]["why"], "no completion; " + T80() + "'s touch is 0.3500"));
+  CHECK(h.place(3).ticker == B79() && h.place(3).side == Side::SELL && h.place(3).count == ctr(4) && h.place(3).price == px(.28));
+  CHECK(h.place(4).ticker == T79() && h.place(4).side == Side::SELL && h.place(4).count == ctr(4) && h.place(4).price == px(.25));
+  // past complete_ms the same
+  Rig k;
+  ArbEngine late("S1", {"KXHIGHNY"}, k.env(), Rig::params());
+  late.step(NOW);
+  late.step(T);
+  k.answer(0, 10);
+  late.step(T + 10);
+  k.answer(1, 10);
+  k.answer(2, 6);
+  late.step(T + 10 + 2001);
+  CHECK(k.n() == 5 && k.place(3).side == Side::SELL && has(k.of("baskets")[k.of("baskets").size() - 2]["why"], "short past complete_ms"));
+}
+
+// A 201 that says filled while the fills come late: the unwind waits for them, so it never sells
+// the hedge (sized from S1's positions before B79.5's fills it would sell all of T79.5 and T80);
+// then each leg's excess over the least goes one tick through the bid, retried each second
+void engine_unwind() {
+  Rig g;
+  ArbEngine e("S1", {"KXHIGHNY"}, g.env(), Rig::params());
+  e.step(NOW);
+  e.step(T);
+  g.answer(0, 10, false);   // B79.5: its 201 says 10, its fills come late
+  e.step(T + 10);
+  g.answer(1, 10);
+  g.answer(2, 6);
+  g.sc.set(T80(), {L(.31, 20)}, {L(.36, 20)});   // no completion
+  CHECK(e.step(T + 20) == 10 && g.n() == 3 && basket_status(e)["state"] == "UNWIND");
+  for (std::int64_t t = T + 1020; t < T + 6000; t += 1000) e.step(t);
+  CHECK(g.n() == 3 && basket_status(e)["tries"] == 0);
+  g.book(0);
+  CHECK(e.step(T + 6000) == 10 && g.n() == 5);
+  const PlaceIntent& a = g.place(3);
+  const PlaceIntent& b = g.place(4);
+  CHECK(a.ticker == B79() && a.side == Side::SELL && a.price == px(.28) && a.count == ctr(4) && a.touch == px(.29) &&
+        a.slip_ticks == 1 && !a.reduce_only && ends_with(a.cid, "l0u1"));
+  CHECK(b.ticker == T79() && b.side == Side::SELL && b.price == px(.25) && b.count == ctr(4) && ends_with(b.cid, "l1u1"));
+  CHECK(g.last("baskets")["state"] == "UNWIND" && has(g.last("baskets")["why"], "pass 1: 2 leg(s) closing to 6"));
+  // B79.5's unwind fills at the bid; T79's misses: a second pass a second on, for T79's 4 alone
+  g.answer(3, 4, true, .29);
+  g.answer(4, 0);
+  e.step(T + 6500);
+  CHECK(g.n() == 5);
+  g.sc.set(T79(), {L(.25, 20)}, {L(.27, 20)});
+  e.step(T + 7000);
+  CHECK(g.n() == 6 && g.place(5).ticker == T79() && g.place(5).price == px(.24) && g.place(5).count == ctr(4) &&
+        ends_with(g.place(5).cid, "l1u2"));
+  g.answer(5, 4, true, .25);
+  CHECK(e.step(T + 7010) == 250 && g.last("baskets")["state"] == "DONE" && g.last("baskets")["why"] == "unwound: every leg holds 6");
+  // legging: B79.5 bought at .31, sold at .29; T79 bought at .28, sold at .25; 4 each
+  CHECK(g.last("baskets")["legging"] == "-0.2000" && e.status()["legging"] == "-0.2000");
+  CHECK(g.pos(B79()) == ctr(6) && g.pos(T79()) == ctr(6) && g.pos(T80()) == ctr(6));
+}
+
+// gw refuses a leg: a completion, refused too: the excess unwound. A one-sided or wide book is
+// not unwound into; the passes run out and the basket freezes with what it holds.
+void engine_refused() {
+  Rig g;
+  ArbEngine e("S1", {"KXHIGHNY"}, g.env(), Rig::params());
+  e.step(NOW);
+  e.step(T);
+  g.answer(0, 10);
+  e.step(T + 10);
+  g.refuse(1, "SYS_CEILING");
+  g.answer(2, 10);
+  e.step(T + 20);
+  CHECK(g.n() == 4 && g.place(3).ticker == T79() && g.place(3).price == px(.29) && g.place(3).count == ctr(10));
+  g.refuse(3, "SYS_CEILING");
+  g.sc.set(T80(), {}, {L(.33, 20)});   // T80 one-sided
+  e.step(T + 30);
+  CHECK(g.n() == 5 && g.place(4).ticker == B79() && g.place(4).side == Side::SELL && g.place(4).count == ctr(10));
+  CHECK(has(g.last("baskets")["why"], T80() + "'s book is one-sided"));
+  g.answer(4, 10, true, .29);
+  g.sc.set(T80(), {L(.20, 20)}, {L(.33, 20)});   // 13c wide
+  for (int i = 1; i <= 9; ++i) e.step(T + 30 + 1000 * i);
+  CHECK(g.n() == 5 && has(g.last("baskets")["why"], "is over 3 ticks and 3c") && basket_status(e)["tries"] == 10);
+  e.step(T + 12000);
+  CHECK(basket_status(e)["state"] == "FROZEN" && basket_status(e)["stuck"] == true && g.alerted("CRIT S1 basket") &&
+        g.alerted("10 unwind passes spent, 10 " + T80() + " over the complete set held"));
+  e.step(T + 20000);
+  CHECK(g.n() == 5 && basket_status(e)["state"] == "FROZEN");
+  // and the event is held: no new basket there
+  g.agree();
+  e.step(T + 40000);
+  CHECK(g.n() == 5 && has(g.last("arb_scans")["why"], "is open in the event (FROZEN)"));
+}
+
+// gw answers EXCHANGE: nothing more goes in the event until the view shows the order ended
+void engine_uncertain() {
+  Rig g;
+  ArbEngine e("S1", {"KXHIGHNY"}, g.env(), Rig::params());
+  e.step(NOW);
+  e.step(T);
+  g.answer(0, 10);
+  e.step(T + 10);
+  g.place(1).reply->set_value(OrderReply{"EXCHANGE", "the venue did not confirm this order in time", ""});
+  g.answer(2, 6);
+  CHECK(e.step(T + 20) == 10 && g.n() == 3 && basket_status(e)["state"] == "UNCERTAIN");
+  e.step(T + 3000);
+  CHECK(g.n() == 3 && basket_status(e)["state"] == "UNCERTAIN");
+  // the private feed settles it: it filled 10
+  g.ended(1, 10);
+  g.book(1);
+  e.step(T + 3010);
+  // back in REST, past complete_ms: T80's 4 over... T80 is short, so T79 and B79.5 unwind 4
+  CHECK(g.n() == 5 && g.place(3).ticker == B79() && g.place(4).ticker == T79() && g.place(3).count == ctr(4));
+  // uncertain past uncertain_max_ms: frozen for good
+  Rig h;
+  arb::Params p = Rig::params();
+  p.uncertain_max_ms = 5000;
+  ArbEngine f("S1", {"KXHIGHNY"}, h.env(), p);
+  f.step(NOW);
+  f.step(T);
+  h.place(0).reply->set_value(OrderReply{"EXCHANGE", "no confirmation", ""});
+  f.step(T + 10);
+  CHECK(basket_status(f)["state"] == "UNCERTAIN");
+  f.step(T + 5020);
+  CHECK(basket_status(f)["state"] == "FROZEN" && basket_status(f)["stuck"] == true && h.alerted("still uncertain after 5 s"));
+}
+
+// Stop mid-basket: frozen, a CRIT alert, nothing sent; once Systematic runs it is only unwound,
+// never completed (decisions 10). A KILL deletes the queued legs: the same.
+void engine_frozen() {
+  Rig g;
+  ArbEngine e("S1", {"KXHIGHNY"}, g.env(), Rig::params());
+  e.step(NOW);
+  e.step(T);
+  g.view->run = RunState::STOP;
+  g.answer(0, 10);
+  CHECK(e.step(T + 10) == 250 && g.n() == 1 && basket_status(e)["state"] == "FROZEN" && g.alerted("CRIT S1 basket S1-") &&
+        g.alerted("is incomplete and frozen: Systematic is STOP; it is unwound once it may send again"));
+  e.step(T + 2000);
+  CHECK(g.n() == 1);
+  g.view->run = RunState::RUN;
+  CHECK(e.step(T + 3000) == 10 && g.n() == 2);
+  CHECK(g.place(1).ticker == B79() && g.place(1).side == Side::SELL && g.place(1).count == ctr(10) && ends_with(g.place(1).cid, "l0u1"));
+  g.answer(1, 10, true, .29);
+  e.step(T + 3010);
+  CHECK(g.last("baskets")["why"] == "unwound: every leg holds 0" && g.last("baskets")["legging"] == "-0.2000");
+
+  // the lane off, the private feed down: the same freeze
+  for (int which = 0; which < 2; ++which) {
+    Rig h;
+    ArbEngine f("S1", {"KXHIGHNY"}, h.env(), Rig::params());
+    f.step(NOW);
+    f.step(T);
+    if (which == 0) h.view->lanes_on.clear();
+    else h.private_up = false;
+    h.answer(0, 10);
+    f.step(T + 10);
+    CHECK(h.n() == 1 && basket_status(f)["state"] == "FROZEN" && has(basket_status(f)["why"], which == 0 ? "lane S1 is off" : "private feed"));
+  }
+
+  // KILL: gw deletes the queued legs unanswered; after the re-arm and a Start, an unwind
+  Rig k;
+  ArbEngine x("S1", {"KXHIGHNY"}, k.env(), Rig::params());
+  x.step(NOW);
+  x.step(T);
+  k.answer(0, 10);
+  x.step(T + 10);
+  CHECK(k.n() == 3);
+  k.view->run = RunState::KILLED;
+  k.posted.erase(k.posted.begin() + 1, k.posted.end());   // the two legs never left gw's inbox
+  x.step(T + 20);
+  CHECK(k.n() == 1 && basket_status(x)["state"] == "FROZEN" && has(basket_status(x)["why"], "Systematic is KILLED"));
+  k.view->run = RunState::RUN;
+  x.step(T + 60000);
+  CHECK(k.n() == 2 && k.place(1).ticker == B79() && k.place(1).side == Side::SELL && k.place(1).count == ctr(10));
+}
+
+// Manual takes over a basket market: frozen for good, nothing unwound, the event left alone
+void engine_takeover() {
+  Rig g;
+  ArbEngine e("S1", {"KXHIGHNY"}, g.env(), Rig::params());
+  e.step(NOW);
+  e.step(T);
+  g.answer(0, 10);
+  e.step(T + 10);
+  g.answer(1, 10);
+  g.answer(2, 6);
+  g.view->held.insert(T80());
+  e.step(T + 20);
+  CHECK(g.n() == 3 && basket_status(e)["state"] == "FROZEN" && basket_status(e)["stuck"] == true &&
+        g.alerted("Manual took " + T80() + " over: the basket leaves the event and unwinds nothing"));
+  g.view->held.clear();
+  e.step(T + 5000);
+  e.step(T + 10000);
+  CHECK(g.n() == 3 && basket_status(e)["state"] == "FROZEN");
+}
+
+// The legging pause: from s1.json it holds new baskets, also in a new engine that sees the lane
+// on; the lane turned off and on resets it, with an alert. A held basket still unwinds.
+void engine_pause() {
+  TempDir dir;
+  const std::string file = dir.file("s1.json");
+  {
+    std::ofstream out(file);
+    out << json{{"v", 1}, {"seq", 4}, {"legging", -6000000}, {"error", ""}, {"baskets", json::array()}}.dump();
+  }
+  Rig g;
+  g.state_file = file;
+  ArbEngine e("S1", {"KXHIGHNY"}, g.env(), Rig::params());
+  e.step(NOW);
+  CHECK(g.alerted("CRIT S1 paused: legging -$6.0000"));
+  e.step(T);
+  CHECK(g.n() == 0 && has(g.last("arb_scans")["why"], "paused: legging -$6.0000, past -$5.0000; turn S1 off and on to reset"));
+  CHECK(e.status()["paused"] == true && e.status()["legging"] == "-6.0000");
+  {
+    Rig h;
+    h.state_file = file;
+    ArbEngine again("S1", {"KXHIGHNY"}, h.env(), Rig::params());
+    again.step(NOW);
+    again.step(T);
+    again.step(T + 300);
+    CHECK(h.n() == 0 && again.status()["paused"] == true);
+  }
+  g.view->lanes_on.clear();
+  e.step(T + 300);
+  CHECK(g.n() == 0 && !g.alerted("reset"));
+  g.view->lanes_on = {"S1"};
+  e.step(T + 600);
+  CHECK(g.alerted("WARN S1's pause (legging -$6.0000) reset by the lane turned off and on"));
+  CHECK(g.n() == 1 && e.status()["paused"] == false && read_json(file)["legging"] == 0 && read_json(file)["seq"] == 5);
+
+  // legging past the pause in this run: the alert, and no new basket while the unwind goes on
+  Rig k;
+  arb::Params p = Rig::params();
+  p.legging_pause = usd(.40);
+  ArbEngine x("S1", {"KXHIGHNY"}, k.env(), p);
+  x.step(NOW);
+  x.step(T);
+  k.answer(0, 10);
+  x.step(T + 10);
+  k.answer(1, 10);
+  k.answer(2, 0);
+  k.sc.set(T80(), {L(.31, 20)}, {L(.36, 20)});
+  x.step(T + 20);
+  CHECK(k.n() == 5);
+  k.answer(3, 10, true, .29);
+  k.answer(4, 10, true, .26);
+  x.step(T + 30);
+  CHECK(x.status()["legging"] == "-0.4000" && x.status()["paused"] == true && k.alerted("CRIT S1 paused: legging -$0.4000"));
+  k.sc.set(T80(), {L(.31, 20)}, {L(.33, 20)});
+  k.agree();
+  x.step(T + 40000);
+  CHECK(k.n() == 5 && has(k.last("arb_scans")["why"], "paused: legging -$0.4000"));
+  // the lane's day past the pause holds new baskets too (s1.json lost)
+  Rig d;
+  d.view->lane_day["S1"] = -usd(5);
+  ArbEngine y("S1", {"KXHIGHNY"}, d.env(), Rig::params());
+  y.step(NOW);
+  y.step(T);
+  CHECK(d.n() == 0 && has(d.last("arb_scans")["why"], "held: S1's day is -$5.0000"));
+}
+
+// A restart mid-basket: the open basket comes back from s1.json frozen, its legs never completed;
+// once an account read after the start is 5 s old, the excess over the least held is unwound
+void engine_restart() {
+  TempDir dir;
+  const std::string file = dir.file("s1.json");
+  Rig g;
+  g.state_file = file;
+  {
+    ArbEngine e("S1", {"KXHIGHNY"}, g.env(), Rig::params());
+    e.step(NOW);
+    e.step(T);
+    g.answer(0, 10);
+    e.step(T + 10);
+    CHECK(g.n() == 3 && read_json(file)["baskets"][0]["st"] == "REST");
+  }
+  // deskd is gone; gw's rebuild from the venue's fills shows what the legs did
+  Rig h;
+  h.state_file = file;
+  h.view->positions = {{"S1|" + B79(), ctr(10)}, {"S1|" + T79(), ctr(10)}, {"S1|" + T80(), ctr(4)}};
+  h.agree();
+  const std::int64_t T2 = T + 120000;
+  h.snap->account_began_ms = h.snap->account_ms = T2;
+  ArbEngine e("S1", {"KXHIGHNY"}, h.env(), Rig::params());
+  // frozen, then unwinding once it may send: the positions wait for the start's account read
+  CHECK(e.step(T2) == 10 && h.n() == 0 && basket_status(e)["state"] == "UNWIND" &&
+        h.alerted("was open at the start (FROZEN): it is unwound once Systematic runs"));
+  e.step(T2 + 3000);
+  CHECK(h.n() == 0);
+  CHECK(e.step(T2 + 5000) == 10 && h.n() == 2);
+  CHECK(h.place(0).ticker == B79() && h.place(0).side == Side::SELL && h.place(0).count == ctr(6) && ends_with(h.place(0).cid, "l0u1"));
+  CHECK(h.place(1).ticker == T79() && h.place(1).side == Side::SELL && h.place(1).count == ctr(6));
+  h.answer(0, 6, true, .29);
+  h.answer(1, 6, true, .26);
+  e.step(T2 + 5010);
+  CHECK(h.last("baskets")["why"] == "unwound: every leg holds 4" && read_json(file)["baskets"].empty());
+  CHECK(g.unsaved == 0 && h.unsaved == 0);
+}
+
+// No s1.json and S1 holding positions: an orphan basket per event, unwound to equal holdings.
+// An s1.json that cannot be read: the same, and new baskets pause until the lane is turned off and on.
+void engine_orphans() {
+  for (int unreadable = 0; unreadable < 2; ++unreadable) {
+    TempDir dir;
+    Rig g;
+    if (unreadable) {
+      g.state_file = dir.file("s1.json");
+      std::ofstream(g.state_file) << "{not json";
+    }
+    g.view->positions = {{"S1|" + T79(), ctr(5)}, {"S1|" + B79(), ctr(5)}, {"S1|" + T80(), ctr(2)}, {"M2|" + T80(), ctr(9)}};
+    g.view->inv = {{"S1|" + T79(), {ctr(5), usd(1.40)}}, {"S1|" + B79(), {ctr(5), usd(1.55)}}, {"S1|" + T80(), {ctr(2), usd(.66)}}};
+    ArbEngine e("S1", {"KXHIGHNY"}, g.env(), Rig::params());
+    e.step(NOW);
+    CHECK(g.n() == 0 && e.status()["baskets"].empty());
+    CHECK(unreadable == (g.alerted("cannot be read") ? 1 : 0));
+    e.step(T);
+    CHECK(g.alerted("WARN S1 " + DAY + ": S1 holds 5 " + B79() + ", 5 " + T79() + ", 2 " + T80() + " with no s1.json"));
+    CHECK(g.n() == 2 && basket_status(e)["kind"] == "ORPHAN");
+    if (g.n() != 2) continue;
+    CHECK(g.place(0).ticker == B79() && g.place(0).side == Side::SELL && g.place(0).count == ctr(3) && g.place(0).price == px(.28));
+    CHECK(g.place(1).ticker == T79() && g.place(1).side == Side::SELL && g.place(1).count == ctr(3) && g.place(1).price == px(.25));
+    g.answer(0, 3, true, .29);
+    g.answer(1, 3, true, .26);
+    e.step(T + 10);
+    // legging: 3 of B79.5's 5 (bought for $1.55) sold at .29, 3 of T79's ($1.40) at .26
+    CHECK(g.last("baskets")["why"] == "unwound: every leg holds 2" && g.last("baskets")["legging"] == "-0.1200");
+    CHECK(e.status()["paused"] == (unreadable == 1));
+    if (unreadable) {
+      CHECK(has(e.status()["pause"], "s1.json cannot be read") && read_json(g.state_file)["error"] != "");
+      g.view->lanes_on.clear();
+      e.step(T + 300);
+      g.view->lanes_on = {"S1"};
+      e.step(T + 600);
+      CHECK(e.status()["paused"] == false && read_json(g.state_file)["error"] == "");
+    }
+  }
+}
+
+// What the finder is given: the lane's budget less what gw counts S1 using (market by market, or
+// by state), the event's group, the shard's cash less its margins; and the write budget
+void engine_limits() {
+  // S1 holds a complete cover of 10 (bought at .28/.31/.33): by market it counts $9.20 of the $15
+  const auto holding = [](Rig& g) {
+    g.view->positions = {{"S1|" + T79(), ctr(10)}, {"S1|" + B79(), ctr(10)}, {"S1|" + T80(), ctr(10)}};
+    g.view->inv = {{"S1|" + T79(), {ctr(10), usd(2.80)}}, {"S1|" + B79(), {ctr(10), usd(3.10)}}, {"S1|" + T80(), {ctr(10), usd(3.30)}}};
+    g.view->worst = {{"S1|" + T79(), usd(2.80)}, {"S1|" + B79(), usd(3.10)}, {"S1|" + T80(), usd(3.30)}};
+    g.agree();
+  };
+  {
+    Rig g;
+    holding(g);
+    ArbEngine e("S1", {"KXHIGHNY"}, g.env(), Rig::params("scan"));
+    e.step(NOW);
+    CHECK(g.last("arb_scans")["qty"] == 6);   // $5.80 left: 6 at $0.92
+  }
+  {
+    Rig g;
+    holding(g);
+    arb::Params p = Rig::params("scan");
+    p.limits.by_state = true;   // deskd.event_risk: the held cover counts about $0
+    ArbEngine e("S1", {"KXHIGHNY"}, g.env(), p);
+    e.step(NOW);
+    CHECK(g.last("arb_scans")["qty"] == 10);
+  }
+  {
+    Rig g;   // another lane's $14.50 in the event's group leaves $0.50
+    g.view->worst = {{"M2|" + T80(), usd(14.50)}};
+    ArbEngine e("S1", {"KXHIGHNY"}, g.env(), Rig::params("scan"));
+    e.step(NOW);
+    CHECK(g.last("arb_scans")["kind"].is_null() && has(g.last("arb_scans")["why"], "a contract counts $0.9200, over the $0.5000 the budget leaves"));
+  }
+  {
+    Rig g;   // the effective ceiling
+    g.view->eff = usd(3);
+    g.view->used = usd(1);
+    ArbEngine e("S1", {"KXHIGHNY"}, g.env(), Rig::params("scan"));
+    e.step(NOW);
+    CHECK(g.last("arb_scans")["qty"] == 2);
+  }
+  {
+    Rig g;   // $5 on the shard, less 6 legs' fee allowance ($0.185 each): 4 contracts fit
+    g.snap->balances[1] = 5 * kOneDollar;
+    ArbEngine e("S1", {"KXHIGHNY"}, g.env(), Rig::params("scan"));
+    e.step(NOW);
+    CHECK(g.last("arb_scans")["qty"] == 4);
+    // a Systematic order working on the shard holds its collateral
+    Gateway::SysOrder o;
+    o.cid = "SM2-x-1";
+    o.lane = "M2";
+    o.ticker = T80();
+    o.side = Side::BUY;
+    o.price = px(.50);
+    o.count = o.left = ctr(2);
+    o.state = OrdState::WORK;
+    g.view->orders[o.cid] = o;   // $1.00: 2 contracts fit
+    e.step(NOW + 300);
+    CHECK(g.last("arb_scans")["qty"] == 2);
+  }
+  {
+    Rig g;   // the write budget: 3 legs need 30 tokens
+    g.room = 25;
+    ArbEngine e("S1", {"KXHIGHNY"}, g.env(), Rig::params());
+    e.step(NOW);
+    e.step(T);
+    CHECK(g.n() == 0 && e.status()["events"][DAY]["why"] == "write budget: shard 1 has 25 tokens, 3 legs need 30");
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -735,5 +1465,18 @@ int main() {
   market_view();
   sizing();
   sizing_random();
+  engine_scan();
+  engine_cover();
+  engine_first();
+  engine_completion();
+  engine_unwind();
+  engine_refused();
+  engine_uncertain();
+  engine_frozen();
+  engine_takeover();
+  engine_pause();
+  engine_restart();
+  engine_orphans();
+  engine_limits();
   return finish("deskd-arb");
 }
