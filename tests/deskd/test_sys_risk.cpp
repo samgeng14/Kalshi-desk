@@ -5,7 +5,8 @@
 //     with fills not booked yet, ended with fills not booked yet, refused; Manual's beside them),
 //     sys_used counts what gw's own loops counted before it (gateway.cpp at 49b980e, kept below
 //     as Old): the venue's used, each lane's, and an order's lane budget, 70% ceiling, correlated
-//     group and event cap
+//     group and event cap; and sys_worst (strat's SysView::worst) by lane and market adds up to
+//     sys_used over any markets
 //   - through place_sys: the lane budget, the ceiling and the group refuse just past their edge
 //     and not at it, an order counts only the part of it that grows its lane's position, and a
 //     reducing order at a full budget passes
@@ -254,6 +255,20 @@ void same_numbers() {
         CHECK(d.gw->sys_used(every, every, nullptr, true) == old.used_all());
         if (d.gw->sys_used(every, every, nullptr, true) != d.gw->sys_used(every, every)) ++ended;
         for (const auto& id : ids) CHECK(d.gw->sys_used(only(id), every) == old.lane(id));
+        // SysView::worst, by lane and market, adds up to the same measure over any markets (a
+        // take engine's game_used is gw's event cap)
+        const auto worst = d.gw->sys_worst();
+        for (const std::string& id : {"R1", "R2", "R3", "Z9"})
+          for (unsigned mask = 0; mask < 1u << tks.size(); mask += 5) {
+            const auto in = [&](const std::string& tk) {
+              const auto i = std::find(tks.begin(), tks.end(), tk) - tks.begin();
+              return i < static_cast<long>(tks.size()) && (mask >> i & 1u);
+            };
+            std::int64_t sum = 0;
+            for (const auto& [key, w] : worst)
+              if (key.compare(0, id.size() + 1, id + "|") == 0 && in(key.substr(id.size() + 1))) sum += w;
+            CHECK(sum == d.gw->sys_used(only(id), in));
+          }
         for (int k = 0; k < 4; ++k) {
           PlaceIntent p;
           p.owner = Owner::SYS; p.lane = ids[rng() % ids.size()]; p.ticker = tks[rng() % tks.size()];
@@ -314,6 +329,13 @@ void limits() {
   CHECK(d.place("L3", "g-6", A1, Side::BUY, 500, 100).code == "SENT");   // another event's group
   // the header's used: every lane's
   CHECK(d.until([&] { const auto v = d.gw->sys_view(); return v && v->used == (56500 + 80000 + 70000 + 500) * 100; }));
+  // and strat's view of it by lane and market (SysView::worst): L1 long 5 at 0.40 and working
+  // $1.60 + $0.40 + the sell's $1.65
+  CHECK(d.until([&] {
+    const auto v = d.gw->sys_view();
+    return v && v->worst == std::map<std::string, std::int64_t>{
+                                {"L1|" + A1, 5650000}, {"L2|" + B1, 8000000}, {"L3|" + A1, 50000}, {"L3|" + B2, 7000000}};
+  }));
 }
 
 // the 70% ceiling: $10 of cash is $7, past which no lane grows (each lane's budget is $10). The

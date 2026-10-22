@@ -65,6 +65,9 @@ class Gateway {
   std::int64_t sys_used(const std::function<bool(const std::string&)>& lanes,
                         const std::function<bool(const std::string&)>& in, const PlaceIntent* extra = nullptr,
                         bool ended = false) const;
+  // gw thread only (inside a Probe). sys_used by lane and market, "lane|ticker" -> micro-dollars
+  // (SysView::worst): over any lane's markets they sum to sys_used(that lane, those markets)
+  std::map<std::string, std::int64_t> sys_worst() const;
   // Any thread: the cids gw's order book owns. Their rows come from gw alone (contract ORDER
   // REVISIONS: the page keeps the highest rev), so the REST publisher leaves them out.
   std::shared_ptr<const std::set<std::string>> manual_cids() const { return std::atomic_load(&owned_); }
@@ -100,6 +103,9 @@ class Gateway {
     std::set<std::string> lanes_on;
     std::map<std::string, SysOrder> orders;           // working ones, and those ended in the last 2 minutes
     std::map<std::string, Qty> positions;             // "lane|ticker" -> the lane's signed position
+    // "lane|ticker" -> the lane's worst case there, held and working, micro-dollars: the measure of
+    // its budget and event cap (sys_worst), so an engine's game cap counts what gw's does
+    std::map<std::string, std::int64_t> worst;
     // the header's Systematic numbers (contract hdr.day.sys, hdr.sys.K, hdr.cost), micro-dollars:
     // its day (real net of fees + unrl at the mids), its fees today, its used worst case, the 70%
     // ceiling and the effective ceiling min(ceiling, used + free)

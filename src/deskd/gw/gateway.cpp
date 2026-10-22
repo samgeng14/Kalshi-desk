@@ -1162,6 +1162,18 @@ Micros Gateway::sys_used(const std::function<bool(const std::string&)>& lanes,
   return u;
 }
 
+std::map<std::string, Micros> Gateway::sys_worst() const {
+  std::map<std::string, Micros> w;
+  for (const auto& [cid, o] : manual_->ledger().orders())
+    if (o.intent.owner == Owner::SYS && !o.terminal()) w[o.intent.lane + "|" + o.intent.ticker] += o.reservation();
+  for (const auto& l : sys_->lanes())
+    if (const auto* d = sys_->day(l.id))
+      for (const auto& [tk, inv] : d->inv)
+        if (const Micros x = sys_->open_worst_in(l.id, [&tk = tk](const std::string& t) { return t == tk; }))
+          w[l.id + "|" + tk] += x;
+  return w;
+}
+
 Qty Gateway::sys_grows(const PlaceIntent& p, Qty pending) const {
   const Qty held = (p.side == Side::BUY ? 1 : -1) * sys_->position(p.lane, p.ticker) + pending;
   return std::max<Qty>(0, held + p.count) - std::max<Qty>(0, held);
@@ -1671,6 +1683,7 @@ void Gateway::sys_tick(std::int64_t now) {
     for (const auto& l : sys_->lanes())
       if (const auto* d = sys_->day(l.id))
         for (const auto& [tk, inv] : d->inv) if (inv.pos) v->positions[l.id + "|" + tk] = inv.pos;
+    v->worst = sys_worst();
     v->day = sys_->day_total(mk);
     for (const auto& l : sys_->lanes())
       if (const auto* dl = sys_->day(l.id)) v->lane_day[l.id] = dl->real - dl->fees + sys_->unrealized(l.id, mk);
