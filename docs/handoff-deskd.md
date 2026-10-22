@@ -25,6 +25,82 @@ Rules in code:
 
 The work is on GitHub: `samgeng14/kalshi-desk`, branch `claude/pensive-meitner-8k2wae` (draft PR #1).
 
+## 2026-10-22: S1 arbitrage (plan 5(c))
+
+S1 ARB is built end to end and off by default (`deskd.arb_mode: "off"` builds no engine); M1,
+M2, P1, D1, Manual and the game lanes trade as before. The plan's own evidence puts it at about
+$0 (9 of 703 events ever positive, the best +1.6c): run it to measure, not to earn.
+
+- **What it trades** (`strat/arb.h`): baskets of IOC legs in one event that pay more than they
+  cost, fees included, in every way the event can settle. YES_COVER buys every market of a ladder
+  proven exhaustive; NO_SET sells YES (buys NO) on markets the venue flags mutually exclusive;
+  DOMINANCE sells "84 or above" and buys "80 or above". An event's settlement states come from
+  the venue's `mutually_exclusive` flag and the markets' strikes (`gw/event_risk.h`; KXHIGH and
+  KXLOW settle on whole degrees, `deskd.arb_lattice`), read by `GET /events/{t}` (rest reads at
+  most 16 event rows a poll, again after 10 minutes or when the listing shows a new market). A
+  basket must lock `arb_thr` a contract after the fee bound (default 1c), settle today or tomorrow
+  (ET), close over 5 minutes out and fit S1's $15; legs walk at most 2 ticks, 1c legs allowed,
+  never into Systematic's own resting order, and a whole event is left alone while Manual is in it.
+- **How it legs** (one basket in flight at a time): the scarcest leg alone at its touch, then
+  every other leg for what it filled. A short leg is completed one tick through within 2 s, or
+  each leg's excess is unwound one tick through the touch (10 passes, a second apart, on a book
+  no wider than 3 ticks or 3c, whichever is more), sized from S1's positions once every fill is
+  booked, never from a 201. An order gw could not place for sure holds the event until the
+  account read settles it. Stop, KILL, HALT, the lane off or the private feed down freeze a
+  basket; once it may send again it is only unwound, never completed (decisions 10). Legging P&L
+  (round trips and completions' ticks) adds up in `<data_dir>/s1.json` with the open baskets
+  (written before each order goes); at -$5 (`arb_legging_pause`) no new basket fires until you
+  turn S1 **off and on while paused**: after a restart that is on, off, on (the engine must see
+  it on first). An unreadable s1.json pauses the same way; a missing one turns S1's positions
+  into orphan baskets, unwound.
+- **Risk** (decisions 5): with `deskd.event_risk` on, gw counts S1's stakes in an event with
+  proven states by state, so a complete basket is about $0 against the lane budget, the 70%
+  ceiling and the event's $15 group; off, every leg counts market by market as every lane always
+  has. Only S1 counts by state; no other lane's numbers change. Its $15 counts against the 70%
+  ceiling with the other lanes on.
+- **Switches** (every one checked at load): `arb_mode` (`off`, `scan`, `trade`), `arb_series`
+  (default `band_series`), `arb_max_qty` (10 contracts, 1-20), `arb_max_legs` (6, 2-6), `arb_thr`
+  ($0.01, $0.005-$0.10), `arb_legging_pause` ($5 at most), `arb_lattice`, `event_risk` (false),
+  `fee_precision` ($0.01, or $0.0001 once demo fills prove it; decisions 7). `trade` needs
+  `systematic_orders` and `event_risk` or the config is refused. `scan` needs neither: it finds
+  and logs baskets (ops.sqlite `arb_scans`, one row an event a minute or on a change) and sends
+  nothing; with Systematic orders on, turning S1 on is refused naming scan mode. `/ops/status`
+  `arb` shows the settings, the pause, legging, each event's last scan and the open baskets
+  (`baskets` rows in ops.sqlite); its `rest` block shows the event rows (`events`, `events_ms`,
+  `events_error`).
+- **The operator's order** (agents never run these):
+  1. On the Mac, demo key: `tools/demo_checks` (or `build-deskd/kalshi-demo-probe --events-check
+     --arb-check`, with `--arb-series` or `--event T` if demo lists no KXHIGH). `--events-check`
+     reads events as deskd does and dumps each body: if `parse_event` refuses one, stop and tell
+     a session; replace `tests/deskd/fixtures/kalshi_event_docs.json` with a dumped body checked
+     for account ids. `--arb-check` buys 1 contract of NO on two markets of one exclusive event
+     and sells both back: `collateral_netting` says whether the venue gives back the $1 one of
+     them must pay (admission holds each leg's cost either way), `ioc_201` whether each 201 is
+     its order's final count (S1 sizes the other legs from it), `fee_precision` which precision
+     the fees rounded to (set `fee_precision` to 0.0001 only if it says so).
+  2. A week of `"arb_mode": "scan"` on PAPER and LIVE (scan places nothing; LIVE is yours to
+     start). `python3 tools/scorecard.py [live]` says how many events locked and the best.
+  3. Trade on PAPER: `"arb_mode": "trade", "systematic_orders": true, "event_risk": true`,
+     restart, S1 on, Start. The scorecard's S1 rule counts baskets complete, unwound and missed,
+     the legging against -$5 (s1.json), and once S1 holds nothing, whether its settlements paid
+     at least what its baskets locked (PAUSE if not: an event settled outside its shape).
+- **Tests**: deskd-event_risk, deskd-arb, deskd-sys_risk, deskd-rest, deskd-wire (the probe's
+  checks against the fake), deskd-fake-wire, deskd-fake-engine (PULL_TOUCH) and
+  deskd-runtime_arb (the whole process: scan, a basket, a missed leg completed and one unwound,
+  an UNKNOWN leg, KILL and Stop mid-basket, the pause and its reset), and scorecard's self-test.
+- **To confirm on demo**: the event body's shape (nested and beside, the flag always present,
+  `collateral_return_type`'s values, whether a settled event still lists its markets); the
+  collateral netting; the fee precision; how far books move between the first leg and the rest,
+  and how often a 1-tick completion fills; how the venue answers a create into a triggered group
+  (a KILL with a leg's create stalled leaves it UNKNOWN up to gw's 2-minute rule); md and fee
+  metadata load before widening `arb_series` (the default scans about 60 brackets).
+- **Still open**: the risk projection by settlement state and `/ops/status` naming which events
+  gw counts by state (a missing or unproven shape is only in the log); S1 in the soak with
+  PULL_TOUCH faults and a `deskd_sim.py --arb` sandbox (the fake-kalshi binary has no event line
+  or fault hook); the ARB family cap with W1 (P12a); `ui/desk/js/sim.js` still lists S1 as KP;
+  the two-venue weather NO basket (a logging hypothesis, waiting on Polymarket listing weather);
+  `docs/invariants.md` rows for S1 (its suites carry the invariants label).
+
 ## 2026-10-22: the game lanes, C1 (college) and the NBA's X1, N1 and N2
 
 The operator asked for every automatic lane. These four are built end to end, each off by default

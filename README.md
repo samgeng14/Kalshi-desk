@@ -77,7 +77,8 @@ never runs on LIVE; `"paper_lane": false` in the paper config leaves it out.
 ```sh
 tools/demo_checks                          # the plan's demo checks on PAPER (play money): order, group,
                                            # venue shapes (duplicate cid, expiry, reduce_only, post-only
-                                           # cross, self-trade) and the lanes' feeds; replies kept in demo-checks/
+                                           # cross, self-trade), the lanes' feeds, and S1's event reads and
+                                           # basket collateral; replies kept in demo-checks/
 python3 tools/latency_report.py            # where each order's time went (data/ops.sqlite): p50/p90/p99
                                            # per segment, click to ack; --hours, --own SYS, --json
 ```
