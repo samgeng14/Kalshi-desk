@@ -18,12 +18,14 @@ G1, held-out Brier (n1). The held-out season (--held-out, default the model's ow
 is priced by the shipped model when it is not a season the model was fitted on (its seasons), else
 by the same features refitted on the panel's other seasons (train_bball.fit: the trainer's own
 held-out score), so no row is priced by coefficients that saw its outcome. The rows: the season's
-rows with a kalshi_mid (the home team's effective mid). Brier(model) and Brier(mid) on those rows,
-and an 80% upper bound of their difference by a paired bootstrap: --boot resamples of the season's
-games with replacement (random.Random(--seed): the same panel gives the same bound), each the mean
-difference over its games' rows; the bound is the smallest resample mean with at least 80% of
-them at or under it. Passes with 150+ games (plan 5(f)'s 150+ settled games), Brier(model) under
-Brier(mid) and the bound under 0 (nba.json: stricter than the plan's "at least the mid's").
+rows with a kalshi_mid (the home team's effective mid; a history row's at the first candle close at
+or after it, never one from before the play the model is told of). Brier(model) and Brier(mid) on
+those rows, and an 80% upper bound of their difference by a paired bootstrap: --boot resamples of
+the season's games with replacement (random.Random(--seed): the same panel gives the same bound),
+each the mean difference over its games' rows; the bound is the smallest resample mean with at
+least 80% of them at or under it. Passes with 150+ games (plan 5(f)'s 150+ settled games),
+Brier(model) under Brier(mid) and the bound under 0 (nba.json: stricter than the plan's "at least
+the mid's").
 
 G2, the executable replay (n1). The same held-out games, traded by N1's rule exactly:
 tools/take_rule.py's decide (deskd's take_decide) in mode MODEL with take_params' defaults ($2
@@ -881,8 +883,11 @@ def synth_panel(games=160, gid0=401900000, day0='2026-11-04T00:00Z', fav_runs=Fa
       r1b + 720 s, Q1 1:40, the same score (its first sighting r1's): stale, and 5c on a minute on
       r3  + 1500 s, Q2 6:00, 18-10 for the run team: priced at its 5 in 6, 0.82/0.84 (the other
           market 0.16/0.18), the same a minute on
-    The model (tests/deskd/fixtures/nba_synthetic.json) prices the run team at 0.81 to 0.92 at r1:
-    it takes there; at r3 it is within 10c of the touch both ways, and the tip within 10c too."""
+    Each row's kalshi_mid is the books a minute on, standing for the first close after the row
+    (nba_panel's): at r1 and r1b the market has moved 5c on the run, a current mid that still
+    prices the run team well under its 5 in 6 (the planted effect G1 measures). The model
+    (tests/deskd/fixtures/nba_synthetic.json) prices the run team at 0.81 to 0.92 at r1: it takes
+    there; at r3 it is within 10c of the touch both ways, and the tip within 10c too."""
     tip0, rows = em.iso_ms(day0), []
     for n in range(games):
         tip = tip0 + (n // 4) * 86400000 + (n % 4) * 3 * 3600000
@@ -904,9 +909,10 @@ def synth_panel(games=160, gid0=401900000, day0='2026-11-04T00:00Z', fav_runs=Fa
                 (720, 1, '1:40', lead, 700, stale, moved), (1500, 2, '6:00', later, 1500, priced, priced)):
             t_left, ot = tb.t_left(nbp.LEAGUE, period, em.clock_seconds(clock))
             bid, ask = nbp.effective(*now)
+            mb, ma = nbp.effective(*nxt)
             row = {'game_id': str(gid0 + n), 'season': nbp.season_of(tip), 't_left_s': nbp.number(t_left),
                    'ot': '1' if ot else '0', 'margin': str(hs - as_), 'possession': '0', 'p0': '%.5f' % p0,
-                   'yes_won': '1' if won else '0', 'kalshi_mid': '%.5f' % ((bid + ask) / 2 / ONE),
+                   'yes_won': '1' if won else '0', 'kalshi_mid': '%.5f' % ((mb + ma) / 2 / ONE),
                    'kalshi_bid': nbp.dollars(bid), 'kalshi_ask': nbp.dollars(ask), 'espn_wp': '',
                    'visible_ms': str(tip + dt * 1000), 'source': 'history', 'lag_s': '41.5', 'event': ev,
                    'home_ticker': home, 'away_ticker': away, 'start_ms': str(tip), 'period': str(period),
@@ -1072,9 +1078,12 @@ def self_test(write_fixture=False):
         g, r2 = res['g1'], res['g2']
         check("n1 prices 2026-27 with the shipped model (not among its seasons)", res['fair'].startswith('the shipped')
               and res['model_sha256'] == sha, res['fair'])
-        check('G1: 640 rows of 160 games; the stale r1 rows make the mid worse: a pass',
-              (g['games'], g['rows']) == (160, 640) and g['diff'] < -0.03 and g['upper80'] < 0 and g['passed'],
-              (g['brier_model'], g['brier_mid'], g['upper80']))
+        # against a current mid: r0's at p0 (Brier 0.25625 over the 160 games), r1's and r1b's 5c on toward
+        # the run team (0.225), r3's 0.83 (26 of 160 run teams lose: (134 x 0.17^2 + 26 x 0.83^2) / 160 =
+        # 0.13615): 0.2106 a row, which the model, pricing the run team at 0.81 to 0.92 at r1, beats
+        check('G1: 640 rows of 160 games; the mid a current one (Brier 0.2106), the model below it: a pass',
+              (g['games'], g['rows']) == (160, 640) and abs(g['brier_mid'] - 0.2106) < 1e-9 and g['diff'] < -0.03
+              and g['upper80'] < 0 and g['passed'], (g['brier_model'], g['brier_mid'], g['upper80']))
         rows, _ = read_panel(panel)
         held = [r for r in rows if r['season'] == '2026-27']
         again = g1(held, lambda r: home_p(model, r))

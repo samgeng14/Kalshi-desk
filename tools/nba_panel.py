@@ -39,7 +39,12 @@ per visible game state in play, games by tip then id, states in the order seen:
   kalshi_mid, kalshi_bid, kalshi_ask
                the home team's effective book at visible_ms over both markets, dollars: bid
                max(home bid, 1 - away ask), ask min(home ask, 1 - away bid) (game_fair.h's
-               effective_book); blank where no side gives one, the mid blank unless both do
+               effective_book); blank where no side gives one, the mid blank unless both do.
+               A history row's mid is the effective book at the first candle close at or after
+               visible_ms instead (at most 120 s on): the close before it can end before the play
+               the row shows, and the mid is only the benchmark the model is scored against
+               (nba_gate.py's G1, train_bball's Brier), where a later price is only the harder
+               test. Its bid and ask, which nba_gate.py decides on, stay at or before
   espn_wp      ESPN's home win probability at visible_ms (blank: none yet). History: the summary
                chart's point of the latest play shown. Recorder: the latest chart point first
                seen (espn_plays; a play first seen under a sequence number already shown was
@@ -64,7 +69,8 @@ and, for tools/nba_gate.py's executable replay:
 
 Quotes. History: a candle's close (yes_bid and yes_ask at end_period_ts) is the quote from that
 instant until the next candle, carried at most 120 s (a minute missing from the candles; how
-often is TO CONFIRM), never a candle that ends after the instant read. Recorder: the book as
+often is TO CONFIRM), never a candle that ends after the instant read (but for a row's
+kalshi_mid, above). Recorder: the book as
 replayed (deskd's units and rules), until it changes or is dropped (a sequence gap, a disconnect,
 a restart: blank until its next snapshot).
 
@@ -233,6 +239,16 @@ class Quotes:
             return None
         return self.vs[tk][i]
 
+    def after(self, tk, t):
+        """The first entry at or after t, nothing when it is more than max_age_ms on."""
+        ts = self.ts.get(tk)
+        if not ts:
+            return None
+        i = bisect.bisect_left(ts, t)
+        if i == len(ts) or (self.max_age_ms is not None and ts[i] - t > self.max_age_ms):
+            return None
+        return self.vs[tk][i]
+
     def times(self, tk, a, b):
         """The entries' times in [a, b]."""
         ts = self.ts.get(tk, [])
@@ -315,6 +331,9 @@ class Game:
 
     def touch(self, t):
         return self.quotes.at(self.home_ticker, t), self.quotes.at(self.away_ticker, t)
+
+    def touch_after(self, t):
+        return self.quotes.after(self.home_ticker, t), self.quotes.after(self.away_ticker, t)
 
     def p0(self):
         """The home team's effective mid at the last quote at or before the tip, at most
@@ -588,7 +607,9 @@ def game_rows(g, counts):
         v = s['visible_ms']
         (hq, aq), (hn, an) = g.touch(v), g.touch(v + NEXT_MS)
         bid, ask = effective(hq, aq)
-        mid = '%.5f' % ((bid + ask) / 2 / UNIT) if bid is not None and ask is not None else ''
+        # the benchmark's mid: a history row's at the first close at or after it (module docstring)
+        mb, ma = effective(*g.touch_after(v)) if g.source == 'history' else (bid, ask)
+        mid = '%.5f' % ((mb + ma) / 2 / UNIT) if mb is not None and ma is not None else ''
         row = {'game_id': g.game_id, 'season': season_of(g.start_ms), 't_left_s': number(c[0]),
                'ot': '1' if c[1] else '0', 'margin': str(s['home_score'] - s['away_score']),
                'possession': str(s['possession']), 'p0': '%.5f' % p0, 'yes_won': str(g.yes_won), 'kalshi_mid': mid,
@@ -872,9 +893,14 @@ def self_test():
     q = Quotes(CANDLE_AGE_MS)
     q.add('X', 1000, (4000, 4200))
     q.add('X', 61000, (4100, 4300))
+    q.add('X', 301000, (4200, 4400))
     check('Quotes: the entry at or before t, never later, carried 120 s at most',
           q.at('X', 999) is None and q.at('X', 1000) == (4000, 4200) and q.at('X', 60999) == (4000, 4200)
           and q.at('X', 181000) == (4100, 4300) and q.at('X', 181001) is None)
+    check('Quotes.after: the first entry at or after t, at most 120 s on',
+          q.after('X', 0) == (4000, 4200) and q.after('X', 1000) == (4000, 4200) and q.after('X', 1001) == (4100, 4300)
+          and q.after('X', 61001) is None and q.after('X', 181000) == (4200, 4400) and q.after('X', 301001) is None
+          and q.after('Y', 0) is None)
 
     # ---- history: two scoreboards' games, one game's summary and both its markets' candles
     s = 1000
@@ -940,10 +966,11 @@ def self_test():
               [r.get('espn_wp') for r in rows] == ['0.6', '0.6', '0.55', '0.55', '0.55', '0.55'])
         # r1 at tip+161.5 s reads the close at tip+120 (i=2: home 0.52/0.55, LAL 0.44/0.47; effective
         # bid max(0.52, 0.53) = 0.53, ask min(0.55, 0.56) = 0.55); a minute on the close at tip+180
-        # (i=3: home 0.50/0.53, LAL 0.46/0.49)
-        check('the effective book and each touch at visible_ms, and a minute on',
+        # (i=3: home 0.50/0.53, LAL 0.46/0.49), which is also the first close at or after it, the mid's:
+        # effective 0.51/0.53
+        check("the effective book and each touch at visible_ms, and a minute on; the mid at the first close after",
               (r1.get('kalshi_bid'), r1.get('kalshi_ask'), r1.get('kalshi_mid'), r1.get('home_bid'), r1.get('away_ask'),
-               r1.get('home_ask_next'), r1.get('away_bid_next')) == ('0.5300', '0.5500', '0.54000', '0.5200', '0.4700',
+               r1.get('home_ask_next'), r1.get('away_bid_next')) == ('0.5300', '0.5500', '0.52000', '0.5200', '0.4700',
                                                                      '0.5300', '0.4600'),
               [r1.get(k) for k in ('kalshi_bid', 'kalshi_ask', 'kalshi_mid', 'home_bid', 'away_ask', 'home_ask_next',
                                    'away_bid_next')])
@@ -979,6 +1006,22 @@ def self_test():
                    {'plays': [_play('q1', 1, 1, '12:00', tip + 1900 * s, 0, 0)]})
         _, c2 = build(ed, kd, None, lag)
         check('a game without candles is counted, not guessed', c2['history'].get('no_candles') == 1, c2['history'])
+
+        # a home three at tip+130 s, shown at tip+171.5: the close at or before it (tip+120, both books
+        # 0.49/0.51) ended before the play, the one after it (tip+180) has priced it, home 0.56/0.58 and
+        # LAL 0.42/0.44: G1's mid 0.57, the decision's book still 0.49/0.51
+        qs = Quotes(CANDLE_AGE_MS)
+        for dt, hq, aq in ((-60, (4900, 5100), (4900, 5100)), (120, (4900, 5100), (4900, 5100)),
+                           (180, (5600, 5800), (4200, 4400)), (240, (5600, 5800), (4200, 4400))):
+            qs.add('H', tip + dt * s, hq)
+            qs.add('A', tip + dt * s, aq)
+        three = Game('history', '1', 'EV', 'H', 'A', tip, 1, qs, lag)
+        three.states = [{'visible_ms': tip + 171500, 'period': 1, 'clock': '11:10', 'home_score': 3, 'away_score': 0,
+                         'possession': 0, 'wp': None}]
+        got = game_rows(three, Counter())
+        got = [(r['kalshi_mid'], r['kalshi_bid'], r['kalshi_ask'], r['home_ask'], r['home_ask_next']) for r in got]
+        check("a history row's mid is never from before the play it shows; its book and touches stay at or before",
+              got == [('0.57000', '0.4900', '0.5100', '0.5100', '0.5800')], got)
 
         # ---- the recorder: the same night, recorded (BOS-LAL), plus a game the history lacks
         rd = os.path.join(d, 'rec')

@@ -20,9 +20,9 @@
    "games": 160,
    "rows": 640,
    "brier_model": 0.175091,
-   "brier_mid": 0.226225,
-   "diff": -0.051134,
-   "upper80": -0.041563,
+   "brier_mid": 0.2106,
+   "diff": -0.035509,
+   "upper80": -0.027175,
    "boot": 2000,
    "seed": 1,
    "pass": true
