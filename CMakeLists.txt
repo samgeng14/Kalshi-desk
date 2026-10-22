@@ -349,7 +349,7 @@ add_library(deskd_core STATIC
   src/deskd/strat/fill_model.cpp
   src/deskd/strat/calendar.cpp
   src/deskd/strat/lip.cpp
-  src/deskd/strat/wcbb_model.cpp
+  src/deskd/strat/bball_model.cpp
   src/deskd/strat/markouts.cpp
   src/deskd/strat/lane_gate.cpp
   src/deskd/store/store.cpp
@@ -529,6 +529,8 @@ deskd_pure_test(sys_risk)
 deskd_pure_test(strat)
 # lane_gate: the one gate-file loader (gates_dir/<lane>.json), each refusal's reason, C1's per-series results
 deskd_pure_test(lane_gate)
+# bball: strat/bball_model, the WCBB and NBA leagues in one loader (NBA's clock and overtime, golden rows)
+deskd_pure_test(bball)
 deskd_fake_test(net)
 deskd_fake_test(wire)
 deskd_fake_test(md)
