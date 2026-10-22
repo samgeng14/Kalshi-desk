@@ -22,6 +22,7 @@
 #include "deskd/ref/scores.h"
 #include "deskd/strat/maker.h"
 #include "deskd/strat/markouts.h"
+#include "deskd/strat/take.h"
 #include "deskd/gw/sys_book.h"
 
 namespace deskd {
@@ -166,22 +167,27 @@ bool Deskd::start(std::string* err) {
     if (cx_sender_) cx_sender_->run(w); else run_cancel_sender(w, q_cx_, cx_stats_, kill_, alert);
   });
   // The strat thread's engines, each at its own cadence and in this order when due together: the
-  // fair before the makers that read it, the merged scores before the game fair. An engine with
-  // work in flight registers with paced().
+  // fair before the makers that read it; the merged scores, then the game fair, then C1's takes,
+  // which use a fair only when it was priced on the score they read. An engine with work in
+  // flight registers with paced().
   StratSteps steps;
   steps.every(250, [this] { if (fair_ && rest_) fair_->step(*rest_->snapshot(), now_ms()); });
   steps.every(250, [this] { if (scores_) scores_->step(now_ms()); });
   steps.every(250, [this] { if (game_fair_) game_fair_->step(now_ms()); });
+  steps.every(250, [this] { if (c1_) c1_->step(now_ms()); });
   steps.every(250, [this] { if (lip_) lip_->step(now_ms()); });
   steps.every(250, [this] { if (band_) band_->step(now_ms()); });
   steps.every(250, [this] { if (paper_) paper_->step(now_ms()); });
   steps.every(250, [this] { if (probe_) probe_->step(now_ms()); });
   steps.every(250, [this] { lip_step(now_ms()); });
   steps.every(250, [this] {
-    if (markouts_)   // every row to the store; the contract's horizons (1s, 10s, 60s) to the stream
+    // every row to the store; the contract's horizons (1s, 10s, 60s) to the stream; C1's own
+    // fills at its retire rule's horizon to gw (LaneMarkout, through its engine)
+    if (markouts_)
       for (const auto& row : markouts_->step(now_ms())) {
         store_.inbox().push(StoreRecord{"markouts", row.store().dump()});
         if (row.on_stream()) pub_->post(PubData{"mo", row.pub()});
+        if (c1_) c1_->markout(row);
       }
   });
   by("strat")->start([steps](Worker& w) mutable { run_strat(w, [&steps] { return steps.step(mono_ms()); }); });
@@ -322,6 +328,7 @@ json Deskd::status() const {
   result["wcbb"] = {{"path", cfg_.wcbb_model}, {"loaded", wcbb_.has_value()}, {"why", wcbb_why_},
                     {"version", wcbb_ ? wcbb_->version : 0}};
   result["game_fair"] = game_fair_ ? game_fair_->status() : json(nullptr);
+  result["college"] = college_status();
   result["markouts"] = markouts_ ? markouts_->status() : json(nullptr);
   if (const auto l = gw_->latency()) {
     auto ms = [](const std::optional<int>& v) { return v ? json(*v) : json(nullptr); };

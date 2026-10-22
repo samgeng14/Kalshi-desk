@@ -1,0 +1,17 @@
+{
+  "model": "volley_markov",
+  "version": 1,
+  "rules": {"best_of": 5, "set_to": 25, "last_set_to": 15, "win_by": 2},
+  "golden": [
+    {"in": {"sets_yes": 0, "sets_opp": 0, "pts_yes": 0, "pts_opp": 0, "p0": 0.5}, "p": 0.5},
+    {"in": {"sets_yes": 0, "sets_opp": 0, "pts_yes": 0, "pts_opp": 0, "p0": 0.75}, "p": 0.7499999999999999},
+    {"in": {"sets_yes": 0, "sets_opp": 0, "pts_yes": 10, "pts_opp": 4, "p0": 0.4}, "p": 0.5358213710220386},
+    {"in": {"sets_yes": 1, "sets_opp": 0, "pts_yes": 20, "pts_opp": 22, "p0": 0.62}, "p": 0.674164089581275},
+    {"in": {"sets_yes": 1, "sets_opp": 1, "pts_yes": 24, "pts_opp": 24, "p0": 0.3}, "p": 0.37771091794864703},
+    {"in": {"sets_yes": 2, "sets_opp": 1, "pts_yes": 23, "pts_opp": 24, "p0": 0.55}, "p": 0.6449221989971041},
+    {"in": {"sets_yes": 0, "sets_opp": 2, "pts_yes": 26, "pts_opp": 25, "p0": 0.8}, "p": 0.3490273119176269},
+    {"in": {"sets_yes": 2, "sets_opp": 2, "pts_yes": 0, "pts_opp": 0, "p0": 0.65}, "p": 0.5667847589379803},
+    {"in": {"sets_yes": 2, "sets_opp": 2, "pts_yes": 13, "pts_opp": 14, "p0": 0.45}, "p": 0.24272865900406945},
+    {"in": {"sets_yes": 2, "sets_opp": 2, "pts_yes": 14, "pts_opp": 14, "p0": 0.9}, "p": 0.5986173029239723}
+  ]
+}

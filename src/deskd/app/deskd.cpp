@@ -116,6 +116,7 @@ int main(int argc, char** argv) {
   if (cfg.ui_dir.empty()) cfg.ui_dir = std::string(DESKD_SOURCE_DIR) + "/ui/desk";
   if (cfg.calendar.empty()) cfg.calendar = std::string(DESKD_SOURCE_DIR) + "/config/calendar.json";
   if (cfg.wcbb_model.empty()) cfg.wcbb_model = std::string(DESKD_SOURCE_DIR) + "/models/wcbb_logit_v1.json";
+  if (cfg.college.volley_model.empty()) cfg.college.volley_model = std::string(DESKD_SOURCE_DIR) + "/models/volley_markov_v1.json";
   // The screen is read from disk on every page load: a desk whose ui dir has no readable page
   // would start and answer every browser with INTERNAL. Say so now, with the path and why.
   if (::access((cfg.ui_dir + "/index.html").c_str(), R_OK) != 0) {

@@ -9,8 +9,8 @@
 //   send-k1          Manual's sender; send-k2, send-k3 Systematic's (week 0: placeholders)
 //   send-cx          cancels and KILL, on its own path
 //   strat            the game scores merged (ref/scores.h), the fairs (financial and game), the
-//                    makers, the LIP meter and the markouts, each engine at its own cadence
-//                    (strat/strat.h)
+//                    makers, C1's takes (strat/take.h), the LIP meter and the markouts, each
+//                    engine at its own cadence (strat/strat.h)
 //   store            the only writer of ops.sqlite
 //   pub              the screen's streams, hb, hdr, snapshots
 //   ops              heartbeat file, disk, preflight rows
@@ -50,7 +50,10 @@
 #include "deskd/store/store.h"
 #include "deskd/strat/calendar.h"
 #include "deskd/strat/fill_model.h"
+#include "deskd/strat/lane_gate.h"
 #include "deskd/strat/lip.h"
+#include "deskd/strat/take.h"
+#include "deskd/strat/volley_model.h"
 #include "deskd/strat/wcbb_model.h"
 #include "deskd/web/pub.h"
 #include "deskd/web/server.h"
@@ -155,7 +158,23 @@ class Deskd {
   // fairs from it (strat thread; its board read by ref_json on md)
   std::optional<WcbbModel> wcbb_;
   std::string wcbb_why_;
+  std::optional<VolleyModel> volley_;    // the volleyball model (deskd.college.volley_model), likewise
+  std::string volley_why_;
   std::unique_ptr<GameFair> game_fair_;
+  // C1 COLLEGE TAKE (plan 5(d)), all read once at start (gw never reads the gate file): its gate
+  // (<gates_dir>/C1.json), each configured series' answer (series -> "" when C1 may trade it,
+  // else why not) and the take rule it was measured on, why no series is tradable ("" = some
+  // is: LaneSpec::gate_why), and its engine on strat (built with deskd.college.enabled and
+  // Systematic orders)
+  std::optional<LaneGate> c1_gate_;
+  std::map<std::string, std::string> c1_tradable_;
+  std::map<std::string, TakeParams> c1_rules_;
+  std::string c1_why_;
+  std::unique_ptr<TakeEngine> c1_;
+  bool college_on() const { return cfg_.college.enabled && cfg_.systematic_orders; }
+  std::string gates_dir() const;   // deskd.gates_dir, or <data_dir>/gates
+  void load_college(const std::map<std::string, std::string>& model_sha);   // c1_gate_ to c1_why_
+  nlohmann::json college_status() const;
   FillModel fill_model_;                 // each market's trade tape: how likely an order is to fill
   std::map<std::string, std::set<std::string>> strat_want_;   // under live_mu_: by lane, the markets it quotes
   std::string key_error_;
