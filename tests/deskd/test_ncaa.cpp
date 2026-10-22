@@ -2,8 +2,8 @@
 // (the recorder's fixture), the team match, and the feed against a local stand-in for data.ncaa.com:
 // its pacing (a fast series hot at 3 s, else 30 s), each state's first sighting, a date without
 // games (404), a failure (503) and the data-only guard. Then ScoreMerge (ref/scores.h): ESPN's and
-// NCAA's score for a market by tools/college_gate.py's rule (its Score self-test's cases), and the
-// store's scores row.
+// NCAA's score for a market by tools/college_gate.py's rule (its Score self-test's cases), a final
+// from either source ending the game, and the store's scores row.
 #include <httplib.h>
 #include <signal.h>
 #include <atomic>
@@ -243,8 +243,8 @@ void merge() {
         r->why == "ESPN has in 10-0 (period 1) and NCAA in 0-0 (period 1)");
   n = ref("NCAA", 205 * s, 110 * s, 10, 2);              // the other team's score
   CHECK(merge_score(&e, &n, 205 * s, age)->why == "ESPN has in 10-0 (period 1) and NCAA in 10-2 (period 1)");
-  n = ref("NCAA", 205 * s, 110 * s, 10, 0, 1, "post");   // the state
-  CHECK(merge_score(&e, &n, 205 * s, age)->why == "ESPN has in 10-0 (period 1) and NCAA post 10-0 (period 1)");
+  n = ref("NCAA", 205 * s, 110 * s, 10, 0, 1, "pre");    // the state
+  CHECK(merge_score(&e, &n, 205 * s, age)->why == "ESPN has in 10-0 (period 1) and NCAA pre 10-0 (period 1)");
   n = ref("NCAA", 205 * s, 110 * s, 10, 0, 2);           // the period, both read
   CHECK(merge_score(&e, &n, 205 * s, age)->why == "ESPN has in 10-0 (period 1) and NCAA in 10-0 (period 2)");
   n = ref("NCAA", 205 * s, 110 * s, 10, 0, 0);           // NCAA's "HALF": no period read, so no difference
@@ -264,6 +264,22 @@ void merge() {
   n.fetched_ms = 201 * s;
   CHECK(merge_score(&e, &n, 300 * s, age)->src == "ESPN");
   CHECK(!merge_score(nullptr, nullptr, 300 * s, age));
+  // a final from either source, however old its last poll, ends the game: the other's row in play
+  // lags it. ESPN says 60-61 final and its scoreboard slows to 20 s; NCAA.com, still live, has
+  // the 60-59 before the last shot, fresh
+  e = ref("ESPN", 200 * s, 199 * s, 60, 61, 4, "post");
+  n = ref("NCAA", 212 * s, 150 * s, 60, 59, 4);
+  r = merge_score(&e, &n, 212 * s, age);
+  CHECK(r && r->state == "post" && r->src == "ESPN" && r->yes_score == 60 && r->opp_score == 61 && r->why.empty());
+  CHECK(merge_score(&e, &n, 201 * s, age)->state == "post");   // both fresh: no disagreement either
+  CHECK(merge_score(&e, nullptr, 400 * s, age)->state == "post");
+  // NCAA.com final first, ESPN's game in play: the same
+  e = ref("ESPN", 212 * s, 150 * s, 60, 59, 4);
+  n = ref("NCAA", 200 * s, 199 * s, 60, 61, 4, "post");
+  r = merge_score(&e, &n, 212 * s, age);
+  CHECK(r && r->state == "post" && r->src == "NCAA" && r->opp_score == 61);
+  e.state = "post";   // both: ESPN's
+  CHECK(merge_score(&e, &n, 212 * s, age)->src == "ESPN");
 
   // The merged board, from both feeds' boards: ESPN alone (another league) as it is; a college
   // game from both; a market only NCAA shows; the sources at odds named in status

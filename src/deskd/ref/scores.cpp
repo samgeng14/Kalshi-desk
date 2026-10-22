@@ -8,6 +8,8 @@ using json = nlohmann::json;
 
 std::optional<EspnRef> merge_score(const EspnRef* espn, const EspnRef* ncaa, std::int64_t now, std::int64_t max_age_ms) {
   if (!espn && !ncaa) return std::nullopt;
+  for (const EspnRef* r : {espn, ncaa})   // over, whichever source still lags
+    if (r && r->state == "post") return *r;
   auto fresh = [&](const EspnRef* r) { return r && now - r->fetched_ms <= max_age_ms; };
   if (fresh(espn) && fresh(ncaa)) {
     const auto& e = *espn;

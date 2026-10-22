@@ -5,6 +5,10 @@
 // score read this board, never a feed's own.
 //
 // For one market, of the sources that show it:
+//   final     either one's row says post, however old its last poll: that row (ESPN's when both
+//             do), so the game is over for the lanes and the fair. A source that lags the final
+//             (NCAA.com often does, and ESPN's scoreboard slows to 20 s once its game is over)
+//             never serves the game in play again
 //   fresh     a source whose last poll (fetched_ms) is at most max_age_ms old
 //   both      fresh: they must agree on the state, the scores (from the market's YES team's side)
 //             and the period when both read one (0 is unread: NCAA.com's "HALF" or "OT"). Then
