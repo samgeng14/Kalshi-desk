@@ -69,6 +69,13 @@ struct ManualPath {
   WriteBudget::Tier write_tier = WriteBudget::basic();
   GroupRegistry* groups = nullptr;
   std::vector<LaneSpec> lanes;   // empty: default_lanes()
+  // deskd.event_risk (decisions 5): a LaneSpec::by_state lane's stakes in an event whose shape the
+  // account read's event rows prove count by settlement state (gw/event_risk.h); off, every lane
+  // counts each market alone
+  bool event_risk = false;
+  // the settle lattice of a series (KXHIGH's whole degrees: 1), for event_shape; none, or 0: the
+  // real line
+  std::function<double(const std::string& series)> lattice;
   bool live = false;             // the production account: a paper_only lane's orders are refused
   bool check_each_message = false;   // tests and the soak: OrderLedger::check after every gw message
   // Systematic's book across a restart (its day, positions, trade ids, HALT and the markets

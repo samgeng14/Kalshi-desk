@@ -24,6 +24,7 @@
 
 #include "deskd/bus/msg.h"
 #include "deskd/bus/queue.h"
+#include "deskd/gw/event_risk.h"
 #include "deskd/gw/write_budget.h"
 
 namespace deskd {
@@ -32,6 +33,7 @@ class KillSwitch;
 class Worker;
 class ManualBook;
 class SysBook;
+struct LaneSpec;
 struct ManualPath;
 struct KalshiWriteReply;
 struct PrivateEvent;
@@ -62,11 +64,17 @@ class Gateway {
   // lane, group and event limits have not. `extra`, an intent of such a lane in such a market, adds
   // the worst case of the part of it that grows its lane's position (after the lane's working
   // orders there on the same side): nothing for a reducing order.
+  // With ManualPath::event_risk on, a LaneSpec::by_state lane's stakes in an event gw has a shape
+  // for count together instead (decisions 5, S1): max(0, their worst case over its settlement
+  // states, gw/event_risk.h), the working orders and `extra` contingent at what they reserve, and an
+  // ended order's fills not booked yet in every measure (an IOC leg between its 201 and its fills).
+  // Only a Kalshi event's stakes net: a leg on another venue counts alone, gross, in any group.
   std::int64_t sys_used(const std::function<bool(const std::string&)>& lanes,
                         const std::function<bool(const std::string&)>& in, const PlaceIntent* extra = nullptr,
                         bool ended = false) const;
   // gw thread only (inside a Probe). sys_used by lane and market, "lane|ticker" -> micro-dollars
-  // (SysView::worst): over any lane's markets they sum to sys_used(that lane, those markets)
+  // (SysView::worst): over any lane's markets they sum to sys_used(that lane, those markets), but
+  // a lane's that sys_used counts by state, whose markets here count each alone, as with event_risk off
   std::map<std::string, std::int64_t> sys_worst() const;
   // Any thread: the cids gw's order book owns. Their rows come from gw alone (contract ORDER
   // REVISIONS: the page keeps the highest rev), so the REST publisher leaves them out.
@@ -297,6 +305,21 @@ class Gateway {
   std::set<int> shards() const;
   std::optional<Px> mark(const std::string& ticker) const;
   std::string lane_row(const std::string& id) const;
+  // An event's shape (gw/event_risk.h) from the account read's event row and listing, made once a
+  // snapshot; nullptr when it has none (no row yet, or one that proves nothing): its markets then
+  // count alone. Why not is logged once per event and reason (a flag the strikes contradict).
+  const EventShape* shape(const std::string& event) const;
+  // the event a by-state lane's stake in ticker counts in: the market's event when shape lists it;
+  // "" = the market counts alone
+  std::string stake_event(const std::string& ticker) const;
+  mutable std::map<std::string, std::optional<EventShape>> shapes_;   // for snapshot_seen_
+  mutable std::map<std::string, std::string> shape_why_;             // by event, the reason logged
+  // lane l's positions in the markets `in` accepts: their worst case, or, `netted`, their stakes
+  // in shaped events into st (counted together by sys_used) and the rest's worst case
+  std::int64_t held_worst(const LaneSpec& l, const std::function<bool(const std::string&)>& in, bool netted,
+                          std::vector<RiskStake>& st) const;
+  // the lane's positions' worst case as sys_used counts it (the lane row's open), micro-dollars
+  std::int64_t sys_open(const std::string& lane) const;
   // Systematic's used worst case (sys_used over every lane and market) and its ceilings
   void sys_money(std::int64_t* used, std::int64_t* ceiling, std::int64_t* eff) const;   // micro-dollars
   // Decisions 1: the budgets of the lanes `on`, venue by venue, against that venue's 70% ceiling;

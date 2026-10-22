@@ -69,6 +69,7 @@ void default_rows() {
     CHECK(l.event_cap == w.event_cap && l.retire_rule == w.rule && l.retire_trades == w.trades && l.retire_loss == w.loss &&
           l.retire_h == w.h);
     CHECK(!l.paper_only && !l.on_at_start && l.gate_why.empty());
+    CHECK(l.by_state == (std::string(w.id) == "S1"));   // decisions 5: only S1 counts by settlement state
     if (fails != failed) std::fprintf(stderr, "  (lane %s)\n", w.id);
   }
   // every lane off at start; the Kalshi budgets sum to $210 (a KP lane's counts on Kalshi), past

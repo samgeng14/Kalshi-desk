@@ -946,6 +946,7 @@ void Gateway::sync_snapshot() {
   if (snapshot != snapshot_seen_) {
     manual_->set_snapshot(snapshot);
     snapshot_seen_ = std::move(snapshot);
+    shapes_.clear();   // made again from this read's event rows and listing
     if (snapshot_seen_ && snapshot_seen_->account_ready && snapshot_seen_->account_ms != settled_ms_) {
       settled_ms_ = snapshot_seen_->account_ms;
       settle_uncertain(*snapshot_seen_);
@@ -1154,19 +1155,93 @@ std::optional<Px> Gateway::mark(const std::string& ticker) const {
   return it == last_mark_.end() ? std::nullopt : std::optional<Px>(it->second);
 }
 
+const EventShape* Gateway::shape(const std::string& event) const {
+  if (!snapshot_seen_) return nullptr;
+  auto it = shapes_.find(event);
+  if (it == shapes_.end()) {
+    std::optional<EventShape> s;
+    std::string why;
+    const auto row = snapshot_seen_->events.find(event);
+    if (row == snapshot_seen_->events.end())
+      why = event + ": no event row yet";
+    else
+      s = event_shape(row->second, snapshot_seen_->markets, path_->lattice ? path_->lattice(row->second.series_ticker) : 0, &why);
+    if (s) {
+      shape_why_.erase(event);
+    } else if (shape_why_[event] != why) {
+      // a row not read yet is routine (rest reads it within a poll); one that proves nothing is not
+      if (row == snapshot_seen_->events.end()) DLOG_INFO("event risk: %s; its markets count one by one", why.c_str());
+      else DLOG_WARN("event risk: %s; its markets count one by one", why.c_str());
+      shape_why_[event] = why;
+    }
+    it = shapes_.emplace(event, std::move(s)).first;
+  }
+  return it->second ? &*it->second : nullptr;
+}
+
+std::string Gateway::stake_event(const std::string& ticker) const {
+  if (!snapshot_seen_) return "";
+  const auto m = snapshot_seen_->markets.find(ticker);
+  if (m == snapshot_seen_->markets.end() || m->second.event_ticker.empty()) return "";
+  const auto* s = shape(m->second.event_ticker);
+  return s && s->index(ticker) >= 0 ? m->second.event_ticker : "";
+}
+
+Micros Gateway::held_worst(const LaneSpec& l, const std::function<bool(const std::string&)>& in, bool netted,
+                           std::vector<RiskStake>& st) const {
+  if (!netted) return sys_->open_worst_in(l.id, in);
+  Micros w = 0;
+  if (const auto* d = sys_->day(l.id))
+    for (const auto& [tk, inv] : d->inv) {
+      if (!inv.pos || !in(tk)) continue;
+      auto k = position_stake(tk, inv.pos, inv.cost);
+      if (auto ev = stake_event(tk); !ev.empty()) st.push_back({std::move(k), std::move(ev)});
+      else w += k.cost;   // alone, as open_worst_in: a long its cost, a short $1 x |pos| less its proceeds
+    }
+  return w;
+}
+
+Micros Gateway::sys_open(const std::string& lane) const {
+  const auto* l = sys_->lane(lane);
+  if (!l) return 0;
+  std::vector<RiskStake> st;
+  const Micros w = held_worst(*l, every, path_->event_risk && l->by_state, st);
+  return w + (st.empty() ? 0 : risk_used(st, [this](const std::string& ev) { return shape(ev); }));
+}
+
 Micros Gateway::sys_used(const std::function<bool(const std::string&)>& lanes,
                          const std::function<bool(const std::string&)>& in, const PlaceIntent* extra, bool ended) const {
+  // the lanes whose stakes in a shaped event count by settlement state (decisions 5: S1)
+  std::set<std::string> netted;
+  if (path_->event_risk)
+    for (const auto& l : sys_->lanes()) if (l.by_state && lanes(l.id)) netted.insert(l.id);
   Micros u = 0;
-  Qty pending = 0;   // extra's lane's working orders in its market, on its side
+  Qty pending = 0;             // extra's lane's working orders in its market, on its side
+  std::vector<RiskStake> st;   // the netted lanes' stakes in shaped events
   for (const auto& [cid, o] : manual_->ledger().orders()) {
     if (o.intent.owner != Owner::SYS) continue;
-    if ((ended || !o.terminal()) && lanes(o.intent.lane) && in(o.intent.ticker)) u += o.reservation();
+    if (lanes(o.intent.lane) && in(o.intent.ticker)) {
+      auto ev = netted.count(o.intent.lane) ? stake_event(o.intent.ticker) : std::string();
+      if (!ev.empty()) {
+        // what it may still add, and its fills not booked yet, whether or not it has ended
+        const Qty q = (o.terminal() ? 0 : o.left) + std::max<Qty>(0, o.filled - o.executions);
+        if (q > 0) st.push_back({order_stake(o.intent.ticker, o.intent.side, q, o.reservation()), std::move(ev)});
+      } else if (ended || !o.terminal()) {
+        u += o.reservation();
+      }
+    }
     if (extra && !o.terminal() && o.intent.lane == extra->lane && o.intent.ticker == extra->ticker && o.intent.side == extra->side)
       pending += o.left;
   }
-  for (const auto& l : sys_->lanes()) if (lanes(l.id)) u += sys_->open_worst_in(l.id, in);
-  if (extra && lanes(extra->lane) && in(extra->ticker))
-    u += (extra->side == Side::BUY ? extra->price : kOneDollar - extra->price) * sys_grows(*extra, pending);
+  for (const auto& l : sys_->lanes()) if (lanes(l.id)) u += held_worst(l, in, netted.count(l.id) > 0, st);
+  if (extra && lanes(extra->lane) && in(extra->ticker)) {
+    const Qty g = sys_grows(*extra, pending);
+    const Micros w = (extra->side == Side::BUY ? extra->price : kOneDollar - extra->price) * g;
+    auto ev = g > 0 && netted.count(extra->lane) ? stake_event(extra->ticker) : std::string();
+    if (!ev.empty()) st.push_back({order_stake(extra->ticker, extra->side, g, w), std::move(ev)});
+    else u += w;
+  }
+  if (!st.empty()) u += risk_used(st, [this](const std::string& ev) { return shape(ev); });
   return u;
 }
 
@@ -1236,8 +1311,10 @@ Micros Gateway::sys_fees() const {
 std::string Gateway::lane_row(const std::string& id) const {
   const auto* l = sys_->lane(id);
   if (!l) return "";
-  // the row's used is the lane's sys_used (lane_json adds its open worst case back)
-  const Micros reserved = sys_used([&id](const std::string& lane) { return lane == id; }, every) - sys_->open_worst(id);
+  // the row's used is the lane's sys_used, and its open the positions' part of it (lane_json adds
+  // them back together)
+  const Micros open = sys_open(id);
+  const Micros reserved = sys_used([&id](const std::string& lane) { return lane == id; }, every) - open;
   int working = 0;
   for (const auto& [cid, o] : manual_->ledger().orders())
     if (o.intent.owner == Owner::SYS && !o.terminal() && o.intent.lane == id) ++working;
@@ -1253,7 +1330,7 @@ std::string Gateway::lane_row(const std::string& id) const {
     }
   const auto mk = [this](const std::string& tk) { return mark(tk); };
   const Micros lip = path_->lane_lip ? path_->lane_lip(id) * 100 : 0;
-  return sys_->lane_json(*l, run_view().state, reserved, working, eff - used_all, mk, blocked, lip).dump();
+  return sys_->lane_json(*l, run_view().state, reserved, working, eff - used_all, mk, blocked, lip, open).dump();
 }
 
 void Gateway::place_sys(PlaceIntent& p) {
@@ -1315,15 +1392,24 @@ void Gateway::place_sys(PlaceIntent& p) {
   // The lane's budget, the venue's 70% ceiling, the correlated group and the lane's event cap,
   // each with this order counted at the worst case of the part of it that grows the lane's
   // position (sys_used): a reducing order, the T-60 s flatten among them, is never refused for
-  // money (plan section 4).
+  // money (plan section 4). Nor is one that raises no measure where its lane's stakes count by
+  // settlement state (sys_used; S1's leg that the basket it holds already covers): past a limit, it
+  // is refused only if it adds to the measure.
   const bool grows = sys_grows(p, lane_pending) > 0;
+  const bool netted = grows && path_->event_risk && lane->by_state && !stake_event(p.ticker).empty();
+  const auto past = [&](const std::function<bool(const std::string&)>& lanes, const std::function<bool(const std::string&)>& in,
+                        Micros limit, bool ended = false) {
+    if (!grows) return false;
+    const Micros with = sys_used(lanes, in, &p, ended);
+    return with > limit && (!netted || with > sys_used(lanes, in, nullptr, ended));
+  };
   const auto own = [&p](const std::string& l) { return l == p.lane; };
-  if (grows && sys_used(own, every, &p) > lane->budget * 100)
+  if (past(own, every, lane->budget * 100))
     return refuse("SYS_CEILING", "lane " + p.lane + " budget " + money_str(lane->budget));
   const Micros equity = (snapshot_seen_->balance.available + snapshot_seen_->balance.portfolio_value.value_or(0)) * 100;
   Micros eff = 0;
   sys_money(nullptr, nullptr, &eff);
-  if (grows && sys_used(every, every, &p, true) > eff)
+  if (past(every, every, eff, true))
     return refuse("SYS_CEILING", "past the effective Systematic ceiling " + money_str(eff / 100));
   // the correlated group (plan section 4, limit 2): every lane's worst case there, held and working
   if (grows) {
@@ -1333,7 +1419,7 @@ void Gateway::place_sys(PlaceIntent& p) {
     };
     const std::string grp = corr_group(p.ticker, m->second.event_ticker);
     const auto in_grp = [&](const std::string& tk) { return corr_group(tk, event_of(tk)) == grp; };
-    if (sys_used(every, in_grp, &p) > corr_group_cap(grp))
+    if (past(every, in_grp, corr_group_cap(grp)))
       return refuse("SYS_CEILING", "group " + grp + " worst case past " + money_str(corr_group_cap(grp) / 100));
     // the lane's own cap in one event (LaneSpec::event_cap: C1's $10 a game), held and working,
     // besides every lane's in the group (a 15-minute series' group spans many events)
@@ -1345,7 +1431,7 @@ void Gateway::place_sys(PlaceIntent& p) {
       };
       const std::string ev = event_key(p.ticker);
       const auto in_ev = [&](const std::string& tk) { return event_key(tk) == ev; };
-      if (sys_used(own, in_ev, &p) > lane->event_cap)
+      if (past(own, in_ev, lane->event_cap))
         return refuse("SYS_CEILING", "lane " + p.lane + "'s worst case in event " + ev + " past " + money_str(lane->event_cap / 100));
     }
   }
@@ -1605,6 +1691,7 @@ void Gateway::sys_tick(std::int64_t now) {
     }
     for (const auto& l : sys_->lanes()) lanes_dirty_.insert(l.id);
     sys_save_due_ = true;
+    shape_why_.clear();   // yesterday's events: a reason still true is logged once more
   }
   sync_snapshot();
   const auto mk = [this](const std::string& tk) { return mark(tk); };

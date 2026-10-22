@@ -16,9 +16,11 @@ const std::vector<LaneSpec>& default_lanes() {
     // contracts and the $25 LIP group cap (limits 2 and 3)
     LaneSpec p1{"P1", "LIP PROBE", "REST", 25 * 10000, 4000, 7500, {"KXNATGAS15M"}, std::nullopt};
     // arbitrage (plan 5(c)): baskets of up to 6 legs of 10 contracts, 1c a contract after fees;
-    // 2.5 x 10 x 6 x 2 passes in its group's 15 s window; its $15 shared with W1 (family ARB)
+    // 2.5 x 10 x 6 x 2 passes in its group's 15 s window; its $15 shared with W1 (family ARB); a
+    // complete basket counted by settlement state with deskd.event_risk on (decisions 5)
     LaneSpec s1{"S1", "ARB", "IOC", 15 * 10000, 2000, 30000, {}, Money{100}, false};
     s1.family = "ARB";
+    s1.by_state = true;
     // thin college games (plan 5(d)): 20c net of the fee, $10 a game, ~$40 open; retired after
     // 100 trades if the net 300 s markout is not positive, or once down $20
     LaneSpec c1{"C1", "COLLEGE TAKE", "IOC", 40 * 10000, 2000, 5000, {}, Money{2000}, false};
@@ -426,9 +428,10 @@ bool SysBook::restore(const json& j, std::int64_t day_start_ms, Halt* halt, std:
 }
 
 json SysBook::lane_json(const LaneSpec& l, RunState run, Micros reserved, int working, Micros eff_left,
-                        const MarkFn& mark, const std::string& blocked, Micros lip) const {
+                        const MarkFn& mark, const std::string& blocked, Micros lip, std::optional<Micros> open) const {
   const auto* d = day(l.id);
-  const Micros open = open_worst(l.id), used = open + reserved, unrl = unrealized(l.id, mark);
+  if (!open) open = open_worst(l.id);
+  const Micros used = *open + reserved, unrl = unrealized(l.id, mark);
   const Micros fees = d ? d->fees : 0, real = d ? d->real - d->fees : 0;
   const Micros budget = l.budget * 100;   // Money (1/10,000 $) to micro-dollars
   const Micros cap_left = std::max<Micros>(0, std::min(budget - used, eff_left));
@@ -455,7 +458,7 @@ json SysBook::lane_json(const LaneSpec& l, RunState run, Micros reserved, int wo
   }
   auto money = [](Micros m) { return money_str(m / 100); };
   return {{"id", l.id}, {"name", l.name}, {"venue", l.venue}, {"state", state}, {"on", is_on}, {"style", l.style},
-          {"budget", money(budget)}, {"used", money(used)}, {"open", money(open)}, {"wrk", working},
+          {"budget", money(budget)}, {"used", money(used)}, {"open", money(*open)}, {"wrk", working},
           {"sent", d ? d->sent : 0}, {"hit", d ? static_cast<int>(d->hit.size()) : 0}, {"fills", d ? d->fills : 0},
           {"ctrs", qty_to_number(d ? d->ctrs : 0)}, {"fees", money(fees)}, {"real", money(real)}, {"unrl", money(unrl)},
           {"day", money(real + unrl)}, {"lip", money(lip)}, {"cap_left", money(cap_left)},

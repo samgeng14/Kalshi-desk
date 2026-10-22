@@ -29,8 +29,8 @@
 // last mid seen when there is none now, and the worst case, as if worth nothing, when there never
 // was one: the daily stop never counts a position it cannot price as flat); open = their worst
 // case (a long can lose its cost, a short its 1 - price); used = open + the reservations of the
-// lane's working orders. Positions carry over midnight; the counters and real start again at ET
-// midnight.
+// lane's working orders (both by settlement state for a by_state lane, as Gateway::sys_used counts
+// them). Positions carry over midnight; the counters and real start again at ET midnight.
 //
 // Fills arrive twice, from the private feed and from each REST read, and each counts once by its
 // trade id. A settlement (the market's result, from REST) realizes the position at $1 or $0.
@@ -76,6 +76,10 @@ struct LaneSpec {
   // lanes of one family ("ARB": S1 and W1) share a cap besides their own budgets; "" = none
   std::string venue = "K", family = "";
   Micros event_cap = 0;   // a cap on its worst case in one event (one game), besides the group's; 0 = none
+  // its stakes in an event whose settlement states gw knows count by state (gw/event_risk.h: a
+  // complete basket about $0), when deskd.event_risk is on (ManualPath::event_risk; decisions 5:
+  // S1 only); off, and in any other market, each market alone, as every lane's always have
+  bool by_state = false;
   std::string gate_why = "";   // why its evidence gate keeps it off; "" = open
   // Retirement (SysBook::retire_due): CAP after retire_trades trades; MARKOUT at retire_trades
   // trades or more once SysBook::kRetireMarked fills are marked at retire_h ("300s") and their mean
@@ -223,8 +227,11 @@ class SysBook {
   bool restore(const nlohmann::json& j, std::int64_t day_start_ms, Halt* halt, std::string* why);
   // the contract's lane row; a retired or gated lane is OFF with why it is
   // lip: the lane's LIP estimate today (strat/lip.h), its own line: never in "day" or the stop
+  // open: its positions' worst case as gw counts it (by settlement state, LaneSpec::by_state);
+  // none: open_worst
   nlohmann::json lane_json(const LaneSpec& l, RunState run, Micros reserved, int working, Micros eff_left,
-                           const MarkFn& mark, const std::string& blocked, Micros lip = 0) const;
+                           const MarkFn& mark, const std::string& blocked, Micros lip = 0,
+                           std::optional<Micros> open = std::nullopt) const;
 
  private:
   std::vector<LaneSpec> lanes_;
