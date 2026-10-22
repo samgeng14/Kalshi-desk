@@ -2,16 +2,23 @@
 // lane's file, a FAIL or unknown verdict, an unknown stage, no params or a param the lane needs,
 // and a model sha256 other than the loaded model's each give their own reason; a shadow PASS loads
 // but does not open the lane, a live PASS opens it; C1's per-series results through tradable_series.
+// The gate tools' own files (college_gate_ok.json, x1_gate.json, n1_gate.json, n2_gate.json, each
+// kept current by its tool's self-test) load as deskd's runtime loads them, with the params it reads.
+#include <algorithm>
 #include <cctype>
 #include <fstream>
 #include <map>
 #include <set>
+#include <sstream>
 #include <string>
 #include <vector>
 
 #include <nlohmann/json.hpp>
 
 #include "check.h"
+#include "deskd/build_paths.h"
+#include "deskd/bus/units.h"
+#include "deskd/gw/sys_book.h"
 #include "deskd/strat/lane_gate.h"
 
 using namespace deskd;
@@ -48,6 +55,14 @@ std::string refusal(const json& j, const std::string& sha = kAbc, const std::vec
 void write(const std::string& path, const std::string& text) {
   std::ofstream f(path);
   f << text;
+}
+
+std::string fixture(const std::string& name) { return std::string(DESKD_SOURCE_DIR) + "/tests/deskd/fixtures/" + name; }
+std::string read_text(const std::string& path) {
+  std::ifstream f(path, std::ios::binary);
+  std::stringstream s;
+  s << f.rdbuf();
+  return s.str();
 }
 
 void sha() {
@@ -245,6 +260,77 @@ void series() {
   CHECK(b && b->series.empty() && tradable_series(*b, {{"KXWB", kAbc}}).at("KXWB") == "the gate did not measure it");
 }
 
+// tools/college_gate.py's gate for its synthetic season, as that tool writes it: C1's, live, both
+// series passed at point level on their models (wcbb_synthetic.json, and volleyball_golden.json,
+// the bytes of models/volley_markov_v1.json), measured at gw's inventory for C1
+void college_fixture() {
+  const std::string path = fixture("college_gate_ok.json");
+  std::string why = "untouched";
+  const auto g = load_lane_gate(path, "C1", "", {"edge"}, &why);
+  CHECK(g && why == "untouched");
+  if (!g) return;
+  CHECK(g->lane == "C1" && g->verdict == "PASS" && g->live() && g->model_sha256.empty() && lane_gate_why(g, why) == "");
+  CHECK(g->params.value("edge", 0.0) == 0.2 && g->tool == "tools/college_gate.py" && g->evidence.contains("series"));
+  const auto& lanes = default_lanes();
+  const auto c1 = std::find_if(lanes.begin(), lanes.end(), [](const LaneSpec& l) { return l.id == "C1"; });
+  CHECK(c1 != lanes.end() && g->params.value("inventory", 0) * kOneContract == c1->inventory);
+  CHECK(g->series.size() == 2 && g->series.count("KXNCAAWBGAME") && g->series.count("KXNCAAWVMATCH"));
+  for (const auto& [name, s] : g->series) CHECK(s.pass && s.why.empty() && s.level == "point" && !s.leader_only);
+  const std::string wb = sha256_hex(read_text(fixture("wcbb_synthetic.json")));
+  const std::string vb = sha256_hex(read_text(fixture("volleyball_golden.json")));
+  CHECK(vb == sha256_hex(read_text(std::string(DESKD_SOURCE_DIR) + "/models/volley_markov_v1.json")));
+  auto t = tradable_series(*g, {{"KXNCAAWBGAME", wb}, {"KXNCAAWVMATCH", vb}});
+  CHECK(t.size() == 2 && t["KXNCAAWBGAME"] == "" && t["KXNCAAWVMATCH"] == "");
+  t = tradable_series(*g, {{"KXNCAAWBGAME", kAbc}, {"KXNCAAWVMATCH", vb}});
+  CHECK(t["KXNCAAWBGAME"] == "the gate measured another model" && t["KXNCAAWVMATCH"] == "");
+}
+
+// tools/x1_backtest.py's gate for its synthetic extract, as that tool writes it (its self-test
+// keeps the file current): deskd loads it as X1's, at stage shadow, with the rule's params
+void x1_fixture() {
+  const std::string path = fixture("x1_gate.json");
+  std::string why = "untouched";
+  const auto g = load_lane_gate(path, "X1", "", {"direction", "thr"}, &why);
+  CHECK(g && why == "untouched");
+  if (!g) return;
+  CHECK(g->lane == "X1" && g->verdict == "PASS" && g->stage == "shadow" && !g->live() && g->model_sha256.empty());
+  CHECK(g->params.value("direction", "") == "fade" && g->params.value("thr", 0.0) == 0.12);
+  CHECK(g->tool.rfind("tools/x1_backtest.py", 0) == 0 && g->evidence.contains("db"));
+  CHECK(lane_gate_why(g, why) == path + ": stage shadow (shadow signals only until its gate is live)");
+}
+
+// tools/nba_gate.py's N1 gate for its synthetic panel, measured on nba_synthetic.json as the
+// model: it loads on that model only, at stage shadow
+void n1_fixture() {
+  const std::string path = fixture("n1_gate.json");
+  const std::string sha = sha256_hex(read_text(fixture("nba_synthetic.json")));
+  std::string why = "untouched";
+  const auto g = load_lane_gate(path, "N1", sha, {"thr"}, &why);
+  CHECK(g && why == "untouched");
+  if (!g) return;
+  CHECK(g->lane == "N1" && g->stage == "shadow" && !g->live() && g->verdict == "PASS");
+  CHECK(g->model_sha256 == "e3febb3b41bd15f51e49568f34147917e32f34943894a3a27ce994bb114fd795" && g->model_sha256 == sha);
+  CHECK(g->params.value("thr", 0.0) == 0.1);
+  CHECK(lane_gate_why(g, "") == path + ": stage shadow (shadow signals only until its gate is live)");
+  // another model, or none, closes it
+  CHECK(!load_lane_gate(path, "N1", kAbc, {"thr"}, &why) && has(why, "measured another model"));
+  CHECK(!load_lane_gate(path, "N1", "", {"thr"}, &why) &&
+        why == path + ": measured model e3febb3b41bd, and no model is loaded");
+}
+
+// tools/nba_gate.py's N2 gate (pregame favourites, no model): live, with its count and band
+void n2_fixture() {
+  const std::string path = fixture("n2_gate.json");
+  std::string why = "untouched";
+  const auto g = load_lane_gate(path, "N2", "", {"count", "fav_lo", "fav_hi"}, &why);
+  CHECK(g && why == "untouched");
+  if (!g) return;
+  CHECK(g->lane == "N2" && g->live() && lane_gate_why(g, "") == "" && g->model_sha256.empty());
+  CHECK(g->params.value("count", 0) == 5 && g->params.value("fav_lo", 0.0) == 0.9 && g->params.value("fav_hi", 0.0) == 0.95);
+  CHECK(!load_lane_gate(path, "N2", kAbc, {"count", "fav_lo", "fav_hi"}, &why) &&
+        why == path + ": names no model, and model ba7816bf8f01 is loaded");
+}
+
 }  // namespace
 
 int main() {
@@ -253,6 +339,10 @@ int main() {
   shadow();
   refusals();
   files();
+  x1_fixture();
+  college_fixture();
+  n1_fixture();
+  n2_fixture();
   series();
   return finish("deskd-lane_gate");
 }
