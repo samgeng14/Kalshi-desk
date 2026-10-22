@@ -354,6 +354,7 @@ add_library(deskd_core STATIC
   src/deskd/strat/lip.cpp
   src/deskd/strat/bball_model.cpp
   src/deskd/strat/volley_model.cpp
+  src/deskd/strat/game_fair.cpp
   src/deskd/strat/markouts.cpp
   src/deskd/strat/lane_gate.cpp
   src/deskd/store/store.cpp
@@ -537,6 +538,8 @@ deskd_pure_test(lane_gate)
 deskd_pure_test(bball)
 # volley: strat/volley_model, tools/volleyball.py's rally-point model (its golden file to 1e-9) and the state from ESPN's linescores
 deskd_pure_test(volley)
+# game_fair: strat/game_fair, the pregame price and the in-game fair of WCBB, NBA and volleyball markets
+deskd_pure_test(game_fair)
 deskd_fake_test(net)
 deskd_fake_test(wire)
 deskd_fake_test(md)
