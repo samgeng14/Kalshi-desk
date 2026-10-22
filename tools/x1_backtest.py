@@ -383,30 +383,46 @@ class Run:
 
 def simulate(game, book, p):
     """Every take the rule makes in one game, TakeEngine's way (module docstring): [trade dict]."""
-    run, trades = Run(), []
+    return simulate_lanes(game, book, [('X1', p)])['X1']
+
+
+def simulate_lanes(game, book, lanes):
+    """Every take each lane's rule makes in one game, the lanes [(lane, params)] replayed together:
+    at each instant each decides in turn, in the order given (strat steps X1's engine, then N1's,
+    then N2's), each its own TakeEngine run and its own position. Systematic's position in each
+    market, which gw's inventory caps (the legs' sys_position), is every replayed lane's takes:
+    another lane that trades the game's markets and is not replayed is not in it. IOCs leave none
+    working. {lane: [trade dict]}."""
+    runs = {lane: Run() for lane, _ in lanes}
+    held = Counter()   # Systematic's position by market, every lane's
+    trades = {lane: [] for lane, _ in lanes}
     for t, inp, quotes in game.instants(book):
-        if inp['first_seen_ms'] != run.run_state:   # a new score state starts a new run
-            run.run_state = inp['first_seen_ms']
-            run.fired = [False, False]
-        # X1's own takes are Systematic's position in the game's markets as far as this replay knows
-        # (N1 trades them too, and is not replayed), which gw's inventory caps; IOCs leave none working
-        for i, k in ((0, 'a'), (1, 'b')):
-            inp[k]['position'] = inp[k]['sys_position'] = run.pos[game.tickers[i]]
-        inp.update(fired=list(run.fired), last_take_ms=run.last_take_ms, game_takes=run.takes, game_used=run.used)
-        d = tr.decide(inp, p)
-        if tr.has_edge(d, p['mode']):
-            run.edge_ms = t
-        elif d['dir'] >= 0 and t - run.edge_ms >= QUIET_MS:
-            run.fired = [False, False]
-        o = d.get('take')
-        if o is None:
-            continue
-        q = quotes[o['ticker']]
-        trades.append(dict(o, game=game.event, league=game.league, date=game.date, t=t, quote_ms=q.t,
-                           mult=game.fee_mult.get(o['ticker'])))
-        run.fired[o['dir']] = True
-        run.last_take_ms, run.takes, run.used = t, run.takes + 1, run.used + o['cost']
-        run.pos[o['ticker']] += o['count'] if o['side'] == 'BUY' else -o['count']
+        for lane, p in lanes:
+            run = runs[lane]
+            if inp['first_seen_ms'] != run.run_state:   # a new score state starts a new run
+                run.run_state = inp['first_seen_ms']
+                run.fired = [False, False]
+            x = dict(inp, a=dict(inp['a']), b=dict(inp['b']))
+            for i, k in ((0, 'a'), (1, 'b')):
+                x[k]['position'] = run.pos[game.tickers[i]]
+                x[k]['sys_position'] = held[game.tickers[i]]
+            x.update(fired=list(run.fired), last_take_ms=run.last_take_ms, game_takes=run.takes, game_used=run.used)
+            d = tr.decide(x, p)
+            if tr.has_edge(d, p['mode']):
+                run.edge_ms = t
+            elif d['dir'] >= 0 and t - run.edge_ms >= QUIET_MS:
+                run.fired = [False, False]
+            o = d.get('take')
+            if o is None:
+                continue
+            q = quotes[o['ticker']]
+            trades[lane].append(dict(o, game=game.event, league=game.league, date=game.date, t=t, quote_ms=q.t,
+                                     mult=game.fee_mult.get(o['ticker'])))
+            run.fired[o['dir']] = True
+            run.last_take_ms, run.takes, run.used = t, run.takes + 1, run.used + o['cost']
+            n = o['count'] if o['side'] == 'BUY' else -o['count']
+            run.pos[o['ticker']] += n
+            held[o['ticker']] += n
     return trades
 
 

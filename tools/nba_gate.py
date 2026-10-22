@@ -49,6 +49,13 @@ with another fair: no score (the fair is p0), flipped margin (the model with the
 possession negated) and the price-only favourite (a fair of 1 for the team whose effective mid is
 over 0.5). Passes with 50+ trades in 30+ games, a positive mean with its 80% lower bound above 0,
 and no placebo's mean above 0 (a placebo that never takes passes).
+gw's inventory limit (N1's 10 contracts a market) counts Systematic's whole position in a market,
+every lane's: the replay's is every replayed lane's takes (x1_backtest.simulate_lanes). N1 alone
+by default; --with-x1 X1.json, X1's gate when it is live (X1 then trades beside N1, as deskd loads
+it: its direction and thr), replays X1's rule in the same games as well, before N1 at each instant
+as strat steps them, ESPN's number the panel's espn_wp dated by its state's first sighting
+(TakeEngine's scoreboard rule); its takes count in N1's room, and only N1's are scored. N2 takes
+before the tip, which the panel does not cover: its 5 contracts of a favourite are not replayed.
 
 Both pass: PASS at stage shadow, else FAIL with the reasons. N1.json carries the model file's
 sha256 (a retrained model closes the gate), params {thr} (deskd reads thr: load_lane_gate(path,
@@ -89,8 +96,8 @@ data/ unless told to) and writes only --write.
 
 Usage:
   python3 tools/nba_gate.py n1 --panel PANEL.csv --model MODEL.json [--held-out SEASON] [--thr 0.10]
-                               [--lag-s 41.5] [--fee-mult 1] [--boot 2000] [--seed 1] [--json]
-                               [--write N1.json [--force]]
+                               [--lag-s 41.5] [--fee-mult 1] [--boot 2000] [--seed 1] [--with-x1 X1.json]
+                               [--json] [--write N1.json [--force]]
   python3 tools/nba_gate.py shadow --ops ops-research.sqlite --data DIR --gate N1.json --model MODEL.json
                                    [--json] [--write N1.json --force]
   python3 tools/nba_gate.py n2 --data DIR [--fee-mult 1] [--min-games 10] [--json] [--write N2.json [--force]]
@@ -326,7 +333,10 @@ class PanelGame(x1.Game):
             t = r['visible_ms']
             hs, as_ = r['home_score'], r['away_score']
             a_sc, b_sc = (hs, as_) if self.a_home else (as_, hs)
-            point = (t, 'in', r['t_left_s'], r['ot'], a_sc, b_sc, None, r['seen_ms'], 0, t)
+            # ESPN's number for A's team (X1's, beside N1), dated by the state's first sighting
+            wp = r.get('espn_wp')
+            espn = None if wp is None else x1.to_px(wp if self.a_home else 1 - wp)
+            point = (t, 'in', r['t_left_s'], r['ot'], a_sc, b_sc, espn, r['seen_ms'], r['seen_ms'] if espn else 0, t)
             _, inp, quotes = self.input_at(book, point)
             p = self.fair(r)
             inp['p0'] = x1.to_px(r['p0'] if self.a_home else 1 - r['p0'])
@@ -369,12 +379,18 @@ def score_take(trade, game, conservative=True):
             'mo60': None if m is None else (m - px) * c - fee_d}
 
 
-def replay(games, p, fair, conservative=True):
-    """Every take of one rule over the games, each priced by fair: (its numbers, the takes)."""
-    trades = []
+def replay(games, p, fair, conservative=True, beside=()):
+    """Every take of N1's rule over the games, each priced by fair, with the lanes beside it
+    [(lane, params)] replayed in the same games, before it at each instant, their takes in
+    Systematic's position (x1_backtest.simulate_lanes): (N1's numbers, with each other lane's take
+    count, and N1's takes)."""
+    trades, others = [], Counter()
     for g in games:
         g.fair = fair
-        trades.extend(x1.simulate(g, g.book, p))
+        lanes = x1.simulate_lanes(g, g.book, list(beside) + [('N1', p)])
+        trades.extend(lanes['N1'])
+        for lane, _ in beside:
+            others[lane] += len(lanes[lane])
     by = {g.event: g for g in games}
     rows, unfilled = {'settle': [], 'mo60': []}, 0
     for t in trades:
@@ -385,7 +401,7 @@ def replay(games, p, fair, conservative=True):
         for k in rows:
             if s[k] is not None:
                 rows[k].append((t['game'], s[k]))
-    return {'trades': len(trades) - unfilled, 'unfilled': unfilled,
+    return {'trades': len(trades) - unfilled, 'unfilled': unfilled, 'beside': {lane: others[lane] for lane, _ in beside},
             'settle': x1.summarize(rows['settle']), 'mo60': x1.summarize(rows['mo60'])}, trades
 
 
@@ -396,8 +412,27 @@ def n1_params(thr):
     return p
 
 
-def g2(rows, model, thr=THR, fee_mult=x1.FEE_MULT):
-    """G2 (module docstring) on the held-out season's rows."""
+def x1_beside(path):
+    """X1's rule from its gate, to replay beside N1 (--with-x1): the file as deskd loads it
+    (load_lane_gate: lane X1, params direction and thr, no model) and its rule as deskd builds it
+    (nba_rule: follow or fade, thr a price between 0 and 1): (its params, what the gate says). Only
+    a live gate: X1 trades nothing beside N1 at stage shadow."""
+    with open(path, encoding='utf-8') as fh:
+        obj = json.load(fh)
+    why = x1.gate_why(obj, 'X1', '', x1.GATE_PARAMS)
+    if why:
+        raise ValueError('--with-x1 %s: %s: X1 trades nothing beside N1 until its gate opens it' % (path, why))
+    d, thr = obj['params']['direction'], obj['params']['thr']
+    if d not in x1.DIRECTIONS:
+        raise ValueError('--with-x1 %s: the direction %r is neither follow nor fade' % (path, d))
+    if isinstance(thr, bool) or not isinstance(thr, (int, float)) or not 0 < round(thr * ONE) < ONE:
+        raise ValueError('--with-x1 %s: thr %r is not a price between 0 and 1' % (path, thr))
+    return x1.rule_params(d, thr), {'gate': os.path.basename(path), 'direction': d, 'thr': thr}
+
+
+def g2(rows, model, thr=THR, fee_mult=x1.FEE_MULT, beside=()):
+    """G2 (module docstring) on the held-out season's rows, the lanes beside N1 [(lane, params)]
+    replayed with it."""
     by_game = defaultdict(list)
     for r in rows:
         by_game[r['game_id']].append(r)
@@ -405,9 +440,9 @@ def g2(rows, model, thr=THR, fee_mult=x1.FEE_MULT):
     p = n1_params(thr)
     fairs = {'no_score': lambda r: r['p0'], 'flipped_margin': lambda r: home_p(model, r, True), 'favourite': favourite}
     out = {'thr': thr, 'games': len(games)}
-    out['rule'], out['trades'] = replay(games, p, lambda r: home_p(model, r))
-    out['visible'] = replay(games, p, lambda r: home_p(model, r), False)[0]
-    out['placebos'] = {k: replay(games, p, fairs[k])[0] for k in PLACEBOS}
+    out['rule'], out['trades'] = replay(games, p, lambda r: home_p(model, r), True, beside)
+    out['visible'] = replay(games, p, lambda r: home_p(model, r), False, beside)[0]
+    out['placebos'] = {k: replay(games, p, fairs[k], True, beside)[0] for k in PLACEBOS}
     s = out['rule']['settle']
     if s['n'] < MIN_G2_TRADES:
         why = 'G2: %d trades, under %d' % (s['n'], MIN_G2_TRADES)
@@ -426,8 +461,13 @@ def g2(rows, model, thr=THR, fee_mult=x1.FEE_MULT):
     return out
 
 
-def n1(panel, model_path, held_out=None, thr=THR, lag_s=LAG_S, fee_mult=x1.FEE_MULT, boot=BOOT, seed=SEED):
+def n1(panel, model_path, held_out=None, thr=THR, lag_s=LAG_S, fee_mult=x1.FEE_MULT, boot=BOOT, seed=SEED,
+       with_x1=None):
     model, sha = load_model(model_path)
+    beside, with_ = [], {}
+    if with_x1:
+        p, with_['X1'] = x1_beside(with_x1)
+        beside.append(('X1', p))
     rows, have = read_panel(panel)
     seasons = sorted({r['season'] for r in rows})
     season = held_out or (model.get('brier') or {}).get('held_out') or seasons[-1]
@@ -452,8 +492,12 @@ def n1(panel, model_path, held_out=None, thr=THR, lag_s=LAG_S, fee_mult=x1.FEE_M
     res = {'panel': os.path.basename(panel), 'model': os.path.basename(model_path), 'model_sha256': sha,
            'held_out': season, 'fair': how, 'thr': thr, 'lag_s': lag_s, 'fee_mult': fee_mult,
            'g1': g1(held, lambda r: home_p(fit, r), boot, seed)}
+    if with_:
+        res['with'] = with_
     if have:
-        res['g2'] = g2(held, fit, thr, fee_mult)
+        res['g2'] = g2(held, fit, thr, fee_mult, beside)
+        for lane, info in with_.items():
+            info['takes'] = res['g2']['rule']['beside'][lane]
     else:
         res['g2'] = {'thr': thr, 'passed': False, 'why': "G2: the panel has no replay columns (tools/nba_panel.py's)"}
     why = '; '.join(w for w in (res['g1']['why'], res['g2']['why']) if w)
@@ -474,6 +518,8 @@ def n1_gate(res, computed):
                         settle=_stats(r2['rule']['settle']), settle_at_the_touch=_stats(r2['visible']['settle']),
                         mo60_at_the_touch=_stats(r2['visible']['mo60']),
                         placebos={k: _stats(v['settle']) for k, v in r2['placebos'].items()})
+    if res.get('with'):   # the lanes replayed beside N1, whose takes counted in its inventory room
+        ev['g2']['beside'] = res['with']
     v = res['verdict']
     return {'lane': 'N1', 'stage': v['stage'], 'verdict': 'PASS' if v['pass'] else 'FAIL',
             'why': None if v['pass'] else v['why'], 'computed': computed, 'tool': 'tools/nba_gate.py n1',
@@ -730,6 +776,9 @@ def report_n1(res):
                    'of the touch and a minute on, fee multiplier %g; dollars a trade' % (r2['games'], res['lag_s'],
                                                                                       res['fee_mult']))
         out.append(HEAD)
+        for lane, info in sorted((res.get('with') or {}).items()):
+            out.append("    beside %s (%s %.2f, %s): %d takes in these games, in Systematic's position as gw's "
+                       'inventory counts it' % (lane, info['direction'], info['thr'], info['gate'], info.get('takes', 0)))
         out.append(_line('N1', r2['rule']))
         out.append(_line('N1 at the touch it saw', r2['visible']))
         for k in PLACEBOS:
@@ -794,6 +843,8 @@ def run(argv):
     a1.add_argument('--fee-mult', type=float, default=x1.FEE_MULT, help="KXNBAGAME's fee multiplier (default 1)")
     a1.add_argument('--boot', type=int, default=BOOT, help='G1 bootstrap resamples (default %d)' % BOOT)
     a1.add_argument('--seed', type=int, default=SEED)
+    a1.add_argument('--with-x1', metavar='X1.json', help="X1's gate, live: X1's rule replayed beside N1, its takes in "
+                    "Systematic's position (gw's inventory per market); default N1 alone")
     a3 = sub.add_parser('shadow', help="G3 on deskd's N1 shadow signals: N1.json at stage live")
     a3.add_argument('--ops', help="deskd's ops-research.sqlite (or ops.sqlite)")
     a3.add_argument('--data', help="the recorder's data directory (the markets' results)")
@@ -835,7 +886,7 @@ def run(argv):
         if a.cmd == 'n1':
             if not 0 < a.thr < 1 or not 0 <= a.lag_s <= 600 or a.boot < 100:
                 return fail('--thr must be in (0, 1), --lag-s 0 to 600 and --boot at least 100')
-            res = n1(a.panel, a.model, a.held_out, a.thr, a.lag_s, a.fee_mult, a.boot, a.seed)
+            res = n1(a.panel, a.model, a.held_out, a.thr, a.lag_s, a.fee_mult, a.boot, a.seed, a.with_x1)
             gate, text = n1_gate, report_n1
         elif a.cmd == 'shadow':
             res = shadow(a.ops, a.data, a.gate, a.model, a.lane, a.fee_mult)
@@ -1173,6 +1224,62 @@ def self_test(write_fixture=False):
               (rf['fair'], rf['g1']['brier_model'], tres['brier']['model']))
         check('40 held-out games is under 150: a G1 FAIL', not rf['verdict']['pass']
               and rf['g1']['why'] == 'G1: 40 held-out games with a Kalshi mid, under 150', rf['g1']['why'])
+
+        # ---- the lanes beside N1: every replayed lane's takes are Systematic's position, which gw's
+        # inventory caps. One game worked by hand: BOS at home (A) at 0.28 / 0.30, DEN 0.50 / 0.52;
+        # N1's fair for BOS 0.75, ESPN's 0.80; three score states 15 s apart. N1 alone buys BOS 4, 4,
+        # then 2 (its 10 a market; edge 0.75 - 0.30 - 0.015). With X1 (FOLLOW 0.10) before it at each
+        # instant: X1 buys BOS 4 (its 4 a market), N1 BOS 4 (Systematic 8); X1, BOS full for it,
+        # sells DEN 3 (BOS at 0.50: 0.80 - 0.50 - 0.02), N1 BOS 2 (10); X1 sells DEN 1 (its 4), and N1,
+        # no room left in BOS, sells DEN 3 (0.75 - 0.50 - 0.02 = 0.23)
+        tip = em.iso_ms('2026-11-04T00:00Z')
+        hev = 'KXNBAGAME-26NOV03DENBOS'
+        hrows = [{'event': hev, 'game_id': '1', 'home': hev + '-BOS', 'away': hev + '-DEN', 'yes_won': 1.0, 'start_ms': tip,
+                  'visible_ms': tip + 600000 + k * 15000, 'seen_ms': tip + 600000 + k * 15000, 'home_score': 10 + 2 * k,
+                  'away_score': 0, 't_left_s': 2000.0, 'ot': False, 'p0': 0.5, 'espn_wp': 0.80,
+                  'q': {'home': (2800, 3000), 'away': (5000, 5200)}, 'q_next': {'home': (2800, 3000), 'away': (5000, 5200)}}
+                 for k in range(3)]
+
+        def takes(beside):
+            hg = PanelGame(hrows, 1.0)
+            hg.fair = lambda r: 0.75
+            lanes = x1.simulate_lanes(hg, hg.book, list(beside) + [('N1', n1_params(0.10))])
+            return {lane: [(t['side'], t['ticker'][-3:], t['count'] // CT, t['edge']) for t in ts] for lane, ts in lanes.items()}
+        alone, both = takes(()), takes([('X1', x1.rule_params('follow', 0.10))])
+        check("N1 alone: BOS 4, 4, then 2, its 10 a market", alone == {'N1': [('BUY', 'BOS', 4, 4350)] * 2 +
+                                                                       [('BUY', 'BOS', 2, 4350)]}, alone)
+        check("X1 beside it: X1's takes count in N1's room (BOS 4 then 2, then DEN), and N1's in X1's",
+              both == {'X1': [('BUY', 'BOS', 4, 4850), ('SELL', 'DEN', 3, 2800), ('SELL', 'DEN', 1, 2800)],
+                       'N1': [('BUY', 'BOS', 4, 4350), ('BUY', 'BOS', 2, 4350), ('SELL', 'DEN', 3, 2300)]}, both)
+        hr, _ = replay([PanelGame(hrows, 1.0)], n1_params(0.10), lambda r: 0.75, False, [('X1', x1.rule_params('follow', 0.10))])
+        check("replay scores N1's takes alone and counts the other lane's", hr['trades'] == 3 and hr['beside'] == {'X1': 3},
+              hr)
+        # --with-x1: X1's gate as deskd loads it, live only; on this panel (no espn_wp) X1 takes nothing
+        x1_fix = os.path.join(ROOT, 'tests', 'deskd', 'fixtures', 'x1_gate.json')
+        try:
+            x1_beside(x1_fix)
+            shadow_why = ''
+        except ValueError as e:
+            shadow_why = str(e)
+        check('--with-x1 refuses a gate at stage shadow: X1 trades nothing beside N1', shadow_why ==
+              '--with-x1 %s: stage shadow (shadow signals only until its gate is live): X1 trades nothing beside N1 '
+              'until its gate opens it' % x1_fix, shadow_why)
+        with open(x1_fix, encoding='utf-8') as fh:
+            xg = dict(json.load(fh), stage='live')
+        x1_live = os.path.join(d, 'X1.json')
+        with open(x1_live, 'w', encoding='utf-8') as fh:
+            json.dump(xg, fh)
+        wr = n1(panel, MODEL_FIXTURE, '2026-27', with_x1=x1_live)
+        check("--with-x1 X1.json (live, fade 0.12): replayed beside N1, said in the evidence; no espn_wp here, so N1's "
+              "replay is its own", wr['with'] == {'X1': {'gate': 'X1.json', 'direction': 'fade', 'thr': 0.12, 'takes': 0}}
+              and wr['g2']['rule']['settle'] == r2['rule']['settle'] and wr['verdict'] == res['verdict']
+              and n1_gate(wr, FIXTURE_COMPUTED)['evidence']['g2']['beside'] == wr['with']
+              and 'beside' not in n1_gate(res, FIXTURE_COMPUTED)['evidence']['g2'], wr.get('with'))
+        rc, text = quiet(['n1', '--panel', panel, '--model', MODEL_FIXTURE, '--held-out', '2026-27', '--with-x1', x1_live])
+        check('the report says what was replayed beside N1', rc == 0 and '    beside X1 (fade 0.12, X1.json): 0 takes in '
+              "these games, in Systematic's position as gw's inventory counts it" in text, text)
+        rc, text = quiet(['n1', '--panel', panel, '--model', MODEL_FIXTURE, '--with-x1', x1_fix])
+        check('--with-x1 at stage shadow is refused at the command line', rc == 2 and 'stage shadow' in text, text.strip())
 
         # the CLI and the gate file
         gate = os.path.join(d, 'gates', 'N1.json')
