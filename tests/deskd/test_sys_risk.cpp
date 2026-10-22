@@ -11,7 +11,8 @@
 //     and not at it, an order counts only the part of it that grows its lane's position, and a
 //     reducing order at a full budget passes
 //   - the IOC lanes' $5 cost budget counts every fee charged: a rebate (a negative fee) is the
-//     lane's P&L but gives none of it back (decisions 6)
+//     lane's P&L but gives none of it back (decisions 6); spent, it refuses what grows an IOC
+//     lane's position and lets what reduces it go
 //   - by settlement state (gw/event_risk.h; decisions 5): with deskd.event_risk off, or for a lane
 //     that does not count by state, every number is Old's, on random books with event rows and on
 //     M2's KXHIGH positions; on, S1's stakes in an event the account read's row shapes count
@@ -444,7 +445,10 @@ void ceiling() {
   }));
 }
 
-// $3.00 and $2.50 charged to an IOC lane, $1.00 rebated to a quoting one: $4.50 net, $5.50 spent
+// $3.00 and $2.50 charged to an IOC lane, $1.00 rebated to a quoting one: $4.50 net, $5.50 spent.
+// Spent, the IOC lane grows nothing more; what reduces its position still goes, as every reducing
+// order does past a limit (S1's unwind of a basket's excess: a leg refused here would be held to
+// settlement)
 void rebates() {
   auto ioc = lane_spec("I1", 10 * 10000);
   ioc.style = "IOC";
@@ -455,10 +459,16 @@ void rebates() {
     const auto t = now_ms();
     return sys.fill("I1", "SI1-1", A1, Side::BUY, 100, 4000, 3000000, t, "t-1") &&
            sys.fill("I1", "SI1-2", A1, Side::SELL, 100, 4100, 2500000, t, "t-2") &&
-           sys.fill("L1", "SL1-1", B1, Side::BUY, 100, 4000, -1000000, t, "t-3");
+           sys.fill("I1", "SI1-3", B2, Side::BUY, 300, 4000, 0, t, "t-3") &&
+           sys.fill("L1", "SL1-1", B1, Side::BUY, 100, 4000, -1000000, t, "t-4");
   }));
   CHECK(d.until([&] { const auto v = d.gw->sys_view(); return v && v->fees == 5500000; }));   // hdr.cost used
-  const auto o = d.place("I1", "i-1", A1, Side::BUY, 4000, 100);
+  auto o = d.place("I1", "i-1", A1, Side::BUY, 4000, 100);
+  CHECK(o.code == "SYS_CEILING" && o.msg == "the IOC lanes' daily cost budget 5.0000 is spent");
+  // I1 long 3 of B2: a sell of 2 reduces it and goes; a sell of 2 more, with the first working,
+  // would leave it short 1 and is refused
+  CHECK(d.place("I1", "r-1", B2, Side::SELL, 4500, 200).code == "SENT");
+  o = d.place("I1", "r-2", B2, Side::SELL, 4500, 200);
   CHECK(o.code == "SYS_CEILING" && o.msg == "the IOC lanes' daily cost budget 5.0000 is spent");
   CHECK(d.place("L1", "q-1", B1, Side::BUY, 3900, 100).code == "SENT");   // a quoting lane is not capped
   CHECK(d.until([&] { return d.row("I1")["state"] == "CAPPED" && d.row("L1")["state"] == "ON"; }));

@@ -1379,8 +1379,6 @@ void Gateway::place_sys(PlaceIntent& p) {
   // the same side, may not grow past the lane's limit.
   Qty pos = 0, pending = 0, lane_pending = 0;
   for (const auto& l : sys_->lanes()) pos += sys_->position(l.id, p.ticker);
-  if (lane->style == "IOC" && sys_fees() >= kCostBudget * 100)
-    return refuse("SYS_CEILING", "the IOC lanes' daily cost budget " + money_str(kCostBudget) + " is spent");
   for (const auto& [cid, o] : manual_->ledger().orders())
     if (o.intent.owner == Owner::SYS && !o.terminal() && o.intent.ticker == p.ticker && o.intent.side == p.side) {
       pending += o.left;
@@ -1396,6 +1394,10 @@ void Gateway::place_sys(PlaceIntent& p) {
   // settlement state (sys_used; S1's leg that the basket it holds already covers): past a limit, it
   // is refused only if it adds to the measure.
   const bool grows = sys_grows(p, lane_pending) > 0;
+  // the IOC lanes' daily cost budget (contract hdr.cost) the same: spent, they grow nothing more,
+  // and what closes a position still goes (S1 unwinding a basket's excess among them)
+  if (grows && lane->style == "IOC" && sys_fees() >= kCostBudget * 100)
+    return refuse("SYS_CEILING", "the IOC lanes' daily cost budget " + money_str(kCostBudget) + " is spent");
   const bool netted = grows && path_->event_risk && lane->by_state && !stake_event(p.ticker).empty();
   const auto past = [&](const std::function<bool(const std::string&)>& lanes, const std::function<bool(const std::string&)>& in,
                         Micros limit, bool ended = false) {
