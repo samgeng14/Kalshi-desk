@@ -468,6 +468,7 @@ add_library(fake_kalshi STATIC
   tests/fake_exchange/wire.cpp
   tests/fake_exchange/engine.cpp
   tests/fake_exchange/net.cpp
+  tests/fake_exchange/listener.cpp
   tests/fake_exchange/rest.cpp
   tests/fake_exchange/tape.cpp
   tests/fake_exchange/fake_kalshi.cpp
