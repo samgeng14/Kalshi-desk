@@ -1800,6 +1800,10 @@ void Gateway::sys_tick(std::int64_t now) {
     sys_money(&v->used, &v->ceiling, &v->eff);
     v->ts_ms = now;
     std::atomic_store(&sys_view_, std::shared_ptr<const SysView>(std::move(v)));
+    // the write buckets refilled to now, as often: S1's write room (and /ops/status) would
+    // otherwise read them as the last write left them, however long ago
+    std::atomic_store(&write_view_, std::shared_ptr<const std::map<int, double>>(
+                                        std::make_shared<const std::map<int, double>>(budget_.all(now))));
     sys_dirty_ = false;
     sys_view_ms_ = now;
     std::set<std::string> held;

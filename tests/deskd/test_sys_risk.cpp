@@ -640,11 +640,24 @@ void ioc_leg() {
     }));
   }
 }
+
+// strat's view of the write buckets (Gateway::write_tokens: S1's write room) refills between
+// writes: a create spends 10 of shard 0's 100, and the view shows the bucket full again without
+// another write (it showed the bucket as the last write left it)
+void write_view() {
+  Desk d({lane_spec("L1", 10 * 10000)}, 1000 * 10000);
+  CHECK(d.run({"L1"}));
+  CHECK(d.place("L1", "w-1", A1, Side::BUY, 4000, 100).code == "SENT");
+  const auto spent = d.gw->write_tokens();
+  CHECK(spent && spent->count(0) && spent->at(0) <= 91);
+  CHECK(d.until([&] { const auto w = d.gw->write_tokens(); return w && w->count(0) && w->at(0) == d.gw->write_cap(); }, 2000));
+}
 }  // namespace
 
 int main() {
   for (int pass = 0; pass < 4; ++pass) same_numbers(pass);
   limits(); ceiling(); rebates();
   kxhigh_book(); second_basket(); covered_leg(); group_netted(); lattice(); ioc_leg();
+  write_view();
   return finish("deskd-sys-risk");
 }

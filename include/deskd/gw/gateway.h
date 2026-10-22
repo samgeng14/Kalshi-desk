@@ -184,8 +184,9 @@ class Gateway {
     std::atomic<std::uint64_t> records_lost{0};       // ...that store's full inbox refused
   };
   const Stats& stats() const { return stats_; }
-  // Any thread: each write bucket's tokens as gw last spent from it (shard -> tokens; 0 = the
-  // unscoped bucket) and the bucket's size (gw/write_budget.h)
+  // Any thread: each write bucket's tokens as of gw's last write or its last view for strat, at
+  // most about 250 ms ago with Systematic on (shard -> tokens; 0 = the unscoped bucket), and the
+  // bucket's size (gw/write_budget.h)
   std::shared_ptr<const std::map<int, double>> write_tokens() const { return std::atomic_load(&write_view_); }
   double write_cap() const { return write_cap_.load(); }
 
