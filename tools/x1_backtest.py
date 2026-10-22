@@ -360,10 +360,10 @@ class Game:
         t, state, t_left, ot, a_sc, b_sc, espn, seen, espn_seen, fetched = point
         (la, qa), (lb, qb) = self.leg(book, 0, t), self.leg(book, 1, t)
         inp = {'a': la, 'b': lb, 'state': state, 'src': 'ESPN', 'score_why': '', 'fetched_ms': fetched,
-               'first_seen_ms': seen, 'start_ms': 0, 'a_score': a_sc, 'b_score': b_sc, 't_left_s': t_left,
-               'ot': ot, 'points': True, 'set_end_ms': 0, 'p0': None, 'fair': None, 'fair_why': '',
-               'espn': espn, 'espn_seen_ms': espn_seen, 'now_ms': t, 'private_up': True, 'not_tradable': '',
-               'volume': 0}
+               'first_seen_ms': seen, 'prev_poll_ms': 0, 'start_ms': 0, 'a_score': a_sc, 'b_score': b_sc,
+               't_left_s': t_left, 'ot': ot, 'points': True, 'set_end_ms': 0, 'p0': None, 'fair': None,
+               'fair_why': '', 'espn': espn, 'espn_seen_ms': espn_seen, 'now_ms': t, 'private_up': True,
+               'not_tradable': '', 'volume': 0}
         return t, inp, {self.tickers[0]: qa, self.tickers[1]: qb}
 
     def instants(self, book):

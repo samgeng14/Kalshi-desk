@@ -46,13 +46,15 @@ The readers keep what deskd would have known and when.
 
 The score a decision reads (Score: college.json's ScoreMerge, which C3 builds in deskd). Each
 source's rows become deskd's score states: first_seen is the first row of a run with the same
-(state, period, scores, linescores), so a row that only moves the clock keeps it. A source counts
-as polled at the decision unless its feed was in an outage (then at the outage's start, or its last
-row since); fresh is polled at most --max-score-age-s ago. Both fresh: their state, scores (from A's
-side) and period (when both read one) must agree, else no score (NO_SCORE, the why names both),
-and agreeing they give the earlier first sighting. One fresh: that one. Neither: the fresher,
-which SCORE_OLD then pulls. Between rows a score is taken as polled: the recorder polls a game in
-play every few seconds, and only the gaps table says when it did not.
+(state, period, scores, linescores), so a row that only moves the clock keeps it, and prev_poll is
+that row's prev_us (the recorder's poll before it; none for the first it saw of the game), deskd's
+prev_poll_ms, which C1's stale_only needs within 10 s of the sighting. A source counts as polled at
+the decision unless its feed was in an outage (then at the outage's start, or its last row since);
+fresh is polled at most --max-score-age-s ago. Both fresh: their state, scores (from A's side) and
+period (when both read one) must agree, else no score (NO_SCORE, the why names both), and agreeing
+they give the earlier first sighting, with its poll before. One fresh: that one. Neither: the
+fresher, which SCORE_OLD then pulls. Between rows a score is taken as polled: the recorder polls a
+game in play every few seconds, and only the gaps table says when it did not.
 
 The fair (GameFair's rules, strat/game_fair.h). p0 is the effective mid of A's YES over both books
 (bid max(bid_A, 1 - ask_B), ask min(ask_A, 1 - bid_B)) at a spread of 15c or less, while the score
@@ -577,9 +579,10 @@ def _lines(raw):
 
 def score_states(rs, src):
     """A game's rows as deskd's score states, oldest first: t (the row, first seen), state, period,
-    clock_s, scores and linescores (home, away), start_ms, and first_seen: the first row of the run
-    of rows with the same (state, period, scores, linescores), deskd's first_seen_ms, which a row
-    that only moves the clock does not change."""
+    clock_s, scores and linescores (home, away), start_ms, first_seen: the first row of the run of
+    rows with the same (state, period, scores, linescores), deskd's first_seen_ms, which a row that
+    only moves the clock does not change, and prev_poll: that row's prev_us (0: none), deskd's
+    prev_poll_ms."""
     out = []
     for r in rs:
         raw = _raw(r)
@@ -591,7 +594,10 @@ def score_states(rs, src):
         st['digest'] = (st['state'], st['period'], st['home_score'], st['away_score'], tuple(home_lines),
                         tuple(away_lines))
         prev = out[-1] if out else None
-        st['first_seen'] = prev['first_seen'] if prev is not None and prev['digest'] == st['digest'] else st['t']
+        if prev is not None and prev['digest'] == st['digest']:
+            st['first_seen'], st['prev_poll'] = prev['first_seen'], prev['prev_poll']
+        else:
+            st['first_seen'], st['prev_poll'] = st['t'], _int(r.get('prev_us')) or 0
         out.append(st)
     return out
 
@@ -601,7 +607,8 @@ class Score:
     source's latest state and when it was last polled; a source whose feed is in an outage was last
     polled at the outage's start (or at its last row since). The fresher of the two, once its last
     poll is at most max_age old; when both are, and their state, scores and (both read) period
-    differ, no score: the why names both. When they agree, the earlier first sighting."""
+    differ, no score: the why names both. When they agree, the earlier first sighting, with the
+    poll before it."""
 
     def __init__(self, sources, max_age_us):
         self.src = {}   # src -> (states, times, a_home, outages merged: disjoint, sorted)
@@ -631,8 +638,9 @@ class Score:
         return any((self.latest(src, t)[0] or {}).get('state') == 'post' for src in self.src)
 
     def at(self, t):
-        """A's score at t: a dict with state ('' for none), why, src, fetched and first seen (us),
-        start_ms, a_home, a_score, b_score, the home side's period, clock_s, scores and lines."""
+        """A's score at t: a dict with state ('' for none), why, src, fetched, first seen and the poll
+        before it (us), start_ms, a_home, a_score, b_score, the home side's period, clock_s, scores and
+        lines."""
         got = []
         for src in ('ESPN', 'NCAA'):
             if src in self.src:
@@ -642,7 +650,7 @@ class Score:
         if not got:
             return {'state': '', 'why': ''}
         fresh = [g for g in got if t - g[2] <= self.max_age]
-        pick, first_seen, why = None, None, ''
+        pick, dated, why = None, None, ''
         if len(fresh) == 2:
             (_, e, _, eh), (_, n, _, nh) = fresh
             ea = (e['home_score'], e['away_score']) if eh else (e['away_score'], e['home_score'])
@@ -653,15 +661,16 @@ class Score:
                 why = 'ESPN has %s %d-%d (period %d) and NCAA %s %d-%d (period %d)' % (
                     e['state'], ea[0], ea[1], e['period'], n['state'], na[0], na[1], n['period'])
                 return {'state': '', 'why': why}
-            pick, first_seen = fresh[0], min(e['first_seen'], n['first_seen'])
+            pick, dated = fresh[0], min((e, n), key=lambda x: x['first_seen'])
         elif fresh:
             pick = fresh[0]
         else:
             pick = max(got, key=lambda g: g[2])   # neither fresh: the fresher, which the age then pulls
         src, st, polled, a_home = pick
+        dated = dated or st
         hs, as_ = st['home_score'], st['away_score']
         return {'state': st['state'], 'why': '', 'src': src, 'fetched': polled,
-                'first_seen': first_seen if first_seen is not None else st['first_seen'],
+                'first_seen': dated['first_seen'], 'prev_poll': dated['prev_poll'],
                 'start_ms': st['start_ms'], 'a_home': a_home, 'a_score': hs if a_home else as_,
                 'b_score': as_ if a_home else hs, 'period': st['period'], 'clock_s': st['clock_s'],
                 'home_score': hs, 'away_score': as_, 'home_lines': st['home_lines'], 'away_lines': st['away_lines']}
@@ -964,8 +973,9 @@ def replay_game(g, score, hists, vols, model, o):
         inp = {'a': _leg(g, a, ta, st['pos'][a], took), 'b': _leg(g, b, tb_, st['pos'][b], took),
                'state': ref['state'], 'src': ref.get('src', ''), 'score_why': ref['why'],
                'fetched_ms': ref.get('fetched', 0) // 1000, 'first_seen_ms': ref.get('first_seen', 0) // 1000,
-               'start_ms': ref.get('start_ms', 0), 'a_score': ref.get('a_score', 0), 'b_score': ref.get('b_score', 0),
-               't_left_s': None, 'ot': False, 'points': points, 'set_end_ms': st['set_end'] // 1000,
+               'prev_poll_ms': ref.get('prev_poll', 0) // 1000, 'start_ms': ref.get('start_ms', 0),
+               'a_score': ref.get('a_score', 0), 'b_score': ref.get('b_score', 0), 't_left_s': None, 'ot': False,
+               'points': points, 'set_end_ms': st['set_end'] // 1000,
                'p0': to_px(p0) if p0 is not None else None, 'fair': to_px(fair) if fair is not None else None,
                'fair_why': fair_why, 'espn': None, 'espn_seen_ms': 0, 'now_ms': t // 1000,
                'last_take_ms': st['last_take'] // 1000, 'game_used': st['used'], 'game_takes': st['takes'],
@@ -1625,6 +1635,7 @@ class Game:
         self.ev = '%s-%sH%sV%s' % (series, _yymondd(tip), code, code)
         self.a, self.b = self.ev + '-H' + code, self.ev + '-V' + code
         self.code, self.league, self.a_wins = code, league, a_wins
+        self.polled = set()   # the sources with a row of the game: the recorder polls it
         close = tip + 30 * 3600 * S_US
         for tk, name in ((self.a, 'Home ' + code), (self.b, 'Visitors ' + code)):
             sp.kmarket(tip - 7200 * S_US, tk, self.ev, name, close)
@@ -1662,8 +1673,12 @@ class Game:
         t = self.tip + int(dt * S_US)
         self.fr.add(t, 'trade_id', self.sid + 1000, self.a, 0.5, count, 'yes', 'tr-%s-%d' % (self.code, t))
 
-    def score(self, src, dt, state, period, clock, home, away, lines=None, prev=None):
+    def score(self, src, dt, state, period, clock, home, away, lines=None, polled=3):
+        """A score row at tip + dt, the recorder's poll before it polled s earlier (the hot polls'
+        3 s), none for the first row of the game from src."""
         t = self.tip + int(dt * S_US)
+        prev = t - int(polled * S_US) if src in self.polled else None
+        self.polled.add(src)
         league = self.league if src == 'ESPN' else NCAA_SPORTS[series_of(self.a)]
         names = {'home': 'Home %s Hawks' % self.code, 'away': 'Visitors %s Bees' % self.code} if src == 'ESPN' else \
             {'home': 'Home ' + self.code, 'away': 'Visitors ' + self.code}
@@ -1757,22 +1772,26 @@ def self_test_part2(check):
               open(FIXTURE_WCBB, 'rb').read()).hexdigest() and volley['name'] == 'volley_markov')
 
     # ---- the score a decision reads
-    def st(t, state, hs, as_, period=1, first=None):
+    def st(t, state, hs, as_, period=1, first=None, prev=0):
         return {'t': t, 'state': state, 'period': period, 'clock_s': 440.0, 'home_score': hs, 'away_score': as_,
-                'home_lines': [], 'away_lines': [], 'start_ms': 0, 'first_seen': first if first is not None else t}
-    sc = Score({'ESPN': ([st(100, 'in', 0, 0), st(200, 'in', 10, 0)], True, [(150 * s, 400 * s)]),
-                'NCAA': ([st(110, 'in', 0, 0), st(260, 'in', 0, 10)], False, [])}, 5 * s)
+                'home_lines': [], 'away_lines': [], 'start_ms': 0, 'first_seen': first if first is not None else t,
+                'prev_poll': prev}
+    sc = Score({'ESPN': ([st(100, 'in', 0, 0, prev=97), st(200, 'in', 10, 0, prev=197)], True, [(150 * s, 400 * s)]),
+                'NCAA': ([st(110, 'in', 0, 0, prev=107), st(260, 'in', 0, 10, prev=257)], False, [])}, 5 * s)
     for x in sc.src.values():   # times in seconds above, microseconds below
         for y in x[0]:
             y['t'] *= s
             y['first_seen'] *= s
+            y['prev_poll'] *= s
         x[1][:] = [y['t'] for y in x[0]]
     r = sc.at(120 * s)
-    check('Score: both fresh and agreeing, the earlier first sighting', (r['state'], r.get('src'), r.get('first_seen'),
-          r['a_score']) == ('in', 'ESPN', 100 * s, 0), r)
+    check('Score: both fresh and agreeing, the earlier first sighting and the poll before it',
+          (r['state'], r.get('src'), r.get('first_seen'), r.get('prev_poll'), r['a_score'])
+          == ('in', 'ESPN', 100 * s, 97 * s, 0), r)
     r = sc.at(210 * s)
     check("Score: a source in its outage was last polled at the outage's start: the other, fresh, is used",
-          (r.get('src'), r.get('fetched'), r.get('first_seen')) == ('NCAA', 210 * s, 110 * s)
+          (r.get('src'), r.get('fetched'), r.get('first_seen'), r.get('prev_poll'))
+          == ('NCAA', 210 * s, 110 * s, 107 * s)
           and sc.latest('ESPN', 210 * s)[1] == 200 * s, r)
     r = sc.at(152 * s)
     check('Score: within the max age of the outage start ESPN is still fresh, and both agree', r.get('src') == 'ESPN'
@@ -1784,12 +1803,16 @@ def self_test_part2(check):
     sc3 = Score({'ESPN': ([st(200 * s, 'in', 10, 0)], True, [(201 * s, 900 * s)])}, 5 * s)
     r = sc3.at(300 * s)
     check('Score: one source, old: the age pulls it (SCORE_OLD)', r['fetched'] == 201 * s and r['state'] == 'in', r)
-    rs = [{'recv_us': 1, 'state': 'in', 'period': '1', 'clock': '9:00', 'home_score': 0, 'away_score': 0, 'raw': '{}'},
-          {'recv_us': 2, 'state': 'in', 'period': '1', 'clock': '8:30', 'home_score': 0, 'away_score': 0, 'raw': '{}'},
-          {'recv_us': 3, 'state': 'in', 'period': '1', 'clock': '8:00', 'home_score': 2, 'away_score': 0, 'raw': '{}'}]
+    rs = [{'recv_us': 1, 'prev_us': None, 'state': 'in', 'period': '1', 'clock': '9:00', 'home_score': 0,
+           'away_score': 0, 'raw': '{}'},
+          {'recv_us': 2, 'prev_us': 1, 'state': 'in', 'period': '1', 'clock': '8:30', 'home_score': 0,
+           'away_score': 0, 'raw': '{}'},
+          {'recv_us': 3, 'prev_us': 2, 'state': 'in', 'period': '1', 'clock': '8:00', 'home_score': 2,
+           'away_score': 0, 'raw': '{}'}]
     ss = score_states(rs, 'ESPN')
-    check("score_states: a clock row keeps the state's first sighting, a score starts a new one",
-          [x['first_seen'] for x in ss] == [1, 1, 3] and ss[1]['clock_s'] == 510, ss)
+    check("score_states: a clock row keeps the state's first sighting and the poll before it, a score starts a "
+          "new one", [(x['first_seen'], x['prev_poll']) for x in ss] == [(1, 0), (1, 0), (3, 2)]
+          and ss[1]['clock_s'] == 510, ss)
     check('period_of: the leading digits', (period_of('2nd'), period_of('1'), period_of('HALF'), period_of(None))
           == (2, 1, 0, 0))
 
@@ -1862,10 +1885,11 @@ def self_test_part2(check):
         # G3: the cheap ask comes 1 s after the score: not stale, no case
         g = game('GC', 3)
         g.stale_ask(201); g.basic()
-        # G4: ESPN down from +150 s to +400 s, the ask gone at +300 s, no NCAA: no case
+        # G4: ESPN down from +150 s to +400 s, the ask gone at +300 s, no NCAA: no case (the 6-0 its
+        # first poll back shows is not dated either: the poll before it was at +147 s)
         g = game('GD', 4)
         g.stale_ask(); g.basic(lead_at=None); g.book(300, {0.48: 10}, {0.66: 10})
-        g.score('ESPN', 400, 'in', 1, '7:20', 6, 0)
+        g.score('ESPN', 400, 'in', 1, '7:20', 6, 0, polled=253)
         sp.gap(T0 + (4 * 1800 + 150) * s, 'espn', 'poll_failed', WB_SPEC + ': timeout', T0 + (4 * 1800 + 150) * s,
                T0 + (4 * 1800 + 150) * s)
         sp.gap(T0 + (4 * 1800 + 400) * s, 'espn', 'recovered', 'down 250 s', T0 + (4 * 1800 + 150) * s,
@@ -1873,7 +1897,7 @@ def self_test_part2(check):
         # G5: the same with NCAA up: NCAA's 10-0 at +250 s is the score, taken
         g = game('GE', 5)
         g.stale_ask(); g.basic(lead_at=None); g.book(300, {0.48: 10}, {0.66: 10})
-        g.score('ESPN', 400, 'in', 1, '7:20', 6, 0)
+        g.score('ESPN', 400, 'in', 1, '7:20', 6, 0, polled=253)
         g.basic('NCAA', lead_at=250, final=False)
         sp.gap(T0 + (5 * 1800 + 150) * s, 'espn', 'poll_failed', WB_SPEC + ': timeout', T0 + (5 * 1800 + 150) * s,
                T0 + (5 * 1800 + 150) * s)
@@ -2056,17 +2080,19 @@ def self_test_part2(check):
     #       left (13 contracts) and 12 at the touch; the fifth run finds no room (INVENTORY: no case)
     #   IC  4 at 0.45 with 0.48 behind it: taken once, 4 (deskd's IOC empties the level), not on each
     #       of the five score changes
+    #   ID  IA, but its first lead is seen 20 s after the poll before it (a feed slow or down): the
+    #       change is not dated (stale_only's TOUCH_AFTER_SCORE), so the 6 and the 4 come a state later
     with tempfile.TemporaryDirectory() as d:
         sp, fr = Rec(d), Frames()
         gs = {}
         for i, (code, asks) in enumerate((('IA', {0.30: 10, 0.52: 10}), ('IB', {0.30: 30, 0.52: 10}),
-                                          ('IC', {0.45: 4, 0.48: 10}))):
+                                          ('IC', {0.45: 4, 0.48: 10}), ('ID', {0.30: 10, 0.52: 10}))):
             g = gs[code] = Game(sp, fr, i + 1, 'KXNCAAWBGAME', code, T0 + i * 1800 * s)
             g.book(100, {0.25: 10}, asks)
             g.score('ESPN', -3600, 'pre', 0, '0:00', 0, 0)
             g.score('ESPN', 60, 'in', 1, '10:00', 0, 0)
             for k, clock in enumerate(('7:20', '7:10', '7:00', '6:50', '6:40')):
-                g.score('ESPN', 200 + 10 * k, 'in', 1, clock, 6 + 2 * k, 0)
+                g.score('ESPN', 200 + 10 * k, 'in', 1, clock, 6 + 2 * k, 0, polled=20 if (code, k) == ('ID', 0) else 3)
             g.score('ESPN', 7000, 'post', 4, '0:00', 70, 60)
         fr.flush(sp)
         res = analyse(d, series=('KXNCAAWBGAME',), wcbb=FIXTURE_WCBB, min_cases=1)
@@ -2080,6 +2106,9 @@ def self_test_part2(check):
               took('IA'))
         check('the touch: a 4-lot at 0.45 is taken once in five score states', took('IC')
               == [(200000, 'BUY', 0.45, 4.0, 0.07, 4.0, 'taken')], took('IC'))
+        check("stale_only: a score change 20 s after the poll before it is not dated, the next state's is",
+              took('ID') == [(210000, 'BUY', 0.3, 6.0, 0.09, 10.0, 'taken'),
+                             (220000, 'BUY', 0.3, 4.0, 0.06, 4.0, 'taken')], took('ID'))
         ib = [c for c in cs if c['event'] == gs['IB'].ev]
         check("inventory: the fourth take of A at 0.30 is the 2 of C1's 20 left, the fifth run none", took('IB')
               == [(200000, 'BUY', 0.3, 6.0, 0.09, 30.0, 'taken'), (210000, 'BUY', 0.3, 6.0, 0.09, 24.0, 'taken'),

@@ -37,10 +37,11 @@ The decision (decide(inp, params)): inp is take.h's TakeInput, a dict with integ
                 every lane's, and what is left of its working orders there by side; a replay
                 keeps them from its own fills, and an IOC-only one has no working orders),
                 bid_since_ms, ask_since_ms}
-  state, src, score_why, fetched_ms, first_seen_ms, start_ms, a_score, b_score, t_left_s (None:
-  no clock), ot, points, set_end_ms, p0, fair, fair_why, espn, espn_seen_ms (A's side; p0, fair
-  and espn are Px or None), now_ms, last_take_ms, game_used (micro-dollars), game_takes, fired
-  ([A, B]), private_up, not_tradable, volume (Qty)
+  state, src, score_why, fetched_ms, first_seen_ms, prev_poll_ms (the poll before that sighting,
+  0: none), start_ms, a_score, b_score, t_left_s (None: no clock), ot, points, set_end_ms, p0,
+  fair, fair_why, espn, espn_seen_ms (A's side; p0, fair and espn are Px or None), now_ms,
+  last_take_ms, game_used (micro-dollars), game_takes, fired ([A, B]), private_up, not_tradable,
+  volume (Qty)
 
 and params is take.h's TakeParams (params(mode) gives take_params' defaults, in the same units;
 inventory is the lane's limit a market, default_lanes()' own, which gw's place_sys enforces).
@@ -138,9 +139,10 @@ def params(mode):
         raise ValueError('unknown mode %r' % mode)
     p = {'mode': mode, 'edge': 2000, 'clip': 2 * ONE, 'max_count': 0, 'fixed_count': 0, 'game_cap': 10000000,
          'inventory': 0, 'max_takes': 0, 'max_score_age_ms': 5000, 'signal_ms': 0, 'cool_ms': 5000,
-         'max_volume': 0, 'stale_only': False, 'leader_only': False, 'points_required': True,
-         'set_window_ms': 120000, 'max_spread': 0, 'min_px': 0, 'max_px': ONE, 'trade_ot': True,
-         'min_t_left_s': 0.0, 'fav_lo': 9000, 'fav_hi': 9500, 'fav_from_ms': 3600000, 'fav_to_ms': 120000}
+         'max_volume': 0, 'stale_only': False, 'max_poll_gap_ms': 10000, 'leader_only': False,
+         'points_required': True, 'set_window_ms': 120000, 'max_spread': 0, 'min_px': 0, 'max_px': ONE,
+         'trade_ot': True, 'min_t_left_s': 0.0, 'fav_lo': 9000, 'fav_hi': 9500, 'fav_from_ms': 3600000,
+         'fav_to_ms': 120000}
     if mode == 'COLLEGE':   # college.json's; the gate may raise edge, never below 10c
         p.update(edge=2000, inventory=20 * CT, cool_ms=5000, max_volume=20000 * CT, stale_only=True)
     elif mode in ('MODEL', 'ESPN_FOLLOW', 'ESPN_FADE'):   # nba.json's (thr 10c until the gate's)
@@ -357,6 +359,12 @@ def decide(i, P):
             if r['team_px'] < P['min_px'] or r['team_px'] > P['max_px']:
                 return fail('BAND', '%s is outside %s-%s' % (px_s, _price(P['min_px']), _price(P['max_px'])))
             r['stage'] += 1
+        # the score's change, between the poll before its first sighting and that sighting
+        gap = i['first_seen_ms'] - i['prev_poll_ms']
+        if P['stale_only'] and (i['prev_poll_ms'] <= 0 or gap > P['max_poll_gap_ms']):
+            return fail('TOUCH_AFTER_SCORE', "the score's change is not dated: " + (
+                '%s from the poll before it (at most %s)' % (_ms(gap), _ms(P['max_poll_gap_ms']))
+                if i['prev_poll_ms'] > 0 else 'no poll before its first sighting'))
         if P['stale_only'] and not (r['since'] > 0 and r['since'] < i['first_seen_ms']):
             return fail('TOUCH_AFTER_SCORE', 'the touch is %s newer than the score' % _ms(r['since'] - i['first_seen_ms'])
                         if r['since'] > 0 else "the touch's age is not known")
@@ -577,10 +585,10 @@ def self_test():
     check('clip_count: the count is the largest that fits, one more step never does', largest)
 
     # the defaults
-    check('params: COLLEGE is 20c net, $2, $10 a game, thin under 20k, stale touches only',
-          params('COLLEGE')['edge'] == 2000 and params('COLLEGE')['clip'] == 20000
+    check("params: COLLEGE is 20c net, $2, $10 a game, thin under 20k, stale touches only, the score's change dated "
+          'to within 10 s', params('COLLEGE')['edge'] == 2000 and params('COLLEGE')['clip'] == 20000
           and params('COLLEGE')['game_cap'] == 10000000 and params('COLLEGE')['max_volume'] == 2000000
-          and params('COLLEGE')['stale_only'] is True)
+          and params('COLLEGE')['stale_only'] is True and params('COLLEGE')['max_poll_gap_ms'] == 10000)
     n = params('MODEL')
     check("params: MODEL is nba.json's (10c, 4 contracts, 4 takes 10 s apart, 30 s, 3c, 5-95c, no OT, 2:00)",
           (n['edge'], n['max_count'], n['max_takes'], n['signal_ms'], n['cool_ms'], n['max_spread'], n['min_px'],
