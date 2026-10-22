@@ -72,6 +72,7 @@ TakeParams params_of(const json& j, TakeMode mode) {
   p.cool_ms = j.at("cool_ms").get<std::int64_t>();
   p.max_volume = qty_of(j.at("max_volume"));
   p.stale_only = j.at("stale_only").get<bool>();
+  p.max_poll_gap_ms = j.at("max_poll_gap_ms").get<std::int64_t>();
   p.leader_only = j.at("leader_only").get<bool>();
   p.points_required = j.at("points_required").get<bool>();
   p.set_window_ms = j.at("set_window_ms").get<std::int64_t>();
@@ -90,7 +91,8 @@ bool same_params(const TakeParams& x, const TakeParams& y) {
   return x.mode == y.mode && x.edge == y.edge && x.clip == y.clip && x.max_count == y.max_count &&
          x.fixed_count == y.fixed_count && x.game_cap == y.game_cap && x.inventory == y.inventory && x.max_takes == y.max_takes &&
          x.max_score_age_ms == y.max_score_age_ms && x.signal_ms == y.signal_ms && x.cool_ms == y.cool_ms &&
-         x.max_volume == y.max_volume && x.stale_only == y.stale_only && x.leader_only == y.leader_only &&
+         x.max_volume == y.max_volume && x.stale_only == y.stale_only && x.max_poll_gap_ms == y.max_poll_gap_ms &&
+         x.leader_only == y.leader_only &&
          x.points_required == y.points_required && x.set_window_ms == y.set_window_ms && x.max_spread == y.max_spread &&
          x.min_px == y.min_px && x.max_px == y.max_px && x.trade_ot == y.trade_ot && x.min_t_left_s == y.min_t_left_s &&
          x.fav_lo == y.fav_lo && x.fav_hi == y.fav_hi && x.fav_from_ms == y.fav_from_ms && x.fav_to_ms == y.fav_to_ms;
@@ -138,6 +140,7 @@ Game game_of(const json& j) {
   in.score_why = j.at("score_why").get<std::string>();
   in.fetched_ms = j.at("fetched_ms").get<std::int64_t>();
   in.first_seen_ms = j.at("first_seen_ms").get<std::int64_t>();
+  in.prev_poll_ms = j.at("prev_poll_ms").get<std::int64_t>();
   in.start_ms = j.at("start_ms").get<std::int64_t>();
   in.a_score = j.at("a_score").get<int>();
   in.b_score = j.at("b_score").get<int>();
@@ -160,9 +163,9 @@ Game game_of(const json& j) {
   in.not_tradable = j.at("not_tradable").get<std::string>();
   in.volume = qty_of(j.at("volume"));
   // the engine fills these from GameFair and the score board; every case sets them all
-  for (const char* k : {"a", "b", "state", "src", "score_why", "fetched_ms", "first_seen_ms", "start_ms", "a_score", "b_score",
-                        "t_left_s", "ot", "points", "set_end_ms", "p0", "fair", "fair_why", "espn", "espn_seen_ms", "now_ms",
-                        "last_take_ms", "game_used", "game_takes", "fired", "private_up", "not_tradable", "volume"})
+  for (const char* k : {"a", "b", "state", "src", "score_why", "fetched_ms", "first_seen_ms", "prev_poll_ms", "start_ms", "a_score",
+                        "b_score", "t_left_s", "ot", "points", "set_end_ms", "p0", "fair", "fair_why", "espn", "espn_seen_ms",
+                        "now_ms", "last_take_ms", "game_used", "game_takes", "fired", "private_up", "not_tradable", "volume"})
     CHECK(j.contains(k));
   return g;
 }
@@ -375,6 +378,14 @@ void whys() {
   CHECK(take_decide(g.in, p).pull == "NO_FEE");
   g.in.a.fee_mult = -1;
   CHECK(take_decide(g.in, p).pull == "NO_FEE");
+  // stale_only and when the score changed: no poll before its first sighting, or one too long before
+  g = college_game();
+  g.in.prev_poll_ms = 0;
+  d = take_decide(g.in, p);
+  CHECK(d.pull == "TOUCH_AFTER_SCORE" && d.why == "the score's change is not dated: no poll before its first sighting" && d.dir == 0);
+  g.in.prev_poll_ms = g.in.first_seen_ms - 10001;
+  d = take_decide(g.in, p);
+  CHECK(d.pull == "TOUCH_AFTER_SCORE" && d.why == "the score's change is not dated: 10001 ms from the poll before it (at most 10000 ms)");
 }
 
 // A pull past a route's count carries that route's order (the engine's PULL row); a take, and a
@@ -509,6 +520,7 @@ struct Rig {
   std::vector<json> rows;                                     // the signals rows, as recorded
   std::set<std::string> wanted;
   std::vector<std::string> alerts;
+  std::int64_t gap = 3000;                                    // score(): its poll before the first sighting (0: none)
   explicit Rig(std::string event = EV, std::string ta = TA, std::string tb = TB)
       : ev(std::move(event)), a(std::move(ta)), b(std::move(tb)) {
     view->run = RunState::RUN;
@@ -547,6 +559,7 @@ struct Rig {
       r.state = state;
       r.fetched_ms = fetched;
       r.first_seen_ms = first_seen;
+      r.prev_poll_ms = gap > 0 ? first_seen - gap : 0;
       r.start_ms = T0 - 3600000;
       r.yes_score = is_a ? sa : sb;
       r.opp_score = is_a ? sb : sa;
@@ -949,6 +962,34 @@ void engine_pulls() {
   CHECK(g.places().size() == 1 && g.places()[0]->price == 4400 && g.rows.size() == 2 && g.rows[1]["touch_since_ms"] == T0 + 500);
 }
 
+// C1 turned on mid-game: its want starts the books and the feeds' reading of the game together,
+// so the state the feeds first show has no poll before it. Its first sighting comes after the
+// touches' first look, yet when it changed is not known: PULL TOUCH_AFTER_SCORE, not a take, for
+// as long as that state lasts. The next state, read by a poll 3 s after the one before, is taken
+void engine_dated() {
+  Rig g;
+  g.gap = 0;
+  TakeEngine e("C1", {"KXNCAAWBGAME"}, g.env(), take_params(TakeMode::COLLEGE));
+  e.step(T0);   // the lane on: the books (dated now), no score yet
+  CHECK(g.wanted == std::set<std::string>({TA, TB}) && game_status(e)["pull"] == "NO_SCORE");
+  g.score(T0 + 400, T0 + 400, 0.70);   // the feeds' first round
+  e.step(T0 + 500);
+  CHECK(g.posted.empty() && game_status(e)["pull"] == "TOUCH_AFTER_SCORE" &&
+        game_status(e)["why"] == "the score's change is not dated: no poll before its first sighting");
+  CHECK(g.rows.size() == 1 && g.rows[0]["action"] == "PULL" && g.rows[0]["first_seen_ms"] == T0 + 400 &&
+        g.rows[0]["touch_since_ms"] == T0);
+  for (std::int64_t t = T0 + 3400; t <= T0 + 6100; t += 900) {   // the same state polled again
+    g.score(T0 + 400, t, 0.70);
+    e.step(t + 50);
+  }
+  CHECK(g.posted.empty() && g.rows.size() == 1 && game_status(e)["pull"] == "TOUCH_AFTER_SCORE");
+  g.gap = 3000;
+  g.score(T0 + 6400, T0 + 6400, 0.70, 62, 48);
+  e.step(T0 + 6500);
+  CHECK(g.places().size() == 1 && g.places()[0]->ticker == TA && g.rows.back()["action"] == "TAKE" &&
+        g.rows.back()["first_seen_ms"] == T0 + 6400);
+}
+
 // The inputs the engine builds: GameFair's fair only on the board's score state; its worst case in
 // the game from SysView::worst; Systematic's position and working orders in each market, as gw's
 // inventory counts them; everyone else's book; the in-game volume; the basketball clock;
@@ -1271,6 +1312,7 @@ int main() {
   engine_refused();
   engine_blocked();
   engine_pulls();
+  engine_dated();
   engine_inputs();
   engine_games();
   engine_series();

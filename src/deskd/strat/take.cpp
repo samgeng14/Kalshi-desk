@@ -301,6 +301,12 @@ TakeDecision take_decide(const TakeInput& in, const TakeParams& p) {
         return fail("BAND", px_s + " is outside " + price_str(p.min_px) + "-" + price_str(p.max_px));
       ++stage;
     }
+    // the score's change, between the poll before its first sighting and that sighting
+    const std::int64_t gap = in.first_seen_ms - in.prev_poll_ms;
+    if (p.stale_only && (in.prev_poll_ms <= 0 || gap > p.max_poll_gap_ms))
+      return fail("TOUCH_AFTER_SCORE", "the score's change is not dated: " +
+                                           (in.prev_poll_ms > 0 ? ms(gap) + " from the poll before it (at most " + ms(p.max_poll_gap_ms) + ")"
+                                                                : std::string("no poll before its first sighting")));
     if (p.stale_only && !(r.since > 0 && r.since < in.first_seen_ms))
       return fail("TOUCH_AFTER_SCORE", r.since > 0 ? "the touch is " + ms(r.since - in.first_seen_ms) + " newer than the score"
                                                    : std::string("the touch's age is not known"));
@@ -547,6 +553,7 @@ void TakeEngine::game(const std::string& ev, const kalshi::MarketRow& ma, const 
     in.score_why = r->why;
     in.fetched_ms = r->fetched_ms;
     in.first_seen_ms = r->first_seen_ms;
+    in.prev_poll_ms = r->prev_poll_ms;
     in.start_ms = r->start_ms;
     in.a_score = r->yes_score;
     in.b_score = r->opp_score;

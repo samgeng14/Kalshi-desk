@@ -129,7 +129,7 @@ void feed() {
   f.step(t0);
   CHECK(wbb == 1 && wvb == 1 && f.board()->size() == 2 && told.size() == 1);
   CHECK(sc().src == "NCAA" && sc().state == "in" && sc().per == "Q2" && sc().clock_s == 252 && sc().yes_score == 31 &&
-        sc().opp_score == 34 && sc().first_seen_ms == t0 && sc().fetched_ms == t0 && !sc().yes_home);
+        sc().opp_score == 34 && sc().first_seen_ms == t0 && sc().prev_poll_ms == 0 && sc().fetched_ms == t0 && !sc().yes_home);
   CHECK(f.board()->at(UCONN).yes_home && f.board()->at(UCONN).yes_score == 34);
   // a date without games has no file: no games, not a failure
   CHECK(f.status()["no_games"] == 1 && f.status()["failures"] == 0 && f.status()["error"] == "");
@@ -146,7 +146,7 @@ void feed() {
     sb["games"][0]["game"]["home"]["score"] = "36";
   }
   f.step(t0 + 6000);
-  CHECK(wbb == 3 && sc().first_seen_ms == t0 + 6000 && sc().opp_score == 36 && told.size() == 2);
+  CHECK(wbb == 3 && sc().first_seen_ms == t0 + 6000 && sc().prev_poll_ms == t0 + 3000 && sc().opp_score == 36 && told.size() == 2);
   if (told.size() == 2) CHECK(told[1].home_score == 36 && told[1].first_seen_ms == t0 + 6000 && told[1].prev_poll_ms == t0 + 3000);
   f.step(t0 + 7000);   // paced
   CHECK(wbb == 3);

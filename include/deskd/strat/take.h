@@ -71,7 +71,10 @@
 //   NO_EDGE            the edge under edge (not FAV_PREGAME)
 //   BAND               the team's price outside [min_px, max_px]; FAV_PREGAME's band
 //                      [fav_lo, fav_hi) comes second instead, before the count
-//   TOUCH_AFTER_SCORE  stale_only: the touch was not first seen before the score state was
+//   TOUCH_AFTER_SCORE  stale_only: the score state's change is not dated (no poll before its
+//                      first sighting, or that poll over max_poll_gap_ms before it: a feed that
+//                      had only begun to read the game, which is when C1 is turned on mid-game),
+//                      or the touch was not first seen before the score state was
 //   TRAILER            leader_only: the team does not lead
 //   FIRED              this signal run already took the team
 // The take is the route that passes every check with the largest edge, then the lowest cost a
@@ -120,6 +123,7 @@ struct TakeParams {
   std::int64_t cool_ms = 5000;          // after any take in the game
   Qty max_volume = 0;                   // the game's in-game volume, both markets, under this (0: any)
   bool stale_only = false;              // the touch taken must be older than the score state's first sighting
+  std::int64_t max_poll_gap_ms = 10000; // stale_only: ...and that sighting at most this long after the poll before it
   bool leader_only = false;             // only the team that leads (a tie leads neither)
   bool points_required = true;          // false: the gate's level "set", only within set_window_ms of a set's end
   std::int64_t set_window_ms = 120000;
@@ -131,7 +135,8 @@ struct TakeParams {
   std::int64_t fav_from_ms = 3600000, fav_to_ms = 120000;   // FAV_PREGAME: from start - from to start - to
 };
 // Each lane's rule as its spec set it: COLLEGE C1 (20c net, $2 clips, $10 a game, 20 contracts a
-// market, 5 s scores, 5 s apart, thin games under 20k contracts, a touch older than the score);
+// market, 5 s scores, 5 s apart, thin games under 20k contracts, a touch older than the score,
+// its change dated to within 10 s);
 // MODEL N1 (10c, $2 up to 4 contracts, 10 a market, 4 takes 10 s apart, the state at most 30 s
 // old, spreads of 3c or less, 5-95c, no overtime nor the last 2 minutes); ESPN_FOLLOW and
 // ESPN_FADE X1 (as N1 but 4 a market, ESPN's number 30 s old at most); FAV_PREGAME N2 (90-95c
@@ -157,6 +162,7 @@ struct TakeInput {
   std::string state, src;               // pre, in, post ("": none); ESPN, NCAA
   std::string score_why;                // why there is no score (the sources disagree); "" when there is
   std::int64_t fetched_ms = 0, first_seen_ms = 0, start_ms = 0;   // the last poll, the state's first sighting, the start
+  std::int64_t prev_poll_ms = 0;        // the poll before that sighting (0: none): the state changed between the two
   int a_score = 0, b_score = 0;         // points (volleyball: sets)
   std::optional<double> t_left_s;       // basketball: regulation time left
   bool ot = false;
@@ -214,16 +220,19 @@ Qty clip_count(Money clip, Px px, double fee_mult, Qty max_count, bool whole_onl
 //           series' unless it shadows), and leaves a game the score board calls final.
 //   input   take_decide's, from A's side:
 //           score   the score board's row (Env::scores, ref/scores.h's merge of ESPN and
-//                   NCAA.com): state, source, last poll, the state's first sighting, start,
-//                   scores, why there is none (the sources disagree), the basketball clock
-//                   (bball_t_left), and ESPN's number (the summary's dated by its play's first
-//                   sighting, else the scoreboard's dated by the score state's)
+//                   NCAA.com): state, source, last poll, the state's first sighting and the poll
+//                   before it, start, scores, why there is none (the sources disagree), the
+//                   basketball clock (bball_t_left), and ESPN's number (the summary's dated by
+//                   its play's first sighting, else the scoreboard's dated by the score state's)
 //           fair    GameFair's row (Env::fairs): p0; and p and points only when the row was
 //                   priced on the score state the board shows, since GameFair one step behind
 //                   would price a new score at the old fair: the game waits the step instead
 //           touch   since each touch price was first seen by this engine, at the step that saw
 //                   it; a market's first look dates its touch then, so a touch can only look
-//                   newer than it is (stale_only fails closed)
+//                   newer than it is (stale_only fails closed). The books and the feeds' reading
+//                   of the game start together when the lane first wants its markets (C1 turned
+//                   on mid-game), so the state the feeds first show is not dated either, and
+//                   stale_only waits for the next (max_poll_gap_ms)
 //           sets    volleyball: when the sets total first went up while it watched (none before)
 //           volume  both markets' in-game volume: the listing's volume less its last pregame
 //                   reading; with none read, the whole volume (it can only overstate)
