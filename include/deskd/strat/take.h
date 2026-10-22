@@ -1,7 +1,8 @@
 #pragma once
 // The IOC game lanes' one decision (decisions 13: one take engine for C1, X1, N1 and N2): from a
 // game's two markets, its score and a reference price, whether to take a touch now, which one and
-// how many. take_decide is pure and runs on any thread. tools/college_gate.py (C1),
+// how many. take_decide is pure and runs on any thread; TakeEngine (at the end) runs it for one
+// lane on strat and sends its takes through gw. tools/college_gate.py (C1),
 // tools/x1_backtest.py (X1) and tools/nba_gate.py (N1, N2) carry the same rule in Python, so a
 // gate measures exactly what its lane trades (plan 5(e): "the S2 mistake was testing one order
 // type and trading another"). The hand-worked cases in tests/deskd/fixtures/
@@ -71,14 +72,26 @@
 // The take is the route that passes every check with the largest edge, then the lowest cost a
 // contract, then the first in route order. With none, the pull is the reason of the route that got
 // furthest down its checks (ties: the larger edge, then route order).
+#include <atomic>
 #include <cstdint>
+#include <functional>
+#include <future>
+#include <map>
+#include <memory>
+#include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
+#include <nlohmann/json.hpp>
 #include "deskd/bus/msg.h"
 #include "deskd/bus/units.h"
+#include "deskd/gw/gateway.h"
 #include "deskd/md/kalshi_md.h"
+#include "deskd/ref/espn.h"
+#include "deskd/strat/game_fair.h"
+#include "deskd/strat/markouts.h"
 
 namespace deskd {
 
@@ -171,6 +184,7 @@ struct TakeDecision {
   std::string pull, why;                // pull: the reason's code ("" when taking); why: in words
   std::optional<Money> edge;            // the take's edge, or the pulled route's when it had one
   int dir = -1;                         // the take's team, or the pulled route's (-1: the game's checks)
+  std::optional<TakeOrder> route;       // a pull past a route's count: that route's order (a signal's row)
 };
 TakeDecision take_decide(const TakeInput& in, const TakeParams& p);
 
@@ -181,5 +195,141 @@ const std::vector<std::string>& take_pull_codes();
 // contracts when whole_only, else 0.01-contract steps; at most max_count (0: no cap). 0 when not
 // one step fits. $2 at 48c: 4 contracts ($1.92 and a 7c fee).
 Qty clip_count(Money clip, Px px, double fee_mult, Qty max_count, bool whole_only);
+
+// ---- TakeEngine: one IOC game lane's owner (C1 COLLEGE, X1 ESPN_FOLLOW or ESPN_FADE, N1 MODEL,
+// N2 FAV_PREGAME). Each step:
+//   games   its series' events of two markets, active and dated (by the event ticker, ET) today
+//           or yesterday, a late game running past midnight; A is the first market by ticker. It
+//           wants their books (Env::want) while the lane is on or it shadows (only tradable
+//           series' unless it shadows), and leaves a game the score board calls final.
+//   input   take_decide's, from A's side:
+//           score   the score board's row (Env::scores): state, source, last poll, the state's
+//                   first sighting, start, scores, the basketball clock (bball_t_left), and
+//                   ESPN's number (the summary's dated by its play's first sighting, else the
+//                   scoreboard's dated by the score state's)
+//           fair    GameFair's row (Env::fairs): p0; and p and points only when the row was
+//                   priced on the score state the board shows, since GameFair one step behind
+//                   would price a new score at the old fair: the game waits the step instead
+//           touch   since each touch price was first seen by this engine, at the step that saw
+//                   it; a market's first look dates its touch then, so a touch can only look
+//                   newer than it is (stale_only fails closed)
+//           sets    volleyball: when the sets total first went up while it watched (none before)
+//           volume  both markets' in-game volume: the listing's volume less its last pregame
+//                   reading; with none read, the whole volume (it can only overstate)
+//           lane    its positions, its worst case in the game (SysView::worst over both markets,
+//                   gw's event cap measure), its takes there and the run's fired teams
+//           books   everyone else's: Systematic's working orders taken out
+// A take goes to gw as one IOC PlaceIntent (cid S<lane>-<ms>-<n>, owner SYS, the touch as its
+// price, ttl 0, reduce_only and override_guard off, touch and fair for the order row) when the
+// lane is on, Systematic runs, the series is tradable, the private feed is up, neither market is
+// Manual's (view->held) and no markout hold applies (mo_after of its fills marked and the mean at
+// or under -mo_floor). The game then waits for gw's answer (answer_ms at most) and, after a
+// refusal, backs off backoff_ms.
+//
+// A signal run (take_decide's fired): each new score state (the board's first sighting) starts a
+// game's run, and a decision that finds no edge run_quiet_ms after the last that found one ends
+// it; a game check that hides the edge (the cool-down, an old score) neither ends nor extends it.
+// In a run each team is taken, or recorded, once.
+//
+// Signals go to the store's "signals" table, a row per team and signal (store/store.h):
+//   TAKE     posted (sent again as REFUSED with gw's code if gw refuses it)
+//   SHADOW   TakeOptions::shadow: what it would take while it may not post (the lane off,
+//            Systematic not running, the series not tradable, the private feed down, a market
+//            Manual's, the markout hold); it counts as taken in the run and the game (fired,
+//            cool-down, takes)
+//   PULL     a team with the edge that a later check pulled: BAND, TOUCH_AFTER_SCORE, TRAILER
+// and each row is sent again with mo10, mo60 and mo300: the gross markout a contract at its
+// market's mid (Env::mid_at) 10, 60 and 300 s on, + in its favour (null with no mid).
+// The markouts of its own fills at TakeOptions::mo_h go to gw as LaneMarkout (C1: "300s", its
+// retire rule's), from the rows the runtime's markouts step hands to markout().
+//
+// Threading: step() and markout() on strat; status() from any thread.
+
+// TakeEngine's own rules, outside take_decide
+struct TakeOptions {
+  bool shadow = false;                  // record what it would take while it may not post
+  std::int64_t run_quiet_ms = 10000;    // a signal run ends this long after its edge was last seen
+  std::int64_t backoff_ms = 10000;      // a game posts nothing this long after gw refuses its take
+  std::int64_t answer_ms = 30000;       // gw's answer awaited at most this long
+  std::string mo_h;                     // its fills' markouts at this horizon go to gw ("": none)
+  std::int64_t mo_after = 0;            // the markout hold: once this many fills are marked (0: none)
+  Money mo_floor = 0;                   // ...a mean at or under -mo_floor a contract holds new takes
+};
+
+class TakeEngine {
+ public:
+  struct Env {
+    std::function<std::shared_ptr<const Gateway::SysView>()> view;
+    std::function<std::shared_ptr<const rest::Snapshot>()> snapshot;
+    std::function<std::optional<MdBook>(const std::string&)> book;
+    std::function<std::shared_ptr<const GameBoard>()> fairs;        // GameFair::board()
+    std::function<std::shared_ptr<const EspnBoard>()> scores;       // the score board (ESPN's)
+    // series -> "" when the lane may trade it, else why not (a series missing: no gate for it)
+    std::function<std::map<std::string, std::string>()> tradable;
+    std::function<bool()> private_up;
+    std::function<bool(GwMsg)> post;                                // gw's inbox
+    std::function<void(std::set<std::string>)> want;                // the markets whose books it needs
+    std::function<std::pair<std::int64_t, Money>()> markout;        // its fills marked, and their mean (the hold)
+    std::function<std::optional<Px>(const std::string&, std::int64_t)> mid_at;   // Markouts::mid_at
+    std::function<bool(const std::string& table, std::string row)> record;       // the store
+    std::function<void(const std::string& lvl, const std::string& msg)> alert;
+  };
+  TakeEngine(std::string lane, std::vector<std::string> series, Env env, TakeParams params, TakeOptions options = {});
+  void step(std::int64_t now_ms);
+  void markout(const MarkoutRow& row);    // each markout row, once (the runtime's markouts step)
+  nlohmann::json status() const;          // per game: the last decision; the counts of signals and refusals
+
+ private:
+  struct Game {
+    std::int64_t run_state = -1, edge_ms = 0;   // the run's score state (its first sighting); its edge last seen
+    bool fired[2] = {false, false}, noted[2] = {false, false};   // taken (or shadowed), recorded as PULL
+    std::int64_t last_take_ms = 0;
+    int takes = 0;
+    std::future<OrderReply> answer;       // gw's answer to the last take
+    std::string answer_id;                // that take's signal row
+    std::int64_t posted_ms = 0, backoff_until = 0;
+    int sets = -1;                        // volleyball: the sets total last seen (-1: none)
+    std::int64_t set_end_ms = 0;
+    std::map<std::string, Qty> pre_volume;   // each market's volume at its last pregame reading
+    std::int64_t seen_ms = 0;             // the last step that listed it
+  };
+  struct Touch {
+    Px bid = -1, ask = -1;
+    std::int64_t bid_ms = 0, ask_ms = 0;
+  };
+  struct Signal {                         // a row whose markouts (or gw's answer) are still to come
+    nlohmann::json row;
+    Side side = Side::BUY;
+    Px px = 0;
+    std::int64_t ts_ms = 0;
+    int marked = 0;                       // horizons done: 10 s, 60 s, 300 s
+    bool open = false;                    // gw's answer to come
+  };
+  void game(const std::string& ev, const kalshi::MarketRow& ma, const kalshi::MarketRow& mb, const Gateway::SysView& v,
+            const GameBoard* fairs, const EspnBoard* scores, const std::string& not_tradable, const std::string& hold,
+            std::int64_t now);
+  void answers(std::int64_t now);
+  void marks(std::int64_t now);
+  std::string signal(const std::string& ev, const TakeOrder& o, const TakeInput& in, const std::string& score,
+                     const char* action, bool shadow, const std::string& why, const std::string& cid);
+  void record(const nlohmann::json& row);
+  void set_last(const std::string& ev, nlohmann::json j);
+  std::string new_cid(std::int64_t now);
+  std::string lane_;
+  std::vector<std::string> series_;
+  Env env_;
+  TakeParams p_;
+  TakeOptions o_;
+  std::map<std::string, Game> games_;     // by event ticker
+  std::map<std::string, Touch> touch_;    // by market
+  std::map<std::string, Signal> signals_; // by row id
+  std::uint64_t seq_ = 0;
+  bool holding_ = false;                  // the markout hold, as of the last step
+  // status(): the per-game decisions under status_mu_, the counts atomic
+  mutable std::mutex status_mu_;
+  std::map<std::string, nlohmann::json> last_;
+  std::string hold_;
+  std::atomic<std::int64_t> takes_{0}, shadows_{0}, pulls_{0}, refusals_{0}, rows_lost_{0}, markouts_{0};
+};
 
 }  // namespace deskd
