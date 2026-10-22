@@ -95,6 +95,22 @@ std::string ordinal(int n) {
   const char* s = (m >= 11 && m <= 13) ? "th" : n % 10 == 1 ? "st" : n % 10 == 2 ? "nd" : n % 10 == 3 ? "rd" : "th";
   return std::to_string(n) + s;
 }
+// One point of ESPN's win probability ({homeWinPercentage, tiePercentage}), in range or nothing.
+std::optional<EspnWp> read_wp(const json& point) {
+  const auto& value = jget(point, "homeWinPercentage");
+  const auto& tie = jget(point, "tiePercentage");
+  if (!value.is_number()) return std::nullopt;
+  const double h = value.get<double>(), t = tie.is_number() ? tie.get<double>() : 0;
+  if (!std::isfinite(h) || h < 0 || h > 1 || !std::isfinite(t) || t < 0 || h + t > 1 + 1e-9) return std::nullopt;
+  return EspnWp{h, t, 0, "", 0};
+}
+// The YES team's chance: the away team's is the rest after home and a tie.
+Px yes_px(const EspnWp& w, bool yes_home) {
+  const double p = yes_home ? w.home : std::max(0.0, 1.0 - w.home - w.tie);
+  return static_cast<Px>(std::llround(std::min(1.0, std::max(0.0, p)) * kOneDollar));
+}
+constexpr std::int64_t kLateTipMs = 3 * 3600000LL;   // a 'pre' game this far past its start is not about to tip
+constexpr std::size_t kLagKept = 200;                 // the latest plays kept for status's lag
 }  // namespace
 
 double team_name_overlap(const std::string& a, const std::string& b) {
@@ -127,6 +143,9 @@ const std::vector<EspnLeague>& espn_leagues() {
       {"KXNCAAWBGAME", "basketball", "womens-college-basketball", {"50"}, 4, "Q"},
       {"KXMLBGAME", "baseball", "mlb", {}, 9, ""},
       {"KXNHLGAME", "hockey", "nhl", {}, 3, "P"},
+      // TO CONFIRM: ESPN's path for it (the recorder reads the same, recorder/config.py), and
+      // whether its linescores carry the current set's points live; the score is sets won
+      {"KXNCAAWVMATCH", "volleyball", "womens-college-volleyball", {}, 5, "S"},
   };
   return L;
 }
@@ -182,7 +201,13 @@ std::vector<EspnGame> parse_scoreboard(const json& sb, const std::string& league
     g.detail = jstr(type, "shortDetail");
     g.period = jint(status, "period", 0);
     g.clock = jstr(status, "displayClock");
-    g.last_play_id = jstr(jget(jget(c, "situation"), "lastPlay"), "id");
+    const auto& situation = jget(c, "situation");
+    const auto& last_play = jget(situation, "lastPlay");
+    g.last_play_id = jstr(last_play, "id");
+    // TO CONFIRM on a capture: the last play's probability, and possession as the team's id
+    g.sb_wp = read_wp(jget(last_play, "probability"));
+    if (g.sb_wp) g.sb_wp->play = g.last_play_id;
+    const std::string ball = jstr(situation, "possession");
     const auto& teams = jget(c, "competitors");
     if (!teams.is_array()) continue;
     for (const auto& t : teams) {
@@ -191,12 +216,21 @@ std::vector<EspnGame> parse_scoreboard(const json& sb, const std::string& league
       (home ? g.home_abbr : g.away_abbr) = jstr(team, "abbreviation");
       (home ? g.home_name : g.away_name) = jstr(team, "displayName");
       (home ? g.home_score : g.away_score) = jint(t, "score", 0);
+      const auto& lines = jget(t, "linescores");
+      if (lines.is_array())
+        for (const auto& l : lines) (home ? g.home_lines : g.away_lines).push_back(jint(l, "value", -1));
+      if (!ball.empty() && (ball == jstr(t, "id") || ball == jstr(team, "id"))) g.possession = home ? 1 : -1;
     }
     if (g.home_abbr.empty() || g.away_abbr.empty() || (g.state != "pre" && g.state != "in" && g.state != "post")) continue;
-    g.fetched_ms = now;
+    g.fetched_ms = g.first_seen_ms = now;
     out.push_back(std::move(g));
   }
   return out;
+}
+
+bool same_score_state(const EspnGame& a, const EspnGame& b) {
+  return a.state == b.state && a.period == b.period && a.home_score == b.home_score && a.away_score == b.away_score &&
+         a.home_lines == b.home_lines && a.away_lines == b.away_lines;
 }
 
 std::optional<EspnWp> parse_summary_wp(const json& j, const EspnGame& g) {
@@ -232,12 +266,11 @@ std::optional<EspnWp> parse_summary_wp(const json& j, const EspnGame& g) {
   // A successful fetch cannot make an older chart point current: the chart's last point must
   // be the latest play, identified.
   if (play.empty() || latest.empty() || play != latest) return std::nullopt;
-  const auto& value = jget(point, "homeWinPercentage");
-  const auto& tie = jget(point, "tiePercentage");
-  if (!value.is_number()) return std::nullopt;
-  const double h = value.get<double>(), t = tie.is_number() ? tie.get<double>() : 0;
-  if (!std::isfinite(h) || h < 0 || h > 1 || !std::isfinite(t) || t < 0 || h + t > 1 + 1e-9) return std::nullopt;
-  return EspnWp{h, t, play_ms};
+  auto w = read_wp(point);
+  if (!w) return std::nullopt;
+  w->play_ms = play_ms;
+  w->play = play;
+  return w;
 }
 
 std::optional<EspnMatch> match_game(const KalshiGame& k, const std::vector<EspnGame>& games) {
@@ -279,13 +312,20 @@ std::optional<EspnMatch> match_game(const KalshiGame& k, const std::vector<EspnG
 
 EspnRef espn_ref(const EspnLeague& lg, const EspnGame& g, bool yes_home, const std::optional<EspnWp>& wp) {
   EspnRef r;
+  r.src = g.src;
   r.fetched_ms = g.fetched_ms;
+  r.first_seen_ms = g.first_seen_ms;
   r.score = std::to_string(g.away_score) + "-" + std::to_string(g.home_score);
   r.state = g.state;
   r.start_ms = g.start_ms;
   r.period = g.period;
+  r.yes_home = yes_home;
   r.yes_score = yes_home ? g.home_score : g.away_score;
   r.opp_score = yes_home ? g.away_score : g.home_score;
+  r.yes_lines = yes_home ? g.home_lines : g.away_lines;
+  r.opp_lines = yes_home ? g.away_lines : g.home_lines;
+  r.possession = yes_home ? g.possession : -g.possession;
+  if (g.sb_wp) r.sb_wp = yes_px(*g.sb_wp, yes_home);
   {   // "7:42", "0:35.4" or "12" (seconds): the period's time left
     const auto colon = g.clock.find(':');
     try {
@@ -310,9 +350,9 @@ EspnRef espn_ref(const EspnLeague& lg, const EspnGame& g, bool yes_home, const s
     r.clock = g.clock;
   }
   if (wp) {
-    const double p = yes_home ? wp->home : std::max(0.0, 1.0 - wp->home - wp->tie);
-    r.espn = static_cast<Px>(std::llround(std::min(1.0, std::max(0.0, p)) * kOneDollar));
+    r.espn = yes_px(*wp, yes_home);
     r.espn_ts_ms = wp->play_ms;
+    r.wp_seen_ms = wp->seen_ms;
   }
   return r;
 }
@@ -325,6 +365,14 @@ EspnFeed::EspnFeed(net::Endpoint ep, MarketsFn markets, Options options)
 }
 EspnFeed::~EspnFeed() = default;
 
+void EspnFeed::set_on_change(ScoreChangeFn fn) { on_change_ = std::move(fn); }
+
+// On, or about to start: from hot_pre_ms before the start until the tip, a late one included.
+bool EspnFeed::hot(const EspnGame& g, std::int64_t now) const {
+  if (g.state == "in") return true;
+  return g.state == "pre" && g.start_ms > 0 && now >= g.start_ms - options_.hot_pre_ms && now <= g.start_ms + kLateTipMs;
+}
+
 std::shared_ptr<const EspnBoard> EspnFeed::board() const {
   std::lock_guard<std::mutex> lk(m_);
   return board_;
@@ -335,8 +383,17 @@ json EspnFeed::status() const {
   json shown = json::object();
   for (const auto& [tk, r] : *board_)
     shown[tk] = {{"per", r.per}, {"clock", r.clock}, {"score", r.score},
-                 {"espn", r.espn ? json(price_str(*r.espn)) : json(nullptr)}, {"fetched_ms", r.fetched_ms}};
-  return {{"requests", requests_}, {"failures", failures_}, {"error", last_error_}, {"markets", shown}};
+                 {"espn", r.espn ? json(price_str(*r.espn)) : json(nullptr)}, {"fetched_ms", r.fetched_ms},
+                 {"first_seen_ms", r.first_seen_ms}, {"wp_seen_ms", r.wp_seen_ms}};
+  // how long after a play's own wall clock its probability first reached us (ESPN's lag plus ours)
+  json lag = nullptr;
+  if (!lag_.empty()) {
+    auto v = lag_;
+    std::nth_element(v.begin(), v.begin() + static_cast<std::ptrdiff_t>(v.size() / 2), v.end());
+    lag = {{"p50_ms", v[v.size() / 2]}, {"plays", v.size()}};
+  }
+  return {{"requests", requests_}, {"failures", failures_}, {"error", last_error_}, {"markets", shown},
+          {"fast_series", options_.fast_series}, {"hot", hot_}, {"lag", lag}};
 }
 
 bool EspnFeed::get(const std::string& target, json* body, std::string* why, Worker* self) {
@@ -387,13 +444,25 @@ void EspnFeed::step(std::int64_t now, Worker* self) {
     if (k.ticker_a.empty() || k.ticker_a == m.ticker) { k.ticker_a = m.ticker; k.code_a = code; k.name_a = m.yes_sub_title; }
     else if (k.ticker_b.empty() || k.ticker_b == m.ticker) { k.ticker_b = m.ticker; k.code_b = code; k.name_b = m.yes_sub_title; }
   }
-  // Scoreboards, for each league and event date within a day and a half of now.
+  // The scoreboards read hot: a fast series' league-date while one of its matched games is on or
+  // about to start, as the last scoreboard said.
+  std::set<std::string> hot_keys;
+  for (const auto& [ev, m] : matched_) {
+    const auto e = events.find(ev);
+    const auto g = games_.find(m.id);
+    const auto from = from_.find(m.id);
+    if (e != events.end() && g != games_.end() && from != from_.end() && options_.fast_series.count(e->second.series) &&
+        hot(g->second, now))
+      hot_keys.insert(from->second);
+  }
+  // Scoreboards, for each league and event date within a day and a half of now. A game keeps its
+  // first sighting while its state is the same.
   std::set<std::pair<const EspnLeague*, std::string>> want;
   for (const auto& [ev, k] : events)
     if (!k.date.empty() && std::llabs(day_ms(k.date) - now) <= 36 * 3600000LL) want.insert({league_of[ev], k.date});
   for (const auto& [lg, date] : want) {
     const auto key = lg->league + "|" + date;
-    if (now - fetched_[key] < options_.scoreboard_ms) continue;
+    if (now - fetched_[key] < (hot_keys.count(key) ? options_.hot_scoreboard_ms : options_.scoreboard_ms)) continue;
     fetched_[key] = now;
     const auto ymd = date.substr(0, 4) + date.substr(5, 2) + date.substr(8, 2);
     for (const auto& grp : lg->groups.empty() ? std::vector<std::string>{""} : lg->groups) {
@@ -402,26 +471,45 @@ void EspnFeed::step(std::int64_t now, Worker* self) {
       if (!get("/apis/site/v2/sports/" + lg->sport + "/" + lg->league + "/scoreboard?limit=300&dates=" + ymd +
                    (grp.empty() ? "" : "&groups=" + grp), &body, &why, self))
         continue;
-      for (auto& g : parse_scoreboard(body, lg->league, now)) games_[g.id] = std::move(g);
+      ++parsed_[lg->league];
+      for (auto& g : parse_scoreboard(body, lg->league, now)) {
+        const auto old = games_.find(g.id);
+        if (old != games_.end()) {
+          const bool same = same_score_state(old->second, g);
+          g.first_seen_ms = same ? old->second.first_seen_ms : now;
+          g.prev_poll_ms = same ? old->second.prev_poll_ms : old->second.fetched_ms;
+        }
+        from_[g.id] = key;
+        games_[g.id] = std::move(g);
+      }
     }
   }
-  // Match each event once, then keep the match.
+  // Match each event once, then keep the match; one that failed waits for its league's next
+  // scoreboard.
   for (const auto& [ev, k] : events) {
     if (matched_.count(ev) || k.ticker_b.empty()) continue;
+    const auto news = parsed_[league_of[ev]->league];
+    const auto tried = match_tried_.find(ev);
+    if (tried != match_tried_.end() && tried->second == news) continue;
+    match_tried_[ev] = news;
     std::vector<EspnGame> candidates;
     for (const auto& [id, g] : games_) if (g.league == league_of[ev]->league) candidates.push_back(g);
     if (auto m = match_game(k, candidates)) {
       DLOG_INFO("espn: %s is %s (%s at %s)", ev.c_str(), m->id.c_str(), games_[m->id].away_abbr.c_str(),
                 games_[m->id].home_abbr.c_str());
       matched_[ev] = *m;
+      match_tried_.erase(ev);
     }
   }
-  // Win probability for games in progress.
+  // Win probability for games in progress, each play's first sighting kept through a miss.
+  std::vector<std::int64_t> lags;
   for (const auto& [ev, m] : matched_) {
-    if (!events.count(ev)) continue;
+    const auto e = events.find(ev);
+    if (e == events.end()) continue;
     auto it = games_.find(m.id);
-    if (it == games_.end() || it->second.state != "in") { wp_.erase(m.id); continue; }
-    if (now - wp_tried_[m.id] < options_.summary_ms) continue;
+    if (it == games_.end() || it->second.state != "in") { wp_.erase(m.id); wp_play_.erase(m.id); continue; }
+    const int every = options_.fast_series.count(e->second.series) ? options_.hot_summary_ms : options_.summary_ms;
+    if (now - wp_tried_[m.id] < every) continue;
     wp_tried_[m.id] = now;
     const auto* lg = league_of[ev];
     json body;
@@ -430,31 +518,55 @@ void EspnFeed::step(std::int64_t now, Worker* self) {
       wp_.erase(m.id);
       continue;
     }
-    wp_[m.id] = parse_summary_wp(body, it->second);
+    auto wp = parse_summary_wp(body, it->second);
+    if (wp) {
+      auto& seen = wp_play_[m.id];
+      if (seen.play != wp->play) {
+        seen = *wp;
+        seen.seen_ms = now;
+        if (wp->play_ms > 0) lags.push_back(now - wp->play_ms);
+      }
+      wp->seen_ms = seen.seen_ms;
+    }
+    wp_[m.id] = wp;
   }
-  // The board: only from a scoreboard younger than keep_ms.
+  // The board: only from a scoreboard younger than keep_ms. Each new state of a watched game is
+  // told once.
   auto board = std::make_shared<EspnBoard>();
+  std::vector<const EspnGame*> changed;
   for (const auto& [ev, m] : matched_) {
     const auto e = events.find(ev);
     const auto g = games_.find(m.id);
-    if (e == events.end() || g == games_.end() || now - g->second.fetched_ms > options_.keep_ms) continue;
+    if (e == events.end() || g == games_.end()) continue;
+    if (on_change_) {
+      auto& told = reported_[m.id];
+      if (told != g->second.first_seen_ms) { told = g->second.first_seen_ms; changed.push_back(&g->second); }
+    }
+    if (now - g->second.fetched_ms > options_.keep_ms) continue;
     const auto w = wp_.find(m.id);
     const std::optional<EspnWp> wp = w == wp_.end() ? std::nullopt : w->second;
     const auto* lg = league_of[ev];
     (*board)[e->second.ticker_a] = espn_ref(*lg, g->second, m.a_home, wp);
     (*board)[e->second.ticker_b] = espn_ref(*lg, g->second, !m.a_home, wp);
   }
-  std::lock_guard<std::mutex> lk(m_);
-  board_ = std::move(board);
+  {
+    std::lock_guard<std::mutex> lk(m_);
+    board_ = std::move(board);
+    hot_ = std::move(hot_keys);
+    lag_.insert(lag_.end(), lags.begin(), lags.end());
+    if (lag_.size() > kLagKept) lag_.erase(lag_.begin(), lag_.end() - static_cast<std::ptrdiff_t>(kLagKept));
+  }
+  for (const auto* g : changed) on_change_(*g);
 }
 
 void EspnFeed::run(Worker& self) {
   while (!self.stopping()) {
     self.beat();
+    const auto due = mono_ms() + options_.round_ms;   // a round every round_ms, from its start
     step(now_ms(), &self);
-    for (int i = 0; i < 50 && !self.stopping(); ++i) {   // a round every 5 s
+    for (auto left = due - mono_ms(); left > 0 && !self.stopping(); left = due - mono_ms()) {
       self.beat();
-      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      std::this_thread::sleep_for(std::chrono::milliseconds(std::min<std::int64_t>(left, 100)));
     }
   }
 }

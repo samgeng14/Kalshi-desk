@@ -19,7 +19,8 @@ section 8 asks only for sections 2 and 3.
 Checked against commit 62ee42b on 2026-10-21 by reading the code and the test bodies; nothing was
 built or run for this table. 85 rules: 45 tested, 20 partly, 10 MISSING, 10 n/a here. The same day
 tests were added for S2-05, S2-10, S2-25, S2-31, S3-11, S3-33 and S3-36: now 50 tested, 17 partly,
-8 MISSING, 10 n/a here.
+8 MISSING, 10 n/a here. On 2026-10-22 S2-36 went from MISSING to partly (a fast series' scores every
+3 s with first-seen times): 50 tested, 18 partly, 7 MISSING, 10 n/a here.
 
 Still MISSING, and why (the operator decides what must close before LIVE):
 - S2-06 `cancel_epoch`, S2-09 the intents journal, S3-28 Manual order groups: not built. gw drains
@@ -30,8 +31,6 @@ Still MISSING, and why (the operator decides what must close before LIVE):
 - S3-29 a derived `contracts_limit`: fixed per lane (50/50/75) until lanes come from a file.
 - S2-02 mutexes outside queues: kept where they guard short copies (no I/O under them); TSan is
   the check (the 4-hour soak).
-- S2-36 cadence: rest reads every 12 s as planned; ESPN is read every 20-30 s, not 3-5 s (the
-  recorder polls scores at 3-5 s for research; deskd shows them, it does not trade on them).
 
 ### Section 2: architecture
 
@@ -72,7 +71,7 @@ Still MISSING, and why (the operator decides what must close before LIVE):
 | S2-33 | net/: a TLS connection is replaced after use or 20 s idle. | `net/pool.cpp` (`PoolConfig::idle_replace_ms` = 20000, `lead_ms`) | `test_net.cpp:test_pool` (deskd-net) | partly: retirement is exercised at 300 ms; the 20 s default is not asserted |
 | S2-34 | A body cut off mid-way is UNKNOWN, never "failed" (responses go through a tested parser). | `net/http.cpp:ResponseParser` (deskd's own strict parser, not llhttp); `gw/kalshi_wire.cpp:classify_write` | `test_http.cpp:test_cuts`, `every_split` (deskd-http); `test_net.cpp:test_faults_over_tls` (deskd-net); `test_sender.cpp:writes_and_faults` (deskd-sender) | tested |
 | S2-35 | Builds use `nice -n 15`, `-j 4` at most, never `build/`. | operator practice | none | n/a here: operator |
-| S2-36 | rest reconciles and reads balances every 10-15 s; poll reads scores every 3-5 s with first-seen times. | `rest/state.h` (`poll_ms` = 12000); `ref/espn.h` (`scoreboard_ms` = 20000, `summary_ms` = 30000) | `test_espn.cpp:feed` asserts the 20-30 s pacing (deskd-espn) | MISSING: no test pins the REST cadence, and deskd polls scores every 20-30 s, not 3-5 s (the recorder's 3-5 s poll is section 7's) |
+| S2-36 | rest reconciles and reads balances every 10-15 s; poll reads scores every 3-5 s with first-seen times. | `rest/state.h` (`poll_ms` = 12000); `ref/espn.h` (`scoreboard_ms` = 20000, `summary_ms` = 30000; for `Options::fast_series`, `hot_scoreboard_ms` = 3000 and `hot_summary_ms` = 10000 while a game is on or within 15 min of its start; `EspnGame::first_seen_ms`, `same_score_state`) | `test_espn.cpp:fast` (a fast series' game read every 3 s, its summary every 10 s, another league's at 20 and 30 s, 20 s again after the final, hot from 15 min before the tip; a state's first sighting kept until its state, period, score or linescore changes, never for the clock; a play's kept until a new play), `feed` (the 20-30 s pacing without a fast series) (deskd-espn) | partly: tested for a fast series, which nothing sets until a lane's engine is wired (C1, the NBA lanes), so deskd still reads scores every 20-30 s; no test pins the REST cadence |
 
 ### Section 3: order handling
 

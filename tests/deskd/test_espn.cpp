@@ -1,8 +1,10 @@
 // ESPN for Kalshi's game markets (ref/espn.h): parsing, the team match, the win-probability
-// rule, the contract's game fields, and the feed against a local stand-in for ESPN.
+// rule, the contract's game fields, and the feed against a local stand-in for ESPN: its pacing,
+// the fast series' hot cadence, and each state's first-seen time.
 #include <httplib.h>
 #include <signal.h>
 #include <atomic>
+#include <mutex>
 #include <thread>
 #include "check.h"
 #include "deskd/app/log.h"
@@ -31,6 +33,10 @@ json summary(const std::string& id, int period, const std::string& clock, int aw
 }
 kalshi::MarketRow market(const std::string& ticker, const std::string& event, const std::string& name) {
   kalshi::MarketRow m; m.ticker = ticker; m.event_ticker = event; m.yes_sub_title = name; m.status = "active"; return m;
+}
+json lines(json t, const std::vector<int>& points) {
+  for (int p : points) t["linescores"].push_back({{"value", static_cast<double>(p)}});   // ESPN writes 18.0
+  return t;
 }
 
 void parsing() {
@@ -94,6 +100,63 @@ void parsing() {
   const auto* ncaam = espn_league_for("KXNCAAMBGAME-26NOV05DUKEUNC-DUKE");
   auto half = g; half.period = 2;
   CHECK(espn_ref(*ncaam, half, true, std::nullopt).per == "H2");
+  // a parse sees everything for the first time; nothing given is nothing read
+  CHECK(g.src == "ESPN" && g.first_seen_ms == now && g.prev_poll_ms == 0);
+  CHECK(g.home_lines.empty() && g.possession == 0 && !g.sb_wp);
+  CHECK(ref.src == "ESPN" && ref.first_seen_ms == now && ref.wp_seen_ms == 0 && !ref.yes_home && !ref.sb_wp);
+
+  // linescores, who has the ball (a team's id) and the scoreboard's own probability, TO CONFIRM
+  // on a capture; the market's side of each
+  auto away = lines(team("away", "LAL", "Los Angeles Lakers", 70), {20, 25, 25});
+  auto home_team = lines(team("home", "BOS", "Boston Celtics", 74), {22, 30, 22});
+  away["id"] = "13";
+  home_team["team"]["id"] = "2";
+  json ev = event("404", "2026-10-10T23:30Z", "in", 3, "4:12", away, home_team, "p9");
+  ev["competitions"][0]["situation"]["possession"] = "2";
+  ev["competitions"][0]["situation"]["lastPlay"]["probability"] = {{"homeWinPercentage", 0.64}, {"tiePercentage", 0.0}};
+  auto one = [&] { auto v = parse_scoreboard(json{{"events", {ev}}}, "nba", now); return v.size() == 1 ? v[0] : EspnGame{}; };
+  const auto x = one();
+  CHECK(x.home_lines == std::vector<int>({22, 30, 22}) && x.away_lines == std::vector<int>({20, 25, 25}));
+  CHECK(x.possession == 1 && x.sb_wp && x.sb_wp->home == 0.64 && x.sb_wp->play == "p9");
+  const auto yes_away = espn_ref(*nba, x, false, std::nullopt);
+  CHECK(!yes_away.yes_home && yes_away.yes_lines == std::vector<int>({20, 25, 25}) &&
+        yes_away.opp_lines == std::vector<int>({22, 30, 22}) && yes_away.possession == -1 && yes_away.sb_wp == Px{3600});
+  const auto yes_home = espn_ref(*nba, x, true, std::nullopt);
+  CHECK(yes_home.yes_home && yes_home.yes_lines == std::vector<int>({22, 30, 22}) && yes_home.possession == 1 &&
+        yes_home.sb_wp == Px{6400} && !yes_home.espn);
+  ev["competitions"][0]["situation"]["possession"] = "13";   // the competitor's own id
+  CHECK(one().possession == -1);
+  ev["competitions"][0]["situation"]["possession"] = "99";   // neither team
+  CHECK(one().possession == 0);
+  ev["competitions"][0]["situation"]["lastPlay"]["probability"]["homeWinPercentage"] = 1.2;
+  CHECK(!one().sb_wp);
+  // the summary's probability carries its play, for the feed's first sighting
+  const auto w = parse_summary_wp(summary("401", 3, "4:12", 70, 74, 0.71, "p9", "2026-10-10T23:58:01Z"), g);
+  CHECK(w && w->play == "p9" && w->seen_ms == 0);
+  auto seen = *w; seen.seen_ms = now + 1;
+  CHECK(espn_ref(*nba, g, true, seen).wp_seen_ms == now + 1);
+  // a state is state, period, scores and linescores; the clock alone is no change
+  auto a = x; a.clock = "3:58"; a.fetched_ms = now + 3000;
+  CHECK(same_score_state(x, a));
+  auto b = x; b.home_lines.back() = 23;
+  auto c = x; c.home_score = 76;
+  auto d = x; d.period = 4;
+  auto e = x; e.state = "post";
+  CHECK(!same_score_state(x, b) && !same_score_state(x, c) && !same_score_state(x, d) && !same_score_state(x, e));
+
+  // volleyball (the path TO CONFIRM): sets won as the score, each set's points as linescores
+  const auto* wvb = espn_league_for("KXNCAAWVMATCH-26OCT10UCLAUSC-UCLA");
+  CHECK(wvb && wvb->sport == "volleyball" && wvb->league == "womens-college-volleyball" && wvb->periods == 5);
+  const auto vb = parse_scoreboard(
+      json{{"events", {event("701", "2026-10-10T23:00Z", "in", 3, "", lines(team("away", "UCLA", "UCLA Bruins", 2), {25, 22, 10}),
+                             lines(team("home", "USC", "USC Trojans", 1), {20, 25, 8}))}}},
+      wvb->league, now);
+  CHECK(vb.size() == 1);
+  if (vb.size() == 1) {
+    const auto r = espn_ref(*wvb, vb[0], false, std::nullopt);
+    CHECK(r.per == "S3" && r.score == "2-1" && r.yes_score == 2 && r.opp_score == 1);
+    CHECK(r.yes_lines == std::vector<int>({25, 22, 10}) && r.opp_lines == std::vector<int>({20, 25, 8}));
+  }
 }
 
 void matching() {
@@ -164,11 +227,17 @@ void feed() {
     const auto& bos = b->at("KXNBAGAME-26OCT10LALBOS-BOS");
     CHECK(lal.per == "Q3" && lal.score == "70-74" && lal.espn == Px{2900} && bos.espn == Px{7100});
     CHECK(lal.espn_ts_ms == 1791676681000LL);
+    CHECK(lal.first_seen_ms == now && lal.fetched_ms == now && lal.wp_seen_ms == now);
   }
   f.step(now + 5000);   // paced: nothing fetched again
   CHECK(boards == 1 && sums == 1);
   f.step(now + 31000);
   CHECK(boards == 2 && sums == 2);
+  {   // no fast series: nothing is read hot; the same state and play keep their first sighting
+    const auto lal = f.board()->at("KXNBAGAME-26OCT10LALBOS-LAL");
+    CHECK(lal.first_seen_ms == now && lal.fetched_ms == now + 31000 && lal.wp_seen_ms == now);
+    CHECK(f.status()["hot"].empty() && f.status()["fast_series"].empty());
+  }
   // ESPN goes away: what was shown stays two minutes, then nothing
   down = true;
   f.step(now + 52000);
@@ -184,10 +253,133 @@ void feed() {
   srv.stop();
   th.join();
 }
+
+// A fast series is read hot while its game is on or about to start: the scoreboard every 3 s and
+// summaries every 10 s, while another league keeps 20 and 30 s. Each state's first sighting, and
+// each play's, is kept on our own clock.
+void fast() {
+  const std::int64_t t0 = 1791676700000LL;   // 2026-10-10T23:58:20Z
+  std::mutex mu;   // the game as ESPN tells it now
+  std::string clock = "4:12", state = "in", play = "p9", wallclock = "2026-10-10T23:57:40Z";   // p9: 40 s before t0
+  int bos = 74;
+  std::vector<int> bos_lines = {22, 30, 22};
+  std::atomic<int> nba_boards{0}, nfl_boards{0}, nba_sums{0}, nfl_sums{0};
+  httplib::Server srv;
+  srv.Get("/apis/site/v2/sports/basketball/nba/scoreboard", [&](const httplib::Request&, httplib::Response& res) {
+    ++nba_boards;
+    std::lock_guard<std::mutex> lk(mu);
+    json sb = {{"events", {event("401", "2026-10-10T23:30Z", state, 3, clock, lines(team("away", "LAL", "Los Angeles Lakers", 70), {20, 25, 25}),
+                                 lines(team("home", "BOS", "Boston Celtics", bos), bos_lines), play),
+                           // tips 20 minutes after t0
+                           event("402", "2026-10-11T00:18:20Z", "pre", 0, "", team("away", "NYK", "New York Knicks", 0),
+                                 team("home", "MIA", "Miami Heat", 0))}}};
+    res.set_content(sb.dump(), "application/json");
+  });
+  srv.Get("/apis/site/v2/sports/basketball/nba/summary", [&](const httplib::Request&, httplib::Response& res) {
+    ++nba_sums;
+    std::lock_guard<std::mutex> lk(mu);
+    res.set_content(summary("401", 3, clock, 70, bos, 0.71, play, wallclock).dump(), "application/json");
+  });
+  srv.Get("/apis/site/v2/sports/football/nfl/scoreboard", [&](const httplib::Request&, httplib::Response& res) {
+    ++nfl_boards;
+    json sb = {{"events", {event("601", "2026-10-10T20:25Z", "in", 4, "2:00", team("away", "DAL", "Dallas Cowboys", 17),
+                                 team("home", "NYG", "New York Giants", 20))}}};
+    res.set_content(sb.dump(), "application/json");
+  });
+  srv.Get("/apis/site/v2/sports/football/nfl/summary", [&](const httplib::Request&, httplib::Response& res) {
+    ++nfl_sums;
+    res.set_content("{}", "application/json");
+  });
+  const int port = srv.bind_to_any_port("127.0.0.1");
+  std::thread th([&] { srv.listen_after_bind(); });
+  std::string why;
+  auto ep = net::Endpoint::parse("http://127.0.0.1:" + std::to_string(port), &why);
+  CHECK(ep.has_value());
+  std::vector<kalshi::MarketRow> watched = {market("KXNBAGAME-26OCT10LALBOS-LAL", "KXNBAGAME-26OCT10LALBOS", "Los Angeles L"),
+                                            market("KXNBAGAME-26OCT10LALBOS-BOS", "KXNBAGAME-26OCT10LALBOS", "Boston"),
+                                            market("KXNFLGAME-26OCT10DALNYG-DAL", "KXNFLGAME-26OCT10DALNYG", "Dallas"),
+                                            market("KXNFLGAME-26OCT10DALNYG-NYG", "KXNFLGAME-26OCT10DALNYG", "New York G")};
+  EspnFeed::Options o;
+  o.fast_series = {"KXNBAGAME"};
+  EspnFeed f(*ep, [&] { return watched; }, o);
+  std::vector<EspnGame> told;
+  f.set_on_change([&](const EspnGame& g) { told.push_back(g); });
+  auto lal = [&] { return f.board()->at("KXNBAGAME-26OCT10LALBOS-LAL"); };
+
+  f.step(t0);
+  CHECK(nba_boards == 1 && nfl_boards == 1 && nba_sums == 1 && nfl_sums == 1);
+  CHECK(f.board()->size() == 4 && told.size() == 2);   // each watched game's first sighting
+  CHECK(lal().first_seen_ms == t0 && lal().wp_seen_ms == t0 && lal().yes_lines == std::vector<int>({20, 25, 25}));
+  {   // the clock runs: a 3 s read for the NBA, none for the NFL; no new state
+    std::lock_guard<std::mutex> lk(mu);
+    clock = "3:58";
+  }
+  f.step(t0 + 3000);
+  CHECK(nba_boards == 2 && nfl_boards == 1 && nba_sums == 1 && nfl_sums == 1);
+  CHECK(lal().first_seen_ms == t0 && lal().fetched_ms == t0 + 3000 && lal().clock == "3:58" && told.size() == 2);
+  CHECK(f.status()["hot"] == json::array({"nba|2026-10-10"}) && f.status()["fast_series"] == json::array({"KXNBAGAME"}));
+  {   // Boston scores: a new state, first seen at this poll, after the one before
+    std::lock_guard<std::mutex> lk(mu);
+    bos = 76;
+    bos_lines = {22, 30, 24};
+  }
+  f.step(t0 + 6000);
+  CHECK(nba_boards == 3 && nfl_boards == 1);
+  CHECK(lal().first_seen_ms == t0 + 6000 && lal().opp_score == 76 && lal().opp_lines == std::vector<int>({22, 30, 24}));
+  CHECK(told.size() == 3);
+  if (told.size() == 3)
+    CHECK(told[2].id == "401" && told[2].home_score == 76 && told[2].first_seen_ms == t0 + 6000 &&
+          told[2].prev_poll_ms == t0 + 3000 && told[2].src == "ESPN");
+  f.step(t0 + 10000);   // the summary at 10 s for the fast series: the same play keeps its sighting
+  CHECK(nba_boards == 4 && nba_sums == 2 && nfl_sums == 1);
+  CHECK(lal().first_seen_ms == t0 + 6000 && lal().espn == Px{2900} && lal().wp_seen_ms == t0);
+  {   // a new play, 40 s after its own wall clock
+    std::lock_guard<std::mutex> lk(mu);
+    play = "p10";
+    wallclock = "2026-10-10T23:58:00Z";
+  }
+  f.step(t0 + 20000);   // the NFL's 20 s scoreboard; its summary waits 30 s
+  CHECK(nba_boards == 5 && nfl_boards == 2 && nba_sums == 3 && nfl_sums == 1);
+  CHECK(lal().wp_seen_ms == t0 + 20000 && lal().first_seen_ms == t0 + 6000 && told.size() == 3);
+  CHECK(f.status()["lag"]["p50_ms"] == 40000 && f.status()["lag"]["plays"] == 2);
+  f.step(t0 + 30000);
+  CHECK(nfl_sums == 2 && nba_sums == 4 && nba_boards == 6 && nfl_boards == 2);
+  {   // the final: one more read, then 20 s again
+    std::lock_guard<std::mutex> lk(mu);
+    state = "post";
+  }
+  f.step(t0 + 33000);
+  CHECK(nba_boards == 7 && lal().per == "FINAL" && told.size() == 4);
+  f.step(t0 + 36000);
+  f.step(t0 + 50000);
+  CHECK(nba_boards == 7 && f.status()["hot"].empty());
+  f.step(t0 + 53000);
+  CHECK(nba_boards == 8 && nba_sums == 4);
+
+  // A game 20 minutes from its start waits 20 s; from 15 minutes before it, it is read hot.
+  std::vector<kalshi::MarketRow> later = {market("KXNBAGAME-26OCT10NYKMIA-NYK", "KXNBAGAME-26OCT10NYKMIA", "New York K"),
+                                          market("KXNBAGAME-26OCT10NYKMIA-MIA", "KXNBAGAME-26OCT10NYKMIA", "Miami")};
+  EspnFeed pre(*ep, [&] { return later; }, o);
+  const int before = nba_boards;
+  pre.step(t0);
+  CHECK(nba_boards == before + 1 && pre.board()->size() == 2 && pre.board()->at("KXNBAGAME-26OCT10NYKMIA-MIA").state == "pre");
+  pre.step(t0 + 3000);
+  CHECK(nba_boards == before + 1);
+  pre.step(t0 + 300000);   // 15 min before the tip: due at 20 s anyway, and hot from now
+  pre.step(t0 + 303000);
+  CHECK(nba_boards == before + 3 && nba_sums == 4);   // no summary before the tip
+  // nothing reads hot without a fast series, whatever the game
+  EspnFeed slow(*ep, [&] { return later; });
+  slow.step(t0 + 300000);
+  slow.step(t0 + 303000);
+  CHECK(nba_boards == before + 4);
+  srv.stop();
+  th.join();
+}
 }  // namespace
 
 int main() {
   signal(SIGPIPE, SIG_IGN);
-  parsing(); matching(); feed();
+  parsing(); matching(); feed(); fast();
   return finish("deskd-espn");
 }
