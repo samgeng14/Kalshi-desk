@@ -839,7 +839,8 @@ function bootPage(opts) {
   {
     const proto = Object.getPrototypeOf(P.$('kill')), anim0 = proto.animate;
     let bgFlashes = 0;
-    proto.animate = function () { let e = this; while (e && e.id !== 'tab-systematic') e = e.parentNode; if (e) bgFlashes++; return {}; };
+    // a flash counts only once SYSTEMATIC is hidden: the lanes' cells flash legitimately while it shows
+    proto.animate = function () { let e = this; while (e && e.id !== 'tab-systematic') e = e.parentNode; if (e && D.tabs.cur !== 'systematic') bgFlashes++; return {}; };
     D.tabs.set('systematic'); P.flush();
     D.act.start(); await P.advance(2000, 250);
     D.tabs.set('manual'); P.flush();
