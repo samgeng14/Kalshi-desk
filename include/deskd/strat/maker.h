@@ -141,6 +141,11 @@ std::optional<Px> grid_ceil(Px p, const std::vector<kalshi::PriceRange>& grid);
 // rounded up to the 1/10,000 dollar); 0 on a series without maker fees.
 Px maker_fee(const kalshi::MarketRow& m, Px p);
 
+// Everyone else's book on tk: Systematic's resting orders there (every lane's, acknowledged and not
+// ended) come off their levels, and a level they made alone goes. The makers quote against it, and
+// S1 (strat/arb.h) prices its legs against it.
+void book_without_own(MdBook& b, const Gateway::SysView& v, const std::string& tk);
+
 // One quoting lane's owner: keeps each market's working quotes equal to maker_quote()'s, by
 // cancel and re-post (no amends), through gw. Strat thread only.
 class MakerEngine {
@@ -220,7 +225,6 @@ class MakerEngine {
   void pace(std::int64_t now, bool running, bool quoting, const Gateway::SysView& v, const rest::Snapshot& s);
   void set_last(const std::string& tk, const std::string& why);
   std::string new_cid();
-  static void without_own(MdBook& b, const Gateway::SysView& v, const std::string& tk);
   std::int64_t event_worst(const Gateway::SysView& v, const rest::Snapshot& s, const std::string& event) const;
 };
 

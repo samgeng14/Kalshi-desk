@@ -47,6 +47,21 @@ Px maker_fee(const kalshi::MarketRow& m, Px p) {
   return static_cast<Px>(std::ceil(0.0175 * *m.fee_multiplier * x * (1 - x) * kOneDollar - 1e-9));
 }
 
+void book_without_own(MdBook& b, const Gateway::SysView& v, const std::string& tk) {
+  auto take = [](std::vector<MdLevel>& side, Px px, Qty q) {
+    for (auto it = side.begin(); it != side.end(); ++it) {
+      if (it->px != px) continue;
+      it->qty -= q;
+      if (it->qty <= 0) side.erase(it);
+      return;
+    }
+  };
+  for (const auto& [cid, o] : v.orders) {
+    if (o.ticker != tk || o.terminal || o.left <= 0 || (o.state != OrdState::WORK && o.state != OrdState::PART)) continue;
+    take(o.side == Side::BUY ? b.bids : b.asks, o.price, o.left);
+  }
+}
+
 MakerDecision maker_quote(const MakerInput& in, const MakerParams& p) {
   MakerDecision d;
   auto pull = [&](const char* why) { d.quotes.clear(); d.pull = why; return d; };
@@ -234,23 +249,6 @@ std::int64_t MakerEngine::event_worst(const Gateway::SysView& v, const rest::Sna
   return w;
 }
 
-// Everyone else's book: Systematic's resting quotes on this market (acknowledged and not ended)
-// come off their levels, and a level they made alone goes.
-void MakerEngine::without_own(MdBook& b, const Gateway::SysView& v, const std::string& tk) {
-  auto take = [](std::vector<MdLevel>& side, Px px, Qty q) {
-    for (auto it = side.begin(); it != side.end(); ++it) {
-      if (it->px != px) continue;
-      it->qty -= q;
-      if (it->qty <= 0) side.erase(it);
-      return;
-    }
-  };
-  for (const auto& [cid, o] : v.orders) {
-    if (o.ticker != tk || o.terminal || o.left <= 0 || (o.state != OrdState::WORK && o.state != OrdState::PART)) continue;
-    take(o.side == Side::BUY ? b.bids : b.asks, o.price, o.left);
-  }
-}
-
 std::string MakerEngine::new_cid() {
   // S<lane>-<ms in base 36>-<seq>: at most 40 characters, [A-Za-z0-9-]
   std::string t;
@@ -325,7 +323,7 @@ void MakerEngine::step(std::int64_t now) {
     MakerDecision d;
     const auto m = snap->markets.find(tk);
     std::optional<MdBook> book = env_.book ? env_.book(tk) : std::nullopt;
-    if (book) without_own(*book, *view, tk);
+    if (book) book_without_own(*book, *view, tk);
     const auto a = env_.anchor ? env_.anchor(tk) : Env::Anchor{};
     // the underlying moved 0.5 sigma (of its move to the close) since the quotes went out: both go
     bool resting = false;
@@ -510,7 +508,7 @@ void MakerEngine::pace(std::int64_t now, bool running, bool quoting, const Gatew
     if (o.lane != lane_ || o.terminal || o.left <= 0 || (o.state != OrdState::WORK && o.state != OrdState::PART)) continue;
     std::optional<MdBook> b = env_.book ? env_.book(o.ticker) : std::nullopt;
     if (!b) continue;
-    without_own(*b, v, o.ticker);
+    book_without_own(*b, v, o.ticker);
     Qty ahead = 0;
     for (const auto& l : o.side == Side::BUY ? b->bids : b->asks)
       if (o.side == Side::BUY ? l.px >= o.price : l.px <= o.price) ahead += l.qty;
