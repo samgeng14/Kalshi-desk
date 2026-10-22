@@ -77,6 +77,34 @@ void parsing() {
   }
 }
 
+// currentPeriod as tools/college_gate.py's period_of must read it too, so the gate measures the
+// periods the lane trades: an ordinal or a bare number is its number; any other text is 0, unread.
+// So a double overtime is never read as the 2nd quarter, and NCAA.com's "2OT" agrees with ESPN's
+// period 6 (WCBB) as its "OT" does with period 5: the lane may trade there (COLLEGE trades
+// overtime), and the gate must measure it
+void periods() {
+  const std::vector<std::pair<std::string, int>> cases = {
+      {"2nd", 2}, {"1", 1}, {"1st", 1}, {"3rd", 3}, {"4th", 4}, {" 2nd ", 2}, {"HALF", 0}, {"OT", 0},
+      {"2OT", 0}, {"3OT", 0}, {"END 1st", 0}, {"FINAL", 0}, {"", 0}};
+  for (const auto& [text, want] : cases) {
+    const auto g = parse_ncaa_scoreboard(json{{"games", {game("1", "live", text, "", "A", 0, "B", 0)}}}, "x", 0);
+    const bool ok = g.size() == 1 && g[0].period == want && g[0].detail == text;
+    if (!ok) std::fprintf(stderr, "currentPeriod \"%s\": %d, want %d\n", text.c_str(), g.empty() ? -1 : g[0].period, want);
+    CHECK(ok);
+  }
+  for (const auto& [text, espn_period] : std::vector<std::pair<std::string, int>>{{"OT", 5}, {"2OT", 6}}) {
+    const auto g = parse_ncaa_scoreboard(json{{"games", {game("9", "live", text, "2:10", "UCONN", 80, "S CAR", 80)}}},
+                                         "basketball-women/d1", 1000);
+    if (g.size() != 1) { CHECK(g.size() == 1); continue; }
+    const EspnRef n = espn_ref(*espn_league_for(SC), g[0], false, std::nullopt);
+    EspnRef e = n;
+    e.src = "ESPN";
+    e.period = espn_period;
+    const auto r = merge_score(&e, &n, 1000, 5000);
+    CHECK(r && r->state == "in" && r->why.empty() && r->src == "ESPN" && r->period == espn_period);
+  }
+}
+
 void matching() {
   const auto games = parse_ncaa_scoreboard(fixture(), "basketball-women/d1", kStart);
   KalshiGame k{EV, "KXNCAAWBGAME", "2026-11-05", -1, SC, "SC", "South Carolina", UCONN, "UCONN", "UConn"};
@@ -466,6 +494,6 @@ void rows() {
 
 int main() {
   signal(SIGPIPE, SIG_IGN);
-  parsing(); matching(); feed(); merge(); merge_dates(); rows();
+  parsing(); periods(); matching(); feed(); merge(); merge_dates(); rows();
   return finish("deskd-ncaa");
 }

@@ -13,8 +13,9 @@
 // the VM's recorded ncaa_scores rows). A date without games has no file: a 404 is no games, not a
 // failure. Its games are read as ESPN's are (parse_ncaa_scoreboard, as recorder/scores.py
 // ncaa_games and tools/college_gate.py read them): gameState pre / live / final is ESPN's pre /
-// in / post (another state is kept as written); currentPeriod's number ("2nd" is 2; "HALF", "OT"
-// and anything else not an ordinal is 0, unread); contestClock as ESPN's clock; names.char6 as
+// in / post (another state is kept as written); currentPeriod's number ("2nd" is 2; "HALF", "OT",
+// "2OT" and anything else not an ordinal is 0, unread, the cases deskd-ncaa's periods() pins and
+// college_gate.py's period_of must give too); contestClock as ESPN's clock; names.char6 as
 // the abbreviation and names.short as the name, for match_game; no linescores, so no volleyball
 // points. Each game carries its first-seen and last-poll times on our own clock, as ESPN's do.
 //
