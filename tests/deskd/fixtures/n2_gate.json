@@ -32,6 +32,7 @@
   "bought_partial": 1,
   "trades": 11,
   "unfilled": 0,
+  "above_band": 0,
   "settle": {
    "n": 11,
    "games": 11,

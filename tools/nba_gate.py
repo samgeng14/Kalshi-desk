@@ -75,8 +75,11 @@ must confirm is that the rule can be done: take_rule's FAV_PREGAME (5 contracts,
 [0.90, 0.95), from 60 to 2 minutes before ESPN's scheduled tip, the score at most 60 s old and
 still pre, spreads of 10c or less) replayed on the recorder's KXNBAGAME socket books, a decision
 at the window's open and at each book or score change in it. Passes when --min-games (10) games
-were bought to 5 contracts: N2.json at stage live, params {count, fav_lo, fav_hi}, no model. The
-takes' settlement P&L is reported, not gated (the forward test is the measurement).
+were bought to 5 contracts by fills: a take counts when x1_backtest.score_trade's conservative fill
+fills it (not when its side or its book is gone within a second) at a team price still in the band
+(the worse of the touch and that next quote can be above it). N2.json at stage live, params
+{count, fav_lo, fav_hi}, no model. The takes' settlement P&L is reported, not gated (the forward
+test is the measurement).
 
 The gate files follow strat/lane_gate.h, checked against lane_gate.cpp's rules
 (x1_backtest.gate_refusal) before writing; --write FILE refuses an existing file without --force.
@@ -661,12 +664,18 @@ def n2(data, fee_mult=x1.FEE_MULT, min_games=MIN_N2_GAMES):
     trades = []
     for _, g in sorted(games.items()):
         trades.extend(x1.simulate(g, book, FAV))
-    bought = Counter()
-    for t in trades:
-        bought[t['game']] += t['count']
+    bought, above = Counter(), 0
+    for t in trades:   # bought by fills (module docstring)
+        s = x1.score_trade(t, games[t['game']], book, True)
+        if s is None:
+            continue
+        if FAV['fav_lo'] <= s['entry'] < FAV['fav_hi']:
+            bought[t['game']] += t['count']
+        else:
+            above += 1
     full = sorted(ev for ev, c in bought.items() if c >= FAV['fixed_count'])
     res = {'data': os.path.basename(os.path.normpath(data)), 'fee_mult': fee_mult, 'min_games': min_games,
-           'counts': counts, 'games': len(games), 'full': full,
+           'counts': counts, 'games': len(games), 'full': full, 'above_band': above,
            'partial': sorted(ev for ev, c in bought.items() if c < FAV['fixed_count']),
            'stats': x1.evaluate(trades, games, book, True), 'trades': trades}
     why = '' if len(full) >= min_games else (
@@ -683,7 +692,7 @@ def n2_gate(res, computed):
     ev = {'study': STUDY, 'data': res['data'], 'fee_mult': res['fee_mult'], 'min_games': res['min_games'],
           'counts': res['counts'], 'games': res['games'], 'bought_full': len(res['full']),
           'bought_partial': len(res['partial']), 'trades': s['trades'], 'unfilled': s['unfilled'],
-          'settle': _stats(s['settle'])}
+          'above_band': res['above_band'], 'settle': _stats(s['settle'])}
     return {'lane': 'N2', 'stage': 'live', 'verdict': 'PASS' if res['passed'] else 'FAIL',
             'why': None if res['passed'] else res['why'], 'computed': computed, 'tool': 'tools/nba_gate.py n2',
             'params': {'count': FAV['fixed_count'] // CT, 'fav_lo': FAV['fav_lo'] / ONE, 'fav_hi': FAV['fav_hi'] / ONE},
@@ -751,9 +760,10 @@ def report_n2(res):
         'nba_gate n2: N2 as deskd trades it (take_decide FAV_PREGAME: 5 contracts at a [0.90, 0.95) ask, 60 to 2 min '
         'before the tip) on %s' % res['data'],
         '  games: %s' % (c or 'none'),
-        '  bought to 5 contracts in %d games, partly in %d; %d takes (%d unfilled), settlement %s a take (t %s), '
-        'reported only' % (len(res['full']), len(res['partial']), s['trades'], s['unfilled'], _usd(s['settle']['mean']),
-                           _t(s['settle'])),
+        '  bought to 5 contracts in %d games, partly in %d; %d takes filled (%d above the band), %d unfilled, '
+        'settlement %s a take (t %s), reported only' % (len(res['full']), len(res['partial']), s['trades'],
+                                                         res['above_band'], s['unfilled'], _usd(s['settle']['mean']),
+                                                         _t(s['settle'])),
         '  the study: %s, %+.2f +- %.2fc (%d of %d won)' % (STUDY['cell'], STUDY['net_c'], STUDY['se_c'], STUDY['won'],
                                                           STUDY['n']),
         'verdict: %s' % ('PASS, stage live (the forward test: 5 contracts, retired after 60 trades or -$15)'
@@ -979,13 +989,22 @@ def synth_results(root, games):
 #   early    0.91/0.92 from 61 min, 0.95/0.96 from 60.5 min: in band only before the window
 #   open     0.91/0.92 from 61 min and still at 60: bought at the window's open
 #   outage   as full, but ESPN down from 65 to 1 min before: the score is too old
+#   vanish   as full, then (PREGAME_MOVES) the favourite's ask pulled 0.6 s on: no fill
+#   above    as full, then a 0.95 ask behind the 0.92 and the 0.92 pulled 0.6 s on: filled at 0.95,
+#            above the band
 PREGAME = (('full', ((70, 8600, 8800, 10), (30, 9100, 9200, 10))),
            ('band95', ((70, 8600, 8800, 10), (30, 9400, 9500, 10))),
            ('thin', ((70, 8600, 8800, 10), (30, 9100, 9200, 3))),
            ('late', ((70, 8600, 8800, 10), (1, 9100, 9200, 10))),
            ('early', ((70, 8600, 8800, 10), (61, 9100, 9200, 10), (60.5, 9500, 9600, 10))),
            ('open', ((70, 8600, 8800, 10), (61, 9100, 9200, 10))),
-           ('outage', ((70, 8600, 8800, 10), (30, 9100, 9200, 10))))
+           ('outage', ((70, 8600, 8800, 10), (30, 9100, 9200, 10))),
+           ('vanish', ((70, 8600, 8800, 10), (30, 9100, 9200, 10))),
+           ('above', ((70, 8600, 8800, 10), (30, 9100, 9200, 10))))
+# the kinds whose book then moves by deltas, as the socket moves a book: (minutes before the tip,
+# [(side, price, contracts)] on the favourite; the other market's YES side is the favourite's NO)
+PREGAME_MOVES = {'vanish': (29.99, (('no', 0.08, -10),)),
+                 'above': (29.99, (('no', 0.05, 10), ('no', 0.08, -10)))}
 
 
 def synth_pregame(root, kinds, day0='2026-11-04T00:00Z'):
@@ -1008,9 +1027,16 @@ def synth_pregame(root, kinds, day0='2026-11-04T00:00Z'):
                                         'raw': json.dumps({'event_ticker': ev, 'yes_sub_title': name})})
         for mins, bid, ask, size in dict(PREGAME)[kind]:
             t = int(tip - mins * 60000)
-            frames.append((t, fav, [(bid / ONE, 10)], [((ONE - ask) / ONE, size)]))
+            frames.append((t, fav, len(frames), 'snapshot', ([(bid / ONE, 10)], [((ONE - ask) / ONE, size)])))
             # the other market at the same instant: YES bid 1 - ask (the favourite's thin side), ask 1 - bid
-            frames.append((t, dog, [((ONE - ask) / ONE, 2 if kind == 'thin' else size)], [(bid / ONE, 10)]))
+            frames.append((t, dog, len(frames), 'snapshot',
+                           ([((ONE - ask) / ONE, 2 if kind == 'thin' else size)], [(bid / ONE, 10)])))
+        if kind in PREGAME_MOVES:
+            mins, moves = PREGAME_MOVES[kind]
+            t = int(tip - mins * 60000)
+            for side, px, d in moves:
+                frames.append((t, fav, len(frames), 'delta', (side, px, d)))
+                frames.append((t, dog, len(frames), 'delta', ('yes' if side == 'no' else 'no', px, d)))
         for t, state in ((tip - 3 * 3600000, 'pre'), (tip + 60000, 'in')):
             raw = {'competitors': [
                 {'homeAway': 'home', 'team': {'id': '1', 'abbreviation': h[0], 'displayName': h[2]}},
@@ -1024,8 +1050,8 @@ def synth_pregame(root, kinds, day0='2026-11-04T00:00Z'):
             sp.write('gaps', {'recv_us': (tip - 60000) * us, 'source': 'espn', 'kind': 'recovered', 'detail': 'test',
                               'from_us': (tip - 65 * 60000) * us, 'to_us': (tip - 60000) * us})
         out.append((ev, fav))
-    for seq, (t, tk, yes, no) in enumerate(sorted(frames), start=1):   # the socket's frames in the order received
-        sp.snapshot(t * us, 1, 1, seq, tk, yes, no)
+    for seq, (t, tk, _, kind, args) in enumerate(sorted(frames), start=1):   # the socket's frames in the order received
+        getattr(sp, kind)(t * us, 1, 1, seq, tk, *args)
     return out
 
 
@@ -1282,6 +1308,18 @@ def self_test(write_fixture=False):
               and abs(s['mean'] - (9 * 0.37 - 4.63 + 0.22) / 11) < 1e-9, (s['n'], s['mean']))
         rc, _ = quiet(['n2', '--data', rec2, '--min-games', '11'])
         check('n2 with --min-games 11 is a FAIL', rc == 0 and not n2(rec2, min_games=11)['passed'])
+        # a game is bought by fills: nine bought as before, one whose ask is gone 0.6 s after the take
+        # (the next quote within a second: no fill) and one at 0.95 then (filled at the worse, above the
+        # band): eleven takes of 5, nine games bought, under 10
+        rec3 = os.path.join(d, 'pregame3')
+        favs3 = synth_pregame(rec3, ['full'] * 9 + ['vanish', 'above'])
+        r3 = n2(rec3)
+        check('n2 counts what fills: a take whose ask is gone within a second, or filled above the band, buys '
+              'nothing; 9 games is a FAIL', [(t['price'], t['count']) for t in r3['trades']] == [(9200, 500)] * 11
+              and r3['full'] == sorted(ev for ev, _ in favs3[:9]) and r3['partial'] == []
+              and (r3['stats']['trades'], r3['stats']['unfilled'], r3['above_band']) == (10, 1, 1) and not r3['passed']
+              and r3['why'].startswith('N2: 9 recorded games were bought to 5 contracts'),
+              (len(r3['full']), r3['stats']['unfilled'], r3['above_band'], r3['why']))
         n2path = os.path.join(d, 'gates', 'N2.json')
         rc, _ = quiet(['n2', '--data', rec2, '--write', n2path])
         with open(n2path, encoding='utf-8') as fh:
