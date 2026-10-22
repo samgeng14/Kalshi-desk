@@ -365,6 +365,7 @@ add_library(deskd_core STATIC
   src/deskd/strat/volley_model.cpp
   src/deskd/strat/game_fair.cpp
   src/deskd/strat/take.cpp
+  src/deskd/strat/arb.cpp
   src/deskd/strat/markouts.cpp
   src/deskd/strat/lane_gate.cpp
   src/deskd/store/store.cpp
@@ -556,6 +557,8 @@ deskd_pure_test(take)
 deskd_pure_test(ncaa)
 # event_risk: gw/event_risk, an event's settlement states from its flag and strikes, and a book's worst case by state (parity with the old risk.cpp)
 deskd_pure_test(event_risk)
+# arb: strat/arb, S1's basket finder: each family on the old scanner's cases, 1c legs, the 2-tick walk, every filter, the sizing
+deskd_pure_test(arb)
 deskd_fake_test(net)
 deskd_fake_test(wire)
 deskd_fake_test(md)
@@ -613,6 +616,7 @@ add_test(NAME deskd-no-legacy-includes COMMAND ${CMAKE_COMMAND} -DROOT=${CMAKE_S
 # A suite registered only where its runtime exists (node, python3) is labelled where it is.
 # One suite a line, as above.
 foreach(t
+    deskd-arb
     deskd-bus
     deskd-event_risk
     deskd-http
