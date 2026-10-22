@@ -241,6 +241,7 @@ if(PYTHON3_EXE)
   add_test(NAME lip-join COMMAND ${PYTHON3_EXE} ${CMAKE_SOURCE_DIR}/tools/lip_join.py --self-test)
   add_test(NAME fillsim2 COMMAND ${PYTHON3_EXE} ${CMAKE_SOURCE_DIR}/tools/fillsim2.py --self-test)
   add_test(NAME scorecard COMMAND ${PYTHON3_EXE} ${CMAKE_SOURCE_DIR}/tools/scorecard.py --self-test)
+  add_test(NAME nba-panel COMMAND ${PYTHON3_EXE} ${CMAKE_SOURCE_DIR}/tools/nba_panel.py --self-test)
   # The commodity replay's own proof that it cannot see the future: it builds its data in memory,
   # moves the reference after a chosen instant and checks no earlier probability changed.
   add_test(NAME commodity-replay
