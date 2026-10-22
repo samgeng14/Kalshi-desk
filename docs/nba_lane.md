@@ -41,6 +41,11 @@ writes):
 | `lane_shadow` | true | X1, N1 and N2 record what they would take while they may not post |
 | `gates_dir` | "" = <data_dir>/gates | where each lane's gate file is |
 
+PAPER's config is `~/.kalshi/deskd-demo.json` and LIVE's `~/.kalshi/deskd-prod.json`; tools/desk.py
+gives each desk its data dir, so `gates_dir` is `<data>/demo/gates` on PAPER and
+`<data>/prod/gates` on LIVE (`<data>`: `~/Library/Application Support/kalshi-desk` on a Mac,
+`${XDG_DATA_HOME:-~/.local/share}/kalshi-desk` elsewhere).
+
 A lane trades only when all of these hold: `nba_lanes` and `systematic_orders` on; its gate file
 `<gates_dir>/<lane>.json` loads and is live (read once at start: a new gate needs a restart); the
 operator turns the lane on (`POST /api/lane/<id>`, the SYSTEMATIC tab) and presses Start. A gated
@@ -95,6 +100,12 @@ that run: it will not buy that game later in the pregame unless the price leaves
 10 s and comes back. Turn N2 on and press Start before the first window opens (60 minutes
 before the day's first tip).
 
+**Before the tip.** With `lane_shadow` on, each built engine watches its games' books all day,
+on or off, so N1 has each game's pregame price. With it off, a lane watches its games only while
+it is on: turn N1 on before the tip (a game it did not watch pregame has no p0 and pulls NO_P0),
+and know that N1 turned on mid-game takes the first state its feeds report as new (SIGNAL_OLD
+dates it by its first sighting alone).
+
 ## What they record
 
 Every signal goes to ops.sqlite's `signals` table (store/store.h): lane, mode, TAKE (sent; again
@@ -126,8 +137,20 @@ a game (fast_series), summaries every 10 s; N2 alone needs no more than the 20 s
 5. N2: `python3 tools/nba_gate.py n2 --data <recorder dir> --write <gates_dir>/N2.json`: this
    season's books show the favourites can be bought (10+ games filled to 5 contracts). A pass
    is stage live.
-6. Restart deskd with `nba_lanes` on, turn the lane on, press Start.
-7. `python3 tools/scorecard.py [paper|live]`: N1 RETIRE after 100 trades unless its net 60 s
+6. On PAPER: add `"nba_lanes": true` under `"deskd"` in `~/.kalshi/deskd-demo.json`, with the
+   gates in `<data>/demo/gates`, and restart the desk (`python3 tools/desk.py`). Read what loaded:
+
+   ```sh
+   curl -s http://127.0.0.1:8788/ops/status | python3 -c \
+       'import json, sys; print(json.dumps(json.load(sys.stdin)["nba"], indent=1))'
+   ```
+
+   Each lane's `why` is "" when its gate is live, else the gate's reason (or the stage-shadow
+   text); `rule` is what it trades. Turn the lane on in the SYSTEMATIC tab and press Start.
+   LIVE is the operator's alone (`deskd-prod.json`, `<data>/prod/gates`, port 8789).
+7. `python3 tools/scorecard.py [paper|live]`: X1 RETIRE after 100 trades unless its net 60 s
+   markout is positive (gw retires it at 100 trades whatever they made, its cap: the verdict says
+   whether another 100 are worth a lane-reset); N1 RETIRE after 100 trades unless its net 60 s
    markout is positive, or once down $20; N2 WAIT under 60 trades or while a position is still
    to settle, then HOLD on a positive settlement P&L, else RETIRE (or once down $15). N1's and
    N2's dollars come from the desk's systematic.json (gw's count of each lane's life). gw
