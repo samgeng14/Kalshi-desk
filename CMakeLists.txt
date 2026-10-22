@@ -351,6 +351,7 @@ add_library(deskd_core STATIC
   src/deskd/strat/lip.cpp
   src/deskd/strat/wcbb_model.cpp
   src/deskd/strat/markouts.cpp
+  src/deskd/strat/lane_gate.cpp
   src/deskd/store/store.cpp
   src/deskd/web/sse.cpp
   src/deskd/web/streams.cpp
@@ -526,6 +527,8 @@ deskd_pure_test(store)
 deskd_pure_test(sys_risk)
 # strat: the strat loop's sleep, clamped to 5..250 ms, and each engine's cadence (strat/strat.h)
 deskd_pure_test(strat)
+# lane_gate: the one gate-file loader (gates_dir/<lane>.json), each refusal's reason, C1's per-series results
+deskd_pure_test(lane_gate)
 deskd_fake_test(net)
 deskd_fake_test(wire)
 deskd_fake_test(md)
@@ -574,6 +577,7 @@ add_test(NAME deskd-no-legacy-includes COMMAND ${CMAKE_COMMAND} -DROOT=${CMAKE_S
 foreach(t
     deskd-bus
     deskd-http
+    deskd-lane_gate
     deskd-manual_admission
     deskd-manual_book
     deskd-manual_gw
