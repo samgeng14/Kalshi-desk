@@ -360,6 +360,18 @@ static void test_config() {
   CHECK(throws(R"({"deskd": {"college": {"series": []}}})", "college: series is empty"));
   CHECK(throws(R"({"deskd": {"college": {"enabled": "yes"}}})", "\"enabled\" has the wrong type"));
   CHECK(throws(R"({"deskd": {"college": [1]}})", "deskd college: not an object"));
+  // X1 and N1: off, on NBA's series, the model in the source tree (deskd's command line), shadow
+  // signals recorded
+  CHECK(!e.nba_lanes && e.nba_series == std::vector<std::string>{"KXNBAGAME"} && e.nba_model.empty() && e.lane_shadow);
+  DeskdConfig nba = load_deskd_config(write(R"({"deskd": {"nba_lanes": true, "nba_series": ["KXNBAGAME", "KXWNBAGAME"],
+    "nba_model": "~/m/nba.json", "lane_shadow": false}})"));
+  CHECK(nba.nba_lanes && nba.nba_series == (std::vector<std::string>{"KXNBAGAME", "KXWNBAGAME"}) && !nba.lane_shadow &&
+        nba.nba_model.size() > 11 && nba.nba_model.find('~') == std::string::npos &&
+        nba.nba_model.compare(nba.nba_model.size() - 11, 11, "/m/nba.json") == 0);
+  CHECK(throws(R"({"deskd": {"nba_series": []}})", "deskd: nba_series is empty"));
+  CHECK(throws(R"({"deskd": {"nba_series": ["KXNBAGAME", "nba"]}})", "nba_series has \"nba\", not a series ticker"));
+  CHECK(throws(R"({"deskd": {"nba_lanes": 1}})", "\"nba_lanes\" has the wrong type"));
+  CHECK(throws(R"({"deskd": {"nba_shadow": true}})", "unknown key \"nba_shadow\""));
   CHECK(throws(R"({"deskd": {"lip_series": ["kxgold15m"]}})", "not a series ticker"));
   CHECK(throws(R"({"deskd": {"lip_series": "KXGOLD15M"}})", "wrong type"));
   CHECK(throws(R"({"deskd": {"band_series": ["KX HIGH"]}})", "band_series has"));

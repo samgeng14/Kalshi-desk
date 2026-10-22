@@ -130,6 +130,10 @@ DeskdConfig load_deskd_config(const std::string& path) {
       "wcbb_model",
       "gates_dir",
       "college",
+      "nba_lanes",
+      "nba_series",
+      "nba_model",
+      "lane_shadow",
   };
   for (auto kv = d.begin(); kv != d.end(); ++kv) {
     if (kv.key() == "live")
@@ -155,7 +159,13 @@ DeskdConfig load_deskd_config(const std::string& path) {
   take(d, "wcbb_model", c.wcbb_model, where);
   take(d, "gates_dir", c.gates_dir, where);
   if (d.contains("college") && !d.at("college").is_null()) take_college(d.at("college"), c.college, where + " college");
+  take(d, "nba_lanes", c.nba_lanes, where);
+  take(d, "nba_series", c.nba_series, where);
+  take(d, "nba_model", c.nba_model, where);
+  take(d, "lane_shadow", c.lane_shadow, where);
+  if (c.nba_series.empty()) throw std::runtime_error(where + ": nba_series is empty");
   c.wcbb_model = expand_home(c.wcbb_model);
+  c.nba_model = expand_home(c.nba_model);
   c.gates_dir = expand_home(c.gates_dir);
   c.calendar = expand_home(c.calendar);
   if (c.write_tier != "basic" && c.write_tier != "advanced")
@@ -163,10 +173,11 @@ DeskdConfig load_deskd_config(const std::string& path) {
   if (!c.peer_url.empty() && !peer_url_ok(c.peer_url))
     throw std::runtime_error(where + ": peer_url must be http://127.0.0.1:PORT/ or http://localhost:PORT/, not \"" +
                              c.peer_url.substr(0, 80) + "\"");
-  for (const auto* list : {&c.lip_series, &c.band_series})
+  for (const auto* list : {&c.lip_series, &c.band_series, &c.nba_series})
     for (const auto& s : *list)
-      if (!series_ok(s)) throw std::runtime_error(where + ": " + (list == &c.lip_series ? "lip_series" : "band_series") +
-                                                  " has \"" + s + "\", not a series ticker");
+      if (!series_ok(s))
+        throw std::runtime_error(where + ": " + (list == &c.lip_series ? "lip_series" : list == &c.band_series ? "band_series" : "nba_series") +
+                                 " has \"" + s + "\", not a series ticker");
   double stop = -1;
   take(d, "daily_stop_dollars", stop, where);
   if (stop >= 0) c.daily_stop = static_cast<Money>(std::llround(stop * 10000.0));
