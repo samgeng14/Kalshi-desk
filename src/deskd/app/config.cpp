@@ -40,6 +40,16 @@ bool series_ok(const std::string& s) {
   return !s.empty() && s.size() <= 40 &&
          std::all_of(s.begin(), s.end(), [](unsigned char ch) { return std::isupper(ch) || std::isdigit(ch); });
 }
+// an amount written as a number of dollars, within [lo, hi] (out keeps its default when absent)
+void take_dollars(const json& j, const char* key, Money& out, Money lo, Money hi, const std::string& where) {
+  if (j.contains(key) && !j.at(key).is_null()) {
+    double v = 0;
+    take(j, key, v, where);
+    out = static_cast<Money>(std::llround(v * 10000.0));
+  }
+  if (out < lo || out > hi)
+    throw std::runtime_error(where + ": " + key + " is $" + money_str(lo) + " to $" + money_str(hi) + ", not $" + money_str(out));
+}
 // "college": C1's section, every key known and every amount inside its range
 void take_college(const json& j, DeskdConfig::College& c, const std::string& where) {
   if (!j.is_object()) throw std::runtime_error(where + ": not an object");
@@ -62,21 +72,49 @@ void take_college(const json& j, DeskdConfig::College& c, const std::string& whe
   if (c.series.empty()) throw std::runtime_error(where + ": series is empty");
   for (const auto& s : c.series)
     if (!series_ok(s)) throw std::runtime_error(where + ": series has \"" + s.substr(0, 40) + "\", not a series ticker");
-  // dollars: each amount within [lo, hi], written as a number of dollars
-  auto dollars = [&](const char* key, Money& out, Money lo, Money hi) {
-    if (j.contains(key) && !j.at(key).is_null()) {
-      double v = 0;
-      take(j, key, v, where);
-      out = static_cast<Money>(std::llround(v * 10000.0));
-    }
-    if (out < lo || out > hi)
-      throw std::runtime_error(where + ": " + key + " is $" + money_str(lo) + " to $" + money_str(hi) + ", not $" + money_str(out));
-  };
-  dollars("clip_dollars", c.clip, 1 * 10000, 5 * 10000);
-  dollars("game_dollars", c.game, c.clip, 15 * 10000);
-  dollars("lane_dollars", c.budget, c.game, 40 * 10000);
+  take_dollars(j, "clip_dollars", c.clip, 1 * 10000, 5 * 10000, where);
+  take_dollars(j, "game_dollars", c.game, c.clip, 15 * 10000, where);
+  take_dollars(j, "lane_dollars", c.budget, c.game, 40 * 10000, where);
   if (c.max_score_age_s < 1 || c.max_score_age_s > 5)
     throw std::runtime_error(where + ": max_score_age_s is 1 to 5, not " + std::to_string(c.max_score_age_s));
+}
+// S1's keys (top level, as the NBA lanes' are): each inside its range, and trade mode only with
+// what it needs; after systematic_orders
+void take_arb(const json& d, DeskdConfig& c, const std::string& where) {
+  take(d, "arb_mode", c.arb_mode, where);
+  if (c.arb_mode != "off" && c.arb_mode != "scan" && c.arb_mode != "trade")
+    throw std::runtime_error(where + ": arb_mode is \"off\", \"scan\" or \"trade\", not \"" + c.arb_mode.substr(0, 40) + "\"");
+  take(d, "event_risk", c.event_risk, where);
+  if (c.arb_mode == "trade" && !c.systematic_orders) throw std::runtime_error(where + ": arb_mode \"trade\" needs systematic_orders");
+  if (c.arb_mode == "trade" && !c.event_risk)
+    throw std::runtime_error(where + ": arb_mode \"trade\" needs event_risk (a basket counted by its settlement states)");
+  if (d.contains("arb_series") && !d.at("arb_series").is_null()) {
+    take(d, "arb_series", c.arb_series, where);
+    if (c.arb_series.empty()) throw std::runtime_error(where + ": arb_series is empty");
+  }
+  for (const auto& s : c.arb_series)
+    if (!series_ok(s)) throw std::runtime_error(where + ": arb_series has \"" + s.substr(0, 40) + "\", not a series ticker");
+  double qty = qty_to_number(c.arb_max_qty);
+  take(d, "arb_max_qty", qty, where);
+  if (!(qty >= 1 && qty <= 20) || qty != std::floor(qty))
+    throw std::runtime_error(where + ": arb_max_qty is 1 to 20 whole contracts, not " + d.at("arb_max_qty").dump());
+  c.arb_max_qty = static_cast<Qty>(qty) * kOneContract;
+  take(d, "arb_max_legs", c.arb_max_legs, where);
+  if (c.arb_max_legs < 2 || c.arb_max_legs > 6)
+    throw std::runtime_error(where + ": arb_max_legs is 2 to 6, not " + std::to_string(c.arb_max_legs));
+  take_dollars(d, "arb_thr", c.arb_thr, 50, 1000, where);
+  take_dollars(d, "arb_legging_pause", c.arb_legging_pause, 1, 5 * 10000, where);
+  take(d, "arb_lattice", c.arb_lattice, where);   // as given: it replaces the default
+  for (const auto& [prefix, step] : c.arb_lattice)
+    if (!series_ok(prefix) || !std::isfinite(step) || step <= 0)
+      throw std::runtime_error(where + ": arb_lattice maps a series prefix to a step over 0, not \"" + prefix.substr(0, 40) +
+                               "\": " + d.at("arb_lattice").at(prefix).dump());
+  double precision = 0.01;
+  take(d, "fee_precision", precision, where);
+  const Money fp = static_cast<Money>(std::llround(precision * 10000.0));
+  if ((fp != 100 && fp != 1) || std::fabs(precision * 10000.0 - static_cast<double>(fp)) > 1e-6)
+    throw std::runtime_error(where + ": fee_precision is 0.01 or 0.0001 (dollars), not " + d.at("fee_precision").dump());
+  c.fee_precision = fp;
 }
 }  // namespace
 
@@ -134,6 +172,15 @@ DeskdConfig load_deskd_config(const std::string& path) {
       "nba_series",
       "nba_model",
       "lane_shadow",
+      "arb_mode",
+      "arb_series",
+      "arb_max_qty",
+      "arb_max_legs",
+      "arb_thr",
+      "arb_legging_pause",
+      "arb_lattice",
+      "event_risk",
+      "fee_precision",
   };
   for (auto kv = d.begin(); kv != d.end(); ++kv) {
     if (kv.key() == "live")
@@ -178,6 +225,7 @@ DeskdConfig load_deskd_config(const std::string& path) {
       if (!series_ok(s))
         throw std::runtime_error(where + ": " + (list == &c.lip_series ? "lip_series" : list == &c.band_series ? "band_series" : "nba_series") +
                                  " has \"" + s + "\", not a series ticker");
+  take_arb(d, c, where);
   double stop = -1;
   take(d, "daily_stop_dollars", stop, where);
   if (stop >= 0) c.daily_stop = static_cast<Money>(std::llround(stop * 10000.0));
@@ -214,6 +262,17 @@ bool peer_url_ok(const std::string& url) {
 std::string peer_url_for(const DeskdConfig& cfg) {
   if (!cfg.peer_url.empty()) return cfg.peer_url.back() == '/' ? cfg.peer_url : cfg.peer_url + "/";
   return cfg.live ? "http://127.0.0.1:8788/" : "http://127.0.0.1:8789/";
+}
+
+double arb_lattice_step(const DeskdConfig& cfg, const std::string& series) {
+  std::size_t best = 0;
+  double step = 0;
+  for (const auto& [prefix, s] : cfg.arb_lattice)
+    if (prefix.size() > best && series.compare(0, prefix.size(), prefix) == 0) {
+      best = prefix.size();
+      step = s;
+    }
+  return step;
 }
 
 }  // namespace deskd

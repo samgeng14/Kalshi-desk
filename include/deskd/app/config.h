@@ -6,6 +6,7 @@
 // Live trading is a command-line flag only (--live). A file can never turn it on, so a copied
 // or edited config cannot make a test run send to the production hosts.
 #include <cstdint>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -77,6 +78,27 @@ struct DeskdConfig {
   // the lane off, Systematic stopped) in ops.sqlite's signals table: N1's last gate reads them. C1
   // records none (its gate measures the recorder's data).
   bool lane_shadow = true;
+  // S1 ARB (plan 5(c)): IOC baskets of one event's markets that pay more than they cost, fees
+  // included, however the event settles (strat/arb.h). "off" builds no engine; "scan" finds and
+  // logs baskets (ops.sqlite's arb_scans) and sends nothing, with S1 kept off, Systematic orders
+  // or not; "trade" lets the operator turn S1 on and press Start, and needs systematic_orders and
+  // event_risk. Every amount is a ceiling the operator may lower.
+  std::string arb_mode = "off";
+  std::vector<std::string> arb_series;    // the series S1 scans and trades; empty (none given): band_series
+  Qty arb_max_qty = 10 * kOneContract;    // a basket's size at most, whole contracts: 1 to 20 (S1's inventory a market)
+  int arb_max_legs = 6;                   // 2 to 6: the Basic write tier, and S1's order group limit (sys_book.cpp)
+  Money arb_thr = 100;                    // u: what a basket contract locks after fees; $0.005 to $0.10 (LaneSpec S1 thr)
+  Money arb_legging_pause = 5 * 10000;    // u: new baskets stop once legging lost this much; over $0, at most $5
+  // each series' settle lattice, by series prefix (KXHIGH and KXLOW settle on whole degrees): an
+  // event of the series may be proven exhaustive on it (gw/event_risk.h); any other on the real line
+  std::map<std::string, double> arb_lattice = {{"KXHIGH", 1.0}, {"KXLOW", 1.0}};
+  // decisions 5: S1's stakes in an event whose settlement states are proven count by state in gw's
+  // risk book (a complete basket about $0; LaneSpec::by_state). Off, every lane counts each market
+  // alone, as today.
+  bool event_risk = false;
+  // decisions 7: the account's balance precision a taker fee rounds to, u: $0.01 until demo fills
+  // prove $0.0001. S1's fee bound (gw/fees.h order_fee_bound); admission keeps its own allowance.
+  Money fee_precision = 100;
   // Manual orders to the (demo) venue. Off by default: gw still admits and answers, but every
   // order is refused RO and the header stays read-only until the operator turns it on.
   bool manual_orders = false;
@@ -112,5 +134,8 @@ std::string expand_home(const std::string& path);
 bool peer_url_ok(const std::string& url);
 // cfg.peer_url, else the other desk's default on 127.0.0.1: 8789 (live) from paper, 8788 from live
 std::string peer_url_for(const DeskdConfig& cfg);  // "~/x" -> "$HOME/x", as src/config.cpp
+// a series' settle lattice: the step of the longest arb_lattice prefix it starts with; 0 (the real
+// line) when none does
+double arb_lattice_step(const DeskdConfig& cfg, const std::string& series);
 
 }  // namespace deskd

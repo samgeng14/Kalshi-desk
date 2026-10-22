@@ -372,6 +372,34 @@ static void test_config() {
   CHECK(throws(R"({"deskd": {"nba_series": ["KXNBAGAME", "nba"]}})", "nba_series has \"nba\", not a series ticker"));
   CHECK(throws(R"({"deskd": {"nba_lanes": 1}})", "\"nba_lanes\" has the wrong type"));
   CHECK(throws(R"({"deskd": {"nba_shadow": true}})", "unknown key \"nba_shadow\""));
+  // S1 (plan 5(c)): off, scanning band_series once on, 10 contracts and 6 legs a basket, 1c a
+  // contract after fees, paused at -$5, KXHIGH and KXLOW on whole degrees; gw counts every market
+  // alone, and fees round to the cent (decisions 5 and 7)
+  CHECK(e.arb_mode == "off" && e.arb_series.empty() && e.arb_max_qty == 1000 && e.arb_max_legs == 6 && e.arb_thr == 100 &&
+        e.arb_legging_pause == 50000 && !e.event_risk && e.fee_precision == 100);
+  CHECK(arb_lattice_step(e, "KXHIGHNY") == 1 && arb_lattice_step(e, "KXLOWTCHI") == 1 && arb_lattice_step(e, "KXNATGAS15M") == 0);
+  DeskdConfig arb = load_deskd_config(write(R"({"deskd": {"systematic_orders": true, "event_risk": true, "arb_mode": "trade",
+    "arb_series": ["KXHIGHDEN"], "arb_max_qty": 20, "arb_max_legs": 4, "arb_thr": 0.005, "arb_legging_pause": 2.5,
+    "arb_lattice": {"KXHIGH": 1, "KXHIGHDEN": 2}, "fee_precision": 0.0001}})"));
+  CHECK(arb.arb_mode == "trade" && arb.arb_series == std::vector<std::string>{"KXHIGHDEN"} && arb.arb_max_qty == 2000 &&
+        arb.arb_max_legs == 4 && arb.arb_thr == 50 && arb.arb_legging_pause == 25000 && arb.event_risk && arb.fee_precision == 1);
+  CHECK(arb_lattice_step(arb, "KXHIGHDEN") == 2 && arb_lattice_step(arb, "KXHIGHNY") == 1 && arb_lattice_step(arb, "KXLOWTNY") == 0);
+  CHECK(load_deskd_config(write(R"({"deskd": {"arb_mode": "scan"}})")).arb_mode == "scan");   // scan needs neither switch
+  CHECK(throws(R"({"deskd": {"arb_mode": "trade", "event_risk": true}})", "deskd: arb_mode \"trade\" needs systematic_orders"));
+  CHECK(throws(R"({"deskd": {"arb_mode": "trade", "systematic_orders": true}})", "deskd: arb_mode \"trade\" needs event_risk"));
+  CHECK(throws(R"({"deskd": {"arb_mode": "on"}})", "arb_mode is \"off\", \"scan\" or \"trade\", not \"on\""));
+  CHECK(throws(R"({"deskd": {"arb_series": []}})", "deskd: arb_series is empty"));
+  CHECK(throws(R"({"deskd": {"arb_series": ["kxhighny"]}})", "arb_series has \"kxhighny\", not a series ticker"));
+  CHECK(throws(R"({"deskd": {"arb_max_qty": 21}})", "arb_max_qty is 1 to 20 whole contracts, not 21"));
+  CHECK(throws(R"({"deskd": {"arb_max_qty": 2.5}})", "arb_max_qty is 1 to 20 whole contracts, not 2.5"));
+  CHECK(throws(R"({"deskd": {"arb_max_legs": 7}})", "arb_max_legs is 2 to 6, not 7"));
+  CHECK(throws(R"({"deskd": {"arb_thr": 0.001}})", "arb_thr is $0.0050 to $0.1000, not $0.0010"));
+  CHECK(throws(R"({"deskd": {"arb_legging_pause": 6}})", "arb_legging_pause is $0.0001 to $5.0000, not $6.0000"));
+  CHECK(throws(R"({"deskd": {"arb_legging_pause": 0}})", "arb_legging_pause is $0.0001 to $5.0000, not $0.0000"));
+  CHECK(throws(R"({"deskd": {"arb_lattice": {"KXHIGH": 0}}})", "arb_lattice maps a series prefix to a step over 0, not \"KXHIGH\": 0"));
+  CHECK(throws(R"({"deskd": {"arb_lattice": [1]}})", "\"arb_lattice\" has the wrong type"));
+  CHECK(throws(R"({"deskd": {"fee_precision": 0.001}})", "fee_precision is 0.01 or 0.0001 (dollars), not 0.001"));
+  CHECK(throws(R"({"deskd": {"event_risk": "on"}})", "\"event_risk\" has the wrong type"));
   CHECK(throws(R"({"deskd": {"lip_series": ["kxgold15m"]}})", "not a series ticker"));
   CHECK(throws(R"({"deskd": {"lip_series": "KXGOLD15M"}})", "wrong type"));
   CHECK(throws(R"({"deskd": {"band_series": ["KX HIGH"]}})", "band_series has"));
