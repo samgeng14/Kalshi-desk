@@ -51,14 +51,15 @@ series rows: 1.0, TO CONFIRM for KXNBAGAME). A league without a game clock (mlb)
 
 When ESPN's number is visible (--align):
   first_seen  (the only alignment the DB supports) the DB: the first ext_wp row showing that
-              number for that score state, and the score state's own first row; decisions at the
-              rows (the poll is the row: ESPN between them is unknown). The recorder: a play's
-              win probability at the espn_plays row that first had it, a late-inserted play (a
-              sequence number under one already seen) dropped; with no plays, the scoreboard's
-              last-play probability dated by its score state's first sighting (TakeEngine's
-              rule); decisions every second for 30 s from each number, the score's poll taken as
-              fresh except inside an ESPN outage in the gaps table (any ESPN feed's: a recovered
-              row does not name its league)
+              number for that score state, rows with no number (-1) between not counting (deskd
+              keeps a play's first sighting through a summary it missed), and the score state's own
+              first row; decisions at the rows (the poll is the row: ESPN between them is unknown).
+              The recorder: a play's win probability at the espn_plays row that first had it, a
+              late-inserted play (a sequence number under one already seen) dropped; with no
+              plays, the scoreboard's last-play probability dated by its score state's first
+              sighting (TakeEngine's rule); decisions every second for 30 s from each number, the
+              score's poll taken as fresh except inside an ESPN outage in the gaps table (any
+              ESPN feed's: a recovered row does not name its league)
   wallclock   (--data only) a play at the running maximum of its game's play wallclocks + --lag-s
               (41.5 s), a play whose wallclock falls under that maximum dropped
 --delay-s D shifts everything ESPN showed D seconds later against the books.
@@ -204,6 +205,18 @@ def first_seen(keys, times):
         if k != prev:
             prev, seen = k, t
         out.append(seen)
+    return out
+
+
+def number_seen(numbers, states, times):
+    """Each row's ESPN number's first sighting: the first row of its run of that number in its
+    score state, where a row without a number (None) does not end the run, as deskd keeps a play's
+    first sighting through a summary it missed; 0 for a row without one."""
+    out, key, seen = [], None, 0
+    for p, s, t in zip(numbers, states, times):
+        if p is not None and (p, s) != key:
+            key, seen = (p, s), t
+        out.append(0 if p is None else seen)
     return out
 
 
@@ -586,17 +599,16 @@ def db_games(samples, results, mult, delay_ms):
         g = Game(ev, rows[0]['league'], game_date(ev, rows[0]['ts'] * 1000), (a, b), a_home,
                  {tk: results.get(tk) for tk in (a, b)}, {tk: mult.get(tk, 1.0) for tk in (a, b)})
         g.max_age_ms = DB_QUOTE_AGE_MS
-        times = [r['ts'] * 1000 for r in rows]
+        times = [r['ts'] * 1000 + delay_ms for r in rows]
         states = [(r['state'], r['period'], r['home_score'], r['away_score']) for r in rows]
+        # -1 is no number: the old desk's summary did not match its scoreboard (the display clock
+        # included, so often while it runs), which does not make the next row's number a new one
         espn = [None if r['wp'] is None or r['wp'] < 0 else to_px(r['wp'] if a_home else 1 - r['wp']) for r in rows]
-        seen = first_seen(states, times)
-        espn_seen = first_seen(list(zip(espn, states)), times)
+        seen, espn_seen = first_seen(states, times), number_seen(espn, states, times)
         for i, r in enumerate(rows):
             t_left, ot = clock_state(g.league, r['period'], r['clock'])
             a_sc, b_sc = (r['home_score'], r['away_score']) if a_home else (r['away_score'], r['home_score'])
-            t = times[i] + delay_ms
-            g.points.append((t, r['state'], t_left, ot, a_sc, b_sc, espn[i], seen[i] + delay_ms,
-                             espn_seen[i] + delay_ms, t))
+            g.points.append((times[i], r['state'], t_left, ot, a_sc, b_sc, espn[i], seen[i], espn_seen[i], times[i]))
         games[ev] = g
     return games
 
@@ -1370,6 +1382,9 @@ def self_test(write_fixture=False):
           and clock_state('nba', 2, '13:00') == (None, False) and clock_state('curling', 1, '1:00') == (None, False))
     check('first_seen: the first row of each run of equal keys',
           first_seen(['a', 'a', 'b', 'b', 'a'], [1, 2, 3, 4, 5]) == [1, 1, 3, 3, 5])
+    check('number_seen: the first row of its run in its score state; a row without one (0) does not end the run, '
+          'another number or another state does',
+          number_seen([5600, None, 5600, 5800, 5600, 5600], ['s'] * 5 + ['t'], [1, 2, 3, 4, 5, 6]) == [1, 0, 1, 4, 5, 6])
     s = summarize([('g1', 1.0), ('g1', 3.0), ('g2', -1.0)])
     check('summarize: mean 1, se clustered by game sqrt(2/1 x (2^2 + 2^2)) / 3 = 4/3, t 0.75',
           s['n'] == 3 and s['games'] == 2 and abs(s['mean'] - 1) < 1e-12 and abs(s['se'] - 4 / 3) < 1e-12
@@ -1408,6 +1423,26 @@ def self_test(write_fixture=False):
         return [x['t'] for x in simulate(g, bk, rule_params('fade', 0.12))]
     check('a signal run ends at a decision without edge 10 s after the last with one (run_quiet_ms)',
           quiet_game(14500) == [1000] and quiet_game(25500) == [1000, 26000], (quiet_game(14500), quiet_game(25500)))
+
+    # the DB's -1 between two equal numbers (the old desk's summary missed): FADE 0.12 with ESPN at
+    # 0.56 for A from 0 s, A at 0.55/0.57 and from 50 s 0.73/0.75 (a gap of 0.18). At 60 s the 0.56
+    # is the one first seen at 0 s, 60 s old: SIGNAL_OLD, no take. With 0.58 at 30 s instead, the
+    # 0.56 at 60 s is a new sighting and A is taken
+    def miss_game(between):
+        ev, t0 = 'KXNBAGAME-26NOV01AAABBB', 1_793_000_000
+        a, b = ev + '-AAA', ev + '-BBB'
+        rows = [{'ts': t0 + 30 * k, 'league': 'nba', 'state': 'in', 'period': 2, 'clock': '6:00', 'home_score': 40,
+                 'away_score': 38, 'wp': wp, 'home_ticker': a, 'away_ticker': b}
+                for k, wp in enumerate((0.56, between, 0.56))]
+        g = db_games({ev: rows}, {}, {a: 1.0, b: 1.0}, 0)[ev]
+        bk = Book()
+        for t, (bid, ask) in ((t0 * 1000, (5500, 5700)), (t0 * 1000 + 50_000, (7300, 7500))):
+            bk.add(a, t, Quote(t, bid, None, ask, None))
+            bk.add(b, t, Quote(t, ONE - ask, None, ONE - bid, None))
+        return [x['t'] - t0 * 1000 for x in simulate(g, bk, rule_params('fade', 0.12))]
+    check("the DB: a -1 row does not make ESPN's next number new (deskd keeps a play's first sighting through a "
+          "miss): 0.56, -1, 0.56 takes nothing at 60 s; 0.56, 0.58, 0.56 takes A at 60 s",
+          miss_game(-1) == [] and miss_game(0.58) == [60_000], (miss_game(-1), miss_game(0.58)))
 
     # gw's inventory, X1's 4 contracts a market, over the position the replay's own takes built
     # (x1_golden.json's 60c cases): FOLLOW 0.10 with ESPN at 0.75 for A's team, A 0.59/0.60 and B
