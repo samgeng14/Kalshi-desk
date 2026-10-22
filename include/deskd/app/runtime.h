@@ -9,8 +9,9 @@
 //   send-k1          Manual's sender; send-k2, send-k3 Systematic's (week 0: placeholders)
 //   send-cx          cancels and KILL, on its own path
 //   strat            the game scores merged (ref/scores.h), the fairs (financial and game), the
-//                    makers, C1's, X1's, N1's and N2's takes (strat/take.h), the LIP meter and
-//                    the markouts, each engine at its own cadence (strat/strat.h)
+//                    makers, C1's, X1's, N1's and N2's takes (strat/take.h), S1's baskets
+//                    (strat/arb.h), the LIP meter and the markouts, each engine at its own
+//                    cadence (strat/strat.h)
 //   store            the only writer of ops.sqlite
 //   pub              the screen's streams, hb, hdr, snapshots
 //   ops              heartbeat file, disk, preflight rows
@@ -70,6 +71,7 @@ class EspnFeed;
 class NcaaFeed;
 class ScoreMerge;
 class MakerEngine;
+class ArbEngine;
 class Markouts;
 struct MdBook;
 namespace rest { class State; struct Snapshot; }
@@ -196,8 +198,14 @@ class Deskd {
   bool nba_on() const { return cfg_.nba_lanes && cfg_.systematic_orders; }
   void load_nba();   // x1_, n1_ and n2_: gate, rule, why
   nlohmann::json nba_status() const;
+  // S1 ARB (plan 5(c)): its engine on strat, with deskd.arb_mode scan or trade (strat/arb.h)
+  std::unique_ptr<ArbEngine> arb_;
+  const std::vector<std::string>& arb_series() const { return cfg_.arb_series.empty() ? cfg_.band_series : cfg_.arb_series; }
+  nlohmann::json arb_status() const;
+  void refresh_events();                 // rest_->set_events: strat_events_ and, with event_risk, Systematic's held events
   FillModel fill_model_;                 // each market's trade tape: how likely an order is to fill
   std::map<std::string, std::set<std::string>> strat_want_;   // under live_mu_: by lane, the markets it quotes
+  std::set<std::string> strat_events_;   // under live_mu_: the events S1 scans (their rows: refresh_events)
   std::string key_error_;
   mutable std::mutex live_mu_;
   std::set<std::string> pins_, live_;

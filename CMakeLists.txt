@@ -572,6 +572,8 @@ deskd_fake_test(runtime_manual)
 deskd_fake_test(runtime_college)
 # runtime_nba: X1, N1 and N2 in the whole process (their gates, one N1 take in its group, X1 in shadow, Stop, KILL, ESPN silent, the game cap; N2's pregame favourite)
 deskd_fake_test(runtime_nba)
+# runtime_arb: S1 in the whole process (scan logs and sends nothing; trade: a basket, a missed leg completed and one unwound, an UNKNOWN leg, KILL and Stop mid-basket, the legging pause)
+deskd_fake_test(runtime_arb)
 deskd_fake_test(pyth)
 # fees: gw/fees.h against the fake's model_fee and charge_fee, at the fake's own balance precision
 deskd_fake_test(fees)
@@ -634,6 +636,7 @@ foreach(t
     deskd-pub_data
     deskd-pyth
     deskd-rest
+    deskd-runtime_arb
     deskd-runtime_college
     deskd-runtime_manual
     deskd-runtime_nba

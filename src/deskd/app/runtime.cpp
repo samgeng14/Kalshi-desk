@@ -20,6 +20,7 @@
 #include "deskd/ref/espn.h"
 #include "deskd/ref/ncaa.h"
 #include "deskd/ref/scores.h"
+#include "deskd/strat/arb.h"
 #include "deskd/strat/maker.h"
 #include "deskd/strat/markouts.h"
 #include "deskd/strat/take.h"
@@ -169,7 +170,8 @@ bool Deskd::start(std::string* err) {
   // The strat thread's engines, each at its own cadence and in this order when due together: the
   // fair before the makers that read it; the merged scores, then the game fair, then C1's, X1's,
   // N1's and N2's takes, which use a fair only when it was priced on the score they read. An
-  // engine with work in flight registers with paced().
+  // engine with work in flight registers with paced(): S1's steps every 10 ms while a basket's
+  // legs are out, else every 250 ms.
   StratSteps steps;
   steps.every(250, [this] { if (fair_ && rest_) fair_->step(*rest_->snapshot(), now_ms()); });
   steps.every(250, [this] { if (scores_) scores_->step(now_ms()); });
@@ -178,6 +180,7 @@ bool Deskd::start(std::string* err) {
   steps.every(250, [this] { if (x1_.engine) x1_.engine->step(now_ms()); });
   steps.every(250, [this] { if (n1_.engine) n1_.engine->step(now_ms()); });
   steps.every(250, [this] { if (n2_.engine) n2_.engine->step(now_ms()); });
+  steps.paced(10, [this] { return arb_ ? arb_->step(now_ms()) : 250; });
   steps.every(250, [this] { if (lip_) lip_->step(now_ms()); });
   steps.every(250, [this] { if (band_) band_->step(now_ms()); });
   steps.every(250, [this] { if (paper_) paper_->step(now_ms()); });
@@ -336,6 +339,7 @@ json Deskd::status() const {
   result["game_fair"] = game_fair_ ? game_fair_->status() : json(nullptr);
   result["college"] = college_status();
   result["nba"] = nba_status();
+  result["arb"] = arb_status();
   result["markouts"] = markouts_ ? markouts_->status() : json(nullptr);
   if (const auto l = gw_->latency()) {
     auto ms = [](const std::optional<int>& v) { return v ? json(*v) : json(nullptr); };
@@ -352,7 +356,8 @@ json Deskd::status() const {
     const auto s = rest_->snapshot();
     result["rest"] = {{"ready",s->ready},{"account_ms",s->account_ms},{"listing_ms",s->listing_ms},
                        {"markets",s->markets.size()},{"revision",s->revision},{"error",s->error},
-                       {"metadata_error",s->metadata_error}};
+                       {"metadata_error",s->metadata_error},{"events",s->events.size()},{"events_ms",s->events_ms},
+                       {"events_error",s->events_error}};
     result["rest"]["live"]=s->live.size();
     std::size_t fee_ready=0;
     for(const auto& tk:s->live) {

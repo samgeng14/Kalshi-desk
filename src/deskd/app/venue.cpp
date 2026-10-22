@@ -16,6 +16,7 @@
 #include "deskd/ref/espn.h"
 #include "deskd/ref/ncaa.h"
 #include "deskd/ref/scores.h"
+#include "deskd/strat/arb.h"
 #include "deskd/strat/maker.h"
 #include "deskd/strat/markouts.h"
 #include "deskd/gw/sys_book.h"
@@ -452,6 +453,27 @@ json Deskd::nba_status() const {
           {"N2", lane(n2_)}};
 }
 
+// S1's: what it scans and trades, its settings, and its engine's status (mode, pause, legging,
+// each event's last scan, the open baskets)
+json Deskd::arb_status() const {
+  json lattice = json::object();
+  for (const auto& [prefix, step] : cfg_.arb_lattice) lattice[prefix] = step;
+  std::string why;
+  if (cfg_.arb_mode == "off") why = "deskd.arb_mode is off";
+  else if (!arb_) why = "no venue credential";
+  return {{"mode", cfg_.arb_mode},
+          {"why", why},
+          {"series", arb_series()},
+          {"max_qty", qty_to_number(cfg_.arb_max_qty)},
+          {"max_legs", cfg_.arb_max_legs},
+          {"thr", money_str(cfg_.arb_thr)},
+          {"legging_pause", money_str(cfg_.arb_legging_pause)},
+          {"lattice", lattice},
+          {"event_risk", cfg_.event_risk},
+          {"fee_precision", money_str(cfg_.fee_precision)},
+          {"engine", arb_ ? arb_->status() : json(nullptr)}};
+}
+
 void Deskd::attach_manual() {
   ManualPath p;
   p.snapshot = [this] { return rest_->snapshot(); };
@@ -486,6 +508,10 @@ void Deskd::attach_manual() {
   p.write_tier = cfg_.write_tier == "advanced" ? WriteBudget::advanced() : WriteBudget::basic();
   p.live = cfg_.live;
   p.check_each_message = options_.check_each_message;
+  // decisions 5: S1's stakes in an event the account read's row shapes count by settlement state,
+  // on the same lattice S1 finds its baskets on
+  p.event_risk = cfg_.event_risk;
+  p.lattice = [this](const std::string& series) { return arb_lattice_step(cfg_, series); };
   p.record = [this](const std::string& table, std::string row) { return store_.inbox().push(StoreRecord{table, std::move(row)}); };
   // gw's alerts on the page: store falling behind on any desk, a lane's refusals with Systematic
   p.alert = [this](const std::string& lvl, const std::string& src, const std::string& msg) { pub_->alert(lvl, src, msg); };
@@ -546,9 +572,29 @@ void Deskd::attach_manual() {
         l.gate_why = n.why;
         if (n.rule && n.rule->mode != TakeMode::FAV_PREGAME) l.thr = n.rule->edge;
       }
+      // S1 ARB (plan 5(c)): deskd.arb_series, at deskd.arb_thr; an engine only in trade mode, and
+      // in scan mode the reason it stays off (LaneSet and place_sys refuse it)
+      if (l.id == "S1" && cfg_.arb_mode != "off") {
+        l.series = arb_series();
+        l.engine = cfg_.arb_mode == "trade";
+        l.thr = cfg_.arb_thr;
+        if (cfg_.arb_mode == "scan") l.gate_why = "deskd.arb_mode is scan: S1 only logs the baskets it finds (arb_scans)";
+      }
     }
     if (!cfg_.live && cfg_.paper_lane) p.lanes.push_back(paper_lane());   // D1: the demo account only
   }
+  // a lane's markets: their books (md) and fee metadata (rest), through refresh_live
+  auto want = [this](const std::string& lane) {
+    return [this, lane](std::set<std::string> markets) {
+      bool changed = false;
+      {
+        std::lock_guard<std::mutex> lk(live_mu_);
+        changed = markets != strat_want_[lane];
+        if (changed) strat_want_[lane] = std::move(markets);
+      }
+      if (changed) refresh_live();
+    };
+  };
   if (cfg_.systematic_orders) {
     // LIP-15 (lane M1): the 15-minute series it trades (deskd.lip_series), quoted by the maker engine
     MakerEngine::Env env;
@@ -588,17 +634,6 @@ void Deskd::attach_manual() {
     };
     env.alert = [this](const std::string& lvl, const std::string& msg) { pub_->alert(lvl, "SYS", msg); };
     env.release = [this](const std::string& tk, std::int64_t now) { return calendar_.active(tk, now); };
-    auto want = [this](const std::string& lane) {
-      return [this, lane](std::set<std::string> markets) {
-        bool changed = false;
-        {
-          std::lock_guard<std::mutex> lk(live_mu_);
-          changed = markets != strat_want_[lane];
-          if (changed) strat_want_[lane] = std::move(markets);
-        }
-        if (changed) refresh_live();
-      };
-    };
     env.want = want("M1");
     env.markout = [this] { const auto m = markouts_->lane_mean("M1", "60s"); return std::make_pair(m.fills, m.mean); };
     MakerParams lip;
@@ -712,6 +747,62 @@ void Deskd::attach_manual() {
       n->engine = std::make_unique<TakeEngine>(id, cfg_.nba_series, std::move(te), *n->rule, o);
     }
   }
+  // S1 ARB (plan 5(c)): IOC baskets of one event's markets that lock after fees however it
+  // settles, the scarcest leg first, a missed leg completed a tick through or unwound; a basket
+  // and the legging in <data_dir>/s1.json. Scan mode finds and logs them (arb_scans) and sends
+  // nothing, Systematic orders or not: without them gw keeps no Systematic book, and the scan
+  // sizes a basket to the lane's budget alone. Its markets' books and fee metadata come as any
+  // lane's (want), its events' rows from rest (refresh_events).
+  if (cfg_.arb_mode == "scan" || cfg_.arb_mode == "trade") {
+    const auto& lanes = default_lanes();
+    const LaneSpec& s1 = *std::find_if(lanes.begin(), lanes.end(), [](const LaneSpec& l) { return l.id == "S1"; });
+    arb::Params ap;
+    ap.mode = cfg_.arb_mode;
+    ap.limits.thr = cfg_.arb_thr;
+    ap.limits.max_qty = cfg_.arb_max_qty;
+    ap.limits.max_legs = cfg_.arb_max_legs;
+    ap.limits.inventory = s1.inventory;
+    ap.limits.by_state = cfg_.event_risk;
+    ap.limits.fee_precision = cfg_.fee_precision * 100;   // u to micro-dollars
+    ap.budget = s1.budget * 100;
+    ap.legging_pause = cfg_.arb_legging_pause * 100;
+    std::shared_ptr<const Gateway::SysView> none;
+    if (!cfg_.systematic_orders) {
+      auto v = std::make_shared<Gateway::SysView>();
+      v->eff = ap.budget;
+      none = std::move(v);
+    }
+    ArbEngine::Env ae;
+    ae.view = [this, none] { return none ? none : gw_->sys_view(); };
+    ae.snapshot = [this] { return rest_->snapshot(); };
+    ae.book = p.book;
+    ae.post = [this](GwMsg m) { return gw_->post(std::move(m)); };
+    ae.want = want("S1");
+    ae.want_events = [this](std::set<std::string> events) {
+      bool changed = false;
+      {
+        std::lock_guard<std::mutex> lk(live_mu_);
+        changed = events != strat_events_;
+        if (changed) strat_events_ = std::move(events);
+      }
+      if (changed) refresh_events();
+    };
+    ae.private_up = [this] { const auto v = feeds_.KXP.view(); return v.up && !v.gap; };
+    // the write tokens Systematic may still spend on a shard: what the bucket holds over the fifth
+    // kept for Manual and the cancels (gw/write_budget.h); a shard gw never wrote to is full
+    ae.write_room = [this](int shard) {
+      const double cap = gw_->write_cap();
+      double tokens = cap;
+      if (const auto w = gw_->write_tokens())
+        if (const auto it = w->find(std::max(0, shard)); it != w->end()) tokens = it->second;
+      return tokens - cap * (1 - WriteBudget::kSysShare);
+    };
+    ae.lattice = [this](const std::string& series) { return arb_lattice_step(cfg_, series); };
+    ae.record = [this](const std::string& table, std::string row) { return store_.inbox().push(StoreRecord{table, std::move(row)}); };
+    ae.alert = [this](const std::string& lvl, const std::string& msg) { pub_->alert(lvl, "SYS", msg); };
+    if (!cfg_.data_dir.empty()) ae.state_file = cfg_.data_dir + "/s1.json";
+    arb_ = std::make_unique<ArbEngine>("S1", arb_series(), std::move(ae), ap);
+  }
   p.send = [this](KalshiWriteJob j) { return q_man_.push(std::move(j)); };
   p.refresh = [this] { rest_->request_refresh(); };
   p.cancel = [this](KalshiWriteJob j) { return q_mcx_.push(std::move(j), Lane::PRIORITY); };
@@ -792,6 +883,7 @@ PreflightRow Deskd::shard_row(const rest::Snapshot& s, bool fresh) const {
     if (why.empty()) series["C1"].push_back(name);
   for (const NbaLane* n : {&x1_, &n1_, &n2_})
     if (n->rule) series[n->id] = cfg_.nba_series;
+  if (cfg_.arb_mode == "trade") series["S1"] = arb_series();
   const auto now = now_ms();
   for (const auto& lane : v->lanes_on) {
     const auto it = series.find(lane);
@@ -868,9 +960,28 @@ void Deskd::refresh_live() {
   else md_->set_watch(std::vector<std::string>(selected.begin(),selected.end()));
 }
 
+// The event rows rest reads (rest::State::set_events): the events S1 scans and, with
+// deskd.event_risk, those of every market Systematic holds, so gw counts a held basket by state
+// after a restart too, and once its markets close within S1's scan lead. Under live_mu_, so the
+// last set sent is the last one made.
+void Deskd::refresh_events() {
+  if (!rest_) return;
+  std::lock_guard<std::mutex> lk(live_mu_);
+  std::set<std::string> events = strat_events_;
+  if (cfg_.event_risk)
+    if (const auto held = gw_->sys_held()) {
+      const auto s = rest_->snapshot();
+      for (const auto& tk : *held)
+        if (const auto it = s->markets.find(tk); it != s->markets.end() && !it->second.event_ticker.empty())
+          events.insert(it->second.event_ticker);
+    }
+  rest_->set_events(std::move(events));
+}
+
 void Deskd::on_rest(std::shared_ptr<const rest::Snapshot>) {
   if (!rest_) return;
   if (const auto held = gw_->sys_held()) rest_->set_held(*held);   // read until they settle
+  refresh_events();
   refresh_live();
   const auto s = rest_->snapshot();
   for (const auto& tk : s->live) {
