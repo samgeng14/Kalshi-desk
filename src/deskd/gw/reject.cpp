@@ -40,13 +40,16 @@ RejectClass classify_refusal(WireOp op, int status, const std::string& text) {
   auto has = [&](const char* s) { return b.find(s) != std::string::npos; };
   if (status == 429) return RejectClass::RETRYABLE;
   if (status == 401 || status == 403) return RejectClass::AUTH;
-  if ((op == WireOp::CANCEL || op == WireOp::BATCH_CANCEL) && status == 404) return RejectClass::GONE;
+  if ((op == WireOp::CANCEL || op == WireOp::BATCH_CANCEL || op == WireOp::GROUP) && status == 404) return RejectClass::GONE;
   if (status == 409 && (has("order_already_exists") || has("already exists") || has("duplicate")))
     return RejectClass::DUPLICATE;
   if (is_post_only_cross(b)) return RejectClass::SOFT_MARKET;
   if (has("self trade") || has("self-trade") || has("self_trade") || has("selftrade"))
     return RejectClass::SOFT_SELF_TRADE;
-  if (has("order group triggered") || has("order_group_triggered") || has("order group is triggered"))
+  // demo, 2026-10-13, an order into a triggered group: 400 exceeded_order_group_contracts_limit
+  // "placing this order would exceed your the order group contracts limit"
+  if (has("order group triggered") || has("order_group_triggered") || has("order group is triggered") ||
+      has("exceeded_order_group_contracts_limit") || has("order group contracts limit"))
     return RejectClass::SOFT_GROUP;
   if (has("market closed") || has("market_closed") || has("market is closed") || has("closed to new orders") ||
       has("market not open") || has("market_not_open") || has("market is not open") || has("trading is paused") ||

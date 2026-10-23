@@ -58,7 +58,11 @@ void SparePool::record_open(const Conn& c, bool inline_open) {   // under mu_
 void SparePool::loop() {
   const std::string label = "pool-" + cfg_.name;
   set_thread_label(label);
+#ifdef __APPLE__
   pthread_setname_np(label.substr(0, 63).c_str());
+#else
+  pthread_setname_np(pthread_self(), label.substr(0, 15).c_str());
+#endif
   int backoff_ms = 0;
   std::int64_t next_try_us = 0;
   std::int64_t next_check_us = mono_us() + static_cast<std::int64_t>(cfg_.check_ms) * 1000;

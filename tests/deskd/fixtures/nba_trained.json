@@ -1,0 +1,28 @@
+{
+  "model": "nba_logit",
+  "note": "SYNTHETIC, for tests only: tools/train_bball.py --write-synthetic (a seeded NBA panel with overtime rows; deskd's bball tests check the C++ loader reproduces the Python trainer). Never a real model.",
+  "league": "nba",
+  "regulation_s": 2880,
+  "version": 1,
+  "trained": "2026-10-21",
+  "seasons": ["2023-24", "2024-25", "2025-26"],
+  "n_games": 2400,
+  "brier": {"model": 0.1294472776975497, "kalshi_mid": 0.14374626288659795, "espn": 0.14836287800687284, "stern": 0.13194508271180938, "stern_ot": 0.1320996468169054, "held_out": "2025-26"},
+  "features": ["logit_p0", "margin_over_sd", "logit_p0_x_tau", "logit_p0_x_sqrt_tau", "possession_over_sd", "ot"],
+  "mean": [-0.008588313405656505, 0.6731790068515999, -0.011856131905878135, -0.011961633877868218, 0.06110205326730714, 0.15666666666666668],
+  "scale": [1.189889617094485, 30.84829456404298, 0.6297483682524416, 0.7794329426391368, 2.608843365890106, 0.36348620637133155],
+  "coef": [-0.14931391143607425, 3.7479632942353427, -0.492135026045741, 1.3937126315976875, 0.17787010586534857, 0.18794070515734504],
+  "intercept": 0.02497816369253865,
+  "golden": [
+    {"in": {"t_left_s": 2880, "margin": 0, "possession": 0, "p0": 0.5, "ot": false}, "p": 0.46731278876529764},
+    {"in": {"t_left_s": 2880, "margin": 0, "possession": 1, "p0": 0.8, "ot": false}, "p": 0.761048115769855},
+    {"in": {"t_left_s": 2160, "margin": 4, "possession": -1, "p0": 0.35, "ot": false}, "p": 0.4576551091745562},
+    {"in": {"t_left_s": 2160, "margin": -7, "possession": 1, "p0": 0.65, "ot": false}, "p": 0.3751505258046158},
+    {"in": {"t_left_s": 1440, "margin": 10, "possession": 1, "p0": 0.55, "ot": false}, "p": 0.8600808707763008},
+    {"in": {"t_left_s": 1440, "margin": -3, "possession": 0, "p0": 0.1, "ot": false}, "p": 0.09235612505424601},
+    {"in": {"t_left_s": 720, "margin": 2, "possession": -1, "p0": 0.9, "ot": false}, "p": 0.8132627550770296},
+    {"in": {"t_left_s": 720, "margin": -12, "possession": 1, "p0": 0.7, "ot": false}, "p": 0.08542299087950268},
+    {"in": {"t_left_s": 60, "margin": 1, "possession": 1, "p0": 0.45, "ot": false}, "p": 0.7162463939414139},
+    {"in": {"t_left_s": 180, "margin": -2, "possession": -1, "p0": 0.97, "ot": true}, "p": 0.5444769169712989}
+  ]
+}

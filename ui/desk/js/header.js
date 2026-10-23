@@ -113,8 +113,58 @@
   function cell(id, text, cls) { var el = $(id); if (!el) return; D.setText(el, text); if (cls !== undefined && el.className !== cls) el.className = cls; }
   function sum(a, b) { return (a || 0) + (b || 0); }
   function health(id, label, state, valueText) {
-    // state: 'ok' | 'warn' | 'crit'
+    // state: 'ok' | 'warn' | 'crit' | 'off'
     cell(id, label + ' ' + valueText, 'hh' + (state === 'ok' ? '' : ' ' + state));
+  }
+  // Polymarket not connected at all (deskd has no PM venue yet): read-only, no cash, its feed
+  // never up. Shown OFF and dim rather than as a failing key; a PM that was up and failed still
+  // reads RO / DOWN.
+  function pmOff(S) {
+    var h = S.hdr, f = S.feeds;
+    return !!(h && h.cash.P.ro && h.cash.P.total === 0 && (!f || (!f.PM.up && f.PM.lag_ms === null)));
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // PAPER | LIVE: one toggle, two accounts. Each account is its own deskd (its own lock, ledger,
+  // venue connections and port: paper, the demo account, 8788; live, production, 8789), both
+  // started by `python3 tools/desk.py`; the toggle flips this tab to the other one
+  // (<meta name="desk-peer">), on the same tab of the screen, asking first before LIVE.
+  // ---------------------------------------------------------------------------------------------
+  var desk = { peer: '', venue: '', mode: '' };
+  function meta(name) {
+    try { var el = document.querySelector('meta[name="' + name + '"]'); return el ? el.getAttribute('content') || '' : ''; }
+    catch (e) { return ''; }
+  }
+  function modeCell(mode) {   // mode: the header's DEMO | LIVE ('' before the first header)
+    desk.mode = mode;
+    var sim = Desk.transport.mode === 'demo' || desk.venue === 'sim', live = mode === 'LIVE', can = switchable();
+    var what = live ? 'LIVE: the production Kalshi account, real money' :
+      sim ? 'SIM: ' + (Desk.transport.mode === 'demo' ? 'the simulated desk in this page' : 'the fake exchange on this machine') + ', nothing reaches Kalshi' :
+      'PAPER: the Kalshi demo account, play money';
+    if (can) {
+      // the toggle: PAPER left, LIVE right, this desk's side lit
+      cell('h-mode', 'PAPER', live ? 'tag sw' : 'tag warn');
+      cell('h-mode-b', 'LIVE', live ? 'tag crit' : 'tag sw');
+    } else {
+      cell('h-mode', !mode ? '-' : live ? 'LIVE' : sim ? 'SIM' : 'PAPER', live ? 'tag crit' : 'tag warn');
+      cell('h-mode-b', '', 'tag hide');
+    }
+    D.setAttr($('hc-mode'), 'title', what + (can ? '. Click to switch to ' + (live ? 'PAPER' : 'LIVE') : ''));
+    D.setClass($('hc-mode'), 'peer', can);
+  }
+  // only between the two accounts' desks: the in-page simulation and the fake exchange have none
+  function switchable() { return !!(desk.peer && desk.mode && Desk.transport.mode === 'live' && desk.venue !== 'sim'); }
+  function switchDesk() {
+    if (!switchable()) return;
+    var toLive = desk.mode !== 'LIVE', name = toLive ? 'LIVE' : 'PAPER';
+    // is it up? the other desk refuses this cross-port fetch (403), but a refusal still answers
+    fetch(desk.peer + 'api/health', { mode: 'no-cors', cache: 'no-store', credentials: 'omit' }).then(function () {
+      if (toLive && !root.confirm('Switch to LIVE?\n\nOrders there trade your real Kalshi account with real money.')) return;
+      root.location.assign(desk.peer + '?tab=' + (Desk.tabs.cur || 'manual'));   // the same tab of the screen
+    }, function () {
+      Desk.store.localAlert('WARN', 'DESK', name + ' is not running: start both with python3 tools/desk.py' +
+        (toLive ? ' (after python3 tools/desk.py setup live, once)' : ''));
+    });
   }
 
   function renderHeader(d) {
@@ -143,8 +193,8 @@
       cell('h-pm', F.money(h.cash.P.total));
       // PM has no shards: its free cash shows only while orders hold some of it
       cell('h-pm-free', h.cash.P.ro || Math.abs(h.cash.P.total - h.cash.P.free) < 100 ? '' : 'free ' + F.money(h.cash.P.free));
-      D.setAttr($('hc-pm'), 'title', h.cash.P.ro ? 'read-only: PM key failing' : 'free ' + F.money(h.cash.P.free));
-      D.setClass($('h-pm-ro'), 'on', h.cash.P.ro);
+      D.setAttr($('hc-pm'), 'title', pmOff(S) ? 'Polymarket: not connected on this desk' : h.cash.P.ro ? 'read-only: PM key failing' : 'free ' + F.money(h.cash.P.free));
+      D.setClass($('h-pm-ro'), 'on', h.cash.P.ro && !pmOff(S));
       // the day's P&L flashes when its realized part moves by a cent (a fill that closed, an exit,
       // a settlement: green up, red down), at most once every 1.5 s; marks and the LIP accrual
       // move it every second while the lanes run, so a move of the total flashes only with FULL
@@ -165,9 +215,9 @@
       if (hcSys && hcSys.className !== sysCls) hcSys.className = sysCls;
       D.setAttr($('h-sys'), 'title', 'K ' + F.money(h.sys.K.used) + '/' + F.money(h.sys.K.eff) + ' ceil ' + F.money(h.sys.K.ceiling) +
         '  P ' + F.money(h.sys.P.used) + '/' + F.money(h.sys.P.eff) + ' ceil ' + F.money(h.sys.P.ceiling));
-      cell('h-mode', h.mode, 'tag ' + (h.mode === 'DEMO' ? 'warn' : 'dim'));
+      modeCell(h.mode);
     } else if (!h && Desk.transport.mode) {
-      cell('h-mode', Desk.transport.mode === 'demo' ? 'DEMO' : 'LIVE', 'tag ' + (Desk.transport.mode === 'demo' ? 'warn' : 'dim'));
+      modeCell(Desk.transport.mode === 'demo' ? 'DEMO' : '');
     }
     if (d.has('clock') || d.has('feeds') || d.has('hdr') || d.has('stale') || d.has('lat') || d.all) {
       var f = S.feeds, lat = h ? h.lat : null;
@@ -176,7 +226,8 @@
       else if (!f.KX.up || !f.KXP.up) health('h-kx', 'KX', 'crit', 'DOWN');
       else if (f.KX.gap || f.KXP.gap) health('h-kx', 'KX', 'crit', 'GAP');
       else { var kl = lat && lat.kx_lag_ms !== null ? lat.kx_lag_ms : f.KX.lag_ms; health('h-kx', 'KX', kl !== null && kl > 1000 ? 'warn' : 'ok', kl === null ? '-' : kl + 'ms'); }
-      if (h && h.cash.P.ro) health('h-pmh', 'PM', 'warn', 'RO');
+      if (h && pmOff(S)) health('h-pmh', 'PM', 'off', 'OFF');
+      else if (h && h.cash.P.ro) health('h-pmh', 'PM', 'warn', 'RO');
       else if (!f) health('h-pmh', 'PM', 'warn', '-');
       else if (!f.PM.up) health('h-pmh', 'PM', 'crit', 'DOWN');
       else { var pl = lat && lat.pm_lag_ms !== null ? lat.pm_lag_ms : f.PM.lag_ms; health('h-pmh', 'PM', pl !== null && pl > 1000 ? 'warn' : 'ok', pl === null ? '-' : pl + 'ms'); }
@@ -201,6 +252,9 @@
         D.setText(kb, label);
         var kc = k.st === 'ARMED' ? '' : k.st === 'KILLING' ? 'pend' : k.st === 'KILLFAIL' ? 'fail' : k.st === 'LOCKED' ? 'locked' : k.st === 'CONFIRM' ? 'rearm confirm' : 'rearm';
         if (kb.className !== kc) kb.className = kc;
+        var kr = Desk.store.hdr ? Desk.store.hdr.run : null;
+        D.setAttr(kb, 'title', kr && kr.state === 'KILLED' ? 'KILLED ' + F.time(kr.since_ms) + (kr.why ? ': ' + kr.why : '') +
+          (k.st === 'LOCKED' ? '' : '. Click RE-ARM, then CONFIRM') : null);
       }
     }
   }
@@ -220,7 +274,7 @@
       D.setClass(document.body, 'stale', S.stale);
       D.setAttr(document.body, 'data-kstale', S.vstale.K ? '1' : null);
       D.setAttr(document.body, 'data-pstale', S.vstale.P ? '1' : null);
-      var why = S.stale ? 'STALE ' + S.staleWhy : (S.vstale.K || S.vstale.P || '');
+      var why = S.stale ? 'STALE ' + S.staleWhy : (S.vstale.K || (pmOff(S) ? '' : S.vstale.P) || '');   // no PM: no alarm
       cell('sb-stale', why, 'sbc' + (why ? ' crit' : ' off'));
     }
     if (d.has('hk') || d.all) {
@@ -427,6 +481,9 @@
       tabs.set(mode === 'SYS' ? 'systematic' : 'manual'); A.seen(mode); R.mark('act');
     }, now);
     $('kill').addEventListener('click', onKill);
+    desk.peer = meta('desk-peer'); desk.venue = meta('desk-venue');
+    if (desk.peer && desk.peer.charAt(desk.peer.length - 1) !== '/') desk.peer += '/';
+    $('hc-mode').addEventListener('click', switchDesk);
     press($('sb-alert'), function () { H.openLog(); }, now);
     press($('sb-keys'), function () { H.openKeys(); }, now);
     press($('sb-set'), function () { H.openSet(); }, now);

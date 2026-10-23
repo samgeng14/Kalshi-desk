@@ -229,6 +229,21 @@ if(PYTHON3_EXE)
   # The alpha audit checked against ground truth: pure noise must yield nothing, an injected
   # signal must be found, and the HAC correction must shrink the t-stat overlap inflates.
   add_test(NAME alpha-decay COMMAND ${PYTHON3_EXE} ${CMAKE_SOURCE_DIR}/tests/test_alpha_decay.py)
+  add_test(NAME latency-report COMMAND ${PYTHON3_EXE} ${CMAKE_SOURCE_DIR}/tools/latency_report.py --self-test)
+  add_test(NAME train-wcbb COMMAND ${PYTHON3_EXE} ${CMAKE_SOURCE_DIR}/tools/train_wcbb.py --self-test)
+  add_test(NAME train-bball COMMAND ${PYTHON3_EXE} ${CMAKE_SOURCE_DIR}/tools/train_bball.py --self-test)
+  add_test(NAME espn-match COMMAND ${PYTHON3_EXE} ${CMAKE_SOURCE_DIR}/tools/espn_match.py --self-test)
+  add_test(NAME take-rule COMMAND ${PYTHON3_EXE} ${CMAKE_SOURCE_DIR}/tools/take_rule.py --self-test)
+  add_test(NAME college-gate COMMAND ${PYTHON3_EXE} ${CMAKE_SOURCE_DIR}/tools/college_gate.py --self-test)
+  add_test(NAME x1-backtest COMMAND ${PYTHON3_EXE} ${CMAKE_SOURCE_DIR}/tools/x1_backtest.py --self-test)
+  add_test(NAME volleyball COMMAND ${PYTHON3_EXE} ${CMAKE_SOURCE_DIR}/tools/volleyball.py --self-test)
+  add_test(NAME replication COMMAND ${PYTHON3_EXE} ${CMAKE_SOURCE_DIR}/tools/replication.py --self-test)
+  add_test(NAME lip-join COMMAND ${PYTHON3_EXE} ${CMAKE_SOURCE_DIR}/tools/lip_join.py --self-test)
+  add_test(NAME fillsim2 COMMAND ${PYTHON3_EXE} ${CMAKE_SOURCE_DIR}/tools/fillsim2.py --self-test)
+  add_test(NAME scorecard COMMAND ${PYTHON3_EXE} ${CMAKE_SOURCE_DIR}/tools/scorecard.py --self-test)
+  add_test(NAME nba-panel COMMAND ${PYTHON3_EXE} ${CMAKE_SOURCE_DIR}/tools/nba_panel.py --self-test)
+  add_test(NAME nba-latency COMMAND ${PYTHON3_EXE} ${CMAKE_SOURCE_DIR}/tools/nba_latency.py --self-test)
+  add_test(NAME nba-gate COMMAND ${PYTHON3_EXE} ${CMAKE_SOURCE_DIR}/tools/nba_gate.py --self-test)
   # The commodity replay's own proof that it cannot see the future: it builds its data in memory,
   # moves the reference after a chosen instant and checks no earlier probability changed.
   add_test(NAME commodity-replay
@@ -273,6 +288,23 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang" AND NOT CMAKE_CXX_COMPILE_OPTIONS
   endif()
 endif()
 
+# The plan's soak runs under ThreadSanitizer (plan section 8): configure a separate build with
+# -DDESKD_TSAN=ON; every target, the fake exchange included, is instrumented.
+option(DESKD_TSAN "build deskd and its tests under ThreadSanitizer" OFF)
+if(DESKD_TSAN)
+  add_compile_options(-fsanitize=thread -g -O1)
+  add_link_options(-fsanitize=thread)
+endif()
+# ... and under AddressSanitizer with UndefinedBehaviorSanitizer (plan section 8: both sanitizers):
+# -DDESKD_ASAN=ON, never together with DESKD_TSAN. Any UB report fails the test that hit it.
+option(DESKD_ASAN "build deskd and its tests under AddressSanitizer and UBSan" OFF)
+if(DESKD_ASAN AND DESKD_TSAN)
+  message(FATAL_ERROR "DESKD_ASAN and DESKD_TSAN cannot be combined: configure one per build")
+endif()
+if(DESKD_ASAN)
+  add_compile_options(-fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -g -O1)
+  add_link_options(-fsanitize=address,undefined)
+endif()
 add_library(deskd_flags INTERFACE)
 target_include_directories(deskd_flags INTERFACE include ${CMAKE_BINARY_DIR}/generated)
 target_include_directories(deskd_flags SYSTEM INTERFACE third_party)
@@ -299,6 +331,10 @@ add_library(deskd_core STATIC
   src/deskd/md/kalshi_md.cpp
   src/deskd/rest/state.cpp
   src/deskd/priv/kalshi_private.cpp
+  src/deskd/ref/pyth.cpp
+  src/deskd/ref/espn.cpp
+  src/deskd/ref/ncaa.cpp
+  src/deskd/ref/scores.cpp
   src/deskd/net/guard.cpp
   src/deskd/net/http.cpp
   src/deskd/net/ws.cpp
@@ -309,11 +345,31 @@ add_library(deskd_core STATIC
   src/deskd/gw/gateway.cpp
   src/deskd/gw/order_ledger.cpp
   src/deskd/gw/manual_admission.cpp
+  src/deskd/gw/manual_book.cpp
+  src/deskd/gw/sys_book.cpp
+  src/deskd/gw/write_budget.cpp
   src/deskd/gw/kill.cpp
   src/deskd/gw/kalshi_sign.cpp
   src/deskd/gw/kalshi_wire.cpp
   src/deskd/gw/reject.cpp
+  src/deskd/gw/fees.cpp
+  src/deskd/gw/event_risk.cpp
+  src/deskd/gw/poly_wire.cpp
+  src/deskd/gw/poly_sign.cpp
   src/deskd/strat/strat.cpp
+  src/deskd/strat/terminal_price.cpp
+  src/deskd/strat/fair.cpp
+  src/deskd/strat/maker.cpp
+  src/deskd/strat/fill_model.cpp
+  src/deskd/strat/calendar.cpp
+  src/deskd/strat/lip.cpp
+  src/deskd/strat/bball_model.cpp
+  src/deskd/strat/volley_model.cpp
+  src/deskd/strat/game_fair.cpp
+  src/deskd/strat/take.cpp
+  src/deskd/strat/arb.cpp
+  src/deskd/strat/markouts.cpp
+  src/deskd/strat/lane_gate.cpp
   src/deskd/store/store.cpp
   src/deskd/web/sse.cpp
   src/deskd/web/streams.cpp
@@ -321,7 +377,7 @@ add_library(deskd_core STATIC
   src/deskd/web/pub.cpp
   src/deskd/web/server.cpp)
 # net/ speaks TLS through OpenSSL 3 (Homebrew's openssl@3 on macOS), and gw/ signs with it
-target_link_libraries(deskd_core PUBLIC deskd_flags OpenSSL::SSL OpenSSL::Crypto)
+target_link_libraries(deskd_core PUBLIC deskd_flags OpenSSL::SSL OpenSSL::Crypto ${DESK_SQLITE_TARGET})
 target_precompile_headers(deskd_core PRIVATE
   <nlohmann/json.hpp> <httplib.h>
   <atomic> <chrono> <condition_variable> <deque> <functional> <future> <map> <memory> <mutex>
@@ -360,6 +416,32 @@ add_executable(deskctl src/deskd/app/deskctl.cpp)
 target_link_libraries(deskctl PRIVATE deskd_core)
 target_precompile_headers(deskctl REUSE_FROM deskd_core)
 
+# One line registers one suite: a step that adds a suite adds a line and edits no shared list
+# (2026-10-21: the automatic lanes are built in parallel worktrees, and every one of them would
+# otherwise edit the same foreach). Each suite also joins deskd-all.
+#   deskd_pure_test(x)   tests/deskd/test_x.cpp on deskd_core: binary deskd-test-x, ctest deskd-x
+#   deskd_fake_test(x)   the same, also linked with the fake exchange (fake_kalshi, below)
+#   fake_kalshi_test(x)  tests/deskd/test_fake_x.cpp on the fake alone: deskd-test-fake-x, ctest deskd-fake-x
+add_custom_target(deskd-all)
+function(deskd_suite target source)
+  add_executable(${target} ${source})
+  target_link_libraries(${target} PRIVATE ${ARGN})
+  target_precompile_headers(${target} REUSE_FROM deskd_core)
+  add_dependencies(deskd-all ${target})
+endfunction()
+function(deskd_pure_test name)
+  deskd_suite(deskd-test-${name} tests/deskd/test_${name}.cpp deskd_core)
+  add_test(NAME deskd-${name} COMMAND deskd-test-${name})
+endfunction()
+function(deskd_fake_test name)
+  deskd_suite(deskd-test-${name} tests/deskd/test_${name}.cpp deskd_core fake_kalshi)
+  add_test(NAME deskd-${name} COMMAND deskd-test-${name})
+endfunction()
+function(fake_kalshi_test name)
+  deskd_suite(deskd-test-fake-${name} tests/deskd/test_fake_${name}.cpp fake_kalshi)
+  add_test(NAME deskd-fake-${name} COMMAND deskd-test-fake-${name})
+endfunction()
+
 # tests/deskd: the repo's CHECK style, one executable per area.
 #   bus      units, messages, the two-lane queue (priority overtakes, a full lane drops and marks a gap)
 #   ops      the account lock, the heartbeat rule, config, the subscription and send guards
@@ -368,13 +450,11 @@ target_precompile_headers(deskctl REUSE_FROM deskd_core)
 #            snapshot and replies checked by contract.js itself (node), KILL with gw frozen and
 #            with send-cx's inbox full
 #   process  the real binaries: a second deskd refused (also from another working directory),
-#            SIGTERM, deskctl status and kill
-foreach(t bus ops web process)
-  add_executable(deskd-test-${t} tests/deskd/test_${t}.cpp)
-  target_link_libraries(deskd-test-${t} PRIVATE deskd_core)
-  target_precompile_headers(deskd-test-${t} REUSE_FROM deskd_core)
-  add_test(NAME deskd-${t} COMMAND deskd-test-${t})
-endforeach()
+#            SIGTERM, deskctl status, kill and lane-reset
+deskd_pure_test(bus)
+deskd_pure_test(ops)
+deskd_pure_test(web)
+deskd_pure_test(process)
 # Without node the contract.js conformance check cannot run: deskd-test-web returns 77 and ctest
 # reports the test skipped, not passed (until 2026-10-06 it printed a line and passed).
 set_tests_properties(deskd-web PROPERTIES SKIP_RETURN_CODE 77)
@@ -390,9 +470,11 @@ add_library(fake_kalshi STATIC
   tests/fake_exchange/wire.cpp
   tests/fake_exchange/engine.cpp
   tests/fake_exchange/net.cpp
+  tests/fake_exchange/listener.cpp
   tests/fake_exchange/rest.cpp
   tests/fake_exchange/tape.cpp
   tests/fake_exchange/fake_kalshi.cpp
+  tests/fake_exchange/fake_poly.cpp
   tests/fake_exchange/client.cpp
   tests/fake_exchange/tls_pki.cpp)
 target_include_directories(fake_kalshi PUBLIC tests/fake_exchange)
@@ -403,28 +485,48 @@ add_executable(fake-kalshi tests/fake_exchange/main.cpp)
 target_link_libraries(fake-kalshi PRIVATE fake_kalshi)
 target_precompile_headers(fake-kalshi REUSE_FROM deskd_core)
 
+# The VM recorder's own tests (recorder/tests; tests/test_recorder.py is the old perps recorder's):
+# Kalshi, ESPN and NCAA replies parsed from fixtures, the REST pollers on a fake REST, the control
+# picks, the gaps report, deploy/base.sh with every system command stubbed, and the recorder run
+# against fake-kalshi with loopback scoreboards. No network. A test that needs pyarrow,
+# cryptography, websockets or duckdb skips when this python3 has none (recorder/requirements.txt).
+if(PYTHON3_EXE)
+  add_test(NAME recorder-unit
+           COMMAND ${PYTHON3_EXE} -m unittest discover -s recorder/tests -t .
+           WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+  set_tests_properties(recorder-unit PROPERTIES ENVIRONMENT "FAKE_KALSHI=$<TARGET_FILE:fake-kalshi>")
+endif()
+
 # The fake's own tests:
 #   fake-engine  no sockets: units, grids and fees (the venue's worked rounding example), matching
 #                (price-time, IOC, FOK, post-only, expiry, reduce-only, self-trade, pause, close),
 #                duplicate client ids, netting and cash per shard, order groups, the socket's
-#                message fields, the street and tape debts, the archive reader on recorded frames
-#                and the synthetic fixture, scenarios, the fixture played to its end, and 5,000
-#                resting orders
+#                message fields, the street, its pull of the touch and tape debts, the archive
+#                reader on recorded frames and the synthetic fixture, scenarios, the fixture
+#                played to its end, 5,000 resting orders, and Polymarket US's fee mode (per fill,
+#                to the cent half to even, the rebate credited) and no self-trade prevention
 #   fake-wire    over loopback: every REST route and shape, cursor paging, auth (a real RSA-PSS
 #                signature), rate limits per shard, the socket's commands, sids and seq, every
 #                channel, and each fault (drops, 5xx, a cut body, chunked, 429, stalls, socket
 #                drops, seq gaps, duplicate fills, the fill before the 201, a cancel racing a fill,
-#                a cancel before the 201), the cancel-all's minute of echo, errors 25-27 (buffer
-#                overflow, market limit, command rate), one order's private messages kept in order
-#                under REPLY_FIRST, the fixture tape over the socket, eight clients at once, and
-#                the fake-kalshi binary started and stopped
-foreach(t engine wire)
-  add_executable(deskd-test-fake-${t} tests/deskd/test_fake_${t}.cpp)
-  target_link_libraries(deskd-test-fake-${t} PRIVATE fake_kalshi)
-  target_precompile_headers(deskd-test-fake-${t} REUSE_FROM deskd_core)
-  add_test(NAME deskd-fake-${t} COMMAND deskd-test-fake-${t})
-endforeach()
+#                a cancel before the 201, one market's creates only, the touch pulled before a
+#                create), the cancel-all's minute of echo, errors 25-27 (buffer overflow, market
+#                limit, command rate), one order's private messages kept in order under
+#                REPLY_FIRST, the fixture tape over the socket, eight clients at once, and the
+#                fake-kalshi binary started and stopped
+#   fake-poly    the fake Polymarket US over loopback: its read routes and shapes (league events,
+#                markets, books, balances, positions, activities, open orders, one order) over the
+#                engine's books, orders and cash, paging, auth with a real Ed25519 signature (a key
+#                made in the test) and the 30 s window, the wire log, TLS, the idle close, and
+#                fake-kalshi --poly; its writes (an asynchronous create and its delayed executions,
+#                a synchronous one, every refusal, GTD and its expiry, post-only refused or
+#                cancelled, no self-trade prevention, cancel, cancel-all, preview), each fault, the
+#                rate limit and a maintenance window
+fake_kalshi_test(engine)
+fake_kalshi_test(wire)
 add_dependencies(deskd-test-fake-wire fake-kalshi)  # it starts the binary once
+fake_kalshi_test(poly)
+add_dependencies(deskd-test-fake-poly fake-kalshi)
 
 # ---- week 1: net/ and the Kalshi wire (plan sections 2-3) ------------------------------------------
 #   http   the strict HTTP/1.1 response parser, no sockets: every split of every reply, chunked with
@@ -437,18 +539,84 @@ add_dependencies(deskd-test-fake-wire fake-kalshi)  # it starts the binary once
 #   wire   the signer (RSA-PSS and Ed25519, verified by the fake), the builders and parsers against
 #          the documented shapes and the fake over TLS, what each write reply means, and the demo
 #          probe binary run against the fake
-foreach(t http pub_data order_ledger manual_admission)
-  add_executable(deskd-test-${t} tests/deskd/test_${t}.cpp)
-  target_link_libraries(deskd-test-${t} PRIVATE deskd_core)
-  target_precompile_headers(deskd-test-${t} REUSE_FROM deskd_core)
-  add_test(NAME deskd-${t} COMMAND deskd-test-${t})
-endforeach()
-foreach(t net wire md rest private sender)
-  add_executable(deskd-test-${t} tests/deskd/test_${t}.cpp)
-  target_link_libraries(deskd-test-${t} PRIVATE deskd_core fake_kalshi)
-  target_precompile_headers(deskd-test-${t} REUSE_FROM deskd_core)
-  add_test(NAME deskd-${t} COMMAND deskd-test-${t})
-endforeach()
+deskd_pure_test(http)
+deskd_pure_test(pub_data)
+deskd_pure_test(order_ledger)
+deskd_pure_test(manual_admission)
+deskd_pure_test(manual_book)
+deskd_pure_test(fair)
+deskd_pure_test(espn)
+deskd_pure_test(sys_book)
+deskd_pure_test(maker)
+deskd_pure_test(markouts)
+deskd_pure_test(fill)
+deskd_pure_test(write_budget)
+deskd_pure_test(calendar)
+deskd_pure_test(lip)
+deskd_pure_test(wcbb)
+deskd_pure_test(store)
+# sys_risk: gw's sys_used against the loops it replaced, on random books; place_sys's limits at their edges
+deskd_pure_test(sys_risk)
+# strat: the strat loop's sleep, clamped to 5..250 ms, and each engine's cadence (strat/strat.h)
+deskd_pure_test(strat)
+# lane_gate: the one gate-file loader (gates_dir/<lane>.json), each refusal's reason, C1's per-series results
+deskd_pure_test(lane_gate)
+# bball: strat/bball_model, the WCBB and NBA leagues in one loader (NBA's clock and overtime, golden rows)
+deskd_pure_test(bball)
+# volley: strat/volley_model, tools/volleyball.py's rally-point model (its golden file to 1e-9) and the state from ESPN's linescores
+deskd_pure_test(volley)
+# game_fair: strat/game_fair, the pregame price and the in-game fair of WCBB, NBA and volleyball markets
+deskd_pure_test(game_fair)
+# take: strat/take, the IOC game lanes' one decision (C1, X1, N1, N2): each mode, every pull, and the hand-worked cases the Python gate tools share
+deskd_pure_test(take)
+# ncaa: ref/ncaa, NCAA.com's scoreboards (the recorder's fixture, a loopback feed, the data guard), and ref/scores' merge of ESPN's and NCAA's score
+deskd_pure_test(ncaa)
+# event_risk: gw/event_risk, an event's settlement states from its flag and strikes, and a book's worst case by state (parity with the old risk.cpp)
+deskd_pure_test(event_risk)
+# arb: strat/arb, S1's basket finder: each family on the old scanner's cases, 1c legs, the 2-tick walk, every filter, the sizing
+deskd_pure_test(arb)
+deskd_fake_test(net)
+deskd_fake_test(wire)
+deskd_fake_test(md)
+deskd_fake_test(rest)
+deskd_fake_test(private)
+deskd_fake_test(sender)
+deskd_fake_test(manual_gw)
+deskd_fake_test(runtime_manual)
+# runtime_college: C1 in the whole process (its gate, one take in its group, KILL, its game cap, retirement across a restart)
+deskd_fake_test(runtime_college)
+# runtime_nba: X1, N1 and N2 in the whole process (their gates, one N1 take in its group, X1 in shadow, Stop, KILL, ESPN silent, the game cap; N2's pregame favourite)
+deskd_fake_test(runtime_nba)
+# runtime_arb: S1 in the whole process (scan logs and sends nothing; trade: a basket, a missed leg completed and one unwound, an UNKNOWN leg, KILL and Stop mid-basket, the legging pause)
+deskd_fake_test(runtime_arb)
+deskd_fake_test(pyth)
+# fees: gw/fees.h against the fake's model_fee and charge_fee, at the fake's own balance precision, and its Polymarket fee and rebate
+deskd_fake_test(fees)
+# poly_wire: gw/poly_wire and gw/poly_sign, Polymarket US's wire: builders, strict parsers, the ledger's rows, the
+# write table, the taker fee allowance, the maintenance window across DST, the signer, and round trips against the fake
+deskd_fake_test(poly_wire)
+# sys_gate: gw's lane gates, retirement (LaneMarkout, why RETIRED, deskctl lane-reset) and event cap
+deskd_fake_test(sys_gate)
+add_dependencies(deskd-test-sender deskctl)   # its deskctl kill --direct case runs the binary
+add_dependencies(deskd-test-sys_gate deskctl)   # its lane-reset case runs the binary
+# The Systematic soak (tests/deskd/soak.cpp): 60 s under ctest; DESKD_SOAK_SECONDS=14400 for the
+# plan's 4 hours, in a build configured with -DDESKD_TSAN=ON.
+add_executable(deskd-soak tests/deskd/soak.cpp)
+target_link_libraries(deskd-soak PRIVATE deskd_core fake_kalshi)
+target_precompile_headers(deskd-soak REUSE_FROM deskd_core)
+add_test(NAME deskd-soak COMMAND deskd-soak)
+if(DESKD_TSAN)
+  # OpenSSL is not instrumented: tests/deskd/tsan.supp says which of its reports are not races
+  set_tests_properties(deskd-soak PROPERTIES ENVIRONMENT "TSAN_OPTIONS=suppressions=${CMAKE_SOURCE_DIR}/tests/deskd/tsan.supp")
+endif()
+set_tests_properties(deskd-soak PROPERTIES TIMEOUT 300)
+# The sandbox's NBA game (tools/deskd_sim.py --nba --check): fake-kalshi, deskd --sim reading a
+# loopback stand-in for ESPN (--espn-url), X1, N1 and N2 on the sim's own gates, each recording the
+# game in shadow and sending nothing. The built binaries; about 25 s.
+if(PYTHON3_EXE)
+  add_test(NAME deskd-sim-nba COMMAND ${PYTHON3_EXE} ${CMAKE_SOURCE_DIR}/tools/deskd_sim.py --check --build ${CMAKE_BINARY_DIR})
+  set_tests_properties(deskd-sim-nba PROPERTIES TIMEOUT 300)
+endif()
 
 # tools/kalshi_demo_probe: signed reads (and, asked for, one tiny post-only order and its cancel)
 # against Kalshi's DEMO exchange through deskd's own net/ and signer, with latency figures. Not a
@@ -459,8 +627,50 @@ target_link_libraries(kalshi-demo-probe PRIVATE deskd_core)
 target_precompile_headers(kalshi-demo-probe REUSE_FROM deskd_core)
 add_dependencies(deskd-test-wire kalshi-demo-probe)
 
-add_custom_target(deskd-all DEPENDS deskd deskctl deskd-test-bus deskd-test-ops deskd-test-web deskd-test-process
-                                    fake-kalshi deskd-test-fake-engine deskd-test-fake-wire
-                                    deskd-test-http deskd-test-net deskd-test-wire deskd-test-md
-                                    deskd-test-pub_data deskd-test-rest deskd-test-private deskd-test-order_ledger
-                                    deskd-test-sender deskd-test-manual_admission kalshi-demo-probe)
+# deskd-all: deskd, deskctl, fake-kalshi, the soak and the probe; every suite joined it through its helper
+add_dependencies(deskd-all deskd deskctl fake-kalshi deskd-soak kalshi-demo-probe)
+
+add_test(NAME deskd-no-legacy-includes COMMAND ${CMAKE_COMMAND} -DROOT=${CMAKE_SOURCE_DIR} -P ${CMAKE_SOURCE_DIR}/tests/deskd/no_legacy_includes.cmake)
+
+# The plan's invariants (section 8; docs/invariants.md names each rule's test): every suite holding
+# one is labelled, so `ctest -L invariants` is the run that must be green before any live order.
+# A suite registered only where its runtime exists (node, python3) is labelled where it is.
+# One suite a line, as above.
+foreach(t
+    deskd-arb
+    deskd-bus
+    deskd-event_risk
+    deskd-http
+    deskd-lane_gate
+    deskd-manual_admission
+    deskd-manual_book
+    deskd-manual_gw
+    deskd-maker
+    deskd-md
+    deskd-net
+    deskd-ops
+    deskd-order_ledger
+    deskd-process
+    deskd-pub_data
+    deskd-pyth
+    deskd-rest
+    deskd-runtime_arb
+    deskd-runtime_college
+    deskd-runtime_manual
+    deskd-runtime_nba
+    deskd-sender
+    deskd-sys_book
+    deskd-sys_gate
+    deskd-sys_risk
+    deskd-web
+    deskd-wire
+    deskd-write_budget
+    recorder-unit
+    ui-desk-v3
+    ui-desk-v3-manual
+    deskd-no-legacy-includes
+    )
+  if(TEST ${t})
+    set_property(TEST ${t} APPEND PROPERTY LABELS invariants)
+  endif()
+endforeach()

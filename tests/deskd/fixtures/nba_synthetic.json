@@ -1,0 +1,28 @@
+{
+  "model": "nba_logit",
+  "note": "HAND-MADE, for tests only: coefficients set by hand, golden rows from docs/wcbb_model.md's formulas (deskd-bball checks the C++ loader; tools/train_bball.py --write-synthetic writes the trainer's own). Never a real model.",
+  "league": "nba",
+  "regulation_s": 2880,
+  "version": 1,
+  "trained": "2026-10-22",
+  "seasons": ["2023-24", "2024-25", "2025-26"],
+  "n_games": 2460,
+  "brier": {"model": 0.162, "kalshi_mid": 0.158, "espn": null, "stern": 0.171, "stern_ot": 0.17, "held_out": "2025-26"},
+  "features": ["logit_p0", "margin_over_sd", "logit_p0_x_tau", "logit_p0_x_sqrt_tau", "possession_over_sd", "ot"],
+  "mean": [0.05, 0.2, 0.02, 0.04, 0.0, 0.03],
+  "scale": [1.1, 9.5, 0.55, 0.8, 1.9, 0.17],
+  "coef": [0.18, 1.45, 0.3, 0.62, 0.11, -0.05],
+  "intercept": -0.02,
+  "golden": [
+    {"in": {"t_left_s": 2880, "margin": 0, "possession": 0, "p0": 0.5, "ot": false}, "p": 0.4770676763429273},
+    {"in": {"t_left_s": 2880, "margin": 0, "possession": 1, "p0": 0.8, "ot": false}, "p": 0.8832115505264646},
+    {"in": {"t_left_s": 2160, "margin": 4, "possession": -1, "p0": 0.35, "ot": false}, "p": 0.4432696368392962},
+    {"in": {"t_left_s": 2160, "margin": -7, "possession": 1, "p0": 0.65, "ot": false}, "p": 0.382033514284903},
+    {"in": {"t_left_s": 1440, "margin": 10, "possession": 1, "p0": 0.55, "ot": false}, "p": 0.9108517344697628},
+    {"in": {"t_left_s": 1440, "margin": -3, "possession": 0, "p0": 0.1, "ot": false}, "p": 0.052358618191235606},
+    {"in": {"t_left_s": 720, "margin": 2, "possession": -1, "p0": 0.9, "ot": false}, "p": 0.870335405675701},
+    {"in": {"t_left_s": 720, "margin": -12, "possession": 1, "p0": 0.7, "ot": false}, "p": 0.04798203023564918},
+    {"in": {"t_left_s": 60, "margin": 1, "possession": 1, "p0": 0.45, "ot": false}, "p": 0.7406938554625984},
+    {"in": {"t_left_s": 180, "margin": -2, "possession": -1, "p0": 0.97, "ot": true}, "p": 0.40761533580324866}
+  ]
+}

@@ -6,6 +6,10 @@
 #include "deskd/gw/kalshi_sign.h"
 #include "deskd/gw/kill.h"
 #include "deskd/net/kalshi_sender.h"
+#include <cstdio>
+#include <fstream>
+#include <sys/wait.h>
+#include "deskd/build_paths.h"
 #include "net_fixture.h"
 using namespace deskd;
 using Kind=kalshi::WriteOutcome::Kind;
@@ -113,7 +117,8 @@ void permits_and_kill() {
   const auto cancelled=h.wait("",WireOp::CANCEL_ALL);
   CHECK(cancelled.outcome.kind==Kind::ACK && h.cancel->kill_seen()==h.kill.generation());
   CHECK(h.kill.rearm_ms()>=tripped && h.kill.rearm_ms()>=cancelled.ack_ms+59000);
-  CHECK(h.venue.orders()==0 && h.venue.f->http_requests()==1);
+  // no create reached the venue: the cancel-all and the sweep's read are all it saw
+  CHECK(h.venue.orders()==0 && until([&]{return h.venue.f->http_requests()==2;}));
   release.set_value(); wg.request_stop(); wg.join();
 
   Harness fresh;
@@ -137,11 +142,132 @@ void lost_result_and_unconfirmed_kill() {
   cx.kill.trip(now_ms(),mono_ms(),"test");
   CHECK(cx.wait("",WireOp::CANCEL_ALL).outcome.kind==Kind::UNKNOWN);
   CHECK(!cx.cancel->healthy() && cx.kill.active());
-  CHECK(cx.venue.f->http_requests()==1);
+  // the cancel-all, then the sweep's read of what still rests (nothing); no second cancel-all
+  CHECK(until([&]{return cx.venue.f->http_requests()==2;}));
   // A second explicit KILL sends again; no automatic retry hides an uncertain operation.
   cx.kill.trip(now_ms(),mono_ms(),"test again");
   CHECK(cx.wait("",WireOp::CANCEL_ALL,1).outcome.kind==Kind::ACK);
-  CHECK(cx.venue.f->http_requests()==2);
+  CHECK(until([&]{return cx.venue.f->http_requests()==4;}));
+}
+// KILL's sweep (plan section 3: "batch cancel of anything still listed"): a cancel-all the venue
+// dropped unread leaves two orders resting; the sweep reads them and batch-cancels both, and the
+// cancel sender still says its cancel-all is unconfirmed (press KILL again).
+void kill_sweeps_leftovers() {
+  Harness h; h.start();
+  CHECK(h.qm.push(h.order("Mleft-1"))); CHECK(h.qm.push(h.order("Mleft-2")));
+  CHECK(h.wait("Mleft-1").outcome.kind==Kind::ACK && h.wait("Mleft-2").outcome.kind==Kind::ACK);
+  auto resting=[&]{ return h.venue.f->with_engine([](fakex::Engine& e,std::int64_t) {
+    int n=0; for(const fakex::Order* o:e.user_orders()) if(o->status==fakex::OrdStatus::RESTING) ++n; return n; }); };
+  CHECK(resting()==2);
+  fakex::HttpFault fault; fault.kind=fakex::HttpFault::Kind::DROP_BEFORE_REPLY;
+  fault.method="DELETE"; fault.path="/portfolio/events/orders"; h.venue.f->add_fault(fault);
+  h.kill.trip(now_ms(),mono_ms(),"test");
+  CHECK(h.wait("",WireOp::CANCEL_ALL).outcome.kind!=Kind::ACK);
+  CHECK(until([&]{return resting()==0;}));
+  CHECK(!h.cancel->healthy());
+}
+// A refusal that says the desk is wrong trips KILL and stops send-k1 (RO), with the reason kept.
+// It comes back only after a cancel-all sent after the failure is confirmed and KILL is re-armed;
+// an unconfirmed one keeps both senders stopped until KILL is pressed again (found on demo,
+// 2026-10-10: a re-arm never cleared the stop, so every order after it was refused RO).
+void hard_refusal_recovers() {
+  Harness h; h.start();
+  auto wrong=h.order("Mwrong-1"); wrong.create.exchange_index=1;   // the market lives on shard 0
+  CHECK(h.qm.push(wrong));
+  const auto refused=h.wait("Mwrong-1");
+  CHECK(refused.outcome.kind==Kind::REFUSED && reject_trips_kill(refused.outcome.cls));
+  CHECK(until([&]{return h.kill.active() && !h.manual->healthy();}));
+  // the KILL names the write and the venue's own words
+  CHECK(h.manual->fail_reason().rfind("venue refused a create (Mwrong-1) as hard_invalid, HTTP 404: not_found",0)==0 &&
+        h.manual->fail_reason().find("; reconciliation required")!=std::string::npos && h.cancel->fail_reason().empty());
+  CHECK(h.wait("",WireOp::CANCEL_ALL).outcome.kind==Kind::ACK);
+  CHECK(until([&]{return h.kill.confirmed_gen()==h.kill.generation();}));
+  CHECK(!h.manual->healthy());   // KILL still active: the operator has not re-armed
+  CHECK(h.kill.rearm(now_ms(),mono_ms()+61000).empty());
+  CHECK(h.manual->healthy() && h.cancel->healthy() && !h.manual->fail_reason().empty());
+  CHECK(h.qm.push(h.order("Mafter-1")));
+  CHECK(h.wait("Mafter-1").outcome.kind==Kind::ACK);
+
+  // A 429 on the cancel-all was refused before processing: send-cx sends it again by itself.
+  Harness rl; rl.start();
+  fakex::HttpFault rate; rate.kind=fakex::HttpFault::Kind::RATE_LIMIT; rate.method="DELETE"; rl.venue.f->add_fault(rate);
+  CHECK(rl.qm.push(rl.order("Mrest-1"))); CHECK(rl.wait("Mrest-1").outcome.kind==Kind::ACK);
+  rl.kill.trip(now_ms(),mono_ms(),"operator");
+  CHECK(rl.wait("",WireOp::CANCEL_ALL).outcome.kind==Kind::ACK);
+  // the create, the 429, the cancel-all again, then the sweep's read
+  CHECK(until([&]{return rl.venue.f->http_requests()==4;}) && rl.cancel->healthy() && rl.cancel->fail_reason().empty());
+  CHECK(rl.kill.confirmed_gen()==rl.kill.generation());
+  CHECK(rl.venue.f->with_engine([](fakex::Engine& e,std::int64_t) {return e.reserved(0,0);})==0);
+
+  Harness u; u.start();
+  fakex::HttpFault lost; lost.kind=fakex::HttpFault::Kind::STATUS_AFTER_ACCEPT; lost.method="DELETE";
+  u.venue.f->add_fault(lost);
+  auto bad=u.order("Mwrong-2"); bad.create.exchange_index=1; CHECK(u.qm.push(bad));
+  CHECK(u.wait("",WireOp::CANCEL_ALL).outcome.kind==Kind::UNKNOWN);
+  CHECK(until([&]{return !u.cancel->healthy() && !u.manual->healthy();}));
+  CHECK(u.cancel->fail_reason().find("cancel-all unconfirmed")!=std::string::npos);
+  CHECK(u.kill.rearm(now_ms(),mono_ms()+61000).empty());
+  CHECK(!u.manual->healthy() && !u.cancel->healthy());   // re-armed, but nothing confirmed the venue is clear
+  u.kill.trip(now_ms(),mono_ms(),"operator again");
+  CHECK(u.wait("",WireOp::CANCEL_ALL,1).outcome.kind==Kind::ACK);
+  CHECK(until([&]{return u.kill.confirmed_gen()==u.kill.generation();}));
+  CHECK(!u.manual->healthy());
+  CHECK(u.kill.rearm(now_ms(),mono_ms()+125000).empty());
+  CHECK(u.manual->healthy() && u.cancel->healthy());
+}
+// send-k2 (Systematic): S creates in an order group, S cancels, the group's trigger and reset;
+// never an M order. KILL's send-cx triggers every registered group after its cancel-all.
+void systematic_role() {
+  Harness h; GroupRegistry groups; h.cancel->set_groups(&groups);
+  BoundedQueue<KalshiWriteJob> qs{64,16};
+  net::PoolConfig cfg; cfg.endpoint=h.venue.ep(); cfg.name="sys-test"; cfg.connect_timeout_ms=500;
+  net::SparePool ps(h.factory,cfg);
+  auto reply=[&h](KalshiWriteReply r) { std::lock_guard<std::mutex> lk(h.mu); h.results.push_back(std::move(r)); return true; };
+  KalshiSender::Options options; options.connect_ms=500; options.reply_ms=300;
+  KalshiSender sys(KalshiSender::Role::SYSTEMATIC,qs,ps,*h.signer,h.kill,reply,[](const std::string&){},options);
+  Worker ws{"send-k2-test"};
+  h.start(); ps.start(); CHECK(ps.wait_ready(1,3000));
+  ws.start([&](Worker& w){sys.run(w);});
+  auto group=[&](const std::string& action,const std::string& id) {
+    KalshiWriteJob j; j.kind=KalshiWriteJob::Kind::GROUP; j.group_action=action; j.group_id=id; j.group_limit=5000;
+    j.shard=0; j.lane="M1"; j.cid="group-"+action; j.kill_generation=h.kill.generation(); return j;
+  };
+  CHECK(qs.push(group("create","")));
+  const auto made=h.wait("group-create",WireOp::GROUP);
+  CHECK(made.outcome.kind==Kind::ACK && !made.group_id.empty() && made.lane=="M1" && made.shard==0);
+  const auto gid=made.group_id;
+  CHECK(h.venue.f->with_engine([&](fakex::Engine& e,std::int64_t){ const auto* g=e.group(gid); return g && g->limit==5000 && !g->triggered; }));
+  groups.add(gid,0);
+  auto order=[&](const std::string& cid) { auto j=h.order(cid); j.create.order_group_id=gid; return j; };
+  CHECK(qs.push(order("SM1-quote-1")));
+  const auto placed=h.wait("SM1-quote-1");
+  CHECK(placed.outcome.kind==Kind::ACK && placed.create && h.venue.has_cid("SM1-quote-1"));
+  CHECK(qs.push(h.order("Mnot-mine-1")));
+  CHECK(h.wait("Mnot-mine-1").local_code=="BAD_REQUEST" && !h.venue.has_cid("Mnot-mine-1"));
+  KalshiWriteJob cx; cx.kind=KalshiWriteJob::Kind::CANCEL; cx.cid="SM1-quote-1"; cx.oid=placed.create ? placed.create->order_id : "x";
+  cx.shard=0; cx.ticker=fx::T;
+  CHECK(qs.push(cx,Lane::PRIORITY));
+  CHECK(h.wait("SM1-quote-1",WireOp::CANCEL).outcome.kind==Kind::ACK);
+  // trigger: the group refuses new orders (soft, never KILL) until reset
+  CHECK(qs.push(group("trigger",gid)));
+  CHECK(h.wait("group-trigger",WireOp::GROUP).outcome.kind==Kind::ACK);
+  CHECK(qs.push(order("SM1-quote-2")));
+  const auto refused=h.wait("SM1-quote-2");
+  if(refused.outcome.cls!=RejectClass::SOFT_GROUP) std::fprintf(stderr,"triggered group: %s %s\n",kalshi::write_kind_name(refused.outcome.kind),refused.outcome.why.c_str());
+  CHECK(refused.outcome.kind==Kind::REFUSED && refused.outcome.cls==RejectClass::SOFT_GROUP);
+  CHECK(!h.kill.active() && sys.healthy());
+  CHECK(qs.push(group("reset",gid)));
+  CHECK(h.wait("group-reset",WireOp::GROUP).outcome.kind==Kind::ACK);
+  CHECK(qs.push(order("SM1-quote-3")));
+  CHECK(h.wait("SM1-quote-3").outcome.kind==Kind::ACK);
+  // KILL: the cancel-all, then every group triggered; a reset is refused while KILLED
+  h.kill.trip(now_ms(),mono_ms(),"test");
+  CHECK(h.wait("",WireOp::CANCEL_ALL).outcome.kind==Kind::ACK);
+  CHECK(until([&]{ return h.venue.f->with_engine([&](fakex::Engine& e,std::int64_t){ const auto* g=e.group(gid); return g && g->triggered; }); }));
+  auto late=group("reset",gid); late.cid="group-late"; late.kill_generation=h.kill.generation();
+  CHECK(qs.push(late));
+  CHECK(h.wait("group-late",WireOp::GROUP).local_code=="KILLED");
+  ws.request_stop(); ws.join(); ps.stop();
 }
 void kill_overtakes_inflight_create() {
   Harness h(1500); h.start();
@@ -157,8 +283,51 @@ void kill_overtakes_inflight_create() {
   CHECK(h.venue.f->with_engine([](fakex::Engine& e,std::int64_t) {return e.reserved(0,0);})==0);
 }
 }
+// deskctl kill --direct (plan section 2: "deskctl kill does the same if deskd hangs"): the real
+// binary, the desk's own key and config, against the fake: two resting orders and an order group;
+// it cancels all, triggers the group and finds nothing left resting. Its guard rules: a production
+// config without --live, and --live with --sim, are refused before any connection.
+void deskctl_direct() {
+  Harness h; h.start();
+  CHECK(h.qm.push(h.order("Mdirect-1"))); CHECK(h.qm.push(h.order("Mdirect-2")));
+  CHECK(h.wait("Mdirect-1").outcome.kind==Kind::ACK && h.wait("Mdirect-2").outcome.kind==Kind::ACK);
+  const auto gid=h.venue.f->with_engine([](fakex::Engine& e,std::int64_t now) { return e.group_create(0,0,10000,now); });
+  CHECK(!gid.empty());
+  TempDir d;
+  const std::string key=d.path+"/k.pem", locks=d.path+"/locks", cfg=d.path+"/desk.json", prod=d.path+"/prod.json";
+  { std::ofstream f(key); f<<pem; }
+  ::mkdir(locks.c_str(),0700);
+  { std::ofstream f(cfg); f<<"{\"env\":\"demo\",\"key_id\":\"sender-test\",\"pem_path\":\""<<key<<"\",\"key_type\":\"ed25519\","
+                            "\"deskd\":{\"lock_dir\":\""<<locks<<"\"}}"; }
+  { std::ofstream f(prod); f<<"{\"env\":\"prod\",\"key_id\":\"sender-test\",\"pem_path\":\""<<key<<"\",\"key_type\":\"ed25519\","
+                             "\"deskd\":{\"lock_dir\":\""<<locks<<"\"}}"; }
+  const std::string url="https://127.0.0.1:"+std::to_string(h.venue.port());
+  auto run=[&](const std::string& args,std::string* out) {
+    FILE* p=::popen((std::string(DESKCTL_BIN)+" "+args+" 2>&1").c_str(),"r");
+    if(!p) return -1;
+    char buf[512]; std::string s;
+    while(std::fgets(buf,sizeof buf,p)) s+=buf;
+    const int st=::pclose(p);
+    if(out) *out=s;
+    return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+  };
+  std::string out;
+  const int code=run("kill --direct --config "+cfg+" --sim "+url+" --sim-ca "+fx::pki().p.ca_cert,&out);
+  if(code!=0) std::fprintf(stderr,"deskctl: %s\n",out.c_str());
+  CHECK(code==0 && out.find("cancel-all: confirmed")!=std::string::npos && out.find("order groups: 1 triggered of 1")!=std::string::npos &&
+        out.find("KILLED at the exchange")!=std::string::npos);
+  CHECK(h.venue.f->with_engine([](fakex::Engine& e,std::int64_t) {
+    for(const fakex::Order* o:e.user_orders()) if(o->status==fakex::OrdStatus::RESTING) return false; return true; }));
+  CHECK(h.venue.f->with_engine([&](fakex::Engine& e,std::int64_t) { return e.group(gid) && e.group(gid)->triggered; }));
+  // refused before any connection: production without --live; --live with --sim
+  const auto before=h.venue.f->http_requests();
+  CHECK(run("kill --direct --config "+prod+" --sim "+url+" --sim-ca "+fx::pki().p.ca_cert,&out)==2 && out.find("needs --live")!=std::string::npos);
+  CHECK(run("kill --direct --live --config "+prod+" --sim "+url+" --sim-ca "+fx::pki().p.ca_cert,&out)==2 && out.find("never --live")!=std::string::npos);
+  CHECK(run("kill --direct",&out)==2);
+  CHECK(h.venue.f->http_requests()==before);
+}
 int main() {
   std::signal(SIGPIPE,SIG_IGN);
-  writes_and_faults(); permits_and_kill(); lost_result_and_unconfirmed_kill(); kill_overtakes_inflight_create();
+  writes_and_faults(); permits_and_kill(); lost_result_and_unconfirmed_kill(); hard_refusal_recovers(); systematic_role(); kill_overtakes_inflight_create(); kill_sweeps_leftovers(); deskctl_direct();
   return finish("deskd-sender");
 }

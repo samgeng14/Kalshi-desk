@@ -22,6 +22,21 @@ bool same_fill(const kalshi::FillRow& a, const kalshi::FillRow& b) {
       a.fee == b.fee && a.taker == b.taker && a.exchange_index == b.exchange_index &&
       a.subaccount == b.subaccount;
 }
+// What makes a venue order row contradict the order gw placed; "" when it is consistent.
+std::string order_mismatch(const OrderLedger::Order& o, const kalshi::OrderRow& row) {
+  auto n = [](Qty q) { return std::to_string(q); };
+  if (!row.client_order_id.empty() && row.client_order_id != o.intent.cid) return "names client order id " + row.client_order_id;
+  if (row.ticker != o.intent.ticker) return "is on " + row.ticker;
+  if (row.side != (o.intent.side == Side::BUY ? kalshi::BookSide::BID : kalshi::BookSide::ASK)) return "is on the other side";
+  if (row.exchange_index && *row.exchange_index != o.shard) return "is on shard " + std::to_string(*row.exchange_index);
+  if (row.initial != o.intent.count) return "has size " + n(row.initial) + ", sent " + n(o.intent.count) + " (1/100 contract)";
+  if (row.yes_price != o.intent.price) return "has price " + price_str(row.yes_price) + ", sent " + price_str(o.intent.price);
+  if (row.filled < 0 || row.remaining < 0 || row.filled > row.initial || row.remaining > row.initial - row.filled)
+    return "has filled " + n(row.filled) + " remaining " + n(row.remaining) + " of " + n(row.initial);
+  if (row.status == kalshi::OrderStatus::EXECUTED && row.filled != row.initial)
+    return "is executed with " + n(row.filled) + " of " + n(row.initial) + " filled";
+  return "";
+}
 }
 bool OrderLedger::Order::terminal() const {
   return state == OrdState::FILL || state == OrdState::CXL || state == OrdState::EXP || state == OrdState::REJ;
@@ -45,12 +60,17 @@ nlohmann::json OrderLedger::Order::json() const {
     {"exp_ms",intent.exp_ms ? J(intent.exp_ms) : J(nullptr)},{"st",state_name(state)},
     {"why",why},{"own",intent.owner == Owner::MAN ? "MAN" : intent.owner == Owner::SYS ? "SYS" : "EXT"},
     {"lane",intent.lane.empty() ? J(nullptr) : J(intent.lane)},{"piq",nullptr},
-    {"fee",money_str(fees / 100)},{"touch",nullptr},{"edge",nullptr},
+    {"fee",money_str(fees / 100)},{"touch",intent.touch ? J(price_str(*intent.touch)) : J(nullptr)},
+    // per contract against the model fair at send, + in our favour (Px and Money share 1/10,000 $)
+    {"edge",intent.fair ? J(money_str(intent.side == Side::BUY ? *intent.fair - intent.price : intent.price - *intent.fair)) : J(nullptr)},
     {"t",{{"click",intent.t_click_ms ? J(intent.t_click_ms) : J(nullptr)},
           {"recv",intent.t_recv_ms},{"sent",sent_ms ? J(sent_ms) : J(nullptr)},
           {"ack",ack_ms ? J(ack_ms) : J(nullptr)},{"done",done_ms ? J(done_ms) : J(nullptr)}}},{"rev",rev}};
 }
-bool OrderLedger::invalid() { healthy_ = false; return false; }
+bool OrderLedger::invalid(const Order& o, const std::string& why) {
+  if (healthy_) why_unhealthy_ = o.intent.cid + ": " + why;
+  healthy_ = false; return false;
+}
 const OrderLedger::Order* OrderLedger::find(const std::string& cid) const {
   const auto it = orders_.find(cid); return it == orders_.end() ? nullptr : &it->second;
 }
@@ -64,9 +84,10 @@ bool OrderLedger::insert(PlaceIntent intent, int shard, kalshi::Micros reserve) 
   const auto cid = o.intent.cid; orders_.emplace(cid,std::move(o)); return true;
 }
 bool OrderLedger::bind(Order& o, const std::string& oid) {
-  if (oid.empty() || (!o.oid.empty() && o.oid != oid)) return invalid();
+  if (oid.empty()) return invalid(o,"the venue named no order id");
+  if (!o.oid.empty() && o.oid != oid) return invalid(o,"order id changed from "+o.oid+" to "+oid);
   const auto it = by_oid_.find(oid);
-  if (it != by_oid_.end() && it->second != o.intent.cid) return invalid();
+  if (it != by_oid_.end() && it->second != o.intent.cid) return invalid(o,"order id "+oid+" already belongs to "+it->second);
   o.oid = oid; by_oid_[oid] = o.intent.cid; return true;
 }
 void OrderLedger::missing(Order& o, std::int64_t at) {
@@ -89,17 +110,22 @@ bool OrderLedger::rejected(const std::string& cid, const std::string& code, std:
   auto it = orders_.find(cid); if (it == orders_.end() || code.empty()) return false;
   auto& o = it->second;
   // Contradictory venue evidence requires reconciliation, never freeing this reservation.
-  if (!o.oid.empty() || o.filled || o.executions || o.uncertain) return invalid();
-  if (o.terminal()) return o.state == OrdState::REJ;
-  o.state = OrdState::REJ; o.why = code; o.left = 0; o.done_ms = at; ++o.rev; return true;
+  if (!o.oid.empty() || o.filled || o.executions || o.uncertain)
+    return invalid(o,"refused "+code+" after the venue showed it (order id, fills or an unknown send)");
+  const bool cancel = code == "POST_CROSS" || code == "USER" || code == "STP";
+  if (o.terminal()) return o.refused && o.why == code;
+  o.refused = true; o.state = cancel ? OrdState::CXL : OrdState::REJ; o.why = code; o.left = 0; o.done_ms = at; ++o.rev; return true;
 }
 bool OrderLedger::acknowledged(const std::string& cid, const kalshi::CreateAck& ack, std::int64_t at) {
   auto it = orders_.find(cid); if (it == orders_.end()) return false;
   auto& o = it->second;
-  if (o.state == OrdState::REJ) return invalid();
-  if ((!ack.client_order_id.empty() && ack.client_order_id != cid) || ack.fill_count < 0 ||
-      ack.remaining < 0 || ack.fill_count > o.intent.count || ack.remaining > o.intent.count - ack.fill_count)
-    return invalid();
+  if (o.refused) return invalid(o,"acknowledged after it was refused "+o.why);
+  if (!ack.client_order_id.empty() && ack.client_order_id != cid)
+    return invalid(o,"acknowledged under client order id "+ack.client_order_id);
+  if (ack.fill_count < 0 || ack.remaining < 0 || ack.fill_count > o.intent.count ||
+      ack.remaining > o.intent.count - ack.fill_count)
+    return invalid(o,"acknowledged filled "+std::to_string(ack.fill_count)+" remaining "+
+                   std::to_string(ack.remaining)+" of "+std::to_string(o.intent.count)+" (1/100 contract)");
   if (!bind(o,ack.order_id)) return false;
   o.uncertain = o.cancel_unverified; if (!o.ack_ms) o.ack_ms = at;
   o.filled = std::max(o.filled,ack.fill_count);
@@ -128,13 +154,9 @@ bool OrderLedger::observed(const kalshi::OrderRow& row, std::int64_t at) {
     it = orders_.find(id->second);
   }
   auto& o = it->second;
-  if (o.state == OrdState::REJ) return invalid();
-  if ((!row.client_order_id.empty() && row.client_order_id != o.intent.cid) || row.ticker != o.intent.ticker ||
-      row.side != (o.intent.side == Side::BUY ? kalshi::BookSide::BID : kalshi::BookSide::ASK) ||
-      (row.exchange_index && *row.exchange_index != o.shard) || row.initial != o.intent.count ||
-      row.yes_price != o.intent.price || row.filled < 0 || row.remaining < 0 || row.filled > row.initial ||
-      row.remaining > row.initial - row.filled ||
-      (row.status == kalshi::OrderStatus::EXECUTED && row.filled != row.initial)) return invalid();
+  if (o.refused) return invalid(o,"the venue shows order "+row.order_id+" after it was refused "+o.why);
+  if (const auto bad = order_mismatch(o,row); !bad.empty())
+    return invalid(o,"order "+row.order_id+" "+bad);
   if (!bind(o,row.order_id)) return false;
   if(row.status != kalshi::OrderStatus::RESTING) o.cancel_unverified=false;
   o.uncertain = o.cancel_unverified; if (!o.ack_ms) o.ack_ms = at;
@@ -149,7 +171,7 @@ bool OrderLedger::observed(const kalshi::OrderRow& row, std::int64_t at) {
     else if (row.status == kalshi::OrderStatus::RESTING) o.state = o.cancel_unverified ? OrdState::PEND : o.filled ? OrdState::PART : OrdState::WORK;
     else o.state = o.intent.exp_ms && updated >= o.intent.exp_ms ? OrdState::EXP : OrdState::CXL;
     o.why = o.state == OrdState::EXP ? "EXPIRY" : o.state == OrdState::CXL ?
-        (o.cancel_requested ? "USER" : o.intent.tif == Tif::IOC ? "IOC_REST" : o.intent.tif == Tif::FOK ? "FOK" : "") : "";
+        (o.cancel_requested ? o.cancel_why : o.intent.tif == Tif::IOC ? "IOC_REST" : o.intent.tif == Tif::FOK ? "FOK" : "") : "";
     if (o.terminal()) o.done_ms = at;
   }
   if (o.filled == o.intent.count) {
@@ -159,12 +181,22 @@ bool OrderLedger::observed(const kalshi::OrderRow& row, std::int64_t at) {
   o.left = std::min(o.left,o.intent.count-o.filled);
   missing(o,at); ++o.rev; return true;
 }
-OrderLedger::FillResult OrderLedger::fill(const kalshi::FillRow& row, const std::string& cid, std::int64_t at) {
-  auto bad = [&]{ invalid(); return FillResult::INVALID; };
+OrderLedger::FillResult OrderLedger::fill(const kalshi::FillRow& row, const std::string& cid, std::int64_t at, bool rest) {
+  auto bad = [&](const Order* o, const std::string& why) {
+    if (healthy_) why_unhealthy_ = (o ? o->intent.cid + ": " : std::string()) + "fill " + row.trade_id + " " + why;
+    healthy_ = false; return FillResult::INVALID;
+  };
   if (row.trade_id.empty() || row.order_id.empty() || row.count <= 0 || row.count > kMaxQty ||
-      row.yes_price < 0 || row.yes_price > kOneDollar || row.fee < -kMaxReserve || row.fee > kMaxReserve) return bad();
+      row.yes_price < 0 || row.yes_price > kOneDollar || row.fee < -kMaxReserve || row.fee > kMaxReserve)
+    return bad(nullptr,"is malformed");
   const auto dup = fills_.find(row.trade_id);
-  if (dup != fills_.end()) return same_fill(dup->second,row) ? FillResult::DUPLICATE : bad();
+  if (dup != fills_.end()) {
+    const auto& a = dup->second;
+    const bool core = a.order_id == row.order_id && a.ticker == row.ticker && a.side == row.side &&
+                      a.count == row.count && a.yes_price == row.yes_price;
+    const bool same = (rest || rest_fills_.count(row.trade_id)) ? core : same_fill(a,row);
+    return same ? FillResult::DUPLICATE : bad(nullptr,"arrived twice with different fields");
+  }
   auto it = orders_.find(cid);
   if (it == orders_.end()) {
     const auto id = by_oid_.find(row.order_id);
@@ -172,13 +204,20 @@ OrderLedger::FillResult OrderLedger::fill(const kalshi::FillRow& row, const std:
     it = orders_.find(id->second);
   }
   auto& o = it->second;
-  if ((!cid.empty() && cid != o.intent.cid) || row.ticker != o.intent.ticker || row.exchange_index != o.shard ||
-      row.side != (o.intent.side == Side::BUY ? kalshi::BookSide::BID : kalshi::BookSide::ASK) ||
-      row.count > o.intent.count - o.executions || o.state == OrdState::REJ ||
-      (row.fee > 0 && o.fees > std::numeric_limits<kalshi::Micros>::max()-row.fee) ||
-      (row.fee < 0 && o.fees < std::numeric_limits<kalshi::Micros>::min()-row.fee)) return bad();
+  if (!cid.empty() && cid != o.intent.cid) return bad(&o,"names client order id "+cid);
+  if (row.ticker != o.intent.ticker) return bad(&o,"is on "+row.ticker);
+  if (row.exchange_index != o.shard) return bad(&o,"is on shard "+std::to_string(row.exchange_index));
+  if (row.side != (o.intent.side == Side::BUY ? kalshi::BookSide::BID : kalshi::BookSide::ASK))
+    return bad(&o,"is on the other side");
+  if (row.count > o.intent.count - o.executions)
+    return bad(&o,"overfills: "+std::to_string(row.count)+" after "+std::to_string(o.executions)+" of "+
+               std::to_string(o.intent.count)+" (1/100 contract)");
+  if (o.refused) return bad(&o,"for an order refused "+o.why);
+  if ((row.fee > 0 && o.fees > std::numeric_limits<kalshi::Micros>::max()-row.fee) ||
+      (row.fee < 0 && o.fees < std::numeric_limits<kalshi::Micros>::min()-row.fee)) return bad(&o,"overflows the fee total");
   if (!bind(o,row.order_id)) return FillResult::INVALID;
-  fills_.emplace(row.trade_id,row); o.executions += row.count; o.fees += row.fee;
+  fills_.emplace(row.trade_id,row); if (rest) rest_fills_.insert(row.trade_id);
+  o.executions += row.count; o.fees += row.fee;
   o.execution_cost += row.yes_price * row.count;
   o.filled = std::max(o.filled,o.executions); o.uncertain=o.cancel_unverified; if(!o.ack_ms) o.ack_ms=at;
   o.left = o.terminal() ? 0 : std::min(o.left,o.intent.count-o.filled);
@@ -186,18 +225,20 @@ OrderLedger::FillResult OrderLedger::fill(const kalshi::FillRow& row, const std:
   else if (!o.terminal()) { o.state=o.cancel_unverified ? OrdState::PEND : OrdState::PART; o.why.clear(); }
   missing(o,at); ++o.rev; return FillResult::APPLIED;
 }
-bool OrderLedger::request_cancel(const std::string& cid) {
+bool OrderLedger::request_cancel(const std::string& cid, const std::string& why) {
   auto it=orders_.find(cid); if(it==orders_.end() || it->second.terminal()) return false;
-  if(!it->second.cancel_requested) { it->second.cancel_requested=true; ++it->second.rev; }
+  if(!it->second.cancel_requested) { it->second.cancel_requested=true; it->second.cancel_why=why; ++it->second.rev; }
   return true;
 }
 bool OrderLedger::cancelled(const std::string& cid, const kalshi::CancelAck& ack,
                              const std::string& reason, std::int64_t at) {
   auto it=orders_.find(cid); if(it==orders_.end()) return false;
   auto& o=it->second;
-  if(o.state==OrdState::REJ) return invalid();
-  if ((!ack.client_order_id.empty() && ack.client_order_id!=cid) || ack.reduced_by<0 || ack.reduced_by>o.intent.count)
-    return invalid();
+  if(o.refused) return invalid(o,"cancel acknowledged after it was refused "+o.why);
+  if (!ack.client_order_id.empty() && ack.client_order_id!=cid)
+    return invalid(o,"cancel acknowledged under client order id "+ack.client_order_id);
+  if (ack.reduced_by<0 || ack.reduced_by>o.intent.count)
+    return invalid(o,"cancel reduced it by "+std::to_string(ack.reduced_by)+" of "+std::to_string(o.intent.count)+" (1/100 contract)");
   if(!bind(o,ack.order_id)) return false;
   // reduced_by=0 alone cannot distinguish an already-cancelled order from a fully filled
   // order whose executions are still in flight. Keep every dollar until an order read/event.
@@ -229,9 +270,23 @@ bool OrderLedger::resolve_absent(const std::string& cid, const History& h) {
   o.why=o.intent.exp_ms ? "EXPIRY" : o.intent.tif==Tif::FOK ? "FOK" : "IOC_REST";
   ++o.rev; return true;
 }
-bool OrderLedger::blocks(const std::string& ticker,int shard) const {
-  for(const auto& pair:orders_) if(pair.second.intent.ticker==ticker && pair.second.shard==shard && pair.second.uncertain) return true;
-  return false;
+std::string OrderLedger::blocking(const std::string& ticker,int shard) const {
+  for(const auto& pair:orders_) if(pair.second.intent.ticker==ticker && pair.second.shard==shard && pair.second.uncertain) return pair.first;
+  return {};
+}
+std::string OrderLedger::check() const {
+  for(const auto& [cid,o]:orders_) {
+    const Qty n=o.intent.count;
+    auto bad=[&](const char* what) { return cid+": "+what+" (count "+std::to_string(n)+", filled "+std::to_string(o.filled)+
+                                            ", executions "+std::to_string(o.executions)+", left "+std::to_string(o.left)+")"; };
+    if(o.filled<0 || o.filled>n) return bad("filled outside 0..count");
+    if(o.executions<0 || o.executions>o.filled) return bad("executions outside 0..filled");
+    if(o.left<0 || o.left>n-o.filled) return bad("left outside 0..count-filled");
+    if(o.terminal() && o.left!=0) return bad("ended with some left");
+    const auto r=o.reservation();
+    if(r<0 || r>o.original_reserve) return bad("reservation outside 0..its admission reserve");
+  }
+  return "";
 }
 kalshi::Micros OrderLedger::reserved(int shard) const {
   kalshi::Micros result=0;

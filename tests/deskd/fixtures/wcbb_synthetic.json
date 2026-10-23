@@ -1,0 +1,26 @@
+{
+  "model": "wcbb_logit",
+  "note": "SYNTHETIC, for tests only: tools/train_wcbb.py on a generated panel (deskd-wcbb checks the C++ loader reproduces the Python trainer). Never a real model.",
+  "version": 1,
+  "trained": "2026-10-21",
+  "seasons": ["2023-24", "2024-25", "2025-26"],
+  "n_games": 2400,
+  "brier": {"model": 0.12338168389655838, "kalshi_mid": 0.13428431911966987, "stern": 0.12197654798448469, "held_out": "2025-26"},
+  "features": ["logit_p0", "margin", "margin_over_sd", "logit_p0_x_tau", "possession", "possession_over_sd", "tau"],
+  "mean": [0.0022651832798627667, -0.1525, -0.6328038214558716, 0.01448873193858177, -0.012916666666666667, -0.06927404555778577, 0.4976920138888889],
+  "scale": [1.195966571276323, 11.397079030026363, 30.49589118029189, 0.6762250080016858, 0.9496928414258767, 2.0232525806986654, 0.28909249623121364],
+  "coef": [0.2067838039961004, -0.2600538022814478, 4.3339688108853, 0.5516988392228334, 0.0700661762857643, 0.17112444447782232, 0.04740328877001179],
+  "intercept": 0.011470086039543845,
+  "golden": [
+    {"in": {"t_left_s": 2400, "margin": 0, "possession": 0, "p0": 0.5}, "p": 0.543610617614447},
+    {"in": {"t_left_s": 2400, "margin": 0, "possession": 1, "p0": 0.8}, "p": 0.8459945605226091},
+    {"in": {"t_left_s": 1800, "margin": 4, "possession": -1, "p0": 0.35}, "p": 0.5095205559960542},
+    {"in": {"t_left_s": 1800, "margin": -7, "possession": 1, "p0": 0.65}, "p": 0.4524186452438625},
+    {"in": {"t_left_s": 1200, "margin": 10, "possession": 1, "p0": 0.55}, "p": 0.8969254441362401},
+    {"in": {"t_left_s": 1200, "margin": -3, "possession": 0, "p0": 0.1}, "p": 0.15292241021912312},
+    {"in": {"t_left_s": 600, "margin": 2, "possession": -1, "p0": 0.9}, "p": 0.759894746569033},
+    {"in": {"t_left_s": 600, "margin": -12, "possession": 1, "p0": 0.7}, "p": 0.07871936225584299},
+    {"in": {"t_left_s": 60, "margin": 1, "possession": 1, "p0": 0.45}, "p": 0.7753763498612894},
+    {"in": {"t_left_s": 60, "margin": -2, "possession": -1, "p0": 0.97}, "p": 0.21205359684177025}
+  ]
+}

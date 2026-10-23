@@ -1,0 +1,244 @@
+{
+ "lane": "X1",
+ "stage": "shadow",
+ "verdict": "PASS",
+ "why": null,
+ "computed": "2026-10-22T00:00:00Z",
+ "tool": "tools/x1_backtest.py --self-test (SYNTHETIC, a planted FADE effect: not a measurement)",
+ "params": {
+  "direction": "fade",
+  "thr": 0.12
+ },
+ "evidence": {
+  "db": {
+   "source": "x1_synthetic.sqlite",
+   "leagues": {
+    "college-football": {
+     "games": 36,
+     "with_number": 1440,
+     "settled": 72
+    },
+    "mlb": {
+     "games": 36,
+     "with_number": 1440,
+     "settled": 72
+    },
+    "nfl": {
+     "games": 36,
+     "with_number": 1440,
+     "settled": 72
+    },
+    "nba": {
+     "games": 0,
+     "with_number": 0,
+     "settled": 0
+    }
+   },
+   "league": null,
+   "games": 108,
+   "swapped": {
+    "KXMLBGAME-26SEP23AAABBB2": -0.8458,
+    "KXNFLGAME-26AUG30AAABBB1": -0.8593,
+    "KXNFLGAME-26SEP08AAABBB1": -0.8458
+   },
+   "split": {
+    "train": [
+     "2026-08-29",
+     "2026-09-21"
+    ],
+    "test": [
+     "2026-09-22",
+     "2026-10-03"
+    ],
+    "train_games": 72,
+    "test_games": 36
+   },
+   "chosen": {
+    "direction": "fade",
+    "thr": 0.12
+   },
+   "test": {
+    "conservative": {
+     "trades": 36,
+     "unfilled": 0,
+     "games": 36,
+     "mo60": {
+      "n": 36,
+      "mean": 0.08,
+      "t": 47.328638,
+      "lower80": 0.077834
+     },
+     "mo300": {
+      "n": 36,
+      "mean": 0.08,
+      "t": 47.328638,
+      "lower80": 0.077834
+     },
+     "settle": {
+      "n": 36,
+      "mean": 0.414444,
+      "t": 7.46,
+      "lower80": 0.343244
+     }
+    },
+    "visible": {
+     "trades": 36,
+     "unfilled": 0,
+     "games": 36,
+     "mo60": {
+      "n": 36,
+      "mean": 0.08,
+      "t": 47.328638,
+      "lower80": 0.077834
+     },
+     "mo300": {
+      "n": 36,
+      "mean": 0.08,
+      "t": 47.328638,
+      "lower80": 0.077834
+     },
+     "settle": {
+      "n": 36,
+      "mean": 0.414444,
+      "t": 7.46,
+      "lower80": 0.343244
+     }
+    },
+    "as_recorded": {
+     "trades": 37,
+     "unfilled": 0,
+     "games": 36,
+     "mo60": {
+      "n": 37,
+      "mean": 0.079189,
+      "t": 46.593698,
+      "lower80": 0.077011
+     },
+     "mo300": {
+      "n": 37,
+      "mean": 0.079189,
+      "t": 46.593698,
+      "lower80": 0.077011
+     },
+     "settle": {
+      "n": 37,
+      "mean": 0.406216,
+      "t": 7.464882,
+      "lower80": 0.336475
+     }
+    }
+   },
+   "best": {
+    "follow": {
+     "thr": 0.03,
+     "train": {
+      "trades": 144,
+      "unfilled": 0,
+      "games": 72,
+      "mo60": {
+       "n": 144,
+       "mean": -0.295,
+       "t": -248.571418,
+       "lower80": -0.296521
+      },
+      "mo300": {
+       "n": 144,
+       "mean": -0.295,
+       "t": -248.571418,
+       "lower80": -0.296521
+      },
+      "settle": {
+       "n": 144,
+       "mean": -0.633889,
+       "t": -8.125513,
+       "lower80": -0.733869
+      }
+     },
+     "test": {
+      "trades": 72,
+      "unfilled": 0,
+      "games": 36,
+      "mo60": {
+       "n": 72,
+       "mean": -0.295,
+       "t": -174.524354,
+       "lower80": -0.297166
+      },
+      "mo300": {
+       "n": 72,
+       "mean": -0.295,
+       "t": -174.524354,
+       "lower80": -0.297166
+      },
+      "settle": {
+       "n": 72,
+       "mean": -0.633889,
+       "t": -5.705,
+       "lower80": -0.776289
+      }
+     }
+    },
+    "fade": {
+     "thr": 0.12,
+     "train": {
+      "trades": 72,
+      "unfilled": 0,
+      "games": 72,
+      "mo60": {
+       "n": 72,
+       "mean": 0.08,
+       "t": 67.409198,
+       "lower80": 0.078479
+      },
+      "mo300": {
+       "n": 72,
+       "mean": 0.08,
+       "t": 67.409198,
+       "lower80": 0.078479
+      },
+      "settle": {
+       "n": 72,
+       "mean": 0.414444,
+       "t": 10.625123,
+       "lower80": 0.364454
+      }
+     },
+     "test": {
+      "trades": 36,
+      "unfilled": 0,
+      "games": 36,
+      "mo60": {
+       "n": 36,
+       "mean": 0.08,
+       "t": 47.328638,
+       "lower80": 0.077834
+      },
+      "mo300": {
+       "n": 36,
+       "mean": 0.08,
+       "t": 47.328638,
+       "lower80": 0.077834
+      },
+      "settle": {
+       "n": 36,
+       "mean": 0.414444,
+       "t": 7.46,
+       "lower80": 0.343244
+      }
+     }
+    }
+   }
+  },
+  "stake": 2.0,
+  "delay_s": 0.0,
+  "grid": [
+   0.03,
+   0.05,
+   0.08,
+   0.1,
+   0.12,
+   0.15,
+   0.2
+  ]
+ }
+}

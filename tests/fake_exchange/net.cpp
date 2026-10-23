@@ -399,6 +399,18 @@ std::string base64(const std::string& raw) {
   return out;
 }
 
+std::string unbase64(const std::string& in) {
+  std::string out(in.size() / 4 * 3 + 3, '\0');
+  const int n = EVP_DecodeBlock(reinterpret_cast<unsigned char*>(out.data()),
+                                reinterpret_cast<const unsigned char*>(in.data()), static_cast<int>(in.size()));
+  if (n < 0) return {};
+  std::size_t len = static_cast<std::size_t>(n);
+  if (!in.empty() && in.back() == '=') --len;
+  if (in.size() > 1 && in[in.size() - 2] == '=') --len;
+  out.resize(len);
+  return out;
+}
+
 std::string ws_accept_key(const std::string& client_key) {
   const std::string in = client_key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
   unsigned char md[EVP_MAX_MD_SIZE];

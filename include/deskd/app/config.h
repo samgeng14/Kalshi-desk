@@ -6,7 +6,9 @@
 // Live trading is a command-line flag only (--live). A file can never turn it on, so a copied
 // or edited config cannot make a test run send to the production hosts.
 #include <cstdint>
+#include <map>
 #include <string>
+#include <vector>
 
 #include "deskd/bus/units.h"
 
@@ -34,6 +36,90 @@ struct DeskdConfig {
   int max_streams = 4;               // SSE streams; leaves 12 of the 16 threads for requests
   int heartbeat_window_ms = 5000;    // gw, md-k and priv-k must each move within this
   Money daily_stop = 30 * 10000;     // u; decision 1, the recommended $30
+  Money equity_floor = 150 * 10000;  // u; plan section 4 limit 5: the account under it halts Systematic
+  // The account's write rate limit tier (gw/write_budget.h): "basic" (100 tokens a second) until
+  // the free Advanced upgrade is run, then "advanced" (300)
+  std::string write_tier = "basic";
+  // The data releases that pull the makers' quotes (strat/calendar.h); "" = none here, and deskd's
+  // command line fills in the repo's config/calendar.json
+  std::string calendar;
+  // The women's college basketball model (docs/wcbb_model.md; tools/train_wcbb.py writes it): the
+  // fair on KXNCAAWBGAME ladders. "" = models/wcbb_logit_v1.json in the source tree; a missing
+  // file runs without it (and says so), one that fails its golden rows is refused and said.
+  std::string wcbb_model;
+  // The lanes' evidence gates (strat/lane_gate.h): <gates_dir>/<lane>.json, read once at start.
+  // "" = <data_dir>/gates.
+  std::string gates_dir;
+  // C1 COLLEGE TAKE (plan 5(d)): IOC takes of thin college games' stale quotes against the game
+  // fair. Its engine is built only when enabled (and with systematic_orders); it then trades only
+  // the series its gate (<gates_dir>/C1.json) passed, on the models the gate measured, once the
+  // operator turns C1 on and presses Start. Every amount is a ceiling the operator may lower.
+  struct College {
+    bool enabled = false;
+    std::vector<std::string> series = {"KXNCAAWBGAME", "KXNCAAWVMATCH"};
+    // the volleyball model (tools/volleyball.py --write; strat/volley_model.h): "" =
+    // models/volley_markov_v1.json in the source tree; read as the WCBB model is
+    std::string volley_model;
+    Money clip = 2 * 10000;        // u, "clip_dollars": a take's cost, fee included; $1 to $5
+    Money game = 10 * 10000;       // u, "game_dollars": the lane's worst case in one game (gw's event cap); the clip to $15
+    Money budget = 40 * 10000;     // u, "lane_dollars": the lane's budget (decisions 1); the game to $40
+    int max_score_age_s = 5;       // the score's last poll at most this long ago; 1 to 5 (plan 5(d))
+  } college;
+  // The NBA lanes: X1 ESPN EXP (plan 5(e)), N1 NBA MODEL and N2 NBA FAV 90-95 (decisions 2), IOC
+  // takes in NBA games (N2's before the start). Their engines are built only with nba_lanes (and
+  // systematic_orders), each once its gate (<gates_dir>/X1.json, N1.json, N2.json) loads; a lane
+  // then trades only once its gate is live, the operator turns it on and presses Start.
+  bool nba_lanes = false;
+  std::vector<std::string> nba_series = {"KXNBAGAME"};   // the series X1, N1 and N2 trade
+  // The NBA model (tools/train_bball.py --league nba): the fair on NBA ladders, and N1's. "" =
+  // models/nba_logit_v1.json in the source tree; read as the WCBB model is.
+  std::string nba_model;
+  // X1, N1 and N2 record what they would take while they may not post (a gate at stage shadow,
+  // the lane off, Systematic stopped) in ops.sqlite's signals table: N1's last gate reads them. C1
+  // records none (its gate measures the recorder's data).
+  bool lane_shadow = true;
+  // S1 ARB (plan 5(c)): IOC baskets of one event's markets that pay more than they cost, fees
+  // included, however the event settles (strat/arb.h). "off" builds no engine; "scan" finds and
+  // logs baskets (ops.sqlite's arb_scans) and sends nothing, with S1 kept off, Systematic orders
+  // or not; "trade" lets the operator turn S1 on and press Start, and needs systematic_orders and
+  // event_risk. Every amount is a ceiling the operator may lower.
+  std::string arb_mode = "off";
+  std::vector<std::string> arb_series;    // the series S1 scans and trades; empty (none given): band_series
+  Qty arb_max_qty = 10 * kOneContract;    // a basket's size at most, whole contracts: 1 to 20 (S1's inventory a market)
+  int arb_max_legs = 6;                   // 2 to 6: the Basic write tier, and S1's order group limit (sys_book.cpp)
+  Money arb_thr = 100;                    // u: what a basket contract locks after fees; $0.005 to $0.10 (LaneSpec S1 thr)
+  Money arb_legging_pause = 5 * 10000;    // u: new baskets stop once legging lost this much; over $0, at most $5
+  // each series' settle lattice, by series prefix (KXHIGH and KXLOW settle on whole degrees): an
+  // event of the series may be proven exhaustive on it (gw/event_risk.h); any other on the real line
+  std::map<std::string, double> arb_lattice = {{"KXHIGH", 1.0}, {"KXLOW", 1.0}};
+  // decisions 5: S1's stakes in an event whose settlement states are proven count by state in gw's
+  // risk book (a complete basket about $0; LaneSpec::by_state). Off, every lane counts each market
+  // alone, as today.
+  bool event_risk = false;
+  // decisions 7: the account's balance precision a taker fee rounds to, u: $0.01 until demo fills
+  // prove $0.0001. S1's fee bound (gw/fees.h order_fee_bound); admission keeps its own allowance.
+  Money fee_precision = 100;
+  // Manual orders to the (demo) venue. Off by default: gw still admits and answers, but every
+  // order is refused RO and the header stays read-only until the operator turns it on.
+  bool manual_orders = false;
+  // Systematic orders to the (demo) venue (send-k2, order groups, lanes). Off by default: the
+  // lanes show, Start stays refused (GROUPS) and no group is created until the operator turns
+  // it on. Independent of manual_orders.
+  bool systematic_orders = false;
+  // The 15-minute series lane M1 (LIP-15) quotes; the plan starts with natural gas alone. A demo
+  // account may list other series, or none: then M1 has nothing to quote.
+  std::vector<std::string> lip_series = {"KXNATGAS15M"};
+  // The series lane M2 (BAND 96-99) quotes: the plan's five weather cities first.
+  std::vector<std::string> band_series = {"KXHIGHNY", "KXHIGHCHI", "KXHIGHMIA", "KXHIGHAUS", "KXHIGHLAX"};
+  // Lane D1 PAPER (strat/maker.h paper_quote) on the demo account, on from the start: orders in
+  // and out every few minutes so the Systematic path can be watched. Never on the production
+  // account, whatever this says.
+  bool paper_lane = true;
+  // The other desk the header's PAPER/LIVE tag switches to: the paper desk (demo account) and
+  // the live one (production) are two deskd processes, each with its own account lock, data and
+  // port. http://127.0.0.1:PORT/ or http://localhost:PORT/ only; "" = the other default port
+  // (8788 paper, 8789 live; tools/desk.py starts them there).
+  std::string peer_url;
   // from the command line only
   bool live = false;
 };
@@ -42,6 +128,14 @@ struct DeskdConfig {
 // missing file, bad JSON, a wrong type, an unknown "deskd" key, or "live" in the file.
 DeskdConfig load_deskd_config(const std::string& path);
 
-std::string expand_home(const std::string& path);  // "~/x" -> "$HOME/x", as src/config.cpp
+std::string expand_home(const std::string& path);
+
+// http://127.0.0.1:PORT/ or http://localhost:PORT/ (PORT 1-65535, the slash optional, nothing after)
+bool peer_url_ok(const std::string& url);
+// cfg.peer_url, else the other desk's default on 127.0.0.1: 8789 (live) from paper, 8788 from live
+std::string peer_url_for(const DeskdConfig& cfg);  // "~/x" -> "$HOME/x", as src/config.cpp
+// a series' settle lattice: the step of the longest arb_lattice prefix it starts with; 0 (the real
+// line) when none does
+double arb_lattice_step(const DeskdConfig& cfg, const std::string& series);
 
 }  // namespace deskd

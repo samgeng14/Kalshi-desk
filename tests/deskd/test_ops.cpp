@@ -3,6 +3,7 @@
 // and file (web's probe and every watched owner), the logger that never blocks a thread, config
 // loading, the empty-subscription guard, and the send guard that keeps production hosts closed
 // without --live and the production account's lock.
+#include <cctype>
 #include <fcntl.h>
 #include <signal.h>
 #include <sys/stat.h>
@@ -257,7 +258,17 @@ static void test_logger_never_blocks() {
   std::printf("20,000 log lines into a full pipe: %.1f ms, %llu dropped\n", ms, static_cast<unsigned long long>(dropped));
   CHECK(flushed);
   CHECK(got.find("] main: line 0 of a flood nobody reads\n") != std::string::npos);   // whole lines
-  CHECK(got.find(std::to_string(dropped) + " log lines dropped") != std::string::npos);
+  // every drop is reported: in one line, or several when the logger woke during the flood (it
+  // reports what was dropped so far each time it wakes; under load that splits the count)
+  std::uint64_t reported = 0;
+  for (std::size_t at = got.find(" log lines dropped"); at != std::string::npos; at = got.find(" log lines dropped", at + 1)) {
+    std::size_t b = at;
+    while (b > 0 && std::isdigit(static_cast<unsigned char>(got[b - 1]))) --b;
+    if (b < at) reported += std::stoull(got.substr(b, at - b));
+  }
+  if (reported != dropped) std::fprintf(stderr, "  reported %llu of %llu dropped\n", static_cast<unsigned long long>(reported),
+                                        static_cast<unsigned long long>(dropped));
+  CHECK(reported == dropped);
   ::close(p[0]);
   ::close(p[1]);
 }
@@ -294,6 +305,12 @@ static void test_config() {
   CHECK(k.key_type == "ed25519");
   DeskdConfig l = load_deskd_config(write(R"({"deskd": {"lock_dir": "/tmp/locks"}})"));
   CHECK(l.lock_dir == "/tmp/locks");
+  // Systematic: off by default; LIP-15's series, natural gas unless set
+  CHECK(!e.systematic_orders && !e.manual_orders && e.lip_series == std::vector<std::string>{"KXNATGAS15M"});
+  DeskdConfig sys = load_deskd_config(write(R"({"deskd": {"systematic_orders": true, "lip_series": ["KXGOLD15M", "KXNATGAS15M"]}})"));
+  CHECK(sys.systematic_orders && sys.lip_series == (std::vector<std::string>{"KXGOLD15M", "KXNATGAS15M"}));
+  CHECK(e.band_series.size() == 5 && e.band_series.front() == "KXHIGHNY");
+  CHECK(load_deskd_config(write(R"({"deskd": {"band_series": ["KXHIGHDEN"]}})")).band_series == std::vector<std::string>{"KXHIGHDEN"});
   auto throws = [&](const std::string& text, const std::string& want) {
     try {
       load_deskd_config(write(text));
@@ -303,6 +320,89 @@ static void test_config() {
     return false;
   };
   CHECK(throws(R"({"deskd": {"live": true}})", "command-line flag only"));
+  // the PAPER/LIVE switch's other desk: loopback http only
+  CHECK(e.peer_url.empty() && peer_url_for(e) == "http://127.0.0.1:8789/");
+  DeskdConfig live_cfg = e;
+  live_cfg.live = true;
+  CHECK(peer_url_for(live_cfg) == "http://127.0.0.1:8788/");
+  CHECK(peer_url_for(load_deskd_config(write(R"({"deskd": {"peer_url": "http://localhost:9001"}})"))) == "http://localhost:9001/");
+  CHECK(peer_url_ok("http://127.0.0.1:8789/") && peer_url_ok("http://localhost:1"));
+  for (const char* bad : {"https://127.0.0.1:8789/", "http://127.0.0.1:8789/x", "http://127.0.0.1:0/", "http://127.0.0.1:70000/",
+                          "http://evil.example:8789/", "http://127.0.0.1:/", "http://127.0.0.1:8789\"><script>"})
+    CHECK(!peer_url_ok(bad));
+  CHECK(throws(R"({"deskd": {"peer_url": "http://kalshi.com/"}})", "peer_url must be"));
+  // the write rate limit tier (gw/write_budget.h): Basic until the upgrade
+  CHECK(e.write_tier == "basic" && load_deskd_config(write(R"({"deskd": {"write_tier": "advanced"}})")).write_tier == "advanced");
+  CHECK(throws(R"({"deskd": {"write_tier": "premier"}})", "write_tier is"));
+  // the data-release calendar's path (deskd's command line fills in the repo's)
+  CHECK(e.calendar.empty() && load_deskd_config(write(R"({"deskd": {"calendar": "/tmp/cal.json"}})")).calendar == "/tmp/cal.json");
+  // C1 (plan 5(d)): off, its two series, $2 a take, $10 a game, $40, scores at most 5 s old; the
+  // gates in <data_dir>/gates. Every key is known and every amount inside its range.
+  CHECK(!e.college.enabled && e.college.series == (std::vector<std::string>{"KXNCAAWBGAME", "KXNCAAWVMATCH"}) &&
+        e.college.clip == 20000 && e.college.game == 100000 && e.college.budget == 400000 && e.college.max_score_age_s == 5 &&
+        e.college.volley_model.empty() && e.gates_dir.empty());
+  DeskdConfig col = load_deskd_config(write(R"({"deskd": {"gates_dir": "~/gates", "college": {"enabled": true,
+    "series": ["KXNCAAWVMATCH"], "volley_model": "/m/v.json", "clip_dollars": 5, "game_dollars": 15, "lane_dollars": 30,
+    "max_score_age_s": 3}}})"));
+  CHECK(col.college.enabled && col.college.series == std::vector<std::string>{"KXNCAAWVMATCH"} && col.college.clip == 50000 &&
+        col.college.game == 150000 && col.college.budget == 300000 && col.college.max_score_age_s == 3 &&
+        col.college.volley_model == "/m/v.json" && !col.gates_dir.empty() && col.gates_dir.find('~') == std::string::npos);
+  CHECK(throws(R"({"deskd": {"college": {"leader_only": true}}})", "deskd college: unknown key \"leader_only\""));
+  CHECK(throws(R"({"deskd": {"college": {"clip_dollars": 6}}})", "college: clip_dollars is $1.0000 to $5.0000, not $6.0000"));
+  CHECK(throws(R"({"deskd": {"college": {"clip_dollars": 0.5}}})", "clip_dollars is $1.0000 to $5.0000, not $0.5000"));
+  CHECK(throws(R"({"deskd": {"college": {"game_dollars": 20}}})", "game_dollars is $2.0000 to $15.0000, not $20.0000"));
+  CHECK(throws(R"({"deskd": {"college": {"clip_dollars": 5, "game_dollars": 4}}})", "game_dollars is $5.0000 to $15.0000"));
+  CHECK(throws(R"({"deskd": {"college": {"lane_dollars": 50}}})", "lane_dollars is $10.0000 to $40.0000, not $50.0000"));
+  CHECK(throws(R"({"deskd": {"college": {"lane_dollars": -1}}})", "lane_dollars is $10.0000 to $40.0000, not $-1.0000"));
+  CHECK(throws(R"({"deskd": {"college": {"max_score_age_s": 10}}})", "max_score_age_s is 1 to 5, not 10"));
+  CHECK(throws(R"({"deskd": {"college": {"max_score_age_s": 0}}})", "max_score_age_s is 1 to 5, not 0"));
+  CHECK(throws(R"({"deskd": {"college": {"series": ["kxncaawbgame"]}}})", "college: series has \"kxncaawbgame\", not a series ticker"));
+  CHECK(throws(R"({"deskd": {"college": {"series": []}}})", "college: series is empty"));
+  CHECK(throws(R"({"deskd": {"college": {"enabled": "yes"}}})", "\"enabled\" has the wrong type"));
+  CHECK(throws(R"({"deskd": {"college": [1]}})", "deskd college: not an object"));
+  // X1 and N1: off, on NBA's series, the model in the source tree (deskd's command line), shadow
+  // signals recorded
+  CHECK(!e.nba_lanes && e.nba_series == std::vector<std::string>{"KXNBAGAME"} && e.nba_model.empty() && e.lane_shadow);
+  DeskdConfig nba = load_deskd_config(write(R"({"deskd": {"nba_lanes": true, "nba_series": ["KXNBAGAME", "KXWNBAGAME"],
+    "nba_model": "~/m/nba.json", "lane_shadow": false}})"));
+  CHECK(nba.nba_lanes && nba.nba_series == (std::vector<std::string>{"KXNBAGAME", "KXWNBAGAME"}) && !nba.lane_shadow &&
+        nba.nba_model.size() > 11 && nba.nba_model.find('~') == std::string::npos &&
+        nba.nba_model.compare(nba.nba_model.size() - 11, 11, "/m/nba.json") == 0);
+  CHECK(throws(R"({"deskd": {"nba_series": []}})", "deskd: nba_series is empty"));
+  CHECK(throws(R"({"deskd": {"nba_series": ["KXNBAGAME", "nba"]}})", "nba_series has \"nba\", not a series ticker"));
+  CHECK(throws(R"({"deskd": {"nba_lanes": 1}})", "\"nba_lanes\" has the wrong type"));
+  CHECK(throws(R"({"deskd": {"nba_shadow": true}})", "unknown key \"nba_shadow\""));
+  // S1 (plan 5(c)): off, scanning band_series once on, 10 contracts and 6 legs a basket, 1c a
+  // contract after fees, paused at -$5, KXHIGH and KXLOW on whole degrees; gw counts every market
+  // alone, and fees round to the cent (decisions 5 and 7)
+  CHECK(e.arb_mode == "off" && e.arb_series.empty() && e.arb_max_qty == 1000 && e.arb_max_legs == 6 && e.arb_thr == 100 &&
+        e.arb_legging_pause == 50000 && !e.event_risk && e.fee_precision == 100);
+  CHECK(arb_lattice_step(e, "KXHIGHNY") == 1 && arb_lattice_step(e, "KXLOWTCHI") == 1 && arb_lattice_step(e, "KXNATGAS15M") == 0);
+  DeskdConfig arb = load_deskd_config(write(R"({"deskd": {"systematic_orders": true, "event_risk": true, "arb_mode": "trade",
+    "arb_series": ["KXHIGHDEN"], "arb_max_qty": 20, "arb_max_legs": 4, "arb_thr": 0.005, "arb_legging_pause": 2.5,
+    "arb_lattice": {"KXHIGH": 1, "KXHIGHDEN": 2}, "fee_precision": 0.0001}})"));
+  CHECK(arb.arb_mode == "trade" && arb.arb_series == std::vector<std::string>{"KXHIGHDEN"} && arb.arb_max_qty == 2000 &&
+        arb.arb_max_legs == 4 && arb.arb_thr == 50 && arb.arb_legging_pause == 25000 && arb.event_risk && arb.fee_precision == 1);
+  CHECK(arb_lattice_step(arb, "KXHIGHDEN") == 2 && arb_lattice_step(arb, "KXHIGHNY") == 1 && arb_lattice_step(arb, "KXLOWTNY") == 0);
+  CHECK(load_deskd_config(write(R"({"deskd": {"arb_mode": "scan"}})")).arb_mode == "scan");   // scan needs neither switch
+  CHECK(throws(R"({"deskd": {"arb_mode": "trade", "event_risk": true}})", "deskd: arb_mode \"trade\" needs systematic_orders"));
+  CHECK(throws(R"({"deskd": {"arb_mode": "trade", "systematic_orders": true}})", "deskd: arb_mode \"trade\" needs event_risk"));
+  CHECK(throws(R"({"deskd": {"arb_mode": "on"}})", "arb_mode is \"off\", \"scan\" or \"trade\", not \"on\""));
+  CHECK(throws(R"({"deskd": {"arb_series": []}})", "deskd: arb_series is empty"));
+  CHECK(throws(R"({"deskd": {"arb_series": ["kxhighny"]}})", "arb_series has \"kxhighny\", not a series ticker"));
+  CHECK(throws(R"({"deskd": {"arb_max_qty": 21}})", "arb_max_qty is 1 to 20 whole contracts, not 21"));
+  CHECK(throws(R"({"deskd": {"arb_max_qty": 2.5}})", "arb_max_qty is 1 to 20 whole contracts, not 2.5"));
+  CHECK(throws(R"({"deskd": {"arb_max_legs": 7}})", "arb_max_legs is 2 to 6, not 7"));
+  CHECK(throws(R"({"deskd": {"arb_thr": 0.001}})", "arb_thr is $0.0050 to $0.1000, not $0.0010"));
+  CHECK(throws(R"({"deskd": {"arb_legging_pause": 6}})", "arb_legging_pause is $0.0001 to $5.0000, not $6.0000"));
+  CHECK(throws(R"({"deskd": {"arb_legging_pause": 0}})", "arb_legging_pause is $0.0001 to $5.0000, not $0.0000"));
+  CHECK(throws(R"({"deskd": {"arb_lattice": {"KXHIGH": 0}}})", "arb_lattice maps a series prefix to a step over 0, not \"KXHIGH\": 0"));
+  CHECK(throws(R"({"deskd": {"arb_lattice": [1]}})", "\"arb_lattice\" has the wrong type"));
+  CHECK(throws(R"({"deskd": {"fee_precision": 0.001}})", "fee_precision is 0.01 or 0.0001 (dollars), not 0.001"));
+  CHECK(throws(R"({"deskd": {"event_risk": "on"}})", "\"event_risk\" has the wrong type"));
+  CHECK(throws(R"({"deskd": {"lip_series": ["kxgold15m"]}})", "not a series ticker"));
+  CHECK(throws(R"({"deskd": {"lip_series": "KXGOLD15M"}})", "wrong type"));
+  CHECK(throws(R"({"deskd": {"band_series": ["KX HIGH"]}})", "band_series has"));
   CHECK(throws(R"({"key_type": "ecdsa"})", "\"key_type\" must be \"rsa\" or \"ed25519\""));
   CHECK(throws(R"({"deskd": {"heartbeat_window": 5000}})", "unknown key \"heartbeat_window\""));
   CHECK(throws(R"({"deskd": {"http_port": "8788"}})", "\"http_port\" has the wrong type"));

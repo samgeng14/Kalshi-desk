@@ -1,0 +1,24 @@
+{
+ "_provenance": "Hand-built in the shape of NCAA.com's data.ncaa.com/casablanca/scoreboard/<sport>/<division>/YYYY/MM/DD/scoreboard.json (games[].game.{gameID, gameState pre|live|final, currentPeriod, contestClock, startTimeEpoch, home/away.{score, names.{char6, short, seo}}}), as henrygd/ncaa-api serves it. Not a capture: TO CONFIRM against the live file.",
+ "inputMD5Sum": "0f4bd1a1d0a7c2b1",
+ "updated_at": "11-05-2026 23:52:07",
+ "games": [
+  {"game": {"gameID": "6305901", "url": "/game/6305901", "title": "South Carolina UConn",
+            "gameState": "live", "currentPeriod": "2nd", "contestClock": "04:12",
+            "startTime": "06:00PM ET", "startTimeEpoch": "1793919600", "startDate": "11-05-2026", "finalMessage": "",
+            "home": {"score": "34", "winner": false, "rank": "2",
+                     "names": {"char6": "UCONN", "short": "UConn", "seo": "uconn", "full": "University of Connecticut"}},
+            "away": {"score": "31", "winner": false, "rank": "1",
+                     "names": {"char6": "S CAR", "short": "South Carolina", "seo": "south-carolina",
+                               "full": "University of South Carolina"}}}},
+  {"game": {"gameID": "6305902", "url": "/game/6305902", "gameState": "pre", "currentPeriod": "",
+            "contestClock": "", "startTime": "07:30PM ET", "startTimeEpoch": "1793925000", "finalMessage": "",
+            "home": {"score": "", "names": {"char6": "DRAKE", "short": "Drake", "seo": "drake"}},
+            "away": {"score": "", "names": {"char6": "IOWA", "short": "Iowa", "seo": "iowa"}}}},
+  {"game": {"gameID": "6305903", "url": "/game/6305903", "gameState": "final", "currentPeriod": "FINAL",
+            "contestClock": "0:00", "startTimeEpoch": "1793898000", "finalMessage": "FINAL",
+            "home": {"score": "61", "winner": true, "names": {"char6": "VERMNT", "short": "Vermont", "seo": "vermont"}},
+            "away": {"score": "58", "winner": false, "names": {"char6": "MAINE", "short": "Maine", "seo": "maine"}}}},
+  {"game": {"gameID": "6305904", "gameState": "live", "home": {"score": "3"}}}
+ ]
+}

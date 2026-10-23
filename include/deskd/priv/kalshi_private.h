@@ -11,9 +11,11 @@ namespace deskd {
 class Worker;
 class KalshiSigner;
 struct PrivateEvent {
-  enum class Kind { ORDER, FILL } kind = Kind::ORDER;
+  enum class Kind { ORDER, FILL, GROUP } kind = Kind::ORDER;
   kalshi::OrderRow order;
   kalshi::FillRow fill;
+  // GROUP (channel order_group_updates): created, triggered, reset, deleted or limit_updated
+  std::string group_id, group_event;
   std::string cid;
   std::optional<Qty> post_position;
   std::int64_t received_ms = 0;

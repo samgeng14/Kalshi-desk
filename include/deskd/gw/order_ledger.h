@@ -3,6 +3,7 @@
 // execution/position ledger are separate: cumulative venue counts never move a position.
 #include <map>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 #include <nlohmann/json.hpp>
@@ -15,10 +16,12 @@ class OrderLedger {
     PlaceIntent intent;
     int shard = -1;
     std::string oid, why;
+    std::string cancel_why = "USER";   // why a cancel was asked (gw's STOP, HALT, LANE_OFF, TAKEOVER)
     OrdState state = OrdState::PEND;
     Qty filled = 0, executions = 0, left = 0;
     kalshi::Micros execution_cost = 0, fees = 0, original_reserve = 0;
     bool uncertain = false, cancel_requested = false, cancel_unverified = false;
+    bool refused = false;   // ended by rejected(): never reached the venue, so no venue evidence may follow
     std::int64_t sent_ms = 0, ack_ms = 0, done_ms = 0, update_ms = 0;
     std::uint64_t rev = 1;
     bool terminal() const;
@@ -40,31 +43,49 @@ class OrderLedger {
   bool insert(PlaceIntent intent, int shard, kalshi::Micros reserve);
   bool sent(const std::string& cid, std::int64_t at);
   bool unknown(const std::string& cid);
+  // REJ with code as why; except POST_CROSS (the venue cancelled a crossing post-only), STP and USER
+  // (cancelled before it was sent), which the contract reports as CXL with that why.
   bool rejected(const std::string& cid, const std::string& code, std::int64_t at);
   bool acknowledged(const std::string& cid, const kalshi::CreateAck& ack, std::int64_t at);
   bool observed(const kalshi::OrderRow& row, std::int64_t at);
   // APPLIED is the ONLY outcome that permits the caller to book this execution in positions.
   // An orphan waits for mapping/reconciliation. Conflicting duplicate executions fail closed.
-  FillResult fill(const kalshi::FillRow& row, const std::string& cid, std::int64_t at);
-  bool request_cancel(const std::string& cid);
+  // rest: the row came from the account read. REST and the private feed report one trade with
+  // fields that may differ in form (fee rounding, the taker flag, the shard), so a duplicate where
+  // either side is REST's is compared on what defines the trade only.
+  FillResult fill(const kalshi::FillRow& row, const std::string& cid, std::int64_t at, bool rest = false);
+  // why: the order's why if the cancel ends it, whichever of the cancel's reply and the private
+  // feed's update arrives first
+  bool request_cancel(const std::string& cid, const std::string& why = "USER");
   bool cancelled(const std::string& cid, const kalshi::CancelAck& ack,
                  const std::string& reason, std::int64_t at);
   // A complete history read begun after the deadline is required to prove absence. Mere
   // absence from an open-orders snapshot, timeout, or local expiry is never sufficient.
   bool resolve_absent(const std::string& cid, const History& history);
   const Order* find(const std::string& cid) const;
-  bool blocks(const std::string& ticker, int shard) const;
+  bool blocks(const std::string& ticker, int shard) const { return !blocking(ticker, shard).empty(); }
+  // the first order on this market and shard whose outcome is unknown, "" when none
+  std::string blocking(const std::string& ticker, int shard) const;
   kalshi::Micros reserved(int shard) const;
   std::vector<std::string> fills_due(std::int64_t now) const;
   bool healthy() const { return healthy_; }
+  // The first order whose counts break the ledger's own bounds (plan section 8's per-message check):
+  // 0 <= executions <= filled <= count, 0 <= left <= count - filled, nothing left once it ended,
+  // and the reservation within what it reserved at admission; "" when none does.
+  std::string check() const;
+  // The first contradiction that made the ledger unhealthy, with the order it names ("" while healthy).
+  const std::string& why_unhealthy() const { return why_unhealthy_; }
+  const std::map<std::string, Order>& orders() const { return orders_; }
  private:
   bool bind(Order& order, const std::string& oid);
-  bool invalid();
+  bool invalid(const Order& order, const std::string& why);
   std::map<std::string, Order> orders_;
   std::map<std::string, std::string> by_oid_;
   std::map<std::string, kalshi::FillRow> fills_;
+  std::set<std::string> rest_fills_;   // trade ids first seen in an account read
   std::map<std::string, std::int64_t> missing_since_;
   bool healthy_ = true;
+  std::string why_unhealthy_;
   void missing(Order& order, std::int64_t at);
 };
 }

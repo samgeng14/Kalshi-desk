@@ -568,7 +568,8 @@ json market_json(const Engine& e, const Market& m) {
   json ranges = json::array();
   for (const auto& r : m.spec.ticks)
     ranges.push_back(json{{"start", px_str(r.start)}, {"end", px_str(r.end)}, {"step", px_str(r.step)}});
-  const char* status = m.state == Market::State::OPEN ? "active" : m.state == Market::State::PAUSED ? "paused" : "closed";
+  const char* status = m.settled ? "settled" : m.state == Market::State::OPEN ? "active"
+                     : m.state == Market::State::PAUSED ? "paused" : "closed";
   json j{{"ticker", m.spec.ticker},
          {"event_ticker", m.spec.event_ticker},
          {"market_type", "binary"},
@@ -584,16 +585,52 @@ json market_json(const Engine& e, const Market& m) {
          {"volume_fp", qty_str(m.volume)},
          {"open_interest_fp", qty_str(m.open_interest)},
          {"price_level_structure", m.spec.price_level_structure},
+         {"fractional_trading_enabled", m.spec.fractional},
          {"price_ranges", ranges}};
   if (m.spec.close_ms > 0) j["close_time"] = rfc3339(m.spec.close_ms);
+  if (m.spec.open_ms > 0) j["open_time"] = rfc3339(m.spec.open_ms);
+  if (!m.spec.strike_type.empty()) j["strike_type"] = m.spec.strike_type;
+  if (m.spec.floor_strike) j["floor_strike"] = *m.spec.floor_strike;
+  if (m.spec.cap_strike) j["cap_strike"] = *m.spec.cap_strike;
+  if (!m.spec.yes_sub_title.empty()) j["yes_sub_title"] = m.spec.yes_sub_title;
+  if (m.settled) j["result"] = m.result;
   return j;
+}
+
+// GET /events/{event_ticker} (get-event.md): {event} with its markets nested in it when
+// with_nested_markets=true, else {event, markets} with them beside it (the default, documented as
+// deprecated); its markets are the listed ones naming it, by ticker, any status. 404 not_found for
+// an event the fake has not been given.
+RestReply get_event(const Engine& e, const net::Request& r, const std::string& event_ticker) {
+  const std::string nested = qstr(r, "with_nested_markets");
+  if (!nested.empty() && nested != "true" && nested != "false") return bad("with_nested_markets must be true or false");
+  const auto it = e.events().find(event_ticker);
+  if (it == e.events().end()) return rest_error(404, "not_found", "event not found");
+  const EventSpec& s = it->second;
+  json ev{{"event_ticker", s.event_ticker},
+          {"series_ticker", s.series_ticker},
+          {"title", s.title},
+          {"sub_title", s.sub_title},
+          {"category", s.category}};
+  if (s.mutually_exclusive) ev["mutually_exclusive"] = *s.mutually_exclusive;
+  if (!s.collateral_return_type.empty()) ev["collateral_return_type"] = s.collateral_return_type;
+  json markets = json::array();
+  for (const auto& [ticker, m] : e.markets())   // std::map: by ticker
+    if (m.spec.event_ticker == s.event_ticker) markets.push_back(market_json(e, m));
+  if (nested == "true") {
+    ev["markets"] = markets;
+    return ok(200, json{{"event", ev}});
+  }
+  return ok(200, json{{"event", ev}, {"markets", markets}});
 }
 
 // GET /markets (get-markets.md): limit 1-1000 (default 100), cursor, tickers (comma-separated),
 // event_ticker, series_ticker, status (unopened | open | paused | closed | settled); ordered by
 // ticker here, a cursor naming the last ticker sent. The venue's order is its own; deskd pages
-// to the empty cursor and never relies on one.
-RestReply list_markets(const Engine& e, const net::Request& r) {
+// to the empty cursor and never relies on one. unopened: a market whose open_time is still ahead
+// (status open lists it too: the engine trades a market from its listing, and deskd's tests
+// list a window shortly before it opens); settled: a market settle_market resolved.
+RestReply list_markets(const Engine& e, const net::Request& r, std::int64_t now) {
   bool b = false;
   const auto l = qint(r, "limit", &b);
   if (b || (l && (*l < 1 || *l > 1000))) return bad("limit must be an integer from 1 to 1000");
@@ -616,8 +653,9 @@ RestReply list_markets(const Engine& e, const net::Request& r) {
     if (!series.empty() && ticker.compare(0, series.size() + 1, series + "-") != 0) continue;
     if (status == "open" && m.state != Market::State::OPEN) continue;
     if (status == "paused" && m.state != Market::State::PAUSED) continue;
-    if (status == "closed" && m.state != Market::State::CLOSED) continue;
-    if (status == "unopened" || status == "settled") continue;   // the fake has neither
+    if (status == "closed" && (m.state != Market::State::CLOSED || m.settled)) continue;
+    if (status == "unopened" && !(m.state == Market::State::OPEN && m.spec.open_ms > now)) continue;
+    if (status == "settled" && !m.settled) continue;
     if (static_cast<int>(out.size()) == limit) {
       more = true;
       break;
@@ -745,7 +783,38 @@ RestReply rest_route(Engine& e, const net::Request& r, const std::string& path, 
     }
     return rest_error(404,"not_found","series not found");
   }
-  if (seg[0] == "markets" && r.method == "GET" && seg.size() == 1) return list_markets(e, r);
+  if (seg[0] == "events" && r.method == "GET" && seg.size() == 2) return get_event(e, r, seg[1]);
+  if (seg[0] == "markets" && r.method == "GET" && seg.size() == 1) return list_markets(e, r, now);
+  // GET /markets/trades (get-trades.md): public prints, newest first; ticker, min_ts / max_ts in
+  // Unix seconds, limit 1-1000 (default 100), cursor
+  if (seg[0] == "markets" && r.method == "GET" && seg.size() == 2 && seg[1] == "trades") {
+    bool b = false;
+    const auto limit = qint(r, "limit", &b), min_ts = qint(r, "min_ts", &b), max_ts = qint(r, "max_ts", &b);
+    if (b || (limit && (*limit < 1 || *limit > 1000))) return bad("limit must be 1-1000; min_ts and max_ts integers");
+    const std::string ticker = qstr(r, "ticker"), cursor = qstr(r, "cursor");
+    long long skip = 0;
+    if (!cursor.empty()) {
+      if (cursor[0] != 't' || cursor.size() > 18 || cursor.find_first_not_of("0123456789", 1) != std::string::npos)
+        return bad("bad cursor");
+      skip = std::stoll(cursor.substr(1));
+    }
+    const long long n = limit ? *limit : 100;
+    json out = json::array();
+    long long seen = 0;
+    bool more = false;
+    const auto& all = e.public_trades();
+    for (auto it = all.rbegin(); it != all.rend(); ++it) {
+      if (!ticker.empty() && it->ticker != ticker) continue;
+      if (min_ts && it->ts_ms < *min_ts * 1000) continue;
+      if (max_ts && it->ts_ms > *max_ts * 1000) continue;
+      if (seen++ < skip) continue;
+      if (static_cast<long long>(out.size()) == n) { more = true; break; }
+      out.push_back({{"trade_id", it->trade_id}, {"ticker", it->ticker}, {"count_fp", qty_str(it->qty)},
+                     {"yes_price_dollars", px_str(it->yes_px)}, {"no_price_dollars", px_str(kDollar - it->yes_px)},
+                     {"taker_side", it->taker_side}, {"created_time", rfc3339(it->ts_ms)}});
+    }
+    return ok(200, json{{"trades", out}, {"cursor", more ? "t" + std::to_string(skip + n) : ""}});
+  }
   if (seg[0] == "markets" && r.method == "GET" && seg.size() >= 2) {
     const Market* m = e.market(seg[1]);
     if (!m) return rest_error(404, "not_found", "market not found");
@@ -764,6 +833,33 @@ RestReply rest_route(Engine& e, const net::Request& r, const std::string& path, 
       };
       return ok(200, json{{"orderbook_fp", json{{"yes_dollars", side(false)}, {"no_dollars", side(true)}}}});
     }
+  }
+  // GET /incentive_programs (public): status active (running now) or all; limit; cursor "i<n>". The
+  // documented `type` filter is ignored, as the venue ignores it (scripts/incentive_audit.py).
+  if (seg[0] == "incentive_programs" && r.method == "GET" && seg.size() == 1) {
+    bool b = false;
+    const auto limit = qint(r, "limit", &b);
+    if (b || (limit && (*limit < 1 || *limit > 10000))) return bad("limit must be 1-10000");
+    const std::string status = qstr(r, "status"), cursor = qstr(r, "cursor");
+    long long skip = 0;
+    if (!cursor.empty()) {
+      if (cursor[0] != 'i' || cursor.size() > 18 || cursor.find_first_not_of("0123456789", 1) != std::string::npos)
+        return bad("bad cursor");
+      skip = std::stoll(cursor.substr(1));
+    }
+    const long long n = limit ? *limit : 100;
+    json out = json::array();
+    long long seen = 0;
+    bool more = false;
+    for (const auto& p : e.incentives()) {
+      if (status == "active" && (now < p.start_ms || now >= p.end_ms)) continue;
+      if (seen++ < skip) continue;
+      if (static_cast<long long>(out.size()) == n) { more = true; break; }
+      out.push_back({{"market_ticker", p.ticker}, {"incentive_type", p.type}, {"period_reward", p.reward},
+                     {"target_size_fp", qty_str(p.target)}, {"discount_factor_bps", p.discount_bps},
+                     {"start_date", rfc3339(p.start_ms)}, {"end_date", rfc3339(p.end_ms)}, {"paid_out", false}});
+    }
+    return ok(200, json{{"incentive_programs", out}, {"next_cursor", more ? "i" + std::to_string(skip + n) : ""}});
   }
   if (seg[0] == "exchange" && seg.size() == 2 && seg[1] == "status" && r.method == "GET")
     return ok(200, json{{"exchange_active", true}, {"trading_active", true}});

@@ -119,6 +119,7 @@ int remaining_ms(std::int64_t deadline_us) {
 std::size_t count_roots(SSL_CTX* ctx) {
   X509_STORE* st = SSL_CTX_get_cert_store(ctx);
   if (!st) return 0;
+#if OPENSSL_VERSION_NUMBER >= 0x30300000L
   STACK_OF(X509_OBJECT)* objs = X509_STORE_get1_objects(st);
   if (!objs) return 0;
   std::size_t n = 0;
@@ -126,6 +127,16 @@ std::size_t count_roots(SSL_CTX* ctx) {
     if (X509_OBJECT_get_type(sk_X509_OBJECT_value(objs, i)) == X509_LU_X509) ++n;
   sk_X509_OBJECT_pop_free(objs, X509_OBJECT_free);
   return n;
+#else
+  // OpenSSL before 3.3 (Linux CI images) has only the borrowed view; the store is private to
+  // this context and not yet shared with any thread while the factory counts its roots.
+  STACK_OF(X509_OBJECT)* objs = X509_STORE_get0_objects(st);
+  if (!objs) return 0;
+  std::size_t n = 0;
+  for (int i = 0; i < sk_X509_OBJECT_num(objs); ++i)
+    if (X509_OBJECT_get_type(sk_X509_OBJECT_value(objs, i)) == X509_LU_X509) ++n;
+  return n;
+#endif
 }
 
 }  // namespace

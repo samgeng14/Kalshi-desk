@@ -1,0 +1,44 @@
+{
+ "lane": "N2",
+ "stage": "live",
+ "verdict": "PASS",
+ "why": null,
+ "computed": "2026-10-22T00:00:00Z",
+ "tool": "tools/nba_gate.py --self-test (SYNTHETIC: recorded books made up for the test, not a measurement)",
+ "params": {
+  "count": 5,
+  "fav_lo": 0.9,
+  "fav_hi": 0.95
+ },
+ "evidence": {
+  "study": {
+   "source": "docs/edge_results.json hunt:sports",
+   "cell": "NBA pregame favourites, ask in [0.90, 0.95)",
+   "net_c": 5.43,
+   "se_c": 1.78,
+   "won": 76,
+   "n": 78,
+   "advice": "forward test at 5-10 contracts for >= 60 trades with a -$15 stop"
+  },
+  "data": "nba_pregame_synthetic",
+  "fee_mult": 1.0,
+  "min_games": 10,
+  "counts": {
+   "events": 15,
+   "recorded": 15
+  },
+  "games": 15,
+  "bought_full": 10,
+  "bought_partial": 1,
+  "trades": 11,
+  "unfilled": 0,
+  "above_band": 0,
+  "settle": {
+   "n": 11,
+   "games": 11,
+   "mean": -0.098182,
+   "t": -0.216553,
+   "lower80": -0.67924
+  }
+ }
+}

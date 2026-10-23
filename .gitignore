@@ -26,3 +26,6 @@ config/*.bak*
 data/snapshots/
 data/live_orders.sqlite*
 config/arm.json
+
+# tools/demo_checks: the venue's raw replies, kept per run
+demo-checks/

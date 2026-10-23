@@ -61,6 +61,7 @@ enum Opcode : int { CONT = 0x0, TEXT = 0x1, BINARY = 0x2, CLOSE = 0x8, PING = 0x
 
 std::string ws_accept_key(const std::string& client_key);  // base64(SHA-1(key + RFC 6455 GUID))
 std::string base64(const std::string& raw);
+std::string unbase64(const std::string& b64);  // "" when it is not base64
 // One frame. A client masks with mask_key; the server never masks.
 std::string ws_frame(int opcode, const std::string& payload, bool fin = true, bool masked = false,
                      std::uint32_t mask_key = 0);

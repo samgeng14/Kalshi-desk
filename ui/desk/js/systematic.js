@@ -466,7 +466,7 @@
   function cxlable(o) { return !(o.local && o.local.cxlPend); }
   // a lane's routine ending: a requote's pull, an expiry, a fill (FILLS has it), a window closing.
   // These leave WORKING at once; a reject, a killed IOC or a cancel the operator or a limit caused
-  // (KILL, STOP, HALT, LANE_OFF, TAKEOVER, USER, STP, POST_CROSS) stays its 3 s.
+  // (KILL, STOP, HALT, LANE_OFF, RETIRED, TAKEOVER, USER, STP, POST_CROSS) stays its 3 s.
   function routineEnd(o) { return o.st === 'FILL' || o.st === 'EXP' || (o.st === 'CXL' && (o.why === 'PULL' || o.why === 'MARKET_CLOSED')); }
   function renderWorking(now) {
     var S = Desk.store, g = grids.work; g.ensure();
@@ -732,7 +732,13 @@
     // DISK warns (red tag) but never blocks START: the recorder is not needed to trade (contract)
     preflightRows(h).forEach(function (r) { if (r.ok === false && r.id !== 'DISK') why.push(r.id + (r.why ? ' ' + r.why : '')); });
     if (!why.length && S.vstale.K) why.push(S.vstale.K);
-    if (h.run.state !== 'STOP') return { block: true, why: h.run.state === 'RUN' ? '' : why.join(', ') };
+    // KILLED first, with who killed and how to leave it (2026-10-14: a KILL from a sender's
+    // venue refusal looked the same as the operator's click, and START just sat disabled)
+    if (h.run.state === 'KILLED') why.unshift('KILLED' + (h.run.why ? ' (' + h.run.why + ')' : '') + ': RE-ARM in the header, then CONFIRM');
+    // an equity-floor HALT ends only with a Start once the equity is back over (gw decides, and
+    // refuses with the floor's sentence while it is not); the daily stop's ends at ET midnight
+    var floorHalt = h.run.state === 'HALTED' && /^equity floor/.test(h.run.why || '');
+    if (h.run.state !== 'STOP' && !floorHalt) return { block: true, why: h.run.state === 'RUN' ? '' : why.join(', ') };
     return { block: why.length > 0, why: why.join(', ') };
   }
   function setDis(btn, dis) { if (btn && btn.disabled !== !!dis) btn.disabled = !!dis; }

@@ -1,0 +1,221 @@
+{
+  "lane": "C1",
+  "stage": "live",
+  "verdict": "PASS",
+  "why": null,
+  "computed": "2026-11-20T18:40:00Z",
+  "tool": "tools/college_gate.py",
+  "params": {
+    "edge": 0.2,
+    "exec_lag_s": 2,
+    "max_score_age_s": 5,
+    "clip": 2.0,
+    "game_cap": 10.0,
+    "inventory": 20,
+    "thin": 20000,
+    "min_cases": 50,
+    "min_t": 2.0,
+    "horizon": "300s",
+    "leader_only": false
+  },
+  "series": {
+    "KXNCAAWBGAME": {
+      "pass": true,
+      "why": "",
+      "level": "point",
+      "leader_only": false,
+      "model": "wcbb_logit",
+      "model_sha256": "0091408c773b132d3bafa20fa422b9eba6e0d67fc9ba06379715b14f3161f932"
+    },
+    "KXNCAAWVMATCH": {
+      "pass": true,
+      "why": "",
+      "level": "point",
+      "leader_only": false,
+      "model": "volley_markov",
+      "model_sha256": "20c2c8c63e20f3ae7eb45fe08253a16b0a227988783a1407a4d445511902af71"
+    }
+  },
+  "evidence": {
+    "data_from": "2026-11-14T22:00:00Z",
+    "data_to": "2026-11-19T14:26:40Z",
+    "fee_mult": 1.0,
+    "series": {
+      "KXNCAAWBGAME": {
+        "point": {
+          "verdict": {
+            "n": 160,
+            "contracts": 640.0,
+            "games": 160,
+            "mean": 0.216438,
+            "se": 0.008168,
+            "t": 26.499
+          },
+          "signals": 160,
+          "taken": 160,
+          "missed": 0,
+          "watched_games": 160,
+          "per_game": 1.0,
+          "dur_s_median": 30.0,
+          "size_shown_median": 10.0,
+          "mo60_net": 0.1525,
+          "settle_net": 0.38875,
+          "leader": {
+            "n": 160,
+            "mo300_net": 0.216438
+          },
+          "trailer": {
+            "n": 0,
+            "mo300_net": null
+          },
+          "tied": {
+            "n": 0,
+            "mo300_net": null
+          },
+          "buy": {
+            "n": 160,
+            "mo300_net": 0.216438
+          },
+          "sell": {
+            "n": 0,
+            "mo300_net": null
+          },
+          "edge_20_30": {
+            "n": 0,
+            "mo300_net": null
+          },
+          "edge_30_40": {
+            "n": 108,
+            "mo300_net": 0.225185
+          },
+          "edge_40_up": {
+            "n": 52,
+            "mo300_net": 0.198269
+          },
+          "pulls": {
+            "TOUCH_AFTER_SCORE": 61
+          }
+        }
+      },
+      "KXNCAAWVMATCH": {
+        "point": {
+          "verdict": {
+            "n": 60,
+            "contracts": 240.0,
+            "games": 60,
+            "mean": 0.227667,
+            "se": 0.014109,
+            "t": 16.136
+          },
+          "signals": 60,
+          "taken": 60,
+          "missed": 0,
+          "watched_games": 60,
+          "per_game": 1.0,
+          "dur_s_median": 30.0,
+          "size_shown_median": 10.0,
+          "mo60_net": 0.1525,
+          "settle_net": 0.399167,
+          "leader": {
+            "n": 0,
+            "mo300_net": null
+          },
+          "trailer": {
+            "n": 0,
+            "mo300_net": null
+          },
+          "tied": {
+            "n": 60,
+            "mo300_net": 0.227667
+          },
+          "buy": {
+            "n": 60,
+            "mo300_net": 0.227667
+          },
+          "sell": {
+            "n": 0,
+            "mo300_net": null
+          },
+          "edge_20_30": {
+            "n": 60,
+            "mo300_net": 0.227667
+          },
+          "edge_30_40": {
+            "n": 0,
+            "mo300_net": null
+          },
+          "edge_40_up": {
+            "n": 0,
+            "mo300_net": null
+          },
+          "pulls": {
+            "TOUCH_AFTER_SCORE": 6
+          }
+        },
+        "set": {
+          "verdict": {
+            "n": 0,
+            "contracts": 0,
+            "games": 0,
+            "mean": null,
+            "se": null,
+            "t": null
+          },
+          "signals": 0,
+          "taken": 0,
+          "missed": 0,
+          "watched_games": 60,
+          "per_game": 0.0,
+          "dur_s_median": null,
+          "size_shown_median": null,
+          "mo60_net": null,
+          "settle_net": null,
+          "leader": {
+            "n": 0,
+            "mo300_net": null
+          },
+          "trailer": {
+            "n": 0,
+            "mo300_net": null
+          },
+          "tied": {
+            "n": 0,
+            "mo300_net": null
+          },
+          "buy": {
+            "n": 0,
+            "mo300_net": null
+          },
+          "sell": {
+            "n": 0,
+            "mo300_net": null
+          },
+          "edge_20_30": {
+            "n": 0,
+            "mo300_net": null
+          },
+          "edge_30_40": {
+            "n": 0,
+            "mo300_net": null
+          },
+          "edge_40_up": {
+            "n": 0,
+            "mo300_net": null
+          },
+          "pulls": {}
+        }
+      }
+    },
+    "wcbb_f": {
+      "pass": true,
+      "why": "",
+      "settled_games": 160,
+      "samples": 18560,
+      "brier_model": 0.124883,
+      "brier_mid": 0.165695,
+      "overlay_fills": 25,
+      "overlay_mo60_net": 0.0296
+    },
+    "control": null
+  }
+}

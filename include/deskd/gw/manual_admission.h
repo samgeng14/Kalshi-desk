@@ -14,8 +14,10 @@ struct ManualContext {
   bool public_ready = false, private_ready = false, clock_trusted = false;
   bool publisher_healthy = false, ledger_healthy = false;
   bool manual_sender_healthy = false, cancel_sender_healthy = false;
+  std::string owner_why;   // which execution owner is not ready, and why ("" = not known)
   bool trading_active = false, shard_active = false;
   bool duplicate_cid = false, unknown_order = false, foreign_order = false;
+  std::string unknown_cid;   // the order whose outcome is unknown (unknown_order)
   // Current spendable cash AFTER all existing exchange and local commitments; never subtract
   // the exchange's working reservations again from its already-available REST balance.
   kalshi::Micros free = 0, shard_free = 0;

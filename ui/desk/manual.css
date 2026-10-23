@@ -10,7 +10,7 @@
 #tab-manual .off { display: none !important; }
 #tab-manual .lb { flex: 0 0 auto; font: 10px/1 var(--font-ui); color: var(--tx2); text-transform: uppercase; letter-spacing: .04em; }
 #tab-manual .v { color: var(--tx0); }
-#tab-manual .v.up { color: var(--up); } #tab-manual .v.dn { color: var(--dn); }
+#tab-manual .v.up { color: var(--up); } #tab-manual .v.dn { color: var(--dn); } #tab-manual .v.warn { color: var(--warn); }
 #tab-manual .tag.own { color: var(--tx0); box-shadow: inset 0 0 0 1px var(--line2); }
 #tab-manual .tag.own.dim { color: var(--tx2); }
 #tab-manual .tag.own:empty, #tab-manual .tag:empty { display: none; }
@@ -113,12 +113,14 @@ body.browse #m-browse { display: flex; }
 #tab-manual table.watch td.dim { color: var(--tx2); }
 #tab-manual table.watch td.fair { color: var(--fair); }
 #tab-manual table.watch td.espn { color: var(--espn); }
+#tab-manual table.watch td.espn.dim { color: var(--tx2); }   /* an old ESPN number (after td.espn, so it wins) */
 #tab-manual table.watch td.warn { color: var(--warn); }
 #tab-manual table.watch tr.grp { cursor: pointer; }
 #tab-manual table.watch tr.closed > td { color: var(--tx2); }
 
 /* ------------------------------------------------------------------------------------------
-   Ticket (176 px: four 22 px rows, two 16 px lines, 32 px buttons)
+   Ticket (210 px: a 20 px title, four 22 px rows, three 16 px lines, 2+32 px buttons, the 2+16 px
+   result line, 2 px spare)
    ------------------------------------------------------------------------------------------ */
 #m-ticket:focus { outline: none; }
 #m-ticket-body { display: flex; flex-direction: column; padding: 0 4px; overflow: hidden; }
@@ -147,6 +149,9 @@ body.browse #m-browse { display: flex; }
 #tab-manual .tk-l button.mv.pend { color: var(--tx2); box-shadow: inset 0 0 0 1px var(--line2); }
 #tab-manual .tk-b { display: flex; gap: 2px; flex: 0 0 32px; height: 32px; margin-top: 2px; }
 #tab-manual .tk-b button { flex: 1 1 50%; height: 32px; font: 600 13px/1 var(--font-num); letter-spacing: 0; }
+#tab-manual .tk-last { margin-top: 2px; }
+#tab-manual .tk-last .n { overflow: hidden; text-overflow: ellipsis; }
+#tab-manual .tk-last .ok { color: var(--up); } #tab-manual .tk-last .warn { color: var(--warn); } #tab-manual .tk-last .crit { color: var(--dn); }
 #tab-manual .tk-b button.confirm { font-weight: 700; }
 body[data-kstale="1"] #m-ticket[data-v="K"] .n, body[data-pstale="1"] #m-ticket[data-v="P"] .n { color: var(--tx2) !important; }
 

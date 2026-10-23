@@ -1,17 +1,12 @@
 #include "fake_kalshi.h"
 
-#include <netinet/in.h>
-#include <netinet/tcp.h>
+#include <ctime>
 #include <openssl/bio.h>
 #include <openssl/evp.h>
 #include <openssl/pem.h>
 #include <openssl/err.h>
 #include <openssl/rsa.h>
-#include <openssl/ssl.h>
-#include <fcntl.h>
-#include <poll.h>
 #include <sys/socket.h>
-#include <unistd.h>
 
 #include <algorithm>
 #include <chrono>
@@ -67,18 +62,6 @@ std::string ordered(std::initializer_list<std::pair<const char*, json>> kv) {
   return s + "}";
 }
 json omit() { return json(json::value_t::discarded); }
-
-std::string base64_decode(const std::string& in) {
-  std::string out(in.size() / 4 * 3 + 3, '\0');
-  const int n = EVP_DecodeBlock(reinterpret_cast<unsigned char*>(out.data()),
-                                reinterpret_cast<const unsigned char*>(in.data()), static_cast<int>(in.size()));
-  if (n < 0) return {};
-  std::size_t len = static_cast<std::size_t>(n);
-  if (!in.empty() && in.back() == '=') --len;
-  if (in.size() > 1 && in[in.size() - 2] == '=') --len;
-  out.resize(len);
-  return out;
-}
 }  // namespace
 
 void FakeKalshi::Bucket::refill(std::int64_t now) {
@@ -87,7 +70,11 @@ void FakeKalshi::Bucket::refill(std::int64_t now) {
 }
 
 FakeKalshi::FakeKalshi(FakeConfig cfg)
-    : cfg_(std::move(cfg)), engine_(cfg_.engine), private_order_(cfg_.private_order) {
+    : cfg_(std::move(cfg)),
+      engine_(cfg_.engine),
+      listener_(ListenerConfig{cfg_.port, cfg_.tls_cert_file, cfg_.tls_key_file, cfg_.tls_close_notify,
+                               cfg_.tls_handshake_ms}),
+      private_order_(cfg_.private_order) {
   manual_now_ = cfg_.start_ms ? cfg_.start_ms : wall_ms();
   const std::int64_t now = now_locked();
   read_ = Bucket{cfg_.tier.read_per_s * cfg_.tier.read_burst_s, cfg_.tier.read_per_s,
@@ -99,35 +86,18 @@ FakeKalshi::FakeKalshi(FakeConfig cfg)
     pubkey_ = PEM_read_bio_PUBKEY(bio, nullptr, nullptr, nullptr);
     BIO_free(bio);
   }
-  if (!cfg_.tls_cert_file.empty() || !cfg_.tls_key_file.empty()) {
-    SSL_CTX* ctx = SSL_CTX_new(TLS_server_method());
-    if (ctx && SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION) == 1 &&
-        SSL_CTX_use_certificate_chain_file(ctx, cfg_.tls_cert_file.c_str()) == 1 &&
-        SSL_CTX_use_PrivateKey_file(ctx, cfg_.tls_key_file.c_str(), SSL_FILETYPE_PEM) == 1 &&
-        SSL_CTX_check_private_key(ctx) == 1) {
-      SSL_CTX_set_mode(ctx, SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
-      tls_ctx_ = ctx;
-    } else {
-      char buf[256];
-      ERR_error_string_n(ERR_get_error(), buf, sizeof buf);
-      tls_err_ = "TLS listener: cannot load " + cfg_.tls_cert_file + " / " + cfg_.tls_key_file + ": " + buf;
-      ERR_clear_error();
-      if (ctx) SSL_CTX_free(ctx);
-    }
-  }
 }
 
 FakeKalshi::~FakeKalshi() {
   stop();
   if (pubkey_) EVP_PKEY_free(static_cast<EVP_PKEY*>(pubkey_));
-  if (tls_ctx_) SSL_CTX_free(static_cast<SSL_CTX*>(tls_ctx_));
 }
 
 std::string FakeKalshi::rest_base() const {
-  return std::string(tls_ctx_ ? "https" : "http") + "://127.0.0.1:" + std::to_string(port_) + kRestPrefix;
+  return std::string(tls() ? "https" : "http") + "://127.0.0.1:" + std::to_string(port()) + kRestPrefix;
 }
 std::string FakeKalshi::ws_url() const {
-  return std::string(tls_ctx_ ? "wss" : "ws") + "://127.0.0.1:" + std::to_string(port_) + kWsPath;
+  return std::string(tls() ? "wss" : "ws") + "://127.0.0.1:" + std::to_string(port()) + kWsPath;
 }
 
 std::int64_t FakeKalshi::now_locked() const {
@@ -145,15 +115,10 @@ bool FakeKalshi::start(std::string* err) {
     if (err) *err = "AuthMode::VERIFY needs a readable public_key_pem";
     return false;
   }
-  if (!tls_err_.empty()) {
-    if (err) *err = tls_err_;
-    return false;
-  }
-  listen_fd_ = net::listen_loopback(cfg_.port, &port_, err);
-  if (listen_fd_ < 0) return false;
   stopping_ = false;
+  if (!listener_.start([this](int fd) { serve(fd); }, [this](const std::string& line) { log_wire(line); }, err))
+    return false;
   running_ = true;
-  acceptor_ = std::thread([this] { accept_loop(); });
   ticker_ = std::thread([this] { tick_loop(); });
   return true;
 }
@@ -161,74 +126,9 @@ bool FakeKalshi::start(std::string* err) {
 void FakeKalshi::stop() {
   if (!running_) return;
   stopping_ = true;
-  if (acceptor_.joinable()) acceptor_.join();
   if (ticker_.joinable()) ticker_.join();
-  {
-    std::lock_guard<std::mutex> lk(conn_mu_);
-    for (const auto& [fd, owned] : conn_fds_) {
-      (void)owned;
-      ::shutdown(fd, SHUT_RDWR);
-    }
-  }
-  std::vector<Conn> conns;
-  {
-    std::lock_guard<std::mutex> lk(conn_mu_);
-    conns.swap(conns_);
-  }
-  for (auto& c : conns)
-    if (c.th.joinable()) c.th.join();
-  ::close(listen_fd_);
-  listen_fd_ = -1;
+  listener_.stop();
   running_ = false;
-}
-
-void FakeKalshi::accept_loop() {
-  while (!stopping_) {
-    pollfd p{listen_fd_, POLLIN, 0};
-    if (::poll(&p, 1, 50) <= 0) continue;
-    const int fd = ::accept(listen_fd_, nullptr, nullptr);
-    if (fd < 0) continue;
-    ++accepted_;
-    net::no_sigpipe(fd);
-    int one = 1;
-    ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
-    auto done = std::make_shared<std::atomic<bool>>(false);
-    std::lock_guard<std::mutex> lk(conn_mu_);
-    // reap the connections that have finished: a sender that writes once per connection opens
-    // thousands an hour
-    for (auto it = conns_.begin(); it != conns_.end();) {
-      if (it->done->load()) {
-        it->th.join();
-        it = conns_.erase(it);
-      } else {
-        ++it;
-      }
-    }
-    if (tls_ctx_) {
-      // the TLS socket belongs to its pump; the pump's socketpair end is what serve() reads. Until
-      // the server side of the handshake ends the TCP socket is listed (kind 3), so a drop or a
-      // stop landing between the client's Finished and the server's still reaches it.
-      conn_fds_[fd] = 3;
-      conns_.push_back(Conn{std::thread([this, fd, done] {
-                              serve_tls(fd, done);
-                              ::close(fd);
-                              done->store(true);
-                            }),
-                            done});
-      continue;
-    }
-    conn_fds_[fd] = 1;
-    conns_.push_back(Conn{std::thread([this, fd, done] {
-                            serve(fd);
-                            {
-                              std::lock_guard<std::mutex> g(conn_mu_);
-                              conn_fds_.erase(fd);  // before the close, so stop() never shuts a reused number
-                            }
-                            ::close(fd);
-                            done->store(true);
-                          }),
-                          done});
-  }
 }
 
 void FakeKalshi::tick_loop() {
@@ -302,6 +202,7 @@ void FakeKalshi::pump_locked(std::int64_t now) {
       case TapeEvent::Kind::MARKET: {
         MarketSpec s = *e.spec;
         if (s.close_ms) s.close_ms = rebase(s.close_ms);
+        if (s.open_ms) s.open_ms = rebase(s.open_ms);
         engine_.add_market(std::move(s), at);
         break;
       }
@@ -333,6 +234,9 @@ void FakeKalshi::pump_locked(std::int64_t now) {
         break;
       case TapeEvent::Kind::CLOSE:
         engine_.close(e.ticker, at);
+        break;
+      case TapeEvent::Kind::PYTH:
+        pyth_locked(e.underlying, e.value, at);
         break;
     }
     ++tape_pos_;
@@ -366,6 +270,17 @@ void FakeKalshi::set_rate_limits(bool on, RateTier tier) {
   write_ = Bucket{tier.write_per_s * tier.write_burst_s, tier.write_per_s, tier.write_per_s * tier.write_burst_s, now};
   write_shard_.clear();
 }
+void FakeKalshi::pyth(const std::string& underlying, double value_usd, std::int64_t source_ts_ms) {
+  std::lock_guard<std::mutex> lk(mu_);
+  pyth_locked(underlying, value_usd, source_ts_ms);
+}
+void FakeKalshi::pyth_locked(const std::string& underlying, double value_usd, std::int64_t source_ts_ms) {
+  Event e;
+  e.channel = "pyth_value";
+  e.type = "pyth_value";
+  e.msg = json{{"underlying_ticker", underlying}, {"value_usd", value_usd}, {"source_ts_ms", source_ts_ms}};
+  publish_now_locked({e});
+}
 void FakeKalshi::drop_ws_connections() {
   std::lock_guard<std::mutex> lk(mu_);
   for (auto& [id, s] : sessions_) {
@@ -373,15 +288,7 @@ void FakeKalshi::drop_ws_connections() {
     ::shutdown(s->fd, SHUT_RDWR);
   }
 }
-void FakeKalshi::drop_http_connections() {
-  // Under conn_mu_: a connection's thread takes its fd out of conn_fds_ before closing it, so a
-  // number listed here is still that connection's.
-  std::lock_guard<std::mutex> lk(conn_mu_);
-  for (auto& [fd, kind] : conn_fds_) {
-    if (kind == 1) ::shutdown(fd, SHUT_RDWR);
-    if (kind == 3) kind = 4;   // a TLS handshake still ending: dropped as soon as it is served
-  }
-}
+void FakeKalshi::drop_http_connections() { listener_.drop_http(); }
 void FakeKalshi::drop_ws_messages(const std::string& channel, int n) {
   std::lock_guard<std::mutex> lk(mu_);
   drop_left_[channel] += n;
@@ -393,17 +300,32 @@ void FakeKalshi::duplicate_ws_messages(const std::string& channel, int n) {
 void FakeKalshi::fragment_ws(std::size_t frame_bytes) { fragment_bytes_ = frame_bytes; }
 void FakeKalshi::stall_ws(int ms) { stall_until_ms_ = steady_ms() + ms; }
 
-bool FakeKalshi::take_fault_locked(const net::Request& req, HttpFault* f) {
+bool FakeKalshi::take_fault_locked(const net::Request& req, const json& body, HttpFault* f) {
   const std::string path = req.path.compare(0, std::char_traits<char>::length(kRestPrefix), kRestPrefix) == 0
                                ? req.path.substr(std::char_traits<char>::length(kRestPrefix))
                                : req.path;
+  const std::string ticker =
+      body.is_object() && body.contains("ticker") && body["ticker"].is_string() ? body["ticker"].get<std::string>() : "";
   for (auto it = faults_.begin(); it != faults_.end(); ++it) {
     if (it->method != req.method || path.compare(0, it->path.size(), it->path) != 0) continue;
+    if (!it->ticker.empty() && it->ticker != ticker) continue;
     *f = *it;
     if (--it->times <= 0) faults_.erase(it);
     return true;
   }
   return false;
+}
+
+void FakeKalshi::pull_touch_locked(const json& create, Qty qty, std::int64_t now) {
+  auto str = [&](const char* k) {
+    return create.is_object() && create.contains(k) && create[k].is_string() ? create[k].get<std::string>() : "";
+  };
+  const std::string ticker = str("ticker"), side = str("side");
+  const std::optional<Px> px = parse_price_req(str("price"));
+  Qty pulled = 0;
+  if (px && (side == "bid" || side == "ask"))   // else the create is refused as it would be anyway
+    pulled = engine_.street_pull_touch(ticker, side == "bid" ? Side::BID : Side::ASK, *px, qty, now);
+  log_wire("http pull-touch " + ticker + " " + qty_str(pulled));
 }
 
 // ---- the wire log -----------------------------------------------------------------------------
@@ -877,7 +799,7 @@ std::string FakeKalshi::auth_refusal(const net::Request& req, std::int64_t now) 
     return "KALSHI-ACCESS-TIMESTAMP is too far from the exchange clock";
   if (cfg_.auth == AuthMode::VERIFY) {
     const std::string text = ts + req.method + req.path;  // the path without its query
-    const std::string raw = base64_decode(sig);
+    const std::string raw = net::unbase64(sig);
     EVP_MD_CTX* ctx = EVP_MD_CTX_new();
     EVP_PKEY_CTX* pctx = nullptr;
     EVP_PKEY* pk = static_cast<EVP_PKEY*>(pubkey_);
@@ -991,11 +913,12 @@ void FakeKalshi::serve(int fd) {
     const std::string path = ours ? req.path.substr(plen) : std::string();
     const std::string what = req.method + " " + (ours ? path : req.path);
 
+    const json body = req.body.empty() ? json() : json::parse(req.body, nullptr, false);
     HttpFault f;
     bool faulted;
     {
       std::lock_guard<std::mutex> lk(mu_);
-      faulted = take_fault_locked(req, &f);
+      faulted = take_fault_locked(req, body, &f);
     }
     using K = HttpFault::Kind;
     auto is = [&](K k) { return faulted && f.kind == k; };
@@ -1014,7 +937,6 @@ void FakeKalshi::serve(int fd) {
     }
     if (is(K::STALL_BEFORE)) std::this_thread::sleep_for(std::chrono::milliseconds(f.stall_ms));
 
-    const json body = req.body.empty() ? json() : json::parse(req.body, nullptr, false);
     Reply rep;
     Targets wait_for;
     std::uint64_t held = 0;  // private messages held until the reply is written (Held)
@@ -1037,6 +959,8 @@ void FakeKalshi::serve(int fd) {
         // come first among this request's; when they reach the client is private_order's business.
         if (is(K::FILL_DURING_CANCEL) && req.method == "DELETE")
           engine_.street_hit(path.substr(path.rfind('/') + 1), f.qty, now);
+        // A pull of the touch lands first too: the order meets the book without it.
+        if (is(K::PULL_TOUCH) && req.method == "POST") pull_touch_locked(body, f.qty, now);
         rep = route_locked(req, path, body, now, &created);
         if (is(K::HIT_AFTER_REST) && rep.status == 201 && !created.empty()) {
           const Order* o = engine_.order(created);
@@ -1075,6 +999,14 @@ void FakeKalshi::serve(int fd) {
     } else {
       std::vector<std::pair<std::string, std::string>> h;
       if (rep.status != 204) h.emplace_back("Content-Type", "application/json");
+      {   // as Kalshi does: whole seconds, which deskd's clock check reads (rest/state.h)
+        char date[64];
+        const std::time_t t = std::time(nullptr);
+        std::tm g{};
+        gmtime_r(&t, &g);
+        std::strftime(date, sizeof date, "%a, %d %b %Y %H:%M:%S GMT", &g);
+        h.emplace_back("Date", date);
+      }
       if (is(K::CHUNKED))
         h.emplace_back("Transfer-Encoding", "chunked");
       else if (rep.status != 204)
@@ -1093,8 +1025,10 @@ void FakeKalshi::serve(int fd) {
       } else {
         data += rep.body;
       }
-      net::write_all(fd, data);
+      // logged before the write: a client that has its reply (and a test that then clears the
+      // log) never sees the entry arrive late (test_rest's fresh-cache check, 2026-10-10)
       log_wire(label);
+      net::write_all(fd, data);
     }
     if (held) {
       std::lock_guard<std::mutex> lk(mu_);
@@ -1102,141 +1036,6 @@ void FakeKalshi::serve(int fd) {
     }
     if (close_after) return;
   }
-}
-
-// One TLS connection: the handshake, then a pump between the TLS socket and one end of a
-// socketpair while serve() reads the other end as it would a plain connection. Both sockets are
-// non-blocking and the pump is the only thread that touches the SSL object.
-void FakeKalshi::serve_tls(int tcp, std::shared_ptr<std::atomic<bool>> done) {
-  (void)done;
-  ::fcntl(tcp, F_SETFL, ::fcntl(tcp, F_GETFL, 0) | O_NONBLOCK);
-  SSL* ssl = SSL_new(static_cast<SSL_CTX*>(tls_ctx_));
-  if (!ssl) return;
-  SSL_set_fd(ssl, tcp);
-  const std::int64_t hs_deadline = steady_ms() + cfg_.tls_handshake_ms;
-  for (;;) {
-    ERR_clear_error();
-    const int r = SSL_accept(ssl);
-    if (r == 1) break;
-    const int e = SSL_get_error(ssl, r);
-    const short ev = e == SSL_ERROR_WANT_READ ? POLLIN : e == SSL_ERROR_WANT_WRITE ? POLLOUT : 0;
-    const std::int64_t left = hs_deadline - steady_ms();
-    pollfd p{tcp, ev, 0};
-    if (ev == 0 || left <= 0 || stopping_ || ::poll(&p, 1, static_cast<int>(std::min<std::int64_t>(left, 50))) < 0) {
-      ++tls_failed_;
-      log_wire("tls handshake-failed");
-      ERR_clear_error();
-      SSL_free(ssl);
-      std::lock_guard<std::mutex> lk(conn_mu_);
-      conn_fds_.erase(tcp);   // before the caller's close, so stop() never shuts a reused number
-      return;
-    }
-  }
-  ++tls_ok_;
-  if (SSL_session_reused(ssl)) ++tls_resumed_;
-  int sp[2];
-  if (::socketpair(AF_UNIX, SOCK_STREAM, 0, sp) != 0) {
-    SSL_free(ssl);
-    std::lock_guard<std::mutex> lk(conn_mu_);
-    conn_fds_.erase(tcp);
-    return;
-  }
-  const int inner = sp[0], srv_fd = sp[1];
-  net::no_sigpipe(inner);
-  net::no_sigpipe(srv_fd);
-  ::fcntl(inner, F_SETFL, ::fcntl(inner, F_GETFL, 0) | O_NONBLOCK);
-  bool dropped = false;   // a drop that reached the TCP socket during the handshake
-  {
-    std::lock_guard<std::mutex> lk(conn_mu_);
-    dropped = conn_fds_.count(tcp) && conn_fds_[tcp] == 4;
-    conn_fds_.erase(tcp);
-    conn_fds_[srv_fd] = 1;
-  }
-  if (dropped) ::shutdown(srv_fd, SHUT_RDWR);
-  std::thread srv([this, srv_fd] {
-    serve(srv_fd);
-    {
-      std::lock_guard<std::mutex> g(conn_mu_);
-      conn_fds_.erase(srv_fd);
-    }
-    ::close(srv_fd);
-  });
-
-  std::string to_inner, to_tls;
-  bool client_done = false;   // close_notify or EOF from the client: nothing more will come
-  bool tls_dead = false;      // a reset or a TLS error: nothing more can go out either
-  bool inner_eof = false;     // serve() closed its end: the reply is all in to_tls
-  bool inner_wr_shut = false;
-  char buf[16384];
-  while (!stopping_) {
-    while (!client_done) {
-      ERR_clear_error();
-      const int r = SSL_read(ssl, buf, sizeof buf);
-      if (r > 0) {
-        to_inner.append(buf, static_cast<std::size_t>(r));
-        continue;
-      }
-      const int e = SSL_get_error(ssl, r);
-      if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE) break;
-      client_done = true;
-      if (e != SSL_ERROR_ZERO_RETURN) tls_dead = true;
-      ERR_clear_error();
-    }
-    while (!to_inner.empty()) {
-      const ssize_t n = ::send(inner, to_inner.data(), to_inner.size(), 0);
-      if (n > 0) {
-        to_inner.erase(0, static_cast<std::size_t>(n));
-        continue;
-      }
-      if (n < 0 && (errno == EAGAIN || errno == EINTR)) break;
-      to_inner.clear();   // serve() is gone
-      break;
-    }
-    if (client_done && to_inner.empty() && !inner_wr_shut) {
-      ::shutdown(inner, SHUT_WR);   // serve() sees the client's close
-      inner_wr_shut = true;
-    }
-    while (!inner_eof && to_tls.size() < (1u << 20)) {
-      const ssize_t n = ::recv(inner, buf, sizeof buf, 0);
-      if (n > 0) {
-        to_tls.append(buf, static_cast<std::size_t>(n));
-        continue;
-      }
-      if (n < 0 && (errno == EAGAIN || errno == EINTR)) break;
-      inner_eof = true;
-    }
-    while (!to_tls.empty() && !tls_dead) {
-      ERR_clear_error();
-      const int r = SSL_write(ssl, to_tls.data(), static_cast<int>(to_tls.size()));
-      if (r > 0) {
-        to_tls.erase(0, static_cast<std::size_t>(r));
-        continue;
-      }
-      const int e = SSL_get_error(ssl, r);
-      if (e == SSL_ERROR_WANT_WRITE || e == SSL_ERROR_WANT_READ) break;
-      tls_dead = true;
-      ERR_clear_error();
-    }
-    if (tls_dead) to_tls.clear();
-    if (inner_eof && to_tls.empty()) break;   // the reply is out: close the TLS side
-    if (tls_dead && client_done) break;
-    pollfd p[2] = {{tcp, 0, 0}, {inner, 0, 0}};
-    if (!client_done) p[0].events |= POLLIN;
-    if (!to_tls.empty()) p[0].events |= POLLOUT;
-    if (!inner_eof && to_tls.size() < (1u << 20)) p[1].events |= POLLIN;
-    if (!to_inner.empty()) p[1].events |= POLLOUT;
-    ::poll(p, 2, 50);
-  }
-  if (!tls_dead && cfg_.tls_close_notify) {
-    ERR_clear_error();
-    SSL_shutdown(ssl);   // close_notify; the peer's is not waited for
-  }
-  ERR_clear_error();
-  ::shutdown(tcp, SHUT_RDWR);
-  ::shutdown(inner, SHUT_RDWR);   // serve() ends if it has not
-  srv.join();
-  ::close(inner);
-  SSL_free(ssl);
 }
 
 void FakeKalshi::serve_ws(int fd, const net::Request& req) {
@@ -1264,10 +1063,7 @@ void FakeKalshi::serve_ws(int fd, const net::Request& req) {
                           "Sec-WebSocket-Accept: " +
                               net::ws_accept_key(key) + "\r\n\r\n"))
     return;
-  {
-    std::lock_guard<std::mutex> lk(conn_mu_);
-    conn_fds_[fd] = 2;  // a socket now: drop_http_connections leaves it alone
-  }
+  listener_.upgraded(fd);  // a socket now: drop_http_connections leaves it alone
   auto s = std::make_shared<Session>();
   s->fd = fd;
   s->authed = cfg_.auth != AuthMode::OFF || !req.header("kalshi-access-key").empty();

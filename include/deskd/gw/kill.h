@@ -51,8 +51,9 @@ class KillSwitch {
   // second click cannot extend or shorten the lockout). Either way the generation moves and the
   // watchers wake: a second KILL is a second cancel-all.
   bool trip(std::int64_t wall_ms, std::int64_t mono_ms, const std::string& why);
-  // send-cx's cancel-all returned at this time: the lockout lasts at least kLockoutMs from now
-  void cancel_all_done(std::int64_t wall_ms, std::int64_t mono_ms);
+  // send-cx's cancel-all returned at this time: the lockout lasts at least kLockoutMs from now.
+  // generation: the KILL generation that cancel-all answered (0 = not known).
+  void cancel_all_done(std::int64_t wall_ms, std::int64_t mono_ms, std::uint64_t generation = 0);
   // Leaves KILLED once the lockout is over: "" on success, else the refusal (BAD_STATE).
   std::string rearm(std::int64_t wall_ms, std::int64_t mono_ms);
 
@@ -63,6 +64,8 @@ class KillSwitch {
   std::string why() const;
   std::uint64_t generation() const { return gen_.load(); }
   std::uint64_t state_gen() const { return state_gen_.load(); }
+  // the newest generation whose cancel-all the venue confirmed (0 = none yet)
+  std::uint64_t confirmed_gen() const { return confirmed_gen_.load(); }
 
  private:
   void persist_locked();
@@ -71,7 +74,7 @@ class KillSwitch {
   std::atomic<std::int64_t> since_{0}, rearm_wall_{0}, rearmed_wall_{0};
   std::int64_t lockout_end_mono_ = 0;   // under m_
   std::string why_;                     // under m_
-  std::atomic<std::uint64_t> gen_{0}, state_gen_{0};
+  std::atomic<std::uint64_t> gen_{0}, state_gen_{0}, confirmed_gen_{0};
   std::vector<std::function<void()>> wakers_;
   std::string path_;
 };

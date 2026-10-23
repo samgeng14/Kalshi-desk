@@ -3,9 +3,12 @@
 //   - a second deskd on the same account is refused (exit 3) while the first holds the lock: from
 //     the same data dir, and from another working directory with a relative --data-dir (the
 //     review's case: until 2026-10-06 the lock sat in the data dir, and both came up)
-//   - a missing data dir is refused and not created; "live" in a config file is refused
+//   - a missing data dir is refused and not created; "live" in a config file is refused; the
+//     sandbox's ESPN stand-in (--espn-url) only with --sim and only on loopback
 //   - the heartbeat file appears; deskctl status reads the workers; deskctl kill KILLs through
 //     the screen's route with its token
+//   - deskctl lane-reset is refused while deskd holds the account's lock; with deskd stopped it
+//     clears one lane's life from the saved Systematic book, and the book still restores
 //   - a stream client that vanishes mid-stream does not end deskd (SIGPIPE ignored)
 //   - SIGTERM shuts down cleanly (exit 0) and releases the lock
 #include <arpa/inet.h>
@@ -30,7 +33,9 @@
 
 #include "check.h"
 #include "deskd/app/lock.h"
+#include "deskd/app/log.h"
 #include "deskd/build_paths.h"
+#include "deskd/gw/sys_book.h"
 
 extern char** environ;
 
@@ -161,6 +166,11 @@ int main() {
             &err) == 3);
   CHECK(err.find("held by another process") != std::string::npos);
   CHECK(err.find("pid " + std::to_string(first)) != std::string::npos);
+  // a ui dir with no page: refused at once with the path and why (it used to start and answer
+  // every browser INTERNAL "cannot read the ui dir's index.html")
+  CHECK(run({DESKD_BIN, "--data-dir", d.path, "--ui-dir", d.file("no-ui"), "--port", std::to_string(free_port())}, d,
+            "noui", &out, &err) == 2);
+  CHECK(err.find("cannot read " + d.file("no-ui") + "/index.html") != std::string::npos);
   // and from another working directory with its own relative data dir: the same account, the
   // same file, refused (the review started two this way and both came up)
   CHECK(run({DESKD_BIN, "--data-dir", "data", "--ui-dir", ui, "--port", std::to_string(free_port())}, d, "otherdir", &out,
@@ -193,6 +203,18 @@ int main() {
   CHECK(run({DESKD_BIN, "--config", d.file("live.json"), "--data-dir", d.path}, d, "livecfg", &out, &err) == 2);
   CHECK(err.find("command-line flag only") != std::string::npos);
   CHECK(run({DESKD_BIN, "--bogus"}, d, "bogus") == 2);
+  // --espn-url, the sandbox's stand-in for ESPN's scoreboards (tools/deskd_sim.py --nba): only with
+  // --sim and only on loopback, refused before the lock; a loopback one with --sim gets as far as
+  // the lock (the first deskd holds it)
+  const std::string sim_ca = d.file("no-ca.pem");
+  CHECK(run({DESKD_BIN, "--data-dir", d.path, "--espn-url", "http://127.0.0.1:9"}, d, "espn-nosim", &out, &err) == 2);
+  CHECK(err.find("--espn-url takes a loopback URL and only with --sim") != std::string::npos);
+  CHECK(run({DESKD_BIN, "--data-dir", d.path, "--sim", "https://127.0.0.1:9", "--sim-ca", sim_ca, "--espn-url",
+             "https://site.api.espn.com"}, d, "espn-far", &out, &err) == 2);
+  CHECK(err.find("--espn-url takes a loopback URL and only with --sim") != std::string::npos);
+  CHECK(run({DESKD_BIN, "--data-dir", d.path, "--sim", "https://127.0.0.1:9", "--sim-ca", sim_ca, "--espn-url",
+             "http://127.0.0.1:9", "--port", std::to_string(free_port())}, d, "espn-sim", &out, &err) == 3);
+  CHECK(err.find("held by another process") != std::string::npos);
 
   // the heartbeat file, written while gw, md-k and priv-k move
   bool beat = false;
@@ -210,6 +232,24 @@ int main() {
   CHECK(out.find("gw") != std::string::npos && out.find("md-k") != std::string::npos && out.find("send-cx") != std::string::npos);
   CHECK(out.find("heartbeat written") != std::string::npos);
   CHECK(out.find("run STOP") != std::string::npos);
+
+  // deskctl lane-reset (decisions 9): a retired lane's life goes from the saved Systematic book
+  // only with deskd stopped. The book: X1 traded once, C1 traded once and retired.
+  const std::string lanes_dir = d.file("lanes"), book = lanes_dir + "/systematic.json", cfg = d.file("demo.json");
+  ::mkdir(lanes_dir.c_str(), 0755);
+  std::ofstream(cfg) << R"({"env": "demo"})";   // the default lock dir, under the children's HOME
+  {
+    deskd::SysBook sys;
+    CHECK(sys.fill("X1", "SX1-a-1", "KXT-26OCT06-A", deskd::Side::BUY, 100, 4000, 7000, deskd::now_ms(), "t-1"));
+    CHECK(sys.fill("C1", "SC1-a-1", "KXT-26OCT06-B", deskd::Side::BUY, 100, 3000, 7000, deskd::now_ms(), "t-2"));
+    CHECK(sys.retire("C1", deskd::now_ms(), "its cap of 1 trades"));
+    std::ofstream(book) << sys.to_json(deskd::SysBook::Halt{}, deskd::now_ms()).dump();
+  }
+  const std::string saved = slurp(book);
+  CHECK(run({DESKCTL_BIN, "lane-reset", "C1", "--config", cfg, "--data-dir", lanes_dir}, d, "reset-held", &out, &err) == 1);
+  CHECK(err.find("LANE NOT RESET") != std::string::npos && err.find("deskd DEMO") != std::string::npos &&
+        err.find("stop deskd first") != std::string::npos);
+  CHECK(slurp(book) == saved);
 
   // a stream client that vanishes mid-stream: deskd writes into a dead socket and lives on
   {
@@ -291,6 +331,41 @@ int main() {
     ::kill(again, SIGTERM);
     CHECK(wait_exit(again, 5s) == 0);
   }
+
+  // deskd stopped: lane-reset clears C1's life and nothing else, and the book restores with C1
+  // afresh (its position kept)
+  CHECK(run({DESKCTL_BIN, "lane-reset", "C1", "--config", cfg, "--data-dir", lanes_dir}, d, "reset", &out, &err) == 0);
+  CHECK(out.find("lane C1: retired at ") != std::string::npos && out.find("its cap of 1 trades") != std::string::npos);
+  CHECK(out.find("cleared: 1 trade(s)") != std::string::npos && out.find("lane C1 reset") != std::string::npos);
+  CHECK(!exists(book + ".tmp"));
+  if (const json j = json::parse(slurp(book), nullptr, false); j.is_object() && j.contains("life")) {
+    CHECK(j["life"].is_object() && !j["life"].contains("C1") && j["life"].contains("X1"));
+    CHECK(j.value("lanes", json()) == json::parse(saved)["lanes"] && j.value("trades", json()) == json::parse(saved)["trades"]);
+    deskd::SysBook sys;
+    std::string why;
+    CHECK(sys.restore(j, j.value("day_start_ms", std::int64_t{0}), nullptr, &why));
+    CHECK(!sys.life("C1") && sys.life("X1") && sys.life("X1")->trades == 1);
+    CHECK(sys.position("C1", "KXT-26OCT06-B") == 100);
+  } else {
+    CHECK(!"the book after lane-reset is a Systematic book");
+  }
+  // nothing left to clear, or no such lane: said, the book untouched
+  const std::string after = slurp(book);
+  CHECK(run({DESKCTL_BIN, "lane-reset", "C1", "--config", cfg, "--data-dir", lanes_dir}, d, "reset-again", &out, &err) == 1);
+  CHECK(err.find("holds no life for lane C1 (lanes with one: X1)") != std::string::npos);
+  CHECK(slurp(book) == after);
+  // a data dir with no book, or a file that is not one
+  CHECK(run({DESKCTL_BIN, "lane-reset", "X1", "--config", cfg, "--data-dir", d.file("a")}, d, "reset-nobook", &out, &err) == 1);
+  CHECK(err.find("no saved Systematic book") != std::string::npos);
+  std::ofstream(d.file("a/systematic.json")) << "{\"v\": 2}";
+  CHECK(run({DESKCTL_BIN, "lane-reset", "X1", "--config", cfg, "--data-dir", d.file("a")}, d, "reset-v2", &out, &err) == 1);
+  CHECK(err.find("not a version 1 Systematic book") != std::string::npos);
+  // usage: the lane and the data dir are required (no default under data/); a production config needs --live
+  CHECK(run({DESKCTL_BIN, "lane-reset", "C1", "--config", cfg}, d, "reset-nodir") == 2);
+  CHECK(run({DESKCTL_BIN, "lane-reset", "--config", cfg, "--data-dir", lanes_dir}, d, "reset-nolane") == 2);
+  std::ofstream(d.file("prod.json")) << R"({"env": "prod"})";
+  CHECK(run({DESKCTL_BIN, "lane-reset", "X1", "--config", d.file("prod.json"), "--data-dir", lanes_dir}, d, "reset-prod") == 2);
+  CHECK(slurp(book) == after);
 
   // deskctl with nobody listening
   CHECK(run({DESKCTL_BIN, "--port", P, "status"}, d, "nobody") == 1);

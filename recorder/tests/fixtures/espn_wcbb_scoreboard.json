@@ -1,0 +1,84 @@
+{
+ "_provenance": "Hand-built in the shape of site.api.espn.com/apis/site/v2/sports/basketball/womens-college-basketball/scoreboard (events[].competitions[0].status.type.{state,name,shortDetail}, competitors[].{homeAway,score,team}, situation), the fields tests/fixtures/espn/status_shapes.json captured live and deskd's ref/espn.cpp reads. Not a capture: replace with one from the VM's first season day.",
+ "leagues": [{"id": "54", "abbreviation": "NCAAW", "slug": "womens-college-basketball"}],
+ "day": {"date": "2026-11-05"},
+ "events": [
+  {
+   "id": "401820001",
+   "date": "2026-11-05T23:00Z",
+   "name": "South Carolina Gamecocks at UConn Huskies",
+   "shortName": "SC @ CONN",
+   "status": {"clock": 312.0, "displayClock": "5:12", "period": 2,
+              "type": {"id": "2", "name": "STATUS_IN_PROGRESS", "state": "in", "completed": false,
+                       "description": "In Progress", "detail": "5:12 - 2nd Quarter", "shortDetail": "5:12 - 2nd"}},
+   "competitions": [
+    {
+     "id": "401820001",
+     "date": "2026-11-05T23:00Z",
+     "status": {"clock": 312.0, "displayClock": "5:12", "period": 2,
+                "type": {"id": "2", "name": "STATUS_IN_PROGRESS", "state": "in", "completed": false,
+                         "description": "In Progress", "detail": "5:12 - 2nd Quarter", "shortDetail": "5:12 - 2nd"}},
+     "competitors": [
+      {"id": "41", "homeAway": "home", "order": 0, "score": "34",
+       "team": {"id": "41", "abbreviation": "CONN", "displayName": "UConn Huskies", "shortDisplayName": "UConn",
+                "logo": "https://a.espncdn.com/i/teamlogos/ncaa/500/41.png"},
+       "linescores": [{"value": 18.0}, {"value": 16.0}]},
+      {"id": "2579", "homeAway": "away", "order": 1, "score": "31",
+       "team": {"id": "2579", "abbreviation": "SC", "displayName": "South Carolina Gamecocks",
+                "shortDisplayName": "South Carolina", "logo": "https://a.espncdn.com/i/teamlogos/ncaa/500/2579.png"},
+       "linescores": [{"value": 15.0}, {"value": 16.0}]}
+     ],
+     "situation": {"lastPlay": {"id": "4018200011051", "text": "Paige Bueckers made Jumper.", "scoreValue": 2},
+                   "possession": "2579", "homeTimeouts": 3, "awayTimeouts": 2},
+     "broadcasts": [{"market": "national", "names": ["ESPN"]}]
+    }
+   ],
+   "links": [{"href": "https://www.espn.com/womens-college-basketball/game/_/gameId/401820001"}]
+  },
+  {
+   "id": "401820002",
+   "date": "2026-11-06T00:30Z",
+   "name": "Iowa Hawkeyes at Drake Bulldogs",
+   "shortName": "IOWA @ DRKE",
+   "competitions": [
+    {
+     "id": "401820002",
+     "status": {"clock": 600.0, "displayClock": "10:00", "period": 0,
+                "type": {"id": "1", "name": "STATUS_SCHEDULED", "state": "pre", "completed": false,
+                         "description": "Scheduled", "detail": "Thu, November 5th at 7:30 PM EST",
+                         "shortDetail": "11/5 - 7:30 PM EST"}},
+     "competitors": [
+      {"homeAway": "home", "score": "0", "team": {"id": "2181", "abbreviation": "DRKE", "displayName": "Drake Bulldogs"}},
+      {"homeAway": "away", "score": "0", "team": {"id": "2294", "abbreviation": "IOWA", "displayName": "Iowa Hawkeyes"}}
+     ]
+    }
+   ]
+  },
+  {
+   "id": "401820003",
+   "date": "2026-11-05T17:00Z",
+   "name": "Maine Black Bears at Vermont Catamounts",
+   "shortName": "ME @ UVM",
+   "competitions": [
+    {
+     "id": "401820003",
+     "status": {"clock": 0.0, "displayClock": "0:00", "period": 4,
+                "type": {"id": "3", "name": "STATUS_FINAL", "state": "post", "completed": true,
+                         "description": "Final", "detail": "Final", "shortDetail": "Final"}},
+     "competitors": [
+      {"homeAway": "home", "score": "61", "team": {"id": "261", "abbreviation": "UVM", "displayName": "Vermont Catamounts"},
+       "linescores": [{"value": 14.0}, {"value": 17.0}, {"value": 12.0}, {"value": 18.0}]},
+      {"homeAway": "away", "score": "58", "team": {"id": "311", "abbreviation": "ME", "displayName": "Maine Black Bears"},
+       "linescores": [{"value": 15.0}, {"value": 13.0}, {"value": 16.0}, {"value": 14.0}]}
+     ]
+    }
+   ]
+  },
+  {
+   "id": "401820004",
+   "date": "2026-11-05T18:00Z",
+   "name": "a malformed event: one competitor only",
+   "competitions": [{"status": {"type": {"state": "in"}}, "competitors": [{"homeAway": "home", "score": "1", "team": {"abbreviation": "X"}}]}]
+  }
+ ]
+}

@@ -20,6 +20,18 @@ static int fails = 0, checks = 0;
     }                                                                               \
   } while (0)
 #define CHECK_NEAR(a, b, eps) CHECK(std::fabs((a) - (b)) <= (eps))
+// A sanitizer build runs several times slower: a test's wall-clock bound is multiplied by this.
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
+constexpr double kSlowdown = 5;
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer)
+constexpr double kSlowdown = 5;
+#else
+constexpr double kSlowdown = 1;
+#endif
+#else
+constexpr double kSlowdown = 1;
+#endif
 
 struct TempDir {
   std::string path;

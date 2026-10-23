@@ -32,6 +32,15 @@ std::optional<PrivateEvent> parse_private_event(const json& frame, std::int64_t 
     out.order = std::move(*order);
     return out;
   }
+  if (frame["type"] == "order_group_updates") {
+    out.kind = PrivateEvent::Kind::GROUP;
+    if (!body.contains("order_group_id") || !body["order_group_id"].is_string() ||
+        !body.contains("event_type") || !body["event_type"].is_string()) return fail();
+    out.group_id = body["order_group_id"].get<std::string>();
+    out.group_event = body["event_type"].get<std::string>();
+    if (out.group_id.empty()) return fail();
+    return out;
+  }
   if (frame["type"] != "fill") return fail();
   out.kind = PrivateEvent::Kind::FILL;
   if (!body.contains("trade_id") || !body["trade_id"].is_string() ||
@@ -89,6 +98,11 @@ void KalshiPrivate::run(Worker& worker) {
     if (connected) connected = ws.send(net::WsOp::TEXT,
         json{{"id",1},{"cmd","subscribe"},{"params",{{"channels",{"user_orders","fill"}}}}}.dump(),
         500,&why,[&]{worker.beat();});
+    // order_group_updates on its own command: Systematic's groups learn of a venue trigger from
+    // it, but a refusal of it costs only that, never the orders and fills.
+    if (connected) connected = ws.send(net::WsOp::TEXT,
+        json{{"id",2},{"cmd","subscribe"},{"params",{{"channels",{"order_group_updates"}}}}}.dump(),
+        500,&why,[&]{worker.beat();});
     std::map<std::int64_t,std::string> sids;
     std::set<std::string> channels;
     const auto started = mono_ms(); auto last_ping = started;
@@ -115,11 +129,21 @@ void KalshiPrivate::run(Worker& worker) {
       const auto j=json::parse(frame.payload,nullptr,false);
       if (!j.is_object() || !j.contains("type") || !j["type"].is_string()) break;
       const auto type=j["type"].get<std::string>();
+      if (type=="error" && j.contains("id") && j["id"]==2) {
+        DLOG_WARN("Kalshi refused order_group_updates: Systematic sees a venue-triggered group only by its refusals");
+        continue;
+      }
       if (type=="subscribed") {
-        if (!j.contains("id") || j["id"]!=1 || !j.contains("msg") || !j["msg"].is_object()) break;
+        if (!j.contains("id") || !j.contains("msg") || !j["msg"].is_object()) break;
         const auto& msg=j["msg"];
         if (!msg.contains("sid") || !msg["sid"].is_number_integer() || !msg.contains("channel") || !msg["channel"].is_string()) break;
         const auto sid=msg["sid"].get<std::int64_t>(); const auto channel=msg["channel"].get<std::string>();
+        if (j["id"]==2) {
+          if (channel!="order_group_updates" || sid<=0 || sids.count(sid)) break;
+          sids[sid]=channel;
+          continue;
+        }
+        if (j["id"]!=1) break;
         if (sid<=0 || sids.count(sid) || (channel!="fill" && channel!="user_orders") || !channels.insert(channel).second) break;
         sids[sid]=channel;
         if (channels.size()==2) {
@@ -131,15 +155,29 @@ void KalshiPrivate::run(Worker& worker) {
       }
       if (!j.contains("sid") || !j["sid"].is_number_integer()) break;
       const auto sid=j["sid"].get<std::int64_t>();
-      if (!sids.count(sid) || (type=="fill" ? sids[sid]!="fill" : type!="user_order" || sids[sid]!="user_orders")) break;
+      if (!sids.count(sid)) break;
+      if (type=="order_group_updates") {
+        // group state is not account state: it neither moves the reconcile fence nor waits for it
+        if (sids[sid]!="order_group_updates") break;
+        if (const auto g=parse_private_event(j,now_ms(),&why); g && event_) event_(*g);
+        continue;
+      }
+      if (type=="fill" ? sids[sid]!="fill" : type!="user_order" || sids[sid]!="user_orders") break;
       const auto event=parse_private_event(j,now_ms(),&why);
       if (!event) break;
       const auto old=generation_.fetch_add(1,std::memory_order_acq_rel);
       const bool trusted=confirmed_.load(std::memory_order_acquire)==old;
-      feed_.set(true,true,lag); // publish uncertainty before handing the event across owners
+      // An untrusted event's uncertainty is published before it crosses owners, and one gw did not
+      // take right after. A trusted one that gw took raises none: gw applies it in order, and
+      // marking every event a gap until the next pass refused orders "private feed not up" between
+      // two lines of this loop (16 in a 4-hour TSan soak, 2026-10-13).
+      if (!trusted) feed_.set(true,true,lag);
       const bool applied=event_ && event_(*event);
       if (trusted && applied) confirmed_.store(old+1,std::memory_order_release);
-      else if (reconcile_) reconcile_();
+      else {
+        feed_.set(true,true,lag);
+        if (reconcile_) reconcile_();
+      }
       if (j.contains("sending_ts_ms") && j["sending_ts_ms"].is_number_integer()) {
         const auto delta=now_ms()-j["sending_ts_ms"].get<std::int64_t>();
         if (delta>=0 && delta<=INT_MAX) lag=static_cast<int>(delta);

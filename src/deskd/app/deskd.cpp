@@ -1,9 +1,20 @@
 // deskd: the event-driven desk (docs: the implementation plan, section 2).
 //
 //   deskd [--config FILE] [--data-dir DIR] [--ui-dir DIR] [--port N] [--live]
+//         [--sim https://127.0.0.1:PORT --sim-ca FILE [--espn-url http://127.0.0.1:PORT]]
 //
-// Starts non-live: production venue hosts are refused unless --live is given AND the production
-// account's lock is held (net/guard.h). No config file is read unless --config names one.
+// --sim points every venue connection at the fake exchange (tests/fake_exchange, fake-kalshi)
+// on a loopback address, its test CA trusted for loopback only: a paper-trading sandbox with
+// no network and the browser tests' venue. Never with --live; a non-loopback URL is refused.
+// The sandbox reads no scores (ESPN and NCAA.com off) unless --espn-url names a loopback
+// stand-in for ESPN's scoreboards (tools/deskd_sim.py --nba scripts an NBA game on one): only
+// with --sim, only loopback, so the sandbox never reaches ESPN.
+//
+// Starts non-live (paper: the demo account): production venue hosts are refused unless --live is
+// given AND the production account's lock is held (net/guard.h). --live is the live desk: the
+// production hosts and a production credential (the config's env "prod"); a demo credential with
+// --live, or a production one without it, is refused. No config file is read unless --config
+// names one. tools/desk.py starts either.
 //
 // The account lock is <lock dir>/kalshi-<prod|demo>.lock, one fixed absolute file (app/lock.h):
 // wherever deskd is started from, a second deskd on the same account is refused (exit 3). The
@@ -15,11 +26,13 @@
 // unusable.
 #include <signal.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include <chrono>
 #include <climits>
 #include <csignal>
 #include <cstdio>
+#include <cerrno>
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
@@ -44,7 +57,10 @@ void usage() {
                "  --data-dir DIR  holds deskd.heartbeat (default data; must exist)\n"
                "  --ui-dir DIR    the screen, served from disk (default %s/ui/desk)\n"
                "  --port N        web port on 127.0.0.1 (default 8788)\n"
-               "  --live          allow the production venue hosts (never without the account lock)\n"
+               "  --live          the live desk: production hosts, a production credential (env prod), the prod lock\n"
+               "  --sim URL       the fake exchange on loopback (https://127.0.0.1:PORT, as fake-kalshi prints it)\n"
+               "  --sim-ca FILE   its test CA (fake-kalshi --tls DIR writes DIR/ca.pem), trusted for loopback only\n"
+               "  --espn-url URL  with --sim only: a loopback stand-in for ESPN's scoreboards (tools/deskd_sim.py --nba)\n"
                "The account lock is <lock dir>/kalshi-prod.lock with --live, else kalshi-demo.lock;\n"
                "lock dir: the config's deskd.lock_dir, else $HOME/%s\n",
                DESKD_SOURCE_DIR, deskd::AccountLock::kDirUnderHome);
@@ -57,6 +73,7 @@ int main(int argc, char** argv) {
   std::string config_path, data_dir, ui_dir;
   int port = -1;
   bool live = false;
+  std::string sim_url, sim_ca, espn_url;
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
     auto value = [&](const char* flag) -> std::string {
@@ -79,6 +96,9 @@ int main(int argc, char** argv) {
       }
       port = static_cast<int>(p);
     } else if (a == "--live") live = true;
+    else if (a == "--sim") sim_url = value("--sim");
+    else if (a == "--sim-ca") sim_ca = value("--sim-ca");
+    else if (a == "--espn-url") espn_url = value("--espn-url");
     else if (a == "-h" || a == "--help") {
       usage();
       return 0;
@@ -99,8 +119,56 @@ int main(int argc, char** argv) {
   if (!data_dir.empty()) cfg.data_dir = expand_home(data_dir);
   if (!ui_dir.empty()) cfg.ui_dir = expand_home(ui_dir);
   if (cfg.ui_dir.empty()) cfg.ui_dir = std::string(DESKD_SOURCE_DIR) + "/ui/desk";
+  if (cfg.calendar.empty()) cfg.calendar = std::string(DESKD_SOURCE_DIR) + "/config/calendar.json";
+  if (cfg.wcbb_model.empty()) cfg.wcbb_model = std::string(DESKD_SOURCE_DIR) + "/models/wcbb_logit_v1.json";
+  if (cfg.college.volley_model.empty()) cfg.college.volley_model = std::string(DESKD_SOURCE_DIR) + "/models/volley_markov_v1.json";
+  if (cfg.nba_model.empty()) cfg.nba_model = std::string(DESKD_SOURCE_DIR) + "/models/nba_logit_v1.json";
+  // The screen is read from disk on every page load: a desk whose ui dir has no readable page
+  // would start and answer every browser with INTERNAL. Say so now, with the path and why.
+  if (::access((cfg.ui_dir + "/index.html").c_str(), R_OK) != 0) {
+    std::fprintf(stderr, "deskd: refusing to start: cannot read %s/index.html (%s); --ui-dir names the screen's directory\n",
+                 cfg.ui_dir.c_str(), std::strerror(errno));
+    return 2;
+  }
   if (port >= 0) cfg.http_port = port;
   cfg.live = live;
+  RuntimeOptions options;
+  if (live) {
+    // the production account: its hosts, its lock (below), and a production credential
+    // (env "prod"; Deskd::start refuses any other with --live)
+    options.rest_url = kProdRestUrl;
+    options.ws_url = kProdWsUrl;
+  }
+  if (!sim_url.empty() || !sim_ca.empty()) {
+    // the fake exchange: loopback only, its CA for loopback only, and never with --live
+    std::string why;
+    const auto ep = net::Endpoint::parse(sim_url, &why);
+    if (live || !ep || (ep->host != "127.0.0.1" && ep->host != "localhost" && ep->host != "::1") || sim_ca.empty()) {
+      std::fprintf(stderr, "deskd: --sim takes a loopback https URL and --sim-ca, and never --live\n");
+      return 2;
+    }
+    std::string base = sim_url;
+    while (!base.empty() && base.back() == '/') base.pop_back();
+    const std::string tail = "/trade-api/v2";
+    if (base.size() >= tail.size() && base.compare(base.size() - tail.size(), tail.size(), tail) == 0)
+      base.erase(base.size() - tail.size());
+    options.rest_url = base + "/trade-api/v2";
+    options.ws_url = base + "/trade-api/ws/v2";
+    options.factory.loopback_ca_file = expand_home(sim_ca);
+    options.espn_url = options.ncaa_url = "";   // no network in the sandbox
+    DLOG_WARN("--sim: every venue connection goes to the fake exchange at %s", base.c_str());
+  }
+  if (!espn_url.empty()) {
+    // ESPN's stand-in: the sandbox's only, on loopback (the real ESPN is a network host)
+    std::string why;
+    const auto ep = net::Endpoint::parse(espn_url, &why);
+    if (sim_url.empty() || !ep || (ep->host != "127.0.0.1" && ep->host != "localhost" && ep->host != "::1")) {
+      std::fprintf(stderr, "deskd: --espn-url takes a loopback URL and only with --sim (the sandbox's stand-in for ESPN)\n");
+      return 2;
+    }
+    options.espn_url = espn_url;
+    DLOG_WARN("--sim: ESPN's scoreboards come from the stand-in at %s", espn_url.c_str());
+  }
 
   // A write to a closed socket is an error to handle, never a reason to end the desk: TLS
   // writes go through write(2), which raises SIGPIPE, and its default action killed the old
@@ -138,11 +206,9 @@ int main(int argc, char** argv) {
     return 3;
   }
   DLOG_INFO("account lock %s (%s account), data %s", lock->path().c_str(), lock->env().c_str(), cfg.data_dir.c_str());
-  if (!cfg.live && cfg.env == "prod")
-    DLOG_WARN("%s says env prod, but deskd follows --live: production hosts stay refused", cfg.config_path.c_str());
   if (cfg.live) DLOG_WARN("--live: production venue hosts allowed while %s is held", lock->path().c_str());
 
-  Deskd desk(cfg, std::move(lock));
+  Deskd desk(cfg, std::move(lock), options);
   if (!desk.start(&err)) {
     std::fprintf(stderr, "deskd: %s\n", err.c_str());
     return 4;

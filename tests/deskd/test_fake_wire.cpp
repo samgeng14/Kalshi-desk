@@ -1,7 +1,8 @@
 // The fake Kalshi over loopback, seen from a raw client (tests/fake_exchange/client.h): every REST
 // route and its shape, cursor paging, auth with a real RSA-PSS signature, the rate limits, the
-// socket's commands, sids and seq, every channel, each fault the plan names (section 8), the
-// recorded tape over the socket, many clients at once, and the fake-kalshi binary.
+// socket's commands, sids and seq, every channel, each fault the plan names (section 8) and S1's
+// (one market's creates, the touch pulled first), the recorded tape over the socket, many clients
+// at once, and the fake-kalshi binary.
 //
 // Shapes are checked against the venue's documents (docs.kalshi.com, fetched 2026-10-06):
 // api-reference/orders/*.md, portfolio/*.md, order-groups/*.md, websockets/*.md and
@@ -362,7 +363,7 @@ void test_rest() {
   CHECK(call(c, "PUT", "/portfolio/order_groups/" + gid + "/trigger").status() == 200);
   CHECK(call(c, "GET", "/portfolio/orders/" + gr1).j["order"]["status"] == "canceled");
   r = call(c, "POST", ORDERS, order(T, "bid", "1", "0.30", "good_till_canceled", "", {{"order_group_id", gid}}));
-  CHECK(r.status() == 400 && r.j["error"]["details"] == "order group triggered");
+  CHECK(r.status() == 400 && r.j["error"]["code"] == "exceeded_order_group_contracts_limit");
   CHECK(call(c, "PUT", "/portfolio/order_groups/" + gid + "/trigger?exchange_index=2").status() == 404);
   CHECK(call(c, "PUT", "/portfolio/order_groups/" + gid + "/reset").status() == 200);
   CHECK(call(c, "PUT", "/portfolio/order_groups/" + gid + "/limit", {{"contracts_limit_fp", "10.00"}}).status() == 200);
@@ -408,6 +409,80 @@ void test_rest() {
   CHECK(net::read_response(fd, buf, res, 2000) == net::ReadResult::OK && res.status == 200 &&
         json::parse(res.body).contains("balance"));
   ::close(fd);
+}
+
+// ---- events (get-event.md): GET /events/{event_ticker} ------------------------------------------
+
+void test_events() {
+  Venue v;
+  CHECK(v.ok);
+  const std::string E = "KXHIGHTST-26OCT06";
+  v.f.with_engine([&](Engine& e, std::int64_t now) {
+    MarketSpec lo = spec(E + "-T79", 0), mid = spec(E + "-B79.5", 0), hi = spec(E + "-T80", 0);
+    lo.strike_type = "less";
+    lo.cap_strike = 79;
+    lo.yes_sub_title = "78 or below";
+    mid.strike_type = "between";
+    mid.floor_strike = 79;
+    mid.cap_strike = 80;
+    hi.strike_type = "greater";
+    hi.floor_strike = 80;
+    for (const MarketSpec& s : {hi, lo, mid}) e.add_market(s, now);
+    EventSpec ev;
+    ev.event_ticker = E;
+    ev.title = "Highest temperature in Testville?";
+    ev.sub_title = "On Oct 6, 2026";
+    ev.category = "Climate and Weather";
+    ev.mutually_exclusive = true;
+    ev.collateral_return_type = "MECNET";
+    CHECK(e.add_event(ev).series_ticker == "KXHIGHTST");
+    EventSpec t;   // T's event: no flag, nothing optional
+    t.event_ticker = "KXTEST-26OCT06";
+    e.add_event(t);
+  });
+  HttpConn c(v.port());
+  // nested: {event} alone, its markets in it by ticker, each as GET /markets/{t} lists it; no auth
+  auto r = c.request("GET", V2 + "/events/" + E + "?with_nested_markets=true");
+  CHECK(r.status() == 200 && keys(r.j) == std::set<std::string>({"event"}));
+  const json ev = r.j["event"];
+  CHECK(keys(ev) == std::set<std::string>({"event_ticker", "series_ticker", "title", "sub_title", "category",
+                                           "mutually_exclusive", "collateral_return_type", "markets"}));
+  CHECK(ev["event_ticker"] == E && ev["series_ticker"] == "KXHIGHTST" && ev["mutually_exclusive"] == true &&
+        ev["collateral_return_type"] == "MECNET" && ev["title"] == "Highest temperature in Testville?");
+  CHECK(ev["markets"].size() == 3 && ev["markets"][0]["ticker"] == E + "-B79.5" && ev["markets"][2]["ticker"] == E + "-T80");
+  CHECK(ev["markets"][1] == c.request("GET", V2 + "/markets/" + E + "-T79").j["market"]);
+  CHECK(ev["markets"][1]["yes_sub_title"] == "78 or below" && ev["markets"][1]["strike_type"] == "less" &&
+        ev["markets"][1]["cap_strike"] == 79 && ev["markets"][1]["event_ticker"] == E);
+  CHECK(!ev["markets"][2].contains("yes_sub_title"));   // none given: left out
+  // the default: the markets beside the event
+  r = c.request("GET", V2 + "/events/" + E);
+  CHECK(r.status() == 200 && keys(r.j) == std::set<std::string>({"event", "markets"}) && !r.j["event"].contains("markets") &&
+        r.j["markets"] == ev["markets"]);
+  CHECK(c.request("GET", V2 + "/events/" + E + "?with_nested_markets=false").j["markets"].size() == 3);
+  // no flag given: left out (the docs list it as required: deskd must read it as unknown); only the
+  // event's own markets
+  r = c.request("GET", V2 + "/events/KXTEST-26OCT06?with_nested_markets=true");
+  CHECK(r.status() == 200 && !r.j["event"].contains("mutually_exclusive") && !r.j["event"].contains("collateral_return_type") &&
+        r.j["event"]["series_ticker"] == "KXTEST" && r.j["event"]["markets"].size() == 1 &&
+        r.j["event"]["markets"][0]["ticker"] == T);
+  // unknown: 404 in the venue's error shape, even with markets naming it; a bad flag: 400; GET only
+  r = c.request("GET", V2 + "/events/KXNATGAS15M-26OCT061145");
+  CHECK(r.status() == 404 && r.j["error"]["code"] == "not_found");
+  CHECK(c.request("GET", V2 + "/events/" + E + "?with_nested_markets=yes").status() == 400);
+  CHECK(call(c, "POST", "/events/" + E, json::object()).status() == 404);
+  // a market listed after the event joins it, a closed one stays in it, and the event given again
+  // replaces its spec
+  v.f.with_engine([&](Engine& e, std::int64_t now) {
+    e.add_market(spec(E + "-B81.5", 0), now);
+    e.close(E + "-T80", now);
+    EventSpec again;
+    again.event_ticker = E;
+    again.mutually_exclusive = false;
+    e.add_event(again);
+  });
+  r = c.request("GET", V2 + "/events/" + E + "?with_nested_markets=true");
+  CHECK(r.j["event"]["mutually_exclusive"] == false && r.j["event"]["title"] == "" && r.j["event"]["markets"].size() == 4 &&
+        r.j["event"]["markets"][1]["ticker"] == E + "-B81.5" && r.j["event"]["markets"][3]["status"] == "closed");
 }
 
 // ---- auth -----------------------------------------------------------------------------------------
@@ -931,6 +1006,84 @@ void test_faults() {
   CHECK(c.closed_by_server(1000));
 }
 
+// A fault for one market's creates, and the street pulling the touch an order would take: S1's leg
+// whose liquidity left before it arrived (arb.json's missing-leg tests).
+void test_ticker_faults() {
+  Venue v;
+  v.f.with_engine([](Engine& e, std::int64_t now) { e.street_add(T, true, 5700, 400, now); });  // a 0.43 ask x4
+  auto ws = open_ws(v.port());
+  ws->send_json(cmd(1, "subscribe", {{"channels", json::array({"orderbook_delta"})}, {"market_tickers", json::array({T})}}));
+  ws->send_json(cmd(2, "subscribe", {{"channels", json::array({"fill"})}}));
+  ws->drain(200);
+  HttpConn c(v.port());
+  using K = HttpFault::Kind;
+  auto fault = [](K k, const std::string& ticker, Qty qty = 0) {
+    HttpFault f;
+    f.kind = k;
+    f.ticker = ticker;
+    f.qty = qty;
+    return f;
+  };
+
+  // a fault naming G is passed over by T's create, which takes the one behind it; G's takes it
+  v.f.add_fault(fault(K::RATE_LIMIT, G));
+  v.f.add_fault(fault(K::STATUS_AFTER_ACCEPT, ""));
+  CHECK(call(c, "POST", ORDERS, post_only(T, "1", "0.30", "TF-t")).status() == 500 && v.has_cid("TF-t"));
+  CHECK(v.f.faults_pending() == 1);
+  CHECK(call(c, "POST", ORDERS, post_only(G, "1", "0.30", "TF-g")).status() == 429 && !v.has_cid("TF-g"));
+  CHECK(v.f.faults_pending() == 0);
+  // the ticker is the body's: a request with none never takes such a fault, even one about T
+  HttpFault read = fault(K::RATE_LIMIT, T);
+  read.method = "GET";
+  read.path = "/markets";
+  v.f.add_fault(read);
+  CHECK(call(c, "GET", "/markets/" + T).status() == 200 && v.f.faults_pending() == 1);
+  v.f.clear_faults();
+  ws->drain(200);
+
+  {  // the 0.42 ask x3 leaves just before a bid up to 0.43 arrives, which meets the 0.43
+    v.f.add_fault(fault(K::PULL_TOUCH, T));
+    v.f.clear_wire_log();
+    auto r = call(c, "POST", ORDERS, order(T, "bid", "2", "0.43", "immediate_or_cancel", "TF-p1"));
+    CHECK(r.status() == 201 && r.j["fill_count"] == "2.00" && r.j["average_fill_price"] == "0.4300");
+    const auto log = v.f.wire_log();
+    const int pull = log_at(log, {"http pull-touch " + T + " 3.00"});
+    CHECK(pull >= 0 && log_at(log, {"http 201 POST"}) > pull);
+    // the socket: the street's -3 at 0.58, then ours at 0.57, then the fill
+    std::vector<std::string> seen;
+    for (const auto& m : ws->drain(300)) {
+      const std::string type = m.value("type", "");
+      const json& msg = m["msg"];
+      if (type == "orderbook_delta")
+        seen.push_back(msg["price_dollars"].get<std::string>() + " " + msg["delta_fp"].get<std::string>() +
+                       (msg.contains("client_order_id") ? " ours" : ""));
+      if (type == "fill") seen.push_back("fill " + msg["count_fp"].get<std::string>());
+    }
+    CHECK(seen == std::vector<std::string>({"0.5800 -3.00", "0.5700 -2.00 ours", "fill 2.00"}));
+  }
+  {  // again: the 0.43 x2 left leaves too, and nothing is within the bid's price
+    v.f.add_fault(fault(K::PULL_TOUCH, T));
+    auto r = call(c, "POST", ORDERS, order(T, "bid", "1", "0.43", "immediate_or_cancel", "TF-p2"));
+    CHECK(r.status() == 201 && r.j["fill_count"] == "0.00" && v.by_cid("TF-p2")->status == OrdStatus::CANCELED);
+    CHECK(v.f.with_engine([](Engine& e, std::int64_t) { return e.levels(T, true).empty(); }));
+  }
+  {  // an ask pulls from the YES bids, `qty` of them: 3 of the 0.40 x5 leave and it takes the 2 left
+    v.f.add_fault(fault(K::PULL_TOUCH, T, 300));
+    auto r = call(c, "POST", ORDERS, order(T, "ask", "3", "0.40", "immediate_or_cancel", "TF-p3"));
+    CHECK(r.status() == 201 && r.j["fill_count"] == "2.00");
+  }
+  {  // a price short of the touch: nothing leaves, and the order rests as sent
+    v.f.with_engine([](Engine& e, std::int64_t now) { e.street_add(T, true, 5600, 200, now); });  // a 0.44 ask x2
+    v.f.add_fault(fault(K::PULL_TOUCH, T));
+    v.f.clear_wire_log();
+    auto r = call(c, "POST", ORDERS, post_only(T, "1", "0.35", "TF-p4"));
+    CHECK(r.status() == 201 && r.j["remaining_count"] == "1.00");
+    CHECK(log_at(v.f.wire_log(), {"http pull-touch " + T + " 0.00"}) >= 0);
+    CHECK(v.f.with_engine([](Engine& e, std::int64_t) { return e.levels(T, true) == std::vector<std::pair<Px, Qty>>({{5600, 200}}); }));
+  }
+  CHECK(v.f.faults_pending() == 0);
+}
+
 // ---- faults on the socket --------------------------------------------------------------------------
 
 void test_ws_faults() {
@@ -1395,11 +1548,13 @@ void test_binary() {
 int main() {
   ::signal(SIGPIPE, SIG_IGN);
   test_rest();
+  test_events();
   test_auth();
   test_rate_limits();
   test_ws_protocol();
   test_ws_private();
   test_faults();
+  test_ticker_faults();
   test_ws_faults();
   test_cancel_all_echo();
   test_ws_limits();

@@ -1,0 +1,14 @@
+{
+  "_provenance": "Hand-built in the shape the old desk read from gateway.polymarket.us/v1/markets/{slug}/book (src/poly.cpp PolyDesk::book, tests/test_poly.cpp): marketData.bids/asks, each level px {value, currency} and qty, best first. Not a capture: TO CONFIRM (poly_checks on the Mac, or the recorder's first rows on the VM).",
+  "marketData": {
+    "marketSlug": "aec-nba-lal-bos-2026-10-21",
+    "bids": [
+      {"px": {"value": "0.385", "currency": "USD"}, "qty": "1200.00"},
+      {"px": {"value": "0.380", "currency": "USD"}, "qty": "500.00"}
+    ],
+    "asks": [
+      {"px": {"value": "0.390", "currency": "USD"}, "qty": "900.00"},
+      {"px": {"value": "0.400", "currency": "USD"}, "qty": "2500.00"}
+    ]
+  }
+}

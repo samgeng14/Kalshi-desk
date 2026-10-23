@@ -1,0 +1,24 @@
+# deskd recorder: finished hours to Cloudflare R2 (recorder/upload.py), run by its timer. Apart
+# from the recorder, so an upload failure never stops recording.
+[Unit]
+Description=deskd recorder: finished hours to R2
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=recorder
+Group=recorder
+WorkingDirectory=/opt/deskd-recorder/current
+EnvironmentFile=/etc/deskd-recorder/recorder.env
+LoadCredential=r2-token:/etc/deskd-recorder/credentials/r2-write.token
+SetCredential=hc-upload-url:
+LoadCredential=hc-upload-url:/etc/deskd-recorder/credentials/healthchecks-upload.url
+ExecStart=/opt/deskd-recorder/.venv/bin/python -m recorder.upload
+TimeoutStartSec=50min
+Nice=10
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/deskd-recorder

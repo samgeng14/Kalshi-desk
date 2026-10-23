@@ -9,20 +9,24 @@
 //     venue terms, cancels, batch cancels, cancel-all and the reads' queries
 //   - parsers: the documented shapes (docs.kalshi.com, 2026-10-06/07), a missing or mistyped
 //     required field failing the whole reply, and the shapes Kalshi's demo sent the probe
+//   - events: GET /events/{t} with its markets nested or beside it, the flag unknown when absent,
+//     a docs-shaped body (hand-written) read whole and shaped by gw/event_risk
 //   - classify_write: ACK, REFUSED with its class, UNKNOWN (5xx, 408, a cut, no venue body, an
 //     unreadable 2xx), NOT_SENT
 //   - round trips against the fake over TLS, signed and verified, through the spare pool: create,
 //     get, fills, positions, balance per shard, cancel, a cancel of a gone order, batch cancel,
-//     cancel-all, markets, orderbook, the soft refusals (post-only cross, collateral, duplicate
-//     cid, triggered group), a bad signature, and the faults that make a write UNKNOWN
+//     cancel-all, markets, orderbook, events, the soft refusals (post-only cross, collateral,
+//     duplicate cid, triggered group), a bad signature, and the faults that make a write UNKNOWN
 //   - the demo probe binary (tools/kalshi_demo_probe.cpp) run against the fake over TLS through
 //     its real command line: handshakes, the reads, the order check, the dumps, no key material
-//     in its output; a production base and a non-demo key file refused before any socket
+//     in its output; S1's events check and arb check (two NO legs, the cash, bought back flat);
+//     a production base, --live and a non-demo key file refused before any socket
 #include <openssl/evp.h>
 #include <openssl/pem.h>
 #include <signal.h>
 #include <sys/wait.h>
 
+#include <atomic>
 #include <cstdio>
 #include <fstream>
 #include <nlohmann/json.hpp>
@@ -30,6 +34,7 @@
 
 #include "deskd/app/log.h"
 #include "deskd/build_paths.h"
+#include "deskd/gw/event_risk.h"
 #include "deskd/gw/kalshi_sign.h"
 #include "deskd/gw/kalshi_wire.h"
 #include "deskd/net/pool.h"
@@ -350,6 +355,29 @@ static void test_builders() {
   CHECK(all.method == "DELETE" && all.path == "/trade-api/v2/portfolio/events/orders" && all.query.empty() &&
         all.op == WireOp::CANCEL_ALL && all.write);
   CHECK(build_cancel_all(0).query == "subaccount=0");
+  {   // order groups: whole contracts, a shard on every call
+    WireRequest g;
+    std::string why;
+    CHECK(build_create_order_group(5000, 2, -1, &g, &why));
+    CHECK(g.method == "POST" && g.path == "/trade-api/v2/portfolio/order_groups/create" && g.write && g.op == WireOp::GROUP);
+    CHECK(json::parse(g.body) == json({{"contracts_limit", 50}, {"contracts_limit_fp", "50.00"}, {"exchange_index", 2}}));
+    CHECK(!build_create_order_group(150, 0, -1, &g, &why) && !build_create_order_group(5000, -1, -1, &g, &why));
+    CHECK(build_order_group_action("og-1", "trigger", 1, -1, &g, &why));
+    CHECK(g.method == "PUT" && g.path == "/trade-api/v2/portfolio/order_groups/og-1/trigger" && g.query == "exchange_index=1");
+    CHECK(!build_order_group_action("og-1", "delete", 1, -1, &g, &why) && !build_order_group_action("og 1", "reset", 1, -1, &g, &why));
+    CHECK(build_transfer(0, 2, 1000000, &g, &why));
+    CHECK(g.method == "POST" && g.path == "/trade-api/v2/portfolio/intra_exchange_instance_transfer" && g.write &&
+          g.op == WireOp::TRANSFER && json::parse(g.body) == json({{"source", "event_contract"}, {"destination", "event_contract"},
+          {"amount", 1000000}, {"source_exchange_shard", 0}, {"destination_exchange_shard", 2}}));
+    CHECK(!build_transfer(1, 1, 100, &g, &why) && !build_transfer(0, 1, 0, &g, &why) && !build_transfer(-1, 1, 100, &g, &why));
+    CHECK(build_delete_order_group("og-1", 2, -1, &g, &why));
+    CHECK(g.method == "DELETE" && g.path == "/trade-api/v2/portfolio/order_groups/og-1" && g.query == "exchange_index=2" &&
+          g.body.empty() && g.write && g.op == WireOp::GROUP);
+    CHECK(!build_delete_order_group("og/1", 0, -1, &g, &why) && !build_delete_order_group("og-1", -1, -1, &g, &why));
+    CHECK(parse_create_order_group(R"({"order_group_id":"og-9","exchange_index":0})", &why) == std::optional<std::string>("og-9"));
+    CHECK(!parse_create_order_group(R"({"exchange_index":0})", &why));
+    CHECK(classify_refusal(WireOp::GROUP, 404, "not_found") == RejectClass::GONE);
+  }
 
   // reads
   ListQuery q;
@@ -383,6 +411,10 @@ static void test_builders() {
   CHECK(mk.target() == "/trade-api/v2/markets?limit=200&series_ticker=KXNATGAS15M&status=open" && !mk.auth);
   CHECK(build_get_orderbook(fx::T, 5).target() == "/trade-api/v2/markets/KXTEST-26OCT06-A/orderbook?depth=5");
   CHECK(build_get_market(fx::T).path == "/trade-api/v2/markets/KXTEST-26OCT06-A" && !build_get_market(fx::T).auth);
+  const WireRequest ev = build_get_event("KXHIGHNY-26OCT07");
+  CHECK(ev.method == "GET" && ev.path == "/trade-api/v2/events/KXHIGHNY-26OCT07" &&
+        ev.query == "with_nested_markets=true" && !ev.auth && !ev.write && ev.op == WireOp::OTHER);
+  CHECK(build_get_event("KXHIGHNY-26OCT07", false).target() == "/trade-api/v2/events/KXHIGHNY-26OCT07");
   CHECK(build_get_exchange_status().path == "/trade-api/v2/exchange/status");
 
   // the bytes: auth headers, Accept, Content-Type with a body, Connection: close for a write
@@ -459,6 +491,28 @@ static void test_parsers() {
   CHECK(!parse_orders("{\"orders\":[" + order + "," + bad_row.dump() + "],\"cursor\":\"\"}", &why) &&
         why.find("orders[1].yes_price_dollars") == 0);
 
+  // GET /markets/trades (public prints; the fill model's backfill)
+  auto trades = parse_trades(R"({"trades":[{"trade_id":"t2","ticker":"KXTEST-26OCT06-A","count_fp":"3.00",
+      "yes_price_dollars":"0.4100","no_price_dollars":"0.5900","taker_side":"no","created_time":"2026-10-06T15:30:01Z"},
+      {"trade_id":"t1","ticker":"KXTEST-26OCT06-A","count_fp":"0.50","yes_price_dollars":"0.4200",
+      "no_price_dollars":"0.5800","taker_side":"yes","created_time":"2026-10-06T15:30:00.25Z"}],"cursor":"c2"})", &why);
+  CHECK(trades && trades->rows.size() == 2 && trades->cursor == "c2");
+  if (trades && trades->rows.size() == 2) {
+    CHECK(trades->rows[0].count == 300 && trades->rows[0].yes_price == 4100 && !trades->rows[0].taker_bought_yes &&
+          trades->rows[0].ts_ms == 1791300601000);
+    CHECK(trades->rows[1].count == 50 && trades->rows[1].taker_bought_yes && trades->rows[1].ts_ms == 1791300600250);
+  }
+  CHECK(!parse_trades(R"({"trades":[{"trade_id":"t","ticker":"K","count_fp":"1.00","yes_price_dollars":"0.4100",
+      "taker_side":"maybe","created_time":"2026-10-06T15:30:01Z"}]})", &why) && why.find("taker_side") != std::string::npos);
+  {
+    TradesQuery tq;
+    tq.ticker = "KXTEST-26OCT06-A";
+    tq.min_ts = 1791300000;
+    tq.limit = 1000;
+    const auto r = build_get_trades(tq);
+    CHECK(r.method == "GET" && !r.auth && r.path == "/trade-api/v2/markets/trades" && r.query == "ticker=KXTEST-26OCT06-A&min_ts=1791300000&limit=1000");
+  }
+
   auto fills = parse_fills(R"({"fills":[{"fill_id":"f1","exchange_index":0,"trade_id":"f1","order_id":"o-1",
       "ticker":"KXTEST-26OCT06-A","market_ticker":"KXTEST-26OCT06-A","outcome_side":"yes","book_side":"bid",
       "count_fp":"2.00","yes_price_dollars":"0.4200","no_price_dollars":"0.5800","is_taker":true,
@@ -501,6 +555,10 @@ static void test_parsers() {
   CHECK(m && m->exchange_index == 2 && m->yes_bid == 4500 && m->yes_ask == 4700 && m->yes_bid_size == 3000 &&
         m->close_ms == 1791301500000 && m->price_ranges.size() == 3 && m->price_ranges[0].step == 10 &&
         m->price_ranges[1].step == 100);
+  CHECK(m && !m->fractional);   // absent: whole contracts only
+  auto mf = parse_market(R"({"market":{"ticker":"T","status":"active","fractional_trading_enabled":true}})", &why);
+  CHECK(mf && mf->fractional && *mf->fractional);
+  CHECK(!parse_market(R"({"market":{"ticker":"T","status":"active","fractional_trading_enabled":"yes"}})", &why));
   auto ms = parse_markets("{\"markets\":[" + market + "],\"cursor\":\"c2\"}", &why);
   CHECK(ms && ms->rows.size() == 1 && ms->cursor == "c2");
   auto ob = parse_orderbook(R"({"orderbook_fp":{"yes_dollars":[["0.3900","10.00"],["0.4000","5.00"]],
@@ -566,6 +624,82 @@ static void test_demo_shapes() {
         mve->exchange_index == 1);
 }
 
+// ---- events: GET /events/{event_ticker} -----------------------------------------------------------
+// The docs' shape (tests/deskd/fixtures/kalshi_event_docs.json, hand-written until kalshi-demo-probe
+// captures demo's) read whole and shaped by gw/event_risk, the markets nested in the event or beside
+// it, the flag unknown when absent, and each body that fails.
+static void test_events() {
+  const std::string dir = std::string(DESKD_SOURCE_DIR) + "/tests/deskd/fixtures/";
+  std::ifstream in(dir + "kalshi_event_docs.json");
+  const std::string docs((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  std::string why;
+  auto e = parse_event(docs, &why);
+  CHECK(e && e->event_ticker == "KXHIGHNY-26OCT07" && e->series_ticker == "KXHIGHNY" && e->mutually_exclusive == true &&
+        e->collateral_return_type == "MECNET" && e->category == "Climate and Weather" && e->sub_title == "On Oct 7, 2026" &&
+        e->markets.size() == 4 && e->fetched_ms == 0);
+  if (!e) std::fprintf(stderr, "  docs event: %s\n", why.c_str());
+  if (e && e->markets.size() == 4) {
+    const MarketRow& b = e->markets[1];
+    CHECK(b.ticker == "KXHIGHNY-26OCT07-B58.5" && b.event_ticker == e->event_ticker && b.strike_type == "between" &&
+          b.floor_strike == 58.0 && b.cap_strike == 59.0 && b.yes_sub_title == "58\xc2\xb0 to 59\xc2\xb0" &&
+          b.yes_bid == 3100 && b.yes_ask == 3300 && b.exchange_index == 0 && b.close_ms && b.price_ranges.size() == 1);
+    CHECK(e->markets[0].strike_type == "less" && !e->markets[0].floor_strike && e->markets[0].cap_strike == 58.0);
+    // what gw/event_risk makes of it: exclusive, and exhaustive on KXHIGH's whole degrees only
+    std::map<std::string, MarketRow> listing;
+    for (const auto& m : e->markets) listing[m.ticker] = m;
+    auto line = event_shape(*e, listing, 0, &why), degrees = event_shape(*e, listing, 1, &why);
+    CHECK(line && line->exclusive && !line->exhaustive);
+    CHECK(degrees && degrees->exclusive && degrees->exhaustive && degrees->tickers.front() == "KXHIGHNY-26OCT07-T58" &&
+          degrees->tickers.back() == "KXHIGHNY-26OCT07-T61");
+  }
+
+  // the markets beside the event (with_nested_markets left out), the flag false: read as given
+  const std::string head = R"("event_ticker":"E-1","series_ticker":"E","title":"t")";
+  const std::string a = R"({"ticker":"E-1-A","event_ticker":"E-1","status":"active","strike_type":"less","cap_strike":5})";
+  const std::string b = R"({"ticker":"E-1-B","status":"closed","strike_type":"greater_or_equal","floor_strike":5})";
+  auto beside = parse_event("{\"event\":{" + head + R"(,"mutually_exclusive":false},"markets":[)" + a + "," + b + "]}", &why);
+  CHECK(beside && beside->mutually_exclusive == false && beside->markets.size() == 2 && beside->markets[1].ticker == "E-1-B" &&
+        beside->markets[1].status == "closed" && beside->markets[1].event_ticker == "E-1" /* the event's, when left out */);
+  // no flag, or a null one: unknown, never false
+  auto unknown = parse_event("{\"event\":{" + head + ",\"markets\":[" + a + "]}}", &why);
+  CHECK(unknown && !unknown->mutually_exclusive && unknown->markets.size() == 1 && unknown->sub_title.empty());
+  auto null_flag = parse_event("{\"event\":{" + head + R"(,"mutually_exclusive":null,"markets":[)" + a + "]}}", &why);
+  CHECK(null_flag && !null_flag->mutually_exclusive);
+  // nested and beside both filled: the same markets in any order, or the body fails
+  auto both = parse_event("{\"event\":{" + head + ",\"markets\":[" + a + "," + b + "]},\"markets\":[" + b + "," + a + "]}", &why);
+  CHECK(both && both->markets.size() == 2 && both->markets[0].ticker == "E-1-A");
+  CHECK(!parse_event("{\"event\":{" + head + ",\"markets\":[" + a + "," + b + "]},\"markets\":[" + a + "]}", &why) &&
+        why == "event.markets and markets list different markets");
+  // nested empty: the ones beside it; none anywhere: an event with none (event_shape refuses it)
+  auto empty_nested = parse_event("{\"event\":{" + head + ",\"markets\":[]},\"markets\":[" + b + "]}", &why);
+  CHECK(empty_nested && empty_nested->markets.size() == 1 && empty_nested->markets[0].ticker == "E-1-B");
+  auto none = parse_event("{\"event\":{" + head + "},\"markets\":null}", &why);
+  CHECK(none && none->markets.empty());
+
+  // each body that fails, and why
+  auto fails_with = [&](const std::string& body, const std::string& expect) {
+    std::string w;
+    const bool failed = !parse_event(body, &w);
+    if (!failed || w.find(expect) != 0)
+      std::fprintf(stderr, "  parse_event: expected \"%s\", got \"%s\"\n", expect.c_str(), w.c_str());
+    return failed && w.find(expect) == 0;
+  };
+  CHECK(fails_with("<html>", "not JSON"));
+  CHECK(fails_with(R"({"markets":[]})", "event: missing or not an object"));
+  CHECK(fails_with(R"({"event":[]})", "event: missing or not an object"));
+  CHECK(fails_with(R"({"event":{"series_ticker":"E","markets":[]}})", "event.event_ticker: missing"));
+  CHECK(fails_with(R"({"event":{"event_ticker":"","series_ticker":"E"}})", "event.event_ticker: empty"));
+  CHECK(fails_with(R"({"event":{"event_ticker":"E-1"}})", "event.series_ticker: missing"));
+  CHECK(fails_with("{\"event\":{" + head + R"(,"mutually_exclusive":"yes"}})", "event.mutually_exclusive: not a boolean"));
+  CHECK(fails_with("{\"event\":{" + head + R"(,"markets":{}}})", "event.markets: not an array"));
+  json bad_px = json::parse(a);
+  bad_px["yes_bid_dollars"] = "0.30005";
+  CHECK(fails_with("{\"event\":{" + head + ",\"markets\":[" + b + "," + bad_px.dump() + "]}}", "event.markets[1].yes_bid_dollars"));
+  CHECK(fails_with("{\"event\":{" + head + R"(},"markets":[{"ticker":"E-1-A"}]})", "markets[0].status: missing"));
+  CHECK(fails_with("{\"event\":{" + head + R"(,"markets":[{"ticker":"E-2-A","event_ticker":"E-2","status":"active"}]}})",
+                   "event.markets[0].event_ticker: another event's \"E-2\""));
+}
+
 // ---- what a write's reply means -----------------------------------------------------------------
 
 static void test_classify() {
@@ -601,6 +735,10 @@ static void test_classify() {
   CHECK(refused(WireOp::CREATE, 400, err("trading_paused", "trading is paused")) == RejectClass::SOFT_MARKET);
   CHECK(refused(WireOp::CREATE, 400, err("insufficient_balance", "insufficient balance")) == RejectClass::SOFT_COLLATERAL);
   CHECK(refused(WireOp::CREATE, 400, err("invalid_order", "invalid order", "order group triggered")) == RejectClass::SOFT_GROUP);
+  // demo's own answer (demo checks, 2026-10-13): the group did its job, never a desk bug
+  CHECK(refused(WireOp::CREATE, 400, err("exceeded_order_group_contracts_limit",
+                                         "placing this order would exceed your the order group contracts limit", "")) ==
+        RejectClass::SOFT_GROUP);
   CHECK(refused(WireOp::CREATE, 400, err("self_trade", "order would self trade")) == RejectClass::SOFT_SELF_TRADE);
   CHECK(refused(WireOp::CREATE, 409, err("order_already_exists", "an order with this client_order_id already exists")) ==
         RejectClass::DUPLICATE);
@@ -735,6 +873,12 @@ static void round_trip(const std::string& key_type) {
   auto fills = parse_fills(rt.send(build_get_fills(fq)).res.body, &why);
   CHECK(fills && fills->rows.size() == 1 && fills->rows[0].count == 200 && fills->rows[0].yes_price == 4200 &&
         fills->rows[0].taker && fills->rows[0].fee > 0 && take && fills->rows[0].order_id == take->order_id);
+  // the take is a public print too: GET /markets/trades shows it, its taker bought YES
+  TradesQuery tq;
+  tq.ticker = fx::T;
+  auto prints = parse_trades(rt.send(build_get_trades(tq)).res.body, &why);
+  CHECK(prints && !prints->rows.empty() && prints->rows[0].count == 200 && prints->rows[0].yes_price == 4200 &&
+        prints->rows[0].taker_bought_yes && prints->rows[0].ticker == fx::T);
   // reduce-only IOC ask sells 1 back into the street's 0.40 bid
   CreateOrder flat = order_on(fx::T, 0, BookSide::ASK, 100, 4000, TimeInForce::IOC, "M-rt-flat");
   flat.reduce_only = true;
@@ -799,6 +943,7 @@ static void round_trip(const std::string& key_type) {
   CHECK(b2 && b2->available == 1000 * 10000);
   auto mkt = parse_market(rt.send(build_get_market(fx::G)).res.body, &why);
   CHECK(mkt && mkt->exchange_index == 2 && mkt->price_ranges.size() == 3 && mkt->price_level_structure == "tapered_deci_cent");
+  CHECK(mkt && mkt->fractional && !*mkt->fractional);   // the fake lists the flag, false by default
   MarketsQuery mq;
   mq.limit = 1;
   auto mp = parse_markets(rt.send(build_get_markets(mq)).res.body, &why);
@@ -809,6 +954,35 @@ static void round_trip(const std::string& key_type) {
   auto book = parse_orderbook(rt.send(build_get_orderbook(fx::T)).res.body, &why);
   CHECK(book && !book->yes.empty() && book->yes.back().first == 4000);
   CHECK(parse_exchange_status(rt.send(build_get_exchange_status()).res.body, &why).has_value());
+
+  // an event: its markets nested and beside it, the flag as given or unknown, and one not listed
+  v.f->with_engine([](fakex::Engine& e, std::int64_t now) {
+    fakex::MarketSpec hi;
+    hi.ticker = "KXTEST-26OCT06-B";
+    hi.strike_type = "greater";
+    hi.floor_strike = 50;
+    hi.yes_sub_title = "above 50";
+    e.add_market(hi, now);
+    fakex::EventSpec ev;
+    ev.event_ticker = "KXTEST-26OCT06";
+    ev.title = "Test event";
+    ev.mutually_exclusive = true;
+    e.add_event(ev);
+    ev.event_ticker = "KXNATGAS15M-26OCT061145";
+    ev.mutually_exclusive.reset();
+    e.add_event(ev);
+  });
+  auto ev = parse_event(rt.send(build_get_event("KXTEST-26OCT06")).res.body, &why);
+  CHECK(ev && ev->series_ticker == "KXTEST" && ev->mutually_exclusive == true && ev->title == "Test event" &&
+        ev->markets.size() == 2 && ev->markets[0].ticker == fx::T && ev->markets[1].yes_sub_title == "above 50" &&
+        ev->markets[1].strike_type == "greater" && ev->markets[1].floor_strike == 50.0);
+  auto ev_beside = parse_event(rt.send(build_get_event("KXTEST-26OCT06", false)).res.body, &why);
+  CHECK(ev_beside && ev_beside->markets.size() == 2 && ev_beside->markets[1].ticker == "KXTEST-26OCT06-B");
+  auto ev_gas = parse_event(rt.send(build_get_event("KXNATGAS15M-26OCT061145")).res.body, &why);
+  CHECK(ev_gas && !ev_gas->mutually_exclusive && ev_gas->markets.size() == 1 && ev_gas->markets[0].exchange_index == 2);
+  const net::Exchange no_event = rt.send(build_get_event("KXTEST-26OCT07"));
+  CHECK(no_event.res.status == 404 && parse_error(404, no_event.res.body).code == "not_found" &&
+        !parse_event(no_event.res.body, &why));
 
   // a signature from another key, and a stale timestamp: AUTH, never a soft refusal
   auto other = KalshiSigner::from_pem("rt-key", new_key_pem("ED25519"), "ed25519", &err);
@@ -850,8 +1024,8 @@ static void round_trip(const std::string& key_type) {
 // naming a key made for this test, the fake over TLS as the venue (its CA trusted for loopback
 // only), the handshake figures, the reads, the order check (a post-only bid at $0.01 placed, read
 // back, cancelled, read back, gone from the resting list) and the dumps. Its output never carries
-// key material, the key id or a signature. A production base, a key file for another environment
-// and a key type that does not match the PEM are each refused before any socket opens.
+// key material, the key id or a signature. A production base, --live, a key file for another
+// environment and a key type that does not match the PEM are each refused before any socket opens.
 static void test_probe_binary() {
   std::string err;
   const std::string pem = new_key_pem("ED25519");
@@ -924,9 +1098,161 @@ static void test_probe_binary() {
     CHECK(std::filesystem::exists(d.file(std::string("kalshi_demo_") + n + ".json")));
   std::printf("probe against the fake: exit %d, %zu bytes of output\n", rc, out.size());
 
+  // --group-check and --feeds-check: the group's life around one bid (created, the bid in it,
+  // triggered: the bid cancelled and a second refused, reset, deleted, each on the socket too),
+  // then the lanes' series and two seconds of pyth_value while the fake relays natural gas
+  std::atomic<bool> relaying{true};
+  std::thread relay([&] {
+    for (int i = 0; relaying; ++i) {
+      v.f->pyth("Commodities.Index.NATGAS/USD", 3.1 + 0.001 * i, now_ms() - 400);
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+  });
+  const std::string more = run(demo_key, "--base " + v.ep().url() + " --handshakes 1 --group-check --order-ticker " + fx::T +
+                                             " --feeds-check --feeds-seconds 2 --lip-series KXNATGAS15M --band-series KXTEST,KXNONE",
+                               &rc);
+  relaying = false;
+  relay.join();
+  CHECK(rc == 0);
+  if (rc != 0) std::fprintf(stderr, "probe output:\n%s\n", more.c_str());
+  auto in = [&](const std::string& s) { return more.find(s) != std::string::npos; };
+  CHECK(in("create group (POST)") && in(", contracts_limit 1 (" + fx::T));
+  CHECK(in("resting, order_group_id as sent"));
+  CHECK(in("the bid after the trigger: canceled"));
+  CHECK(in("outcome REFUSED soft_group (HTTP 400)") && !in("gw expects soft_group"));
+  CHECK(in("order_group_updates for it: created, triggered, reset, deleted (subscribed yes)"));
+  CHECK(in("this check's orders resting: 0"));
+  CHECK(in("M1  KXNATGAS15M        1 open, 0 with a YES bid, 0 with a strike; next " + fx::G));
+  CHECK(in("M2  KXTEST             1 open") && in("M2  KXNONE           none open") && in("M2  1 of 2 series with open markets\n"));
+  CHECK(in("subscribed: pyth_value yes, order_group_updates yes"));
+  {   // --venue-checks (plan section 9's demo checks) against the fake's reading of each shape
+    const std::string vc = run(demo_key, "--base " + v.ep().url() + " --handshakes 1 --venue-checks --order-ticker " + fx::T +
+                                             " --dump " + d.path, &rc);
+    CHECK(rc == 0);
+    if (rc != 0) std::fprintf(stderr, "probe output:\n%s\n", vc.c_str());
+    auto line = [&](const std::string& check, const std::string& verdict, const std::string& seen) {
+      const auto at = vc.find("  " + check + " ");
+      return at != std::string::npos && vc.find(verdict, at) < vc.find('\n', at) && vc.find(seen, at) < vc.find('\n', at);
+    };
+    CHECK(line("duplicate_cid", "OK", "again REFUSED duplicate (HTTP 409)"));
+    CHECK(line("shortest_expiry", "SEEN", "now + 1 s accepted"));   // the fake's lead is 0 (K1)
+    CHECK(line("reduce_only_gtc", "SEEN", "REFUSED hard_invalid (HTTP 400)"));
+    CHECK(line("reduce_only_ioc_flat", "OK", "ACK, filled 0.00"));
+    CHECK(line("post_only_cross", "OK", "-> deskd POST_CROSS"));
+    CHECK(line("self_trade_taker_at_cross", "OK", "the resting bid resting"));
+    CHECK(line("self_trade_maker", "OK", "the resting bid canceled"));
+    CHECK(vc.find("this check's orders resting: 0") != std::string::npos && vc.find("NOT OK") == std::string::npos);
+    CHECK(std::filesystem::exists(d.file("kalshi_demo_venue_checks.json")));
+    // nothing of them rests on the fake
+    CHECK(v.f->with_engine([](fakex::Engine& e, std::int64_t) {
+      int n = 0;
+      for (const auto* o : e.user_orders()) if (o->status == fakex::OrdStatus::RESTING) ++n;
+      return n;
+    }) == 0);
+  }
+  CHECK(in("pyth_value: 1 underlyings,") && in("Commodities.Index.NATGAS/USD"));
+  CHECK(in("KXNATGAS15M      Commodities.Index.NATGAS/USD") && in("KXGOLD15M        not seen"));
+  CHECK(in("\nok\n"));
+  CHECK(!in("BEGIN") && !in("KALSHI-ACCESS") && !in("probe-key") && !in("?"));
+  // the group is gone, and neither bid rests
+  CHECK(v.f->with_engine([](fakex::Engine& e, std::int64_t) {
+    int resting = 0;
+    for (const auto* o : e.user_orders()) resting += o->status == fakex::OrdStatus::RESTING;
+    return e.groups().empty() && resting == 0;
+  }));
+
+  {   // --events-check and --arb-check (S1): today's event of three brackets the venue flags mutually
+      // exclusive, each with a street bid and ask (spreads 3c, 2c and 1c), yesterday's settled one, and
+      // an event whose flag the venue leaves out
+    v.f->with_engine([](fakex::Engine& e, std::int64_t now) {
+      const auto bracket = [&](const std::string& tk, const char* type, std::optional<double> lo, std::optional<double> hi,
+                               fakex::Px bid, fakex::Px spread) {
+        fakex::MarketSpec s = fx::spec(tk, 0);
+        s.strike_type = type;
+        s.floor_strike = lo;
+        s.cap_strike = hi;
+        e.add_market(s, now);
+        e.street_add(tk, false, bid, 1000, now);
+        e.street_add(tk, true, fakex::kDollar - bid - spread, 1000, now);
+      };
+      bracket("KXHIGHTST-26OCT22-T78", "less", std::nullopt, 79, 3000, 200);
+      bracket("KXHIGHTST-26OCT22-B79.5", "between", 79, 80, 4000, 300);
+      bracket("KXHIGHTST-26OCT22-T80", "greater", 80, std::nullopt, 2500, 100);
+      fakex::EventSpec ev;
+      ev.event_ticker = "KXHIGHTST-26OCT22";
+      ev.title = "Highest temperature in Testville?";
+      ev.mutually_exclusive = true;
+      ev.collateral_return_type = "MECNET";
+      e.add_event(ev);
+      bracket("KXHIGHTST-26OCT21-B79.5", "between", 79, 80, 4000, 200);
+      e.settle_market("KXHIGHTST-26OCT21-B79.5", false, now);
+      ev.event_ticker = "KXHIGHTST-26OCT21";
+      ev.collateral_return_type.clear();
+      e.add_event(ev);
+      bracket("KXFLAG-26OCT22-A", "", std::nullopt, std::nullopt, 4000, 100);
+      bracket("KXFLAG-26OCT22-B", "", std::nullopt, std::nullopt, 5000, 100);
+      fakex::EventSpec unflagged;
+      unflagged.event_ticker = "KXFLAG-26OCT22";
+      e.add_event(unflagged);
+    });
+    const std::string ev = run(demo_key, "--base " + v.ep().url() + " --handshakes 1 --events-check --arb-check --arb-series KXHIGHTST" +
+                                             " --dump " + d.path, &rc);
+    CHECK(rc == 0);
+    if (rc != 0) std::fprintf(stderr, "probe output:\n%s\n", ev.c_str());
+    auto in_ev = [&](const std::string& s) { return ev.find(s) != std::string::npos; };
+    auto line = [&](const std::string& check, const std::string& verdict, const std::string& seen) {
+      const auto at = ev.find("  " + check + " ");
+      return at != std::string::npos && ev.find(verdict, at) < ev.find('\n', at) && ev.find(seen, at) < ev.find('\n', at);
+    };
+    // the events check: today's (nested only, as the fake sends it) and yesterday's settled one
+    CHECK(in_ev("mutually_exclusive true, collateral_return_type MECNET, 3 markets nested (3 naming the event), 0 beside"));
+    CHECK(in_ev("read by parse_event: 3 active; deskd's shape: exclusive, exhaustive on steps of 1, 3 states\n"));
+    CHECK(in_ev("    read and parsed: 2 of 2 events (2 read)\n") && in_ev("    mutually_exclusive present: 2 of 2\n"));
+    CHECK(in_ev("    collateral_return_type: MECNET\n") && in_ev("fills the markets beside the event too: 0 of 2\n"));
+    CHECK(in_ev("    without it: 3 markets beside the event, 0 in it (KXHIGHTST-26OCT22); parse_event reads it\n"));
+    CHECK(in_ev("    nested markets naming their event: 4 of 4\n") && in_ev("    a settled event's markets: listed (1 settled)\n"));
+    // the arb check: NO on the two narrowest (T80, then T78), the fake holding each leg's cost
+    CHECK(in_ev("create (NO leg 1, IOC sell at 0.2500)") && in_ev("create (NO leg 2, IOC sell at 0.3000)"));
+    CHECK(line("collateral_netting", "SEEN", "the legs cost $1.4779 with fees and the cash fell $1.4779: not netted"));
+    CHECK(in_ev("create (buy back 1, IOC reduce_only at 0.2600)") && in_ev("create (buy back 2, IOC reduce_only at 0.3200)"));
+    CHECK(line("bought_back", "OK", "flat in both; the round trip cost $0.0867 of play money"));
+    CHECK(line("ioc_201", "OK", "4 IOCs: each 201's fill_count is its order's"));
+    CHECK(line("fee_precision", "SEEN", "$0.0001 (direct member): 4 fills at multiplier 1"));   // the fake's precision
+    CHECK(in_ev("\nok\n") && !in_ev("NOT OK") && !in_ev("probe-key"));
+    for (const char* n : {"event_KXHIGHTST-26OCT22", "event_KXHIGHTST-26OCT21", "event_KXHIGHTST-26OCT22_beside",
+                          "events_check", "arb_check", "arb_positions"})
+      CHECK(std::filesystem::exists(d.file(std::string("kalshi_demo_") + n + ".json")));
+    // four IOCs of 1 contract, Systematic's self-trade setting, the last two reduce_only; flat after
+    CHECK(v.f->with_engine([](fakex::Engine& e, std::int64_t) {
+      int n = 0;
+      for (const auto* o : e.user_orders())
+        if (o->client_order_id.rfind("P-arb-", 0) == 0)
+          n += o->tif == fakex::Tif::IOC && o->initial == 100 && o->stp == fakex::Stp::TAKER_AT_CROSS &&
+               o->reduce_only == (o->side == fakex::Side::BID);
+      for (const auto& [k, p] : e.positions())
+        if (k.second.rfind("KXHIGHTST-", 0) == 0 && p.pos != 0) return -1;
+      return n;
+    }) == 4);
+    // an event without the flag: read and parsed (its flag unknown), and no leg is sent in it
+    const std::size_t orders_before = v.orders();
+    const std::string nf = run(demo_key, "--base " + v.ep().url() + " --handshakes 1 --events-check --arb-check --event KXFLAG-26OCT22", &rc);
+    CHECK(rc == 1 && nf.find("mutually_exclusive ABSENT, collateral_return_type absent, 2 markets nested") != std::string::npos);
+    CHECK(nf.find("deskd's shape: none: ") != std::string::npos);
+    CHECK(nf.find("not measured: no event fits (the last tried: KXFLAG-26OCT22 is not flagged mutually exclusive)") !=
+          std::string::npos);
+    CHECK(v.orders() == orders_before);
+  }
+
   // a production base: the guard refuses it before any socket, exit 2, no handshake section
   const std::string prod = run(demo_key, "--base https://api.elections.kalshi.com/trade-api/v2 --handshakes 1", &rc);
   CHECK(rc == 2 && prod.find("is a production host") != std::string::npos && prod.find("handshakes (") == std::string::npos);
+  // the arb check too; and --live is refused before the key file is read or anything connects
+  const std::string prod_arb = run(demo_key, "--base https://api.elections.kalshi.com/trade-api/v2 --arb-check", &rc);
+  CHECK(rc == 2 && prod_arb.find("is a production host") != std::string::npos && prod_arb.find("arb check (") == std::string::npos);
+  const auto accepted = v.f->connections_accepted();
+  const std::string live = run(demo_key, "--base " + v.ep().url() + " --arb-check --live", &rc);
+  CHECK(rc == 2 && live.find("--live is refused") != std::string::npos && live.find("key: ") == std::string::npos);
+  CHECK(v.f->connections_accepted() == accepted);
   // a key file for another environment, and a key type that does not match the PEM
   const std::string wrong_env = run(key_file("prod.json", "prod", "ed25519"), "--base " + v.ep().url(), &rc);
   CHECK(rc == 2 && wrong_env.find("only ever touches the demo exchange") != std::string::npos);
@@ -935,14 +1261,38 @@ static void test_probe_binary() {
   CHECK(v.f->connections_accepted() > 0);   // the first run connected; the three refusals added nothing
 }
 
+// Plan sections 2-3 (docs/invariants.md S2-25, S3-36): the venue refusing for the moment (cash on
+// that shard, a self-trade, a post-only cross, a closed market, a triggered group) is soft and
+// never trips KILL; one that says the desk is wrong (bad request, auth, unknown) does.
+static void test_soft_refusals() {
+  const std::pair<int, const char*> soft[] = {
+      {400, "insufficient_balance: not enough cash on this shard"}, {400, "Insufficient funds"},
+      {400, "self-trade prevention: this order would match your own order"}, {409, "post only cross"},
+      {400, "market_closed"}, {400, "trading is paused"},
+      {400, "exceeded_order_group_contracts_limit"}};
+  for (const auto& [status, text] : soft) {
+    const auto c = classify_refusal(WireOp::CREATE, status, text);
+    if (!reject_is_soft(c) || reject_trips_kill(c)) std::fprintf(stderr, "  not soft: %d %s\n", status, text);
+    CHECK(reject_is_soft(c) && !reject_trips_kill(c));
+  }
+  CHECK(classify_refusal(WireOp::CREATE, 400, "insufficient_balance") == RejectClass::SOFT_COLLATERAL);
+  CHECK(classify_refusal(WireOp::CREATE, 400, "self_trade") == RejectClass::SOFT_SELF_TRADE);
+  CHECK(reject_trips_kill(classify_refusal(WireOp::CREATE, 400, "invalid_parameters: count")));
+  CHECK(reject_trips_kill(classify_refusal(WireOp::CREATE, 401, "")));
+  CHECK(reject_trips_kill(classify_refusal(WireOp::CREATE, 500, "something new")));
+  CHECK(!reject_trips_kill(classify_refusal(WireOp::CREATE, 429, "too many requests")));
+}
+
 int main() {
   ::signal(SIGPIPE, SIG_IGN);
   CHECK(fx::pki().ok);
+  test_soft_refusals();
   test_signer();
   test_values();
   test_builders();
   test_parsers();
   test_demo_shapes();
+  test_events();
   test_classify();
   round_trip("ed25519");
   round_trip("rsa");

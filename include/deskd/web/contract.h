@@ -1,5 +1,5 @@
 #pragma once
-// JSON in the shapes of ui/desk/js/contract.js (version 1.5.0), the single statement of what
+// JSON in the shapes of ui/desk/js/contract.js (version 1.6.0), the single statement of what
 // deskd serves the screen. "If the backend and this file disagree, this file wins": the tests
 // run contract.js's own validator over what these builders produce (tests/deskd/contract_check.cjs).
 //
@@ -22,7 +22,7 @@
 
 namespace deskd {
 
-constexpr const char* kContractVersion = "1.5.0";
+constexpr const char* kContractVersion = "1.6.0";
 // grev of the empty universe deskd lists until gw has markets (contract 1.5: a short id that
 // changes whenever a group or a count changes; nothing changes while there is nothing)
 constexpr const char* kEmptyUniverseGrev = "0";
@@ -43,6 +43,7 @@ nlohmann::json subs_json(const Subs& s);
 // to 02:00 on the first Sunday of November), worked out here rather than through TZ and
 // localtime_r, which read process-wide state another thread may change.
 std::string et_date(std::int64_t wall_ms);
+std::int64_t et_midnight_ms(std::int64_t wall_ms);   // the start of wall_ms's ET day, epoch ms
 std::string et_date_after(const std::string& date);   // "2026-10-31" -> "2026-11-01"
 
 // hb.data: {epoch, sid, srv_ms, date, feeds}
@@ -59,6 +60,16 @@ struct HdrInputs {
   // Unknown account data stays read-only; known data is an exact cash.K contract object.
   nlohmann::json cash_k;
   std::optional<std::int64_t> kx_lag_ms, clk_off_ms, gw_ack_ms;
+  // Manual's day (realized today, net of fees, plus open positions at the mid) and the open
+  // worst case plus working reservations; zero when unknown. No Systematic or LIP yet.
+  Money day_man = 0, risk = 0;
+  // Systematic's part (gw's lanes), when Systematic is attached: its day (in day_man's total, so
+  // day.man = the account's day - day.sys), its fees today and cost budget, and hdr.sys.K.
+  struct Sys {
+    Money day = 0, fees = 0, budget = 0, used = 0, ceiling = 0, eff = 0;
+    Money lip = 0;   // Systematic's LIP estimate today: day.lip, never in day.sys or the stop
+  };
+  std::optional<Sys> sys;
 };
 nlohmann::json hdr_json(const HdrInputs& in);
 
@@ -87,5 +98,7 @@ std::vector<std::string> check_request(const std::string& key, const nlohmann::j
 // GET /api/universe's query, as contract.js's parseQuery and validateQuery see it: offset and
 // limit are numbers when they are all digits, every other value a string.
 std::vector<std::string> check_universe_query(const nlohmann::json& q);
+// GET /api/fill's query (contract 1.6), as contract.js validateQuery checks it
+std::vector<std::string> check_fill_query(const nlohmann::json& q);
 
 }  // namespace deskd

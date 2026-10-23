@@ -1,0 +1,34 @@
+#!/bin/sh
+# Plan section 9's Kalshi demo checks in one run, on the demo account (play money) only:
+# kalshi-demo-probe's order check, order-group check, venue checks (duplicate client_order_id,
+# shortest expiry, reduce_only, post-only at the ask, self-trade both ways), feeds check, and S1's
+# two (plan 5(c)): the events check (GET /events as deskd reads it: the mutually_exclusive flag,
+# collateral_return_type, nested markets; read only) and the arb check (1 contract of NO on two
+# markets of one mutually exclusive event, the cash before and after, both bought back: does the
+# venue net the pair's collateral, does each IOC's 201 match its order, and which precision the
+# fees round to). The probe refuses a production host, --live, and a key file whose env is not
+# demo before anything connects.
+#
+#   tools/demo_checks                      # ~/.kalshi/demo.json
+#   tools/demo_checks --key FILE --order-ticker T
+#   tools/demo_checks --arb-series KXHIGHNY,KXHIGHCHI   # or --event T: where the S1 checks look
+#
+# The venue's raw replies, the checks' reports (kalshi_demo_venue_checks.json,
+# kalshi_demo_events_check.json, kalshi_demo_arb_check.json) and the printout go to
+# demo-checks/<UTC time>/. Look the replies over for account ids before committing any as a
+# fixture (an event body replaces tests/deskd/fixtures/kalshi_event_docs.json). Exit 0 when every
+# check is OK. The operator runs this on the Mac; agents never do.
+set -u
+root=$(cd "$(dirname "$0")/.." && pwd)
+probe="$root/build-deskd/kalshi-demo-probe"
+if [ ! -x "$probe" ]; then
+  echo "demo_checks: no $probe; build it: cmake -S . -B build-deskd -G Ninja && ninja -C build-deskd kalshi-demo-probe" >&2
+  exit 2
+fi
+out="$root/demo-checks/$(date -u +%Y%m%dT%H%M%SZ)"
+mkdir -p "$out"
+{ "$probe" --handshakes 2 --order-check --group-check --venue-checks --feeds-check --events-check --arb-check --dump "$out" "$@"
+  echo $? > "$out/exit"; } 2>&1 | tee "$out/probe.txt"
+rc=$(cat "$out/exit" 2>/dev/null || echo 1)
+echo "demo_checks: exit $rc; replies and reports in $out"
+exit "$rc"

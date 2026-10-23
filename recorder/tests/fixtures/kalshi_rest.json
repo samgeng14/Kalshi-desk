@@ -1,0 +1,35 @@
+{
+ "_provenance": "Kalshi REST replies in the shapes the fake exchange serves (tests/fake_exchange/rest.cpp) and the demo sent (tests/deskd/fixtures/kalshi_demo_markets.json), plus the older cents shapes the recorder still reads. Hand-built.",
+ "orderbook_fp": {"orderbook_fp": {"yes_dollars": [["0.3000", "5.00"], ["0.4100", "12.00"]],
+                                   "no_dollars": [["0.5000", "3.00"], ["0.5500", "7.00"]]}},
+ "orderbook_cents": {"orderbook": {"yes": [[41, 12], [30, 5]], "no": [[55, 7]]}},
+ "orderbook_one_side": {"orderbook_fp": {"yes_dollars": [["0.0100", "480.00"]], "no_dollars": null}},
+ "orderbook_empty": {"orderbook_fp": {}},
+ "markets_top": {"cursor": "", "markets": [
+   {"ticker": "KXNCAAWBGAME-26NOV05UCONNSC-UCONN", "event_ticker": "KXNCAAWBGAME-26NOV05UCONNSC", "status": "active",
+    "yes_bid_dollars": "0.4100", "yes_bid_size_fp": "12.00", "yes_ask_dollars": "0.4500", "yes_ask_size_fp": "7.00",
+    "last_price_dollars": "0.4300", "volume_fp": "1520.00", "rules_primary": "If UConn wins ..."},
+   {"ticker": "KXNCAAWBGAME-26NOV05UCONNSC-SC", "event_ticker": "KXNCAAWBGAME-26NOV05UCONNSC", "status": "active",
+    "yes_bid": 55, "yes_ask": 59, "last_price": 57, "volume": 1490},
+   {"ticker": "NOT-ON-THE-LIST", "status": "active", "yes_bid_dollars": "0.1000"}]},
+ "trades_p1": {"cursor": "t2", "trades": [
+   {"trade_id": "a1", "ticker": "KXNCAAWBGAME-26NOV05UCONNSC-UCONN", "count_fp": "2.00", "yes_price_dollars": "0.4500",
+    "no_price_dollars": "0.5500", "taker_side": "yes", "created_time": "2026-11-05T23:41:02.123Z"},
+   {"trade_id": "a2", "ticker": "KXNCAAWBGAME-26NOV05UCONNSC-UCONN", "count": 5, "yes_price": 44, "taker_side": "no",
+    "created_time": "2026-11-05T23:40:01Z"}]},
+ "trades_p2": {"cursor": "", "trades": [
+   {"trade_id": "a1", "ticker": "KXNCAAWBGAME-26NOV05UCONNSC-UCONN", "count_fp": "2.00", "yes_price_dollars": "0.4500",
+    "no_price_dollars": "0.5500", "taker_side": "yes", "created_time": "2026-11-05T23:41:02.123Z"},
+   {"trade_id": "a3", "ticker": "KXNCAAWBGAME-26NOV05UCONNSC-UCONN", "count_fp": "1.00", "yes_price_dollars": "0.4300",
+    "taker_side": "yes", "created_time": "2026-11-05T23:39:00Z"}]},
+ "incentives_p1": {"next_cursor": "i2", "incentive_programs": [
+   {"market_ticker": "KXNATGAS15M-26NOV051500-00", "incentive_type": "liquidity", "period_reward": 200000,
+    "target_size_fp": "300.00", "discount_factor_bps": 5000, "start_date": "2026-11-05T00:00:00Z",
+    "end_date": "2027-01-01T00:00:00Z", "paid_out": false},
+   {"market_ticker": "KXBTCPERP", "incentive_type": "margin_taker_volume", "period_reward": 50000,
+    "start_date": "2026-11-01T00:00:00Z", "end_date": "2026-12-01T00:00:00Z", "paid_out": false}]},
+ "incentives_p2": {"next_cursor": "", "incentive_programs": [
+   {"market_ticker": "KXHIGHNY-26NOV05-B60", "incentive_type": "volume", "period_reward": 10000,
+    "target_size": 100, "start_date": "2026-11-05T00:00:00Z", "end_date": "2026-11-06T00:00:00Z", "paid_out": true},
+   {"market_ticker": "KXETHPERP", "incentive_type": "margin_maker_volume", "period_reward": 1}]}
+}

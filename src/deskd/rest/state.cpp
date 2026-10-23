@@ -87,18 +87,22 @@ std::optional<std::int64_t> http_date_ms(const std::string& date) {
   return static_cast<std::int64_t>(::timegm(&tm)) * 1000;
 }
 
-json universe_row(const kalshi::MarketRow& m, const Snapshot& state) {
+json universe_row(const kalshi::MarketRow& m, const Snapshot& state, const FairOf& fair_of) {
   // Kalshi uses 0/1 for absent sides on some listings; a zero-sized side is absent as well.
   auto bid = m.yes_bid, ask = m.yes_ask;
   if (bid && (*bid <= 0 || (m.yes_bid_size && *m.yes_bid_size == 0))) bid.reset();
   if (ask && (*ask >= 10000 || (m.yes_ask_size && *m.yes_ask_size == 0))) ask.reset();
-  const auto spread = bid && ask && *ask >= *bid ? std::optional<Px>(*ask - *bid) : std::nullopt;
+  json spread = nullptr;   // not an optional: GCC 13 warns that one may be read uninitialized
+  if (bid && ask && *ask >= *bid) spread = kalshi::price_wire(*ask - *bid);
+  const auto fair = fair_of ? fair_of(m.ticker) : std::nullopt;
+  const auto edge = fair ? take_edge(m, bid, ask, *fair) : std::nullopt;
   return {{"v", "K"}, {"tk", m.ticker}, {"ev", event(m)}, {"title", m.title.empty() ? m.ticker : m.title},
           {"short", label(m)}, {"cat", category(m)}, {"grp", group(m)}, {"gk", group(m)}, {"kind", kind(m)},
           {"date", outcome_date(m)}, {"close_ms", effective_close(m)}, {"bid", optional_px(bid)},
-          {"ask", optional_px(ask)}, {"sprd", optional_px(spread)},
+          {"ask", optional_px(ask)}, {"sprd", spread},
           {"vol", static_cast<double>(m.volume_24h.value_or(0)) / 100.0}, {"fee", fee(m)},
-          {"fair", nullptr}, {"edge", nullptr}, {"pin", state.pins.count(m.ticker) != 0},
+          {"fair", fair ? json(price_str(*fair)) : json(nullptr)},
+          {"edge", edge ? json(money_str(*edge)) : json(nullptr)}, {"pin", state.pins.count(m.ticker) != 0},
           {"live", state.live.count(m.ticker) != 0}};
 }
 }  // namespace
@@ -153,12 +157,21 @@ State::State(net::ConnFactory& factory, net::Endpoint endpoint, const KalshiSign
   options_.timeout_ms = std::max(100, options_.timeout_ms);
   options_.page_size = std::clamp(options_.page_size, 1, 1000);
   options_.max_pages = std::clamp(options_.max_pages, 1, 1000);
+  options_.event_reads = std::max(1, options_.event_reads);
 }
 
 std::shared_ptr<const Snapshot> State::snapshot() const { return std::atomic_load(&published_); }
 void State::request_refresh() { refresh_requested_.store(true); }
 void State::set_pins(std::set<std::string> pins) { controls(true, std::move(pins)); }
 void State::set_live(std::set<std::string> live) { controls(false, std::move(live)); }
+void State::set_held(std::set<std::string> held) {
+  std::lock_guard<std::mutex> lock(controls_mu_);
+  held_ = std::move(held);
+}
+void State::set_events(std::set<std::string> event_tickers) {
+  std::lock_guard<std::mutex> lock(controls_mu_);
+  events_ = std::move(event_tickers);
+}
 
 void State::controls(bool pins, std::set<std::string> values) {
   std::shared_ptr<const Snapshot> result;
@@ -197,33 +210,62 @@ void State::publish(Snapshot next) {
   if (callback_) callback_(result);
 }
 
-bool State::get(kalshi::WireRequest request, std::string* body, std::string* why, Worker* worker) {
+namespace {
+// sleeps ms in short slices, beating, and gives up early when the worker stops
+bool rest_wait(Worker* worker, std::int64_t ms) {
+  const auto until = mono_ms() + ms;
+  while (mono_ms() < until) {
+    if (worker) { worker->beat(); if (worker->stopping()) return false; }
+    std::this_thread::sleep_for(std::chrono::milliseconds(std::min<std::int64_t>(50, std::max<std::int64_t>(1, until - mono_ms()))));
+  }
+  return true;
+}
+}  // namespace
+
+bool State::get(kalshi::WireRequest request, std::string* body, std::string* why, Worker* worker, int timeout_ms) {
+  if (timeout_ms <= 0) timeout_ms = options_.timeout_ms;
   if (worker && worker->stopping()) { *why = "REST worker stopping"; return false; }
   if (request.auth && !signer_) { *why = "demo signing key not loaded"; return false; }
   if (starts(request.path, kalshi::kBasePath)) request.path.replace(0, std::string(kalshi::kBasePath).size(), endpoint_.base_path);
-  if (!conn_ || !conn_->usable()) {
-    conn_ = factory_.open(endpoint_, options_.timeout_ms, why);
-    if (!conn_) return false;
+  for (int attempt = 0;; ++attempt) {
+    // at most one request every request_gap_ms from this owner (Kalshi's read rate limit)
+    if (last_request_mono_ && options_.request_gap_ms > 0 &&
+        !rest_wait(worker, last_request_mono_ + options_.request_gap_ms - mono_ms())) {
+      *why = "REST worker stopping"; return false;
+    }
+    if (!conn_ || !conn_->usable()) {
+      conn_ = factory_.open(endpoint_, timeout_ms, why);
+      if (!conn_) return false;
+    }
+    const auto auth = request.auth ? signer_->headers(now_ms(), request.method, request.path) : net::HeaderList{};
+    if (request.auth && auth.size() != 3) { *why = "request signing failed"; return false; }
+    const auto bytes = kalshi::request_bytes(request, endpoint_.host_header(), auth);
+    const auto sent = now_ms(), mono = mono_ms();
+    last_request_mono_ = mono;
+    const auto reply = net::exchange(*conn_, bytes, net::mono_us() + timeout_ms * 1000LL, false,
+                                   [worker] { if (worker) worker->beat(); });
+    const auto received = now_ms();
+    if (!reply.reusable) conn_.reset();
+    if (worker) worker->beat();
+    if (reply.fate != net::Exchange::Fate::REPLIED) { *why = request.path + ": " + reply.why; return false; }
+    // Cached replies' Date is the origin generation time, not a measurement of this round trip.
+    if (reply.res.header("age").empty() || reply.res.header("age") == "0")
+      clock_.observe(reply.res.header("date"), sent, received, mono_ms() - mono);
+    if (reply.res.status == 429 && attempt < options_.retries_429) {
+      std::int64_t wait = std::min<std::int64_t>(8000, static_cast<std::int64_t>(options_.backoff_429_ms) << attempt);
+      const auto after = reply.res.header("retry-after");
+      if (!after.empty() && after.size() < 4 && std::all_of(after.begin(), after.end(), ::isdigit))
+        wait = std::max<std::int64_t>(wait, std::min<std::int64_t>(10000, std::stoll(after) * 1000));
+      if (!rest_wait(worker, wait)) { *why = "REST worker stopping"; return false; }
+      continue;
+    }
+    if (reply.res.status != 200) {
+      *why = request.path + ": HTTP " + std::to_string(reply.res.status);
+      return false;  // no response bodies/headers in logs: they can contain account identifiers
+    }
+    *body = reply.res.body;
+    return true;
   }
-  const auto auth = request.auth ? signer_->headers(now_ms(), request.method, request.path) : net::HeaderList{};
-  if (request.auth && auth.size() != 3) { *why = "request signing failed"; return false; }
-  const auto bytes = kalshi::request_bytes(request, endpoint_.host_header(), auth);
-  const auto sent = now_ms(), mono = mono_ms();
-  const auto reply = net::exchange(*conn_, bytes, net::mono_us() + options_.timeout_ms * 1000LL, false,
-                                 [worker] { if (worker) worker->beat(); });
-  const auto received = now_ms();
-  if (!reply.reusable) conn_.reset();
-  if (worker) worker->beat();
-  if (reply.fate != net::Exchange::Fate::REPLIED) { *why = request.path + ": " + reply.why; return false; }
-  // Cached replies' Date is the origin generation time, not a measurement of this round trip.
-  if (reply.res.header("age").empty() || reply.res.header("age") == "0")
-    clock_.observe(reply.res.header("date"), sent, received, mono_ms() - mono);
-  if (reply.res.status != 200) {
-    *why = request.path + ": HTTP " + std::to_string(reply.res.status);
-    return false;  // no response bodies/headers in logs: they can contain account identifiers
-  }
-  *body = reply.res.body;
-  return true;
 }
 
 bool State::account(Snapshot& next, std::string* why, Worker* worker) {
@@ -244,6 +286,15 @@ bool State::account(Snapshot& next, std::string* why, Worker* worker) {
   std::vector<kalshi::PositionRow> positions;
   if (!pages(&positions, [&](const std::string& cursor) { q.cursor = cursor; return kalshi::build_get_positions(q); },
              kalshi::parse_positions, fetch, options_.max_pages, why)) return false;
+  // The day's history: whole on the first read, then only what is new since the last good one
+  // (Options::incremental_overlap_ms says why).
+  const std::int64_t since = orders_since_ms_ > 0 ? std::min(orders_since_ms_, started_ms_ - 5000) : started_ms_ - 5000;
+  const std::int64_t orders_from = std::max(since, et_midnight_ms(now_ms()) - 86400000);
+  // Fills since the earlier of this start and today's ET midnight: the day's P&L is built from them.
+  const std::int64_t fills_from = std::min(started_ms_ - 5000, et_midnight_ms(now_ms()));
+  bool whole = whole_read_next_ || !next.account_ready || next.account_began_ms <= 0 ||
+               next.orders_from_ms != orders_from || next.fills_from_ms != fills_from;
+  const std::int64_t delta_from = next.account_began_ms - options_.incremental_overlap_ms;
   q = kalshi::ListQuery{};
   q.limit = options_.page_size;
   q.status = "resting";
@@ -251,18 +302,46 @@ bool State::account(Snapshot& next, std::string* why, Worker* worker) {
   auto orders_builder = [&](const std::string& cursor) { q.cursor = cursor; return kalshi::build_get_orders(q); };
   if (!pages(&orders, orders_builder, kalshi::parse_orders, fetch, options_.max_pages, why)) return false;
   q.status.clear();
-  q.min_ts = (started_ms_ - 5000) / 1000;
+  q.min_ts = (whole ? orders_from : std::max(orders_from, delta_from)) / 1000;
   if (!pages(&recent, orders_builder, kalshi::parse_orders, fetch, options_.max_pages, why)) return false;
+  // an order resting at the last read that neither list has now left the book before the overlap
+  std::set<std::string> fresh;
+  for (const auto& row : orders) fresh.insert(row.order_id);
+  for (const auto& row : recent) fresh.insert(row.order_id);
+  std::vector<std::string> gone;
+  if (!whole)
+    for (const auto& row : next.orders)
+      if (row.status == kalshi::OrderStatus::RESTING && !fresh.count(row.order_id)) gone.push_back(row.order_id);
+  if (!whole && static_cast<int>(gone.size()) > options_.incremental_max_gone) {
+    whole = true;
+    gone.clear();
+    recent.clear();
+    q.min_ts = orders_from / 1000;
+    if (!pages(&recent, orders_builder, kalshi::parse_orders, fetch, options_.max_pages, why)) return false;
+  }
   std::map<std::string, kalshi::OrderRow> unique_orders;
+  if (!whole) for (const auto& row : next.orders) unique_orders[row.order_id] = row;
   for (auto& row : orders) unique_orders[row.order_id] = std::move(row);
   for (auto& row : recent) unique_orders[row.order_id] = std::move(row);
+  for (const auto& id : gone) {
+    // a failure here reads the whole day next time, which needs no order by id
+    whole_read_next_ = true;
+    if (!fetch(kalshi::build_get_order(id), &body, why)) return false;
+    auto row = kalshi::parse_order(body, why);
+    if (!row) return false;
+    if (row->order_id != id) { *why = "GET order " + id + " answered another order"; return false; }
+    unique_orders[id] = std::move(*row);
+  }
   orders.clear();
   for (auto& entry : unique_orders) orders.push_back(std::move(entry.second));
   std::vector<kalshi::FillRow> fills;
+  q.min_ts = (whole ? fills_from : std::max(fills_from, delta_from)) / 1000;
   if (!pages(&fills, [&](const std::string& cursor) { q.cursor = cursor; return kalshi::build_get_fills(q); },
              kalshi::parse_fills, fetch, options_.max_pages, why)) return false;
+  auto fill_key = [](const kalshi::FillRow& row) { return row.trade_id.empty() ? row.fill_id : row.trade_id; };
   std::map<std::string, kalshi::FillRow> unique_fills;
-  for (auto& row : fills) unique_fills[row.trade_id.empty() ? row.fill_id : row.trade_id] = std::move(row);
+  if (!whole) for (const auto& row : next.fills) unique_fills[fill_key(row)] = row;
+  for (auto& row : fills) unique_fills[fill_key(row)] = std::move(row);
   fills.clear();
   for (auto& entry : unique_fills) fills.push_back(std::move(entry.second));
   std::set<int> shards{0};
@@ -283,28 +362,50 @@ bool State::account(Snapshot& next, std::string* why, Worker* worker) {
   next.positions = std::move(positions);
   next.orders = std::move(orders);
   next.fills = std::move(fills);
+  next.orders_from_ms = orders_from;
+  next.fills_from_ms = fills_from;
   next.account_ready = true;
   next.account_ms = now_ms();
+  whole_read_next_ = false;
   return true;
 }
 
 bool State::listing(Snapshot& next, std::string* why, Worker* worker) {
+  const int deadline = std::max(options_.timeout_ms, options_.listing_timeout_ms);
   auto fetch = [&](kalshi::WireRequest request, std::string* body, std::string* error) {
-    return get(std::move(request), body, error, worker);
+    return get(std::move(request), body, error, worker, deadline);
   };
   kalshi::MarketsQuery q;
-  q.limit = options_.page_size;
+  q.limit = std::max(1, std::min(options_.page_size, options_.listing_page_size));
   q.status = "open";
   q.max_close_ts = (now_ms() + std::max(2, options_.listing_horizon_days) * kDay) / 1000;
+  // Multivariate combo markets (KXMVE...) are most of an open listing and not traded here; a
+  // position or order in one is still fetched by ticker below.
+  q.mve_filter = mve_filter_refused_ ? "" : "exclude";
   std::vector<kalshi::MarketRow> markets;
-  if (!pages(&markets, [&](const std::string& cursor) { q.cursor = cursor; return kalshi::build_get_markets(q); },
-             kalshi::parse_markets, fetch, options_.max_pages, why)) return false;
+  auto list = [&] {
+    markets.clear();
+    return pages(&markets, [&](const std::string& cursor) { q.cursor = cursor; return kalshi::build_get_markets(q); },
+                 kalshi::parse_markets, fetch, options_.max_pages, why);
+  };
+  if (!list()) {
+    if (mve_filter_refused_ || why->find(": HTTP 400") == std::string::npos) return false;
+    mve_filter_refused_ = true;   // the venue refused the combination: list everything instead
+    DLOG_WARN("Kalshi refused mve_filter=exclude on the market listing; listing without it");
+    q.mve_filter.clear();
+    q.cursor.clear();
+    if (!list()) return false;
+  }
   std::map<std::string, kalshi::MarketRow> rows;
   for (auto& market : markets) rows[market.ticker] = std::move(market);
   // A position/order can outlive the public OPEN listing. Fetch its actual status rather than
   // dropping it (or guessing settled from the wall clock). Include old live markets for the
   // contract's final live=false/closed transition and its 30-minute retention rule.
-  std::set<std::string> needed = snapshot()->live;
+  std::set<std::string> needed = snapshot()->live, held;
+  {
+    std::lock_guard<std::mutex> lock(controls_mu_);
+    held = held_;
+  }
   for (const auto& p : next.positions) if (p.position) needed.insert(p.ticker);
   for (const auto& o : next.orders) if (o.status == kalshi::OrderStatus::RESTING && o.remaining) needed.insert(o.ticker);
   for (const auto& ticker : needed) if (!rows.count(ticker)) {
@@ -313,6 +414,12 @@ bool State::listing(Snapshot& next, std::string* why, Worker* worker) {
     auto market = kalshi::parse_market(body, why);
     if (!market) return false;
     rows[ticker] = std::move(*market);
+  }
+  // Systematic's held markets: one that cannot be read now costs only its own row this poll
+  for (const auto& ticker : held) if (!rows.count(ticker)) {
+    std::string body, miss;
+    if (!fetch(kalshi::build_get_market(ticker), &body, &miss)) continue;
+    if (auto market = kalshi::parse_market(body, &miss)) rows[ticker] = std::move(*market);
   }
   next.markets = std::move(rows);
   next.listing_ready = true;
@@ -334,8 +441,10 @@ void State::metadata(Snapshot& next,Worker* worker) {
   std::vector<std::string> due;
   for(const auto& name:names) {
     const auto it=series_.find(name);
+    // Fetched again a minute before it goes stale: refetching only once stale left every order
+    // on the market refused RO until the next poll (12 s), every five minutes (soak, 2026-10-10).
     if(it==series_.end() || !it->second.fetched_ms || now_ms()<it->second.fetched_ms ||
-       now_ms()-it->second.fetched_ms>=kFeeFreshMs) due.push_back(name);
+       now_ms()-it->second.fetched_ms>=kFeeRefreshMs) due.push_back(name);
   }
   std::sort(due.begin(),due.end(),[&](const auto& a,const auto& b) {
     const auto ia=series_.find(a),ib=series_.find(b);
@@ -377,18 +486,42 @@ bool State::refresh(Worker* worker) {
   Snapshot next = *snapshot();
   next.error.clear();
   std::string why;
-  if (!account(next, &why, worker)) { next.account_ready = false; next.error = "account: " + why; }
+  const std::int64_t account_began = now_ms();
+  // account() and listing() change next only once every page is in: a failure leaves the last read.
+  auto young = [](std::int64_t at, int keep_ms) { return at > 0 && now_ms() >= at && now_ms() - at <= keep_ms; };
+  if (!account(next, &why, worker)) {
+    next.account_ready = next.account_ready && young(next.account_ms, options_.account_keep_ms);
+    next.error = "account: " + why;
+  } else next.account_began_ms = account_began;
   if (!next.listing_ready || mono_ms() - last_listing_mono_ >= options_.listing_poll_ms) {
     if (!listing(next, &why, worker)) {
-      next.listing_ready = false;
+      next.listing_ready = next.listing_ready && young(next.listing_ms, options_.listing_keep_ms);
       if (!next.error.empty()) next.error += "; ";
       next.error += "listing: " + why;
     }
   }
   metadata(next,worker);
+  events(next, worker);
+  incentives(next, worker);
   next.ts_ms = now_ms();
   if (next.account_ready && commit_ && !commit_(fence)) {
-    next.account_ready = false;
+    // These pages may straddle a private event, so they never become the account. The last
+    // consistent read stays (ready if it was): gw counts every order of its own that a read
+    // cannot reflect at worst case, and a private feed that is down or unreconciled blocks
+    // orders by itself. Marking the account not ready here instead refused clicks for a poll
+    // after every fill or cancel during active trading.
+    const auto prev = snapshot();
+    next.exchange = prev->exchange;
+    next.balance = prev->balance;
+    next.balances = prev->balances;
+    next.positions = prev->positions;
+    next.orders = prev->orders;
+    next.fills = prev->fills;
+    next.orders_from_ms = prev->orders_from_ms;
+    next.fills_from_ms = prev->fills_from_ms;
+    next.account_ready = prev->account_ready;
+    next.account_ms = prev->account_ms;
+    next.account_began_ms = prev->account_began_ms;
     if (!next.error.empty()) next.error += "; ";
     next.error += "private feed changed during account read; reconciling again";
     if (fence) request_refresh(); // a disconnected socket requests a refresh after subscribing
@@ -398,6 +531,172 @@ bool State::refresh(Worker* worker) {
   const bool ready = next.ready;
   publish(std::move(next));
   return ready;
+}
+
+void State::incentives(Snapshot& next, Worker* worker) {
+  if (options_.lip_series.empty() || (last_lip_mono_ && mono_ms() - last_lip_mono_ < options_.lip_poll_ms)) return;
+  last_lip_mono_ = mono_ms();
+  const std::int64_t now = now_ms();
+  std::map<std::string, kalshi::IncentiveRow> lip;
+  std::string cursor, why, body;
+  for (int page = 0; page < options_.lip_max_pages; ++page) {
+    if (!get(kalshi::build_get_incentive_programs("active", cursor, 1000), &body, &why, worker)) break;
+    const auto rows = kalshi::parse_incentive_programs(body, &why);
+    if (!rows) break;
+    for (const auto& p : rows->rows) {
+      if (p.type != "liquidity" || p.end_ms <= now) continue;   // the venue's type filter is ignored: read it here
+      const bool ours = std::any_of(options_.lip_series.begin(), options_.lip_series.end(), [&](const std::string& s) {
+        return p.market_ticker.size() > s.size() && p.market_ticker.compare(0, s.size(), s) == 0 && p.market_ticker[s.size()] == '-';
+      });
+      if (!ours) continue;
+      auto& slot = lip[p.market_ticker];
+      // the one running now, else the soonest
+      const bool running = p.start_ms <= now, held = slot.end_ms && slot.start_ms <= now;
+      if (!slot.end_ms || (running && !held) || (running == held && p.start_ms < slot.start_ms)) slot = p;
+    }
+    cursor = rows->cursor;
+    if (cursor.empty()) break;
+  }
+  if (!why.empty()) {
+    // the last good read stays; LIP is an estimate, never a reason to refuse anything
+    DLOG_WARN("incentive programs: %s", why.c_str());
+    return;
+  }
+  next.lip = std::move(lip);
+  next.lip_ms = now;
+}
+
+// The rows of the events asked for (set_events), from GET /events/{t} with the markets nested: at
+// most event_reads a poll, the one read longest ago first. A row is read again event_cache_ms after
+// it was read, and first of all when a listing newer than it shows a market of its event that it
+// lacks (a bracket added since). A failed read keeps the last row. A row that lacks a market the
+// listing shows is left out of the snapshot until a read lists it: that market can pay YES in a
+// state the row cannot show (a ladder proven exhaustive without it is not), so until then gw counts
+// the event market by market. A row read after the listing that still lacks the market is read
+// again only after the next listing: a venue whose two reads disagree costs a read a listing, not
+// one a poll.
+void State::events(Snapshot& next, Worker* worker) {
+  next.events_error.clear();
+  std::set<std::string> wanted;
+  {
+    std::lock_guard<std::mutex> lock(controls_mu_);
+    wanted = events_;
+  }
+  std::map<std::string, std::vector<std::string>> listed;   // event -> its markets the listing shows
+  for (const auto& [ticker, m] : next.markets) if (wanted.count(event(m))) listed[event(m)].push_back(ticker);
+  auto lacks = [&listed](const kalshi::EventRow& row) -> std::string {   // the first one it lacks, else ""
+    const auto it = listed.find(row.event_ticker);
+    if (it == listed.end()) return "";
+    for (const auto& ticker : it->second) {
+      const auto in = [&ticker](const kalshi::MarketRow& m) { return m.ticker == ticker; };
+      if (std::none_of(row.markets.begin(), row.markets.end(), in)) return ticker;
+    }
+    return "";
+  };
+  auto young = [this](std::int64_t at) { return at > 0 && now_ms() >= at && now_ms() - at < options_.event_cache_ms; };
+  struct Due { std::string event; bool behind; std::int64_t attempted_ms; };
+  std::vector<Due> due;
+  for (const auto& name : wanted) {
+    const auto it = event_rows_.find(name);
+    if (it == event_rows_.end()) { due.push_back({name, false, 0}); continue; }
+    const auto& row = it->second.row;
+    const bool behind = row.fetched_ms && row.fetched_ms < next.listing_ms && !lacks(row).empty();
+    if (behind || !young(row.fetched_ms)) due.push_back({name, behind, it->second.attempted_ms});
+  }
+  std::sort(due.begin(), due.end(), [](const Due& a, const Due& b) {
+    if (a.behind != b.behind) return a.behind;
+    return a.attempted_ms != b.attempted_ms ? a.attempted_ms < b.attempted_ms : a.event < b.event;
+  });
+  int tried = 0;
+  for (const auto& d : due) {
+    if (tried++ == options_.event_reads || (worker && worker->stopping())) break;
+    auto& cached = event_rows_[d.event];
+    cached.attempted_ms = now_ms();
+    std::string body, why;
+    if (!get(kalshi::build_get_event(d.event), &body, &why, worker)) { next.events_error = why; continue; }
+    auto row = kalshi::parse_event(body, &why);
+    if (!row) { next.events_error = "invalid event row for " + d.event + ": " + why; continue; }
+    if (row->event_ticker != d.event) { next.events_error = "GET event " + d.event + " answered another event"; continue; }
+    row->fetched_ms = now_ms();
+    cached.row = std::move(*row);
+  }
+  next.events.clear();
+  bool whole = true;
+  for (const auto& name : wanted) {
+    const auto it = event_rows_.find(name);
+    if (it == event_rows_.end() || !it->second.row.fetched_ms) { whole = false; continue; }
+    const auto& row = it->second.row;
+    if (const auto missing = lacks(row); !missing.empty()) {
+      next.events_error = "the row of event " + name + " does not list " + missing + ", which the listing shows";
+      whole = false;
+      continue;
+    }
+    if (!young(row.fetched_ms)) whole = false;   // its read failed or waits: the last row stays
+    next.events[name] = row;
+  }
+  if (whole) next.events_ms = now_ms();
+  // a row no longer asked for goes once it would be read again
+  for (auto it = event_rows_.begin(); it != event_rows_.end();) {
+    if (!wanted.count(it->first) && !young(it->second.row.fetched_ms)) it = event_rows_.erase(it);
+    else ++it;
+  }
+}
+
+void State::request_trades(const std::string& ticker, std::int64_t since_ms) {
+  std::lock_guard<std::mutex> lock(controls_mu_);
+  const auto failed = trades_failed_.find(ticker);
+  if (failed != trades_failed_.end() && mono_ms() - failed->second < 60000) return;
+  auto& at = trades_wanted_[ticker];
+  if (!at || since_ms < at) at = since_ms;
+}
+
+void State::backfill_trades(Worker* worker) {
+  // A backfill never delays the account: a refresh asked for (a private event to reconcile, and
+  // until then Manual and Systematic orders are refused STALE) goes first, and one asked for
+  // while a market's pages are being read stops them; the market is read again from the start.
+  if (refresh_requested_.load()) return;
+  std::string ticker;
+  std::int64_t since = 0;
+  {
+    std::lock_guard<std::mutex> lock(controls_mu_);
+    if (trades_wanted_.empty()) return;
+    ticker = trades_wanted_.begin()->first;
+    since = trades_wanted_.begin()->second;
+    trades_wanted_.erase(trades_wanted_.begin());
+  }
+  std::vector<kalshi::TradeRow> rows;
+  kalshi::TradesQuery q;
+  q.ticker = ticker;
+  q.min_ts = since / 1000;
+  q.limit = 1000;
+  std::string why;
+  for (int page = 0; page < 5; ++page) {
+    if (refresh_requested_.load()) {
+      std::lock_guard<std::mutex> lock(controls_mu_);
+      auto& at = trades_wanted_[ticker];
+      if (!at || since < at) at = since;
+      return;
+    }
+    std::string body;
+    if (!get(kalshi::build_get_trades(q), &body, &why, worker)) break;
+    auto p = kalshi::parse_trades(body, &why);
+    if (!p) break;
+    for (auto& r : p->rows) rows.push_back(std::move(r));
+    if (p->cursor.empty()) {
+      why.clear();
+      if (trades_cb_) trades_cb_(ticker, since, std::move(rows));   // every print since `since`
+      return;
+    }
+    q.cursor = p->cursor;
+  }
+  if (why.empty()) {   // five full pages: the tape is complete from the oldest print read
+    const std::int64_t from = rows.empty() ? since : rows.back().ts_ms;
+    if (trades_cb_) trades_cb_(ticker, from, std::move(rows));
+    return;
+  }
+  DLOG_WARN("trades for %s: %s", ticker.c_str(), why.c_str());
+  std::lock_guard<std::mutex> lock(controls_mu_);
+  trades_failed_[ticker] = mono_ms();
 }
 
 void State::run(Worker& worker) {
@@ -411,6 +710,8 @@ void State::run(Worker& worker) {
       last_attempt = now;
       refresh(&worker);
       next = mono_ms() + options_.poll_ms;
+    } else {
+      backfill_trades(&worker);   // between polls, one market at a time
     }
     if (!worker.stopping()) std::this_thread::sleep_for(std::chrono::milliseconds(50));
   }
@@ -481,7 +782,19 @@ json market_json(const kalshi::MarketRow& market, bool pin, bool live, std::int6
           {"pin", pin}, {"gk", group(market)}, {"live", live}};
 }
 
-json universe(const Snapshot& state, const json& query, std::int64_t now) {
+std::optional<Money> take_edge(const kalshi::MarketRow& m, std::optional<Px> bid, std::optional<Px> ask, Px fair) {
+  const double mult = m.fee_multiplier.value_or(1.0);
+  auto fee = [mult](Px p) {   // per contract, in 1/10,000 dollar, rounded up
+    const double x = static_cast<double>(p) / kOneDollar;
+    return static_cast<Money>(std::ceil(0.07 * mult * x * (1 - x) * kOneDollar - 1e-9));
+  };
+  std::optional<Money> best;
+  if (ask) best = static_cast<Money>(fair - *ask) - fee(*ask);
+  if (bid) { const Money e = static_cast<Money>(*bid - fair) - fee(*bid); if (!best || e > *best) best = e; }
+  return best;
+}
+
+json universe(const Snapshot& state, const json& query, std::int64_t now, const FairOf& fair_of) {
   const auto errors = check_universe_query(query);
   if (!errors.empty()) return err_body("BAD_REQUEST", errors.front());
   const auto day = query.at("day").get<std::string>();
@@ -497,7 +810,7 @@ json universe(const Snapshot& state, const json& query, std::int64_t now) {
     if (!is_open(market) || (market.open_ms && *market.open_ms > now) || !market.close_ms || *market.close_ms <= now) continue;
     const auto outcome = outcome_date(market);
     if (outcome.empty() || (day == "T" ? outcome > today : outcome != date)) continue;
-    auto row = universe_row(market, state);
+    auto row = universe_row(market, state, fair_of);
     if (!text.empty() && upper(market.ticker + " " + market.title + " " + label(market) + " " + group(market)).find(text) == std::string::npos) continue;
     const auto c = category(market);
     cats[c] = cats[c].get<int>() + 1;

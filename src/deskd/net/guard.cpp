@@ -32,12 +32,44 @@ HostClass classify_host(const std::string& host) {
   return HostClass::UNKNOWN;
 }
 
+SendGuard SendGuard::data_hosts(std::vector<std::string> hosts) {
+  SendGuard g(false, nullptr);
+  g.data_ = true;
+  for (auto& h : hosts) {
+    for (auto& c : h) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    g.hosts_.push_back(std::move(h));
+  }
+  return g;
+}
+
+SendGuard SendGuard::direct_kill(bool live, bool holder_is_deskd_live) {
+  SendGuard g(live, nullptr);
+  g.direct_ = true;
+  g.holder_live_ = holder_is_deskd_live;
+  return g;
+}
+
 std::string SendGuard::refuse(const std::string& host) const {
+  if (data_) {
+    const auto cls = classify_host(host);
+    if (cls == HostClass::LOOPBACK) return "";
+    if (cls != HostClass::UNKNOWN) return host + " is a venue host; this connection is for public data only";
+    std::string h;
+    for (char c : host) h.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+    if (!h.empty() && h.back() == '.') h.pop_back();
+    for (const auto& allowed : hosts_) if (h == allowed) return "";
+    return host + " is not an allowed data host";
+  }
   switch (classify_host(host)) {
     case HostClass::LOOPBACK:
     case HostClass::DEMO:
       return "";
     case HostClass::PRODUCTION:
+      if (direct_) {
+        if (!live_) return host + " is a production host and deskctl was not given --live";
+        if (!holder_live_) return host + " is a production host and the production lock's holder is not \"deskd LIVE\"";
+        return "";
+      }
       if (!live_) return host + " is a production host and deskd was not started with --live";
       if (!lock_ || !lock_->held() || lock_->env() != "prod")
         return host + " is a production host and the production account's lock is not held";

@@ -27,7 +27,7 @@
 //                                                      ?subaccount&exchange_index (default 0): 200 {}
 //   POST   /portfolio/intra_exchange_instance_transfer moves cash between shards (src/client.cpp's body)
 //   GET    /markets (paged by ticker), /markets/{ticker}, /markets/{ticker}/orderbook,
-//          /exchange/status                                                     (no auth)
+//          /events/{event_ticker}?with_nested_markets, /exchange/status        (no auth)
 // Errors are {"error":{"code","message","details"?}} (what the venue sent the old desk:
 // src/executor.cpp kalshi_error_body; the docs' ErrorResponse is the inner object), except a 429,
 // whose body is {"error": "too many requests"} (getting_started/rate_limits.md).
@@ -69,15 +69,8 @@
 // budget too: deskd names the shard on every write.
 //
 // TLS (week-0 review issue 10(a), added 2026-10-07): with tls_cert_file and tls_key_file set the
-// listener speaks TLS 1.2+ (https:// and wss://), so a client's real TLS path runs against the
-// fake: the handshake and its verification (tests/fake_exchange/tls_pki.h makes a CA and a leaf at
-// run time), TLS 1.3's session tickets arriving after the handshake, resumption, close_notify, a
-// bare FIN without one (tls_close_notify false: a load balancer that just drops), and the idle
-// close of a kept-open connection. Each TLS connection runs a pump thread between the TLS socket
-// and a local socketpair whose other end is served exactly like a plain connection, so every
-// fault, the wire log and the idle close behave the same in both modes. One difference: the order
-// between two connections' bytes (EVENTS_FIRST, REPLY_FIRST) holds for what the fake hands its
-// pumps; the two pumps then forward in parallel, microseconds apart.
+// listener (listener.h, which the fake Polymarket US shares) speaks TLS 1.2+ (https:// and wss://),
+// each connection's bytes pumped through a socketpair served exactly like a plain connection.
 //
 // Threads: one per connection (two with TLS), one writer per socket, a timer. The engine sits
 // behind one mutex. Nothing here talks to anything but 127.0.0.1.
@@ -96,6 +89,7 @@
 #include <vector>
 
 #include "engine.h"
+#include "listener.h"
 #include "net.h"
 #include "tape.h"
 
@@ -136,10 +130,17 @@ struct HttpFault {
     FILL_DURING_CANCEL,   // cancel: the street takes `qty` first; the reply's reduced_by is the
                           // rest, and the fill and its user_order follow the reply
                           // (private_order EVENTS_FIRST puts them first instead)
+    PULL_TOUCH,           // create: just before it, the street pulls `qty` (0: all of theirs) from
+                          // the other side's best level, if the order's price reaches it (an
+                          // arbitrage leg whose liquidity left first); the book's deltas go out
+                          // ahead of the order's messages
   };
   Kind kind = Kind::STATUS_AFTER_ACCEPT;
   std::string method = "POST";
   std::string path = "/portfolio/events/orders";  // a prefix of the path after /trade-api/v2
+  // Only a request whose JSON body names this ticker (a create's "ticker"); "": any request. A
+  // fault that names one is passed over by requests that name another, or none.
+  std::string ticker;
   int status = 500;
   int stall_ms = 2000;
   std::size_t chunk_bytes = 16;
@@ -196,10 +197,10 @@ class FakeKalshi {
 
   bool start(std::string* err);
   void stop();
-  int port() const { return port_; }
+  int port() const { return listener_.port(); }
   std::string rest_base() const;  // http(s)://127.0.0.1:<port>/trade-api/v2
   std::string ws_url() const;     // ws(s)://127.0.0.1:<port>/trade-api/ws/v2
-  bool tls() const { return tls_ctx_ != nullptr; }
+  bool tls() const { return listener_.tls(); }
 
   // ---- time
   std::int64_t now_ms() const;
@@ -222,6 +223,11 @@ class FakeKalshi {
     }
   }
 
+  // ---- Kalshi's pyth_value channel: one reference value, to every pyth_value subscription.
+  // The shape is the old desk's reading of the documented channel (src/reference_feed.cpp):
+  // {type: pyth_value, sid, msg: {underlying_ticker, value_usd, source_ts_ms}}, no seq.
+  void pyth(const std::string& underlying, double value_usd, std::int64_t source_ts_ms);
+
   // ---- a tape or scenario, from now at `speed` (2.0 plays twice as fast)
   void play(Tape tape, double speed = 1.0);
   bool tape_done() const;
@@ -243,17 +249,18 @@ class FakeKalshi {
   void stall_ws(int ms);                                       // writers wait, then send it all
 
   // ---- what happened on the wire, in the order it was written: "http 201 POST
-  // /portfolio/events/orders", "http cut ...", "http drop ...", "ws <conn> fill <trade_id>",
-  // "ws <conn> user_order <order_id>", "ws <conn> orderbook_delta <ticker> <seq>" ...
+  // /portfolio/events/orders", "http cut ...", "http drop ...", "http pull-touch <ticker> <qty>",
+  // "ws <conn> fill <trade_id>", "ws <conn> user_order <order_id>",
+  // "ws <conn> orderbook_delta <ticker> <seq>" ...
   std::vector<std::string> wire_log() const;
   void clear_wire_log();
   std::size_t ws_connections() const;
   std::uint64_t http_requests() const { return requests_.load(); }
-  std::uint64_t connections_accepted() const { return accepted_.load(); }
+  std::uint64_t connections_accepted() const { return listener_.accepted(); }
   std::uint64_t idle_closes() const { return idle_closes_.load(); }
-  std::uint64_t tls_handshakes() const { return tls_ok_.load(); }        // completed
-  std::uint64_t tls_handshake_failures() const { return tls_failed_.load(); }
-  std::uint64_t tls_resumed() const { return tls_resumed_.load(); }
+  std::uint64_t tls_handshakes() const { return listener_.tls_handshakes(); }        // completed
+  std::uint64_t tls_handshake_failures() const { return listener_.tls_handshake_failures(); }
+  std::uint64_t tls_resumed() const { return listener_.tls_resumed(); }
   // Waits until every queued socket message is written (or `ms` passes).
   bool wait_ws_flushed(int ms = 2000);
 
@@ -304,10 +311,8 @@ class FakeKalshi {
   using Targets = std::vector<std::pair<std::shared_ptr<Session>, std::uint64_t>>;
 
   std::int64_t now_locked() const;
-  void accept_loop();
   void tick_loop();
   void serve(int fd);
-  void serve_tls(int tcp_fd, std::shared_ptr<std::atomic<bool>> done);   // the pump; serve() on a socketpair
   void serve_ws(int fd, const net::Request& req);
   void writer_loop(const std::shared_ptr<Session>& s);
   void log_wire(const std::string& line);
@@ -318,6 +323,7 @@ class FakeKalshi {
   // still held goes behind them (Held); the returned targets cover what went out now.
   Targets publish_locked(const std::vector<Event>& events);
   Targets publish_now_locked(const std::vector<Event>& events);
+  void pyth_locked(const std::string& underlying, double value_usd, std::int64_t source_ts_ms);
   std::uint64_t hold_locked(std::vector<Event> events, bool ready);  // a new Held batch; its id
   void release_locked(std::uint64_t id);   // that batch is ready: publish what can go
   void sweep_locked(const std::shared_ptr<Session>& s);   // drops overflowed subscriptions
@@ -328,7 +334,8 @@ class FakeKalshi {
   void ws_command_locked(const std::shared_ptr<Session>& s, const std::string& text);
   void ws_command_inner_locked(const std::shared_ptr<Session>& s, const std::string& text);
   void pump_locked(std::int64_t now);
-  bool take_fault_locked(const net::Request& req, HttpFault* f);
+  bool take_fault_locked(const net::Request& req, const json& body, HttpFault* f);
+  void pull_touch_locked(const json& create, Qty qty, std::int64_t now);   // PULL_TOUCH
 
   std::string auth_refusal(const net::Request& req, std::int64_t now) const;
   bool rate_ok_locked(const net::Request& req, const std::string& path, const json& body, std::int64_t now);
@@ -344,18 +351,9 @@ class FakeKalshi {
   mutable std::int64_t clock_ms_ = 0;
   void* pubkey_ = nullptr;  // EVP_PKEY*
 
-  int listen_fd_ = -1, port_ = 0;
-  void* tls_ctx_ = nullptr;  // SSL_CTX*, when TLS
-  std::string tls_err_;
+  Listener listener_;
   std::atomic<bool> running_{false}, stopping_{false};
-  std::thread acceptor_, ticker_;
-  struct Conn {
-    std::thread th;
-    std::shared_ptr<std::atomic<bool>> done;
-  };
-  std::mutex conn_mu_;
-  std::vector<Conn> conns_;
-  std::map<int, int> conn_fds_;  // fd -> 1 (REST) or 2 (upgraded) while its thread owns it
+  std::thread ticker_;
 
   std::map<int, std::shared_ptr<Session>> sessions_;
   int next_session_ = 1;
@@ -377,8 +375,7 @@ class FakeKalshi {
 
   mutable std::mutex log_mu_;
   std::deque<std::string> wire_;
-  std::atomic<std::uint64_t> requests_{0}, accepted_{0}, idle_closes_{0};
-  std::atomic<std::uint64_t> tls_ok_{0}, tls_failed_{0}, tls_resumed_{0};
+  std::atomic<std::uint64_t> requests_{0}, idle_closes_{0};
 };
 
 }  // namespace fakex

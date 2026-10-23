@@ -14,6 +14,80 @@ whether a model proposed it, you typed it, or a bot fired it.
                        reconcile: balance, positions, orders, fills, settlements ──► eval / gate
 ```
 
+## The desk (deskd): one desk, a PAPER | LIVE toggle
+
+```sh
+python3 tools/desk.py setup            # once: PAPER (the Kalshi demo account) from ~/.kalshi/demo.json
+python3 tools/desk.py setup live       # once: LIVE (real Kalshi) from ~/.kalshi/prod.json (or --key FILE)
+python3 tools/desk.py                  # the desk: PAPER, and LIVE too after you type LIVE; one browser tab
+python3 tools/desk.py sim              # the fake exchange: no network, no key, http://127.0.0.1:8790/
+python3 tools/desk.py status           # both accounts
+python3 tools/desk.py kill paper|live  # KILL, as the screen's button
+```
+
+The header's PAPER | LIVE toggle flips the tab between the two accounts (asking first before
+LIVE), keeping the screen's tab. Underneath each account is its own deskd (its own lock, order
+ledger and venue connections; ports 8788 and 8789), so a fault on one never touches the other's
+orders; one command starts both and Ctrl-C stops both. The live config starts with Systematic
+off; set `"systematic_orders": true` in `~/.kalshi/deskd-prod.json` yourself when you want lanes
+there. `python3 tools/desk.py paper` or `live` runs one alone.
+
+If a desk hangs, `build-deskd/deskctl kill --direct --config ~/.kalshi/deskd-demo.json` cancels
+everything at the exchange with the desk's own key (for LIVE: the prod config and `--live`, and
+only while the lock says "deskd LIVE"). `python3 tools/scorecard.py` (or `scorecard.py live`) prints
+each lane's day and the plan's lane rules.
+
+A lane its kill rule retired stays off across restarts (the lane row says why, a CRIT alert said
+when, and turning it on is refused). With that desk stopped, `python3 tools/desk.py lane-reset C1`
+(for LIVE: `lane-reset C1 live`) gives it a fresh life: it runs `build-deskd/deskctl lane-reset` on
+that desk's own config and data directory (`~/Library/Application Support/kalshi-desk/demo` on a
+Mac, `${XDG_DATA_HOME:-~/.local/share}/kalshi-desk/demo` elsewhere; `prod` for LIVE). Its open
+positions stay in the book, and its loss limit still counts them at their mark (one with none, as
+just after a restart or until a closed market settles, at its best: it waits only while that could
+bring the lane back inside its limit).
+
+Lanes run together only while their budgets fit their venue's 70% ceiling (0.7 x the account's cash
+and positions; a lane on both venues counts on each). Turning one on past it is refused, naming the
+lanes and the overflow; Kalshi's lanes add up to $210, far past the ceiling of a ~$140 account, so
+pick the ones that run. A Start whose lanes no longer fit (the equity fell) fails its CASH check:
+turn a lane off.
+
+Women's college basketball (KXNCAAWBGAME): `python3 tools/train_wcbb.py --panel FILE.csv` fits
+the in-game model and writes `models/wcbb_logit_v1.json` (the panel's columns and the pandas
+one-liner that makes it are in the script's docstring; `docs/wcbb_model.md` is the file format).
+With that file present, deskd shows the model's fair on those ladders while a game is on, from
+the pregame Kalshi price it saw before tip. Without it there is no fair, and the log says so.
+
+Before LIVE: `ctest --test-dir build-deskd -L invariants --output-on-failure` runs every test that
+`docs/invariants.md` names for the plan's rules. `python3 tools/replication.py --data DIR` (the
+recorder's data) counts the 15-minute windows whose strike pyth_value reproduced, LIP-15's anchor gate;
+`tools/lip_join.py` and `tools/fillsim2.py` (the same `--data DIR`) give the join rule per series
+and what resting behind the touch would have earned.
+
+Research reads `ops-research.sqlite`, the copy the desk writes beside `ops.sqlite` after each ET
+midnight, never the live file. `/ops/status` shows the live file's size; past 1 GB the desk alerts.
+
+Each desk's log also goes to `deskd.log` in its data directory. After anything odd, run
+`python3 tools/desk.py report` (or `report live`): the run state and why, any stopped sender, and
+every KILL, refusal and unsent order from the log. On PAPER, Systematic has lane D1 PAPER, on from
+the start: it quotes 1 contract at the touch in two liquid demo markets, buys 1 at the ask after
+5 quiet minutes and exits any position within 90 s, so START shows orders going in and out. It
+never runs on LIVE; `"paper_lane": false` in the paper config leaves it out.
+
+```sh
+tools/demo_checks                          # the plan's demo checks on PAPER (play money): order, group,
+                                           # venue shapes (duplicate cid, expiry, reduce_only, post-only
+                                           # cross, self-trade), the lanes' feeds, and S1's event reads and
+                                           # basket collateral; replies kept in demo-checks/
+python3 tools/latency_report.py            # where each order's time went (data/ops.sqlite): p50/p90/p99
+                                           # per segment, click to ack; --hours, --own SYS, --json
+```
+
+Each desk writes every ended order's timeline and every fill to `data/ops.sqlite` (read it, never
+write it: deskd's store thread is its only writer). Systematic uses at most 80% of each shard's
+write budget (Kalshi's Basic tier, 100 tokens a second); after the free Advanced upgrade set
+`"write_tier": "advanced"` in the desk's config.
+
 ## Build (macOS)
 
 ```sh

@@ -3,6 +3,7 @@
 #include <openssl/pem.h>
 #include <signal.h>
 #include <fstream>
+#include <thread>
 #include "check.h"
 #include "deskd/app/log.h"
 #include "deskd/app/projection.h"
@@ -83,6 +84,17 @@ void discovery(json& capture) {
   CHECK(rest::universe(s,{{"day","T"},{"v","P"}},t)["total"]==0);
   const auto filtered=rest::universe(s,{{"day","T"},{"cat","WEATHER"},{"offset",4},{"limit",2}},t);
   CHECK(filtered["total"]==5 && filtered["rows"].size()==1);
+  {   // a model's fair: the row carries it and the better take's edge after the taker fee
+    kalshi::MarketRow fm; fm.fee_multiplier=1.0;
+    // buy at 0.48 against 0.50: 2c less 0.07 x 0.48 x 0.52 = 1.7472c, rounded up to 1.75c
+    CHECK(rest::take_edge(fm,Px{5100},Px{4800},5000)==std::optional<Money>(25));
+    CHECK(rest::take_edge(fm,Px{5300},Px{5600},5000)==std::optional<Money>(300-175));   // selling at 0.53
+    CHECK(!rest::take_edge(fm,std::nullopt,std::nullopt,5000));
+    auto with=rest::universe(s,{{"day","T"},{"cat","SPORTS"}},t,[&](const std::string& tk) -> std::optional<Px> {
+      return tk==m.ticker ? std::optional<Px>(5000) : std::nullopt; });
+    CHECK(with["rows"].size()==1 && with["rows"][0]["fair"]=="0.5000");
+    capture["responses"].push_back({{"key","GET /api/universe"},{"status",200},{"json",with}});
+  }
   for (const auto& p:s.markets)
     capture["events"].push_back({{"type","mkt"},{"seq",1},{"ts_ms",t},{"data",rest::market_json(p.second,false,true,t)}});
   kalshi::OrderRow o;
@@ -111,7 +123,7 @@ void reconcile() {
   auto signer=key(); CHECK(signer!=nullptr);
   SendGuard guard(false,nullptr); net::ConnFactory factory(guard);
   const auto endpoint=net::Endpoint::parse("http://127.0.0.1:"+std::to_string(fake.port())+"/trade-api/v2",&why);
-  rest::Options opts; opts.page_size=2;
+  rest::Options opts; opts.page_size=2; opts.request_gap_ms=0; opts.backoff_429_ms=20;
   rest::State state(factory,*endpoint,signer.get(),{},opts);
   CHECK(state.refresh_once());
   auto s=state.snapshot();
@@ -132,16 +144,71 @@ void reconcile() {
   CHECK(meta["fee"]["type"]=="QUAD_MAKER" && meta["fee"]["mult"]==1.5);
   fake.clear_wire_log(); CHECK(state.refresh_once());
   for(const auto& entry:fake.wire_log()) CHECK(entry.find("/series/")==std::string::npos); // fresh cache
+  // A failed account read keeps the last good one while it is young, and says so.
   fakex::HttpFault fault; fault.method="GET"; fault.path="/portfolio/balance";
   fault.kind=fakex::HttpFault::Kind::DROP_BEFORE_REPLY; fake.add_fault(fault);
-  CHECK(!state.refresh_once());
-  CHECK(!state.snapshot()->account_ready && state.snapshot()->balances==s->balances);
+  const auto good=state.snapshot();
   CHECK(state.refresh_once());
+  CHECK(state.snapshot()->account_ready && state.snapshot()->balances==s->balances);
+  CHECK(state.snapshot()->account_ms==good->account_ms && state.snapshot()->account_began_ms==good->account_began_ms);
+  CHECK(state.snapshot()->error.rfind("account: ",0)==0);
+  std::this_thread::sleep_for(std::chrono::milliseconds(2));   // a whole refresh can take under 1 ms
+  CHECK(state.refresh_once() && state.snapshot()->error.empty() && state.snapshot()->account_ms>good->account_ms);
+  {   // an older one is not kept; nor is a listing
+    auto strict=opts; strict.account_keep_ms=-1; strict.listing_keep_ms=-1; strict.listing_poll_ms=100;
+    rest::State old(factory,*endpoint,signer.get(),{},strict);
+    CHECK(old.refresh_once());
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    fake.add_fault(fault);
+    CHECK(!old.refresh_once() && !old.snapshot()->account_ready && old.snapshot()->listing_ready);
+    fakex::HttpFault listing_fault; listing_fault.method="GET"; listing_fault.path="/markets";
+    listing_fault.kind=fakex::HttpFault::Kind::DROP_BEFORE_REPLY; fake.add_fault(listing_fault);
+    std::this_thread::sleep_for(std::chrono::milliseconds(110));   // listing_poll_ms is at least 100
+    const bool listed=old.refresh_once();
+    if(listed || !old.snapshot()->account_ready || old.snapshot()->listing_ready) std::fprintf(stderr,"listing fault: %d %d %d %s\n",listed,(int)old.snapshot()->account_ready,(int)old.snapshot()->listing_ready,old.snapshot()->error.c_str());
+    CHECK(!listed && old.snapshot()->account_ready && !old.snapshot()->listing_ready);
+    CHECK(!old.snapshot()->markets.empty());   // the rows stay for the screen; admission waits on ready
+    CHECK(old.refresh_once());
+  }
+  // A private event during the read: the pages are discarded, the last consistent read stays.
+  const auto consistent=state.snapshot();
   state.set_reconcile_guard([] { return std::uint64_t{7}; }, [](std::uint64_t) { return false; });
-  CHECK(!state.refresh_once() && !state.snapshot()->account_ready);
+  CHECK(state.refresh_once() && state.snapshot()->account_ready);
   CHECK(state.snapshot()->error.find("private feed changed") != std::string::npos);
+  CHECK(state.snapshot()->account_ms==consistent->account_ms &&
+        state.snapshot()->account_began_ms==consistent->account_began_ms &&
+        state.snapshot()->balances==consistent->balances);
+  {   // with no consistent read yet, the account is not ready
+    rest::State fresh(factory,*endpoint,signer.get(),{},opts);
+    fresh.set_reconcile_guard([] { return std::uint64_t{7}; }, [](std::uint64_t) { return false; });
+    CHECK(!fresh.refresh_once() && !fresh.snapshot()->account_ready);
+  }
   state.set_reconcile_guard([] { return std::uint64_t{8}; }, [](std::uint64_t fence) { return fence == 8; });
   CHECK(state.refresh_once());
+  {   // the listing leaves out multivariate combos; a venue that refuses the filter gets the plain listing
+    kalshi::MarketsQuery mq; mq.limit=200; mq.status="open"; mq.mve_filter="exclude";
+    CHECK(kalshi::build_get_markets(mq).query.find("mve_filter=exclude")!=std::string::npos);
+    rest::State lister(factory,*endpoint,signer.get(),{},opts);
+    CHECK(lister.refresh_once() && lister.snapshot()->listing_ready);
+    fakex::HttpFault refuse; refuse.method="GET"; refuse.path="/markets";
+    refuse.kind=fakex::HttpFault::Kind::STATUS_AFTER_ACCEPT; refuse.status=400; fake.add_fault(refuse);
+    const auto before=fake.http_requests();
+    rest::State fallback(factory,*endpoint,signer.get(),{},opts);
+    CHECK(fallback.refresh_once() && fallback.snapshot()->listing_ready && !fallback.snapshot()->markets.empty());
+    CHECK(fallback.snapshot()->markets.size()==lister.snapshot()->markets.size());
+    CHECK(fake.http_requests()>before);
+  }
+  {   // Kalshi's 429 is refused before processing: the same read waits and goes again
+    fakex::HttpFault limited; limited.method="GET"; limited.path="/markets"; limited.kind=fakex::HttpFault::Kind::RATE_LIMIT;
+    fake.add_fault(limited); fake.add_fault(limited);
+    rest::State patient(factory,*endpoint,signer.get(),{},opts);
+    CHECK(patient.refresh_once() && patient.snapshot()->listing_ready);
+    for(int i=0;i<=opts.retries_429;++i) fake.add_fault(limited);
+    rest::State gives_up(factory,*endpoint,signer.get(),{},opts);
+    CHECK(!gives_up.refresh_once());
+    CHECK(gives_up.snapshot()->error.find("HTTP 429")!=std::string::npos);
+    CHECK(gives_up.refresh_once());   // the faults are spent: the next poll loads it
+  }
   opts.max_pages=1;
   rest::State capped(factory,*endpoint,signer.get(),{},opts);
   CHECK(!capped.refresh_once());
@@ -160,6 +227,211 @@ void reconcile() {
   CHECK(cash["shards"][0]["free"]=="496.0000" && cash["shards"][0]["cash"]=="500.0000");
   CHECK(cash["total"]=="575.0000" && cash["free"]=="571.0000");
 }
+// The day's orders and fills: whole on the first read, then only what is new, merged by id; an
+// order that left the book before the window is read by its id, and too many of them, or a
+// failure, read the whole day again (rest::Options::incremental_overlap_ms).
+void incremental() {
+  fakex::FakeConfig cfg; cfg.rate_limits=false;
+  fakex::FakeKalshi fake(cfg);
+  fake.with_engine([](fakex::Engine& e,std::int64_t now) {
+    fakex::MarketSpec m; m.ticker="INC-0"; m.exchange_index=0; m.close_ms=now+3600000; e.add_market(m,now);
+    e.set_cash(0,0,500*fakex::kMicrosPerDollar,now);
+  });
+  std::string why; CHECK(fake.start(&why));
+  auto signer=key();
+  SendGuard guard(false,nullptr); net::ConnFactory factory(guard);
+  const auto endpoint=net::Endpoint::parse("http://127.0.0.1:"+std::to_string(fake.port())+"/trade-api/v2",&why);
+  std::map<std::string,std::string> id_of;   // cid -> order id
+  auto place=[&](const std::string& tag,int n) {
+    fake.with_engine([&](fakex::Engine& e,std::int64_t now) {
+      for (int i=0;i<n;++i) {
+        fakex::NewOrder o; o.ticker="INC-0"; o.client_order_id="Minc-"+tag+std::to_string(i);
+        o.price=1000+100*i; o.count=100; o.exchange_index=0; o.tif=fakex::Tif::GTC; o.post_only=true;
+        const auto r=e.create(o,now); CHECK(!r.err); id_of[o.client_order_id]=r.order_id;
+      }
+    });
+  };
+  auto find=[](const rest::Snapshot& s,const std::string& cid) -> const kalshi::OrderRow* {
+    for (const auto& o:s.orders) if (o.client_order_id==cid) return &o;
+    return nullptr;
+  };
+  auto count=[&](const std::string& what) {   // requests since the log was cleared
+    int n=0;
+    for (const auto& line:fake.wire_log())
+      if (line.size()>=what.size() && line.compare(line.size()-what.size(),what.size(),what)==0) ++n;
+    return n;
+  };
+  auto by_id=[&] {
+    int n=0;
+    for (const auto& line:fake.wire_log()) if (line.find("GET /portfolio/orders/")!=std::string::npos) ++n;
+    return n;
+  };
+  place("a",6);
+  std::this_thread::sleep_for(std::chrono::milliseconds(1100));   // older than the next read's start second
+  rest::Options opts; opts.page_size=2; opts.request_gap_ms=0; opts.incremental_overlap_ms=0; opts.incremental_max_gone=3;
+  rest::State state(factory,*endpoint,signer.get(),{},opts);
+  fake.clear_wire_log();
+  CHECK(state.refresh_once() && state.snapshot()->orders.size()==6);
+  const int whole_pages=count("GET /portfolio/orders");
+  // the best bid fills, another is cancelled: both left the book, so each is read by its id
+  fake.with_engine([&](fakex::Engine& e,std::int64_t now) {
+    CHECK(e.street_take("INC-0",fakex::Side::ASK,1500,100,now)==100);
+    CHECK(!e.cancel(id_of["Minc-a0"],"INC-0",0,0,now).err);
+  });
+  fake.clear_wire_log();
+  CHECK(state.refresh_once());
+  auto s=state.snapshot();
+  CHECK(s->orders.size()==6 && s->fills.size()==1 && by_id()==2);
+  CHECK(count("GET /portfolio/orders")<whole_pages);   // the old orders were not read again
+  CHECK(find(*s,"Minc-a5") && find(*s,"Minc-a5")->status==kalshi::OrderStatus::EXECUTED);
+  CHECK(find(*s,"Minc-a0") && find(*s,"Minc-a0")->status==kalshi::OrderStatus::CANCELED);
+  CHECK(find(*s,"Minc-a1") && find(*s,"Minc-a1")->status==kalshi::OrderStatus::RESTING);
+  // a read with nothing new keeps every row and the one fill, counted once
+  fake.clear_wire_log();
+  CHECK(state.refresh_once() && state.snapshot()->orders.size()==6 && state.snapshot()->fills.size()==1 && by_id()==0);
+  // more than incremental_max_gone left at once: the whole day again, nothing by id
+  fake.with_engine([&](fakex::Engine& e,std::int64_t now) {   // one by one: a cancel-all would cancel the next minute's too
+    for (int i=1;i<=4;++i) CHECK(!e.cancel(id_of["Minc-a"+std::to_string(i)],"INC-0",0,0,now).err);
+  });
+  fake.clear_wire_log();
+  CHECK(state.refresh_once());
+  s=state.snapshot();
+  CHECK(by_id()==0 && s->orders.size()==6 && s->fills.size()==1);
+  for (const auto& o:s->orders) CHECK(o.status!=kalshi::OrderStatus::RESTING);
+  // new orders come in the window; once older than the read's start, one that leaves is read by id,
+  // and when that read fails the account keeps its last read and the next is whole
+  place("b",2);
+  CHECK(state.refresh_once() && state.snapshot()->orders.size()==8);
+  std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+  CHECK(state.refresh_once());
+  fake.with_engine([&](fakex::Engine& e,std::int64_t now) { CHECK(!e.cancel(id_of["Minc-b0"],"INC-0",0,0,now).err); });
+  fakex::HttpFault fault; fault.method="GET"; fault.path="/portfolio/orders/"+id_of["Minc-b0"];
+  fault.kind=fakex::HttpFault::Kind::DROP_BEFORE_REPLY; fake.add_fault(fault);
+  const auto kept=state.snapshot();
+  state.refresh_once();
+  s=state.snapshot();
+  CHECK(s->account_ms==kept->account_ms && s->error.rfind("account: ",0)==0);
+  CHECK(find(*s,"Minc-b0") && find(*s,"Minc-b0")->status==kalshi::OrderStatus::RESTING);   // the last read's
+  fake.clear_wire_log();
+  CHECK(state.refresh_once() && state.snapshot()->error.empty());
+  s=state.snapshot();
+  CHECK(by_id()==0 && s->orders.size()==8 && s->fills.size()==1);
+  CHECK(find(*s,"Minc-b0")->status==kalshi::OrderStatus::CANCELED && find(*s,"Minc-b1")->status==kalshi::OrderStatus::RESTING);
+}
+// Event rows (rest::State::set_events): GET /events/{t} with the markets nested, at most event_reads
+// a poll, read again once older than event_cache_ms or when a newer listing shows a market the row
+// lacks. A failed read keeps the last row; a row the listing shows to lack a market is left out
+// until a read lists it.
+void event_rows() {
+  fakex::FakeConfig cfg; cfg.rate_limits=false;
+  fakex::FakeKalshi fake(cfg);
+  const std::string E="KXHIGHTST-26OCT22";
+  auto bracket=[&](fakex::Engine& e,std::int64_t now,int lo) {
+    fakex::MarketSpec m; m.ticker=E+"-B"+std::to_string(lo)+".5"; m.close_ms=now+3600000;
+    m.strike_type="between"; m.floor_strike=lo; m.cap_strike=lo+1; e.add_market(m,now);
+  };
+  std::set<std::string> many{E,"KXGONE-26OCT22"};   // the venue does not know KXGONE's
+  fake.with_engine([&](fakex::Engine& e,std::int64_t now) {
+    bracket(e,now,70); bracket(e,now,72);
+    fakex::EventSpec ev; ev.event_ticker=E; ev.mutually_exclusive=true; e.add_event(ev);
+    for (int i=0;i<20;++i) {
+      fakex::EventSpec other; other.event_ticker="KXMANY-"+std::to_string(100+i); e.add_event(other);
+      many.insert(other.event_ticker);
+    }
+    e.set_cash(0,0,500*fakex::kMicrosPerDollar,now);
+  });
+  std::string why; CHECK(fake.start(&why));
+  auto signer=key();
+  SendGuard guard(false,nullptr); net::ConnFactory factory(guard);
+  const auto endpoint=net::Endpoint::parse("http://127.0.0.1:"+std::to_string(fake.port())+"/trade-api/v2",&why);
+  auto reads=[&] {   // event reads since the log was cleared
+    std::vector<std::string> out;
+    for (const auto& line:fake.wire_log()) if (line.find(" GET /events/")!=std::string::npos) out.push_back(line);
+    return out;
+  };
+  rest::Options opts; opts.request_gap_ms=0; opts.listing_poll_ms=100;
+  rest::State state(factory,*endpoint,signer.get(),{},opts);
+  fake.clear_wire_log();
+  CHECK(state.refresh_once() && reads().empty() && state.snapshot()->events.empty());   // none asked
+  // asked for: read at the next poll, with the time it was read
+  state.set_events({E});
+  CHECK(state.snapshot()->events.empty());
+  const auto asked=now_ms();
+  fake.clear_wire_log();
+  CHECK(state.refresh_once() && reads().size()==1);
+  auto s=state.snapshot();
+  CHECK(s->events.size()==1 && s->events.count(E));
+  const auto first=s->events.count(E) ? s->events.at(E) : kalshi::EventRow{};
+  CHECK(first.mutually_exclusive==std::optional<bool>(true) && first.series_ticker=="KXHIGHTST" && first.markets.size()==2);
+  CHECK(first.fetched_ms>=asked && s->events_ms>=first.fetched_ms && s->events_error.empty());
+  fake.clear_wire_log();   // younger than event_cache_ms: kept, not read again
+  CHECK(state.refresh_once() && reads().empty() && state.snapshot()->events.at(E).fetched_ms==first.fetched_ms);
+  // a bracket added: the next listing shows it and the row is read again in the same poll
+  fake.with_engine([&](fakex::Engine& e,std::int64_t now) { bracket(e,now,74); });
+  std::this_thread::sleep_for(std::chrono::milliseconds(110));   // listing_poll_ms is at least 100
+  fake.clear_wire_log();
+  CHECK(state.refresh_once() && reads().size()==1);
+  s=state.snapshot();
+  CHECK(s->markets.count(E+"-B74.5") && s->events.at(E).markets.size()==3 && s->events.at(E).fetched_ms>first.fetched_ms);
+  std::this_thread::sleep_for(std::chrono::milliseconds(110));
+  fake.clear_wire_log();
+  CHECK(state.refresh_once() && reads().empty());   // the next listing agrees with it
+  // another bracket, and that read fails: the row the listing shows to be short is left out, and
+  // read first at the next poll
+  fake.with_engine([&](fakex::Engine& e,std::int64_t now) { bracket(e,now,76); });
+  fakex::HttpFault fault; fault.method="GET"; fault.path="/events/"+E;
+  fault.kind=fakex::HttpFault::Kind::DROP_BEFORE_REPLY; fake.add_fault(fault);
+  const auto whole=state.snapshot()->events_ms;
+  std::this_thread::sleep_for(std::chrono::milliseconds(110));
+  CHECK(state.refresh_once());
+  s=state.snapshot();
+  CHECK(s->markets.count(E+"-B76.5") && !s->events.count(E) && s->events_ms==whole);
+  CHECK(s->events_error.find("does not list "+E+"-B76.5")!=std::string::npos);
+  fake.clear_wire_log();
+  CHECK(state.refresh_once() && reads().size()==1);
+  s=state.snapshot();
+  CHECK(s->events.count(E) && s->events.at(E).markets.size()==4 && s->events_error.empty() && s->events_ms>whole);
+  {   // older than event_cache_ms: read again; a failed read keeps the last row, and events_ms waits
+    auto quick=opts; quick.event_cache_ms=100;
+    rest::State st(factory,*endpoint,signer.get(),{},quick);
+    st.set_events({E});
+    CHECK(st.refresh_once() && st.snapshot()->events.count(E));
+    const auto read=st.snapshot()->events.at(E).fetched_ms, done=st.snapshot()->events_ms;
+    std::this_thread::sleep_for(std::chrono::milliseconds(110));
+    fake.add_fault(fault);
+    CHECK(st.refresh_once());
+    s=st.snapshot();
+    CHECK(s->events.count(E) && s->events.at(E).fetched_ms==read && s->events_ms==done && !s->events_error.empty());
+    fake.clear_wire_log();
+    CHECK(st.refresh_once() && reads().size()==1);
+    s=st.snapshot();
+    CHECK(s->events.at(E).fetched_ms>read && s->events_ms>done && s->events_error.empty());
+  }
+  // twenty-one new ones at once: 16 this poll, KXGONE's 404 among them; the next poll reads the
+  // five never read before KXGONE's again
+  state.set_events(many);
+  fake.clear_wire_log();
+  CHECK(state.refresh_once() && reads().size()==16);
+  s=state.snapshot();
+  CHECK(s->events.size()==16 && s->events.count(E) && !s->events.count("KXGONE-26OCT22"));
+  CHECK(s->events_error.find("HTTP 404")!=std::string::npos);
+  const auto partial=s->events_ms;
+  fake.clear_wire_log();
+  CHECK(state.refresh_once() && reads().size()==6);
+  CHECK(reads().size()==6 && reads()[5].find("KXGONE-26OCT22")!=std::string::npos);
+  s=state.snapshot();
+  CHECK(s->events.size()==21 && s->events.count("KXMANY-119") && s->events_ms==partial);
+  // asked for no longer: out of the snapshot at the next poll; asked again while its row is young,
+  // back without a read
+  state.set_events({E});
+  fake.clear_wire_log();
+  CHECK(state.refresh_once() && reads().empty());
+  s=state.snapshot();
+  CHECK(s->events.size()==1 && s->events_error.empty() && s->events_ms>partial);
+  state.set_events(many);
+  fake.clear_wire_log();
+  CHECK(state.refresh_once() && reads().size()==1 && state.snapshot()->events.size()==21);   // KXGONE's alone
+}
 void cash_projection(json& capture) {
   rest::Snapshot s; s.balances={{0,920000},{2,50000}};
   kalshi::PositionRow p; p.ticker="TEST-A"; p.exchange_index=0; p.position=500;
@@ -173,6 +445,18 @@ void cash_projection(json& capture) {
   CHECK(cash["total"]=="99.0000" && cash["free"]=="97.0000");
   HdrInputs hdr; hdr.cash_k=cash;
   capture["events"].push_back({{"type","hdr"},{"seq",1},{"ts_ms",now_ms()},{"data",hdr_json(hdr)}});
+  {   // Systematic's part: day.man is the account's day less day.sys; the stop counts sys only
+    HdrInputs h=hdr; h.daily_stop=300000; h.day_man=-50000;
+    h.sys=HdrInputs::Sys{-120000,7000,50000,45000,690000,600000};
+    const auto j=hdr_json(h);
+    CHECK(j["day"]["total"]=="-5.0000" && j["day"]["sys"]=="-12.0000" && j["day"]["man"]=="7.0000");
+    CHECK(j["stop"]["left"]=="18.0000" && j["stop"]["limit"]=="30.0000" && j["stop"]["hit"]==false);
+    CHECK(j["sys"]["K"]==json({{"used","4.5000"},{"ceiling","69.0000"},{"eff","60.0000"}}));
+    CHECK(j["cost"]==json({{"used","0.7000"},{"budget","5.0000"}}));
+    h.sys->day=-310000;
+    CHECK(hdr_json(h)["stop"]["hit"]==true && hdr_json(h)["stop"]["left"]=="-1.0000");
+    capture["events"].push_back({{"type","hdr"},{"seq",2},{"ts_ms",now_ms()},{"data",hdr_json(h)}});
+  }
   // Equivalent BUY orders against NO inventory allocate the reducing room highest first.
   s.positions[0].position=-500; s.orders[0].side=s.orders[1].side=kalshi::BookSide::BID;
   cash=rest_cash_json(s,false); CHECK(cash["shards"][0]["cash"]=="94.7500");
@@ -188,7 +472,7 @@ void cash_projection(json& capture) {
 int main() {
   ::signal(SIGPIPE,SIG_IGN);
   clock_checks(); series_fees(); json capture={{"events",json::array()},{"responses",json::array()}};
-  discovery(capture); reconcile(); cash_projection(capture);
+  discovery(capture); reconcile(); incremental(); event_rows(); cash_projection(capture);
   TempDir dir; std::ofstream out(dir.file("capture.json")); out<<capture.dump(); out.close();
   const std::string command="node '"+std::string(DESKD_SOURCE_DIR)+"/tests/deskd/contract_check.cjs' '"+dir.file("capture.json")+"'";
   CHECK(std::system(command.c_str())==0);

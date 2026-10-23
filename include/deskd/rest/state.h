@@ -51,10 +51,25 @@ struct Snapshot {
   ClockEstimate clock;
   std::set<std::string> pins, live;
   bool ready = false, account_ready = false, listing_ready = false;
-  std::int64_t account_ms = 0, listing_ms = 0, ts_ms = 0;
+  // account_began_ms: when the last complete account read began. Anything deskd saw finish
+  // before it is in these balances and positions; anything later may not be.
+  std::int64_t account_began_ms = 0, account_ms = 0, listing_ms = 0, ts_ms = 0;
+  // the windows `orders` (beyond the resting ones) and `fills` cover, from the read that made them
+  std::int64_t orders_from_ms = 0, fills_from_ms = 0;
+  // the liquidity incentive programs on Options::lip_series' markets (ticker -> the one running,
+  // else the next), from GET /incentive_programs; lip_ms when they were read (0: never)
+  std::map<std::string, kalshi::IncentiveRow> lip;
+  std::int64_t lip_ms = 0;
+  // the rows of the events State::set_events asks for (event_ticker -> GET /events/{t}, its markets
+  // nested), each with the time it was read; a row the listing shows to lack a market of its event
+  // is left out (State::events). events_ms: when every event asked for last had a row younger than
+  // Options::event_cache_ms that the listing agreed with (0: never).
+  std::map<std::string, kalshi::EventRow> events;
+  std::int64_t events_ms = 0;
   std::uint64_t revision = 0;
   std::string error;
   std::string metadata_error;
+  std::string events_error;   // this poll's last failed or held-back event row; "" when none
 };
 
 struct Options {
@@ -63,6 +78,32 @@ struct Options {
   // Public listing horizon. UI still admits only outcome dates T/T1; a longer close horizon
   // includes games whose published trading close is after their expected outcome date.
   int listing_horizon_days = 4;
+  // The public listing is the big read (a 1,000-market page measured 1.6 MB on demo). Smaller
+  // pages with their own deadline finish on a slow link; account reads keep timeout_ms.
+  int listing_page_size = 200, listing_timeout_ms = 15000;
+  // Kalshi rate-limits reads: requests leave at most every request_gap_ms, and a 429 (refused
+  // before processing, so a read is safe to repeat) waits backoff_429_ms, doubling, up to
+  // retries_429 times, or as long as the venue's Retry-After says, then repeats the same request.
+  int request_gap_ms = 100, retries_429 = 5, backoff_429_ms = 500;
+  // A failed poll keeps the last good read while it is younger than these (with an error saying
+  // so): one timeout on a slow link no longer refuses every click STALE until the next poll. gw
+  // treats the read's age itself (an account read over 60 s old is STALE) and counts every order
+  // of its own the read cannot reflect at worst case.
+  int account_keep_ms = 60000, listing_keep_ms = 300000;
+  // The day's orders and fills are read whole once, then from the last read's start less this
+  // overlap and merged by id (fills never change; an order is final once it leaves the book, and
+  // one that left since the last read is read by id). A whole read again after a failure, a new
+  // ET day, or more than incremental_max_gone such orders. Whole reads every poll grew with the
+  // day (13,500 orders by hour 4 of the soak) until almost every one overlapped a private event
+  // and was discarded, and orders went STALE (2026-10-13).
+  int incremental_overlap_ms = 300000, incremental_max_gone = 10;
+  // LIP programs (strat/lip.h): read every lip_poll_ms for markets of these series; none: never
+  std::vector<std::string> lip_series;
+  int lip_poll_ms = 120000, lip_max_pages = 10;
+  // Event rows (set_events): each read again event_cache_ms after it was read, and at most
+  // event_reads of them a poll, so a long list of new events is read over a few polls instead of
+  // holding up one poll's account and listing.
+  int event_cache_ms = 600000, event_reads = 16;
 };
 
 class State {
@@ -75,7 +116,25 @@ class State {
   std::shared_ptr<const Snapshot> snapshot() const;
   void set_pins(std::set<std::string> pins);  // immediate immutable publication; no network
   void set_live(std::set<std::string> live);  // ladders/lanes; positions/orders are also included
+  // Markets read by ticker on every listing poll whatever their status: Systematic's held
+  // inventory, so a market that settles after its position left the unsettled list still shows
+  // gw its result. No subscription, no publication.
+  void set_held(std::set<std::string> held);
+  // Events whose rows the snapshot carries (GET /events/{t}: the venue's mutually_exclusive and
+  // every market of the event, for gw/event_risk.h): the events S1 scans and those Systematic
+  // holds. Read from the next poll on; no publication.
+  void set_events(std::set<std::string> event_tickers);
+  // Orders created since this time are read too (default: since start): a restart reads the
+  // previous run's last orders, so their fills can be told apart by client id. Before run().
+  void set_orders_since(std::int64_t ms) { orders_since_ms_ = ms; }
   void request_refresh();
+  // The fill model's backfill (strat/fill_model.h): a market's public prints since `since_ms`,
+  // read between polls (at most 5 pages of 1,000) and handed to the callback with the time the
+  // tape is complete from. Any thread; a market asked again within a minute of a failure waits.
+  using TradesCallback = std::function<void(const std::string& ticker, std::int64_t covered_from_ms,
+                                            std::vector<kalshi::TradeRow> rows)>;
+  void set_trades_callback(TradesCallback cb) { trades_cb_ = std::move(cb); }   // before run()
+  void request_trades(const std::string& ticker, std::int64_t since_ms);
   // Set before run(). A private-event generation fences the whole paged read: an event or
   // reconnect during it means those pages cannot be accepted as one reconciled account.
   void set_reconcile_guard(std::function<std::uint64_t()> begin,
@@ -85,11 +144,14 @@ class State {
 
  private:
   bool refresh(Worker* worker);
-  bool get(kalshi::WireRequest request, std::string* body, std::string* why, Worker* worker);
+  bool get(kalshi::WireRequest request, std::string* body, std::string* why, Worker* worker, int timeout_ms = 0);
   bool account(Snapshot& next, std::string* why, Worker* worker);
   bool listing(Snapshot& next, std::string* why, Worker* worker);
   void metadata(Snapshot& next, Worker* worker);
+  void incentives(Snapshot& next, Worker* worker);
+  void events(Snapshot& next, Worker* worker);
   void publish(Snapshot next);
+  void backfill_trades(Worker* worker);
   void controls(bool pins, std::set<std::string> values);
   net::ConnFactory& factory_;
   net::Endpoint endpoint_;
@@ -100,24 +162,41 @@ class State {
   std::function<bool(std::uint64_t)> commit_;
   std::shared_ptr<const Snapshot> published_;
   std::mutex controls_mu_;  // controls/publication only, never held over I/O or callbacks
-  std::set<std::string> pins_, live_;
+  std::set<std::string> pins_, live_, held_, events_;
+  TradesCallback trades_cb_;
+  std::map<std::string, std::int64_t> trades_wanted_;   // ticker -> since ms (under controls_mu_)
+  std::map<std::string, std::int64_t> trades_failed_;   // ticker -> mono ms of the last failure
+  std::int64_t orders_since_ms_ = 0;
+  bool whole_read_next_ = false;   // REST owner only
   std::atomic<bool> refresh_requested_{false};
   ClockCheck clock_;
   std::unique_ptr<net::Conn> conn_;  // REST owner only; read connections can be reused
-  std::int64_t started_ms_ = 0, last_listing_mono_ = 0;
+  std::int64_t started_ms_ = 0, last_listing_mono_ = 0, last_lip_mono_ = 0;
+  bool mve_filter_refused_ = false;
+  std::int64_t last_request_mono_ = 0;   // the venue answered 400 to mve_filter=exclude: listed without it
   struct CachedSeries { kalshi::SeriesRow row; std::int64_t fetched_ms = 0, attempted_ms = 0; };
   std::map<std::string,CachedSeries> series_;
+  struct CachedEvent { kalshi::EventRow row; std::int64_t attempted_ms = 0; };   // row.fetched_ms 0: never read
+  std::map<std::string, CachedEvent> event_rows_;   // REST owner only
 };
 
 // Contract 1.5 projections. Missing exchange_index remains null; the gateway must refuse a
-// write without it. No model is invented: universe fair and edge are null. LIP remains false
+// write without it. No model is invented: universe fair and edge are null unless fair_of gives
+// a model's fair (strat/fair.h); then edge = the better take at the touch vs fair, after the
+// taker fee, per contract. LIP remains false
 // until incentive metadata is integrated. Unknown fees retain the presentation fallback;
 // that fallback is NOT approval to trade: admission must require fee_ready().
 constexpr std::int64_t kFeeFreshMs = 300000;
+constexpr std::int64_t kFeeRefreshMs = kFeeFreshMs - 60000;   // fetched again before it is stale
 bool fee_ready(const kalshi::MarketRow& market, std::int64_t now_ms);
 std::string category(const kalshi::MarketRow& market);
 std::string outcome_date(const kalshi::MarketRow& market);
 nlohmann::json market_json(const kalshi::MarketRow& market, bool pin, bool live, std::int64_t now_ms);
-nlohmann::json universe(const Snapshot& state, const nlohmann::json& query, std::int64_t now_ms);
+using FairOf = std::function<std::optional<Px>(const std::string& ticker)>;
+nlohmann::json universe(const Snapshot& state, const nlohmann::json& query, std::int64_t now_ms,
+                        const FairOf& fair_of = {});
+// the better of buying at the ask and selling at the bid against fair, net of the taker fee at
+// that price (0.07 x mult x p(1-p)), per contract; nullopt without a touch
+std::optional<Money> take_edge(const kalshi::MarketRow& market, std::optional<Px> bid, std::optional<Px> ask, Px fair);
 
 }  // namespace deskd::rest

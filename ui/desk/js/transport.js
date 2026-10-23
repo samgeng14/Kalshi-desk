@@ -104,7 +104,9 @@
     });
   }
 
-  var SILENT_MS = 5000, PROBE_MS = 5000;
+  // a stream silent 3 s (no heartbeat: the backend sends one each second) is reopened, and the
+  // reopen resyncs from /api/snapshot (plan section 6); the store greys the screen at the same 3 s
+  var SILENT_MS = 3000, PROBE_MS = 5000;
   function Live(sid) {
     this.sid = sid; this.es = null; this.opened = false; this.retry = null; this.epoch = null;
     this.lastMsg = 0; this.wd = null; this.probing = false; this.lastProbe = 0; this.reopens = 0;
@@ -248,6 +250,9 @@
   function subKeys(a) { return (a || []).map(function (x) { return x.v + '|' + x.tk; }).sort().join(','); }
   function sendSubs() {
     if (!T.impl) return;
+    // live: only once the stream is open (the backend answers 409 BAD_STATE for a sid with no
+    // stream, as every boot did); the stream's 'open' re-sends them (main.js)
+    if (T.mode === 'live' && !(T.impl.es && T.impl.es.readyState === 1)) return;
     var body = wantSubs(), sig = JSON.stringify(body);
     if (sig === lastSub) return;
     lastSub = sig;

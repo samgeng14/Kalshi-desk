@@ -23,6 +23,7 @@ const char* fee_type_name(FeeType t) {
     case FeeType::QUADRATIC: return "quadratic";
     case FeeType::QUADRATIC_WITH_MAKER_FEES: return "quadratic_with_maker_fees";
     case FeeType::QUADRATIC_WITH_COMBO_MAKER_FEES: return "quadratic_with_combo_maker_fees";
+    case FeeType::POLY: return "poly";
   }
   return "quadratic";
 }
@@ -34,7 +35,9 @@ Micros model_fee(FeeType type, int mult_milli, bool taker, Qty q, Px yes_px) {
   // in thousandths, so the divisor gains 1e3. 128 bits: 1e8 contracts' worth of q at the
   // worst p overflows 64.
   __int128 den;
-  if (taker) {
+  if (type == FeeType::POLY) {
+    return 0;  // poly_fee's, with the market's own coefficient
+  } else if (taker) {
     den = static_cast<__int128>(1000000) * 1000;
   } else if (type == FeeType::QUADRATIC_WITH_MAKER_FEES) {
     den = static_cast<__int128>(4000000) * 1000;
@@ -63,6 +66,20 @@ Micros charge_fee(Micros revenue, Micros trade_fee, Micros precision, Micros& ac
   return trade_fee + rounding - rebate;
 }
 
+Micros poly_fee(int coeff_micro, int rate_micro, bool taker, Qty q, Px yes_px) {
+  // rate x C x P x (1 - P) in cents, with the rate in millionths, C = q / 100 and P = yes_px /
+  // 10,000: r q p (1e4 - p) / 1e14, then to the nearest cent, half to even (core.js roundHE)
+  const int r = taker ? coeff_micro : rate_micro;
+  if (r <= 0 || q <= 0 || yes_px <= 0 || yes_px >= kDollar) return 0;
+  const __int128 num = static_cast<__int128>(r) * q * yes_px * (kDollar - yes_px);
+  const __int128 den = static_cast<__int128>(100000000) * 1000000;
+  __int128 cents = num / den;
+  const __int128 rem = num % den;
+  if (2 * rem > den || (2 * rem == den && cents % 2 != 0)) ++cents;
+  const Micros fee = static_cast<Micros>(cents) * (kMicrosPerDollar / 100);
+  return taker ? fee : -fee;
+}
+
 const char* tif_name(Tif t) {
   switch (t) {
     case Tif::FOK: return "fill_or_kill";
@@ -71,7 +88,14 @@ const char* tif_name(Tif t) {
   }
   return "";
 }
-const char* stp_name(Stp s) { return s == Stp::MAKER ? "maker" : "taker_at_cross"; }
+const char* stp_name(Stp s) {
+  switch (s) {
+    case Stp::TAKER_AT_CROSS: return "taker_at_cross";
+    case Stp::MAKER: return "maker";
+    case Stp::NONE: return "none";
+  }
+  return "taker_at_cross";
+}
 const char* status_name(OrdStatus s) {
   switch (s) {
     case OrdStatus::RESTING: return "resting";
@@ -89,6 +113,16 @@ bool is_no(const Order& o) { return o.side == Side::ASK; }
 Px side_px(const Order& o) { return o.side == Side::BID ? o.price : kDollar - o.price; }
 const char* outcome(Side s) { return s == Side::BID ? "yes" : "no"; }
 const char* book_side(Side s) { return s == Side::BID ? "bid" : "ask"; }
+// Self-trade prevention applies: the taker meets a resting order of its own subaccount, and its
+// stp is not NONE
+bool self_trade(const Order& t, const Order& mk) {
+  return t.stp != Stp::NONE && !t.street && !mk.street && mk.subaccount == t.subaccount;
+}
+// What a taker fill of q at yes_px pays on a market before any balance rounding
+Micros taker_fee(const MarketSpec& s, Qty q, Px yes_px) {
+  if (s.fee_type == FeeType::POLY) return poly_fee(s.poly_coeff_micro, s.poly_rebate_micro, true, q, yes_px);
+  return model_fee(s.fee_type, s.fee_mult_milli, true, q, yes_px);
+}
 }  // namespace
 
 // ---- one call's bookkeeping -------------------------------------------------------------------
@@ -145,6 +179,13 @@ Market* Engine::market(const std::string& t) {
 const Market* Engine::market(const std::string& t) const {
   auto it = markets_.find(t);
   return it == markets_.end() ? nullptr : &it->second;
+}
+
+const EventSpec& Engine::add_event(EventSpec spec) {
+  if (spec.series_ticker.empty()) spec.series_ticker = spec.event_ticker.substr(0, spec.event_ticker.find('-'));
+  EventSpec& e = event_specs_[spec.event_ticker];
+  e = std::move(spec);
+  return e;
 }
 
 std::vector<std::pair<Px, Qty>> Engine::levels(const std::string& ticker, bool no_side) const {
@@ -207,6 +248,26 @@ void Engine::pause(const std::string& ticker, std::int64_t now_ms) {
 void Engine::resume(const std::string& ticker, std::int64_t now_ms) {
   for (auto& [t, m] : markets_)
     if ((ticker.empty() || t == ticker) && m.state == Market::State::PAUSED) m.state = Market::State::OPEN;
+}
+
+void Engine::settle_market(const std::string& ticker, bool yes, std::int64_t now_ms) {
+  Market* m = market(ticker);
+  if (!m || m->settled) return;
+  close(ticker, now_ms);
+  m->settled = true;
+  m->result = yes ? "yes" : "no";
+  for (auto& [key, p] : positions_) {
+    if (key.second != ticker || !p.pos) continue;
+    const bool wins = (p.pos > 0) == yes;
+    const Micros payout = wins ? notional(kDollar, std::abs(p.pos)) : 0;
+    cash_[{key.first, p.exchange_index}] += payout;
+    p.realized += payout - p.cost;
+    p.cost = 0;
+    p.pos_fees = 0;
+    p.pos = 0;
+    p.updated_ms = now_ms;
+  }
+  cash_updated_ms_ = now_ms;
 }
 
 void Engine::close(const std::string& ticker, std::int64_t now_ms) {
@@ -465,7 +526,7 @@ Qty Engine::fillable(const Market& m, const Order& t) const {
     const Px maker_yes = t.side == Side::BID ? kDollar - it->first : it->first;
     if (t.side == Side::BID ? maker_yes > t.price : maker_yes < t.price) break;
     for (const Order* mk : it->second.q) {
-      if (!t.street && !mk->street && mk->subaccount == t.subaccount) {
+      if (self_trade(t, *mk)) {
         if (t.stp == Stp::TAKER_AT_CROSS) return std::min(n, t.remaining);
         continue;  // maker STP cancels it and goes on
       }
@@ -482,7 +543,7 @@ void Engine::match(Market& m, Order& t, Op& op) {
     const Px maker_yes = t.side == Side::BID ? kDollar - it->first : it->first;
     if (t.side == Side::BID ? maker_yes > t.price : maker_yes < t.price) break;
     Order* mk = it->second.q.front();
-    if (!t.street && !mk->street && mk->subaccount == t.subaccount) {
+    if (self_trade(t, *mk)) {
       if (t.stp == Stp::TAKER_AT_CROSS) {
         // "cancels the taker order ... execution stops and any partial fills already matched
         // are executed"
@@ -514,6 +575,8 @@ void Engine::execute(Market& m, Order& t, Order& mk, Qty q, Op& op) {
   mk.filled += q;
   mk.updated_ms = op.now;
   unrest(m, mk, q, op, t.street ? std::string() : t.client_order_id, t.street ? 0 : t.subaccount);
+  // a resting order filled to the last contract is executed, as the venue reports it
+  if (!mk.street && mk.remaining == 0 && mk.status == OrdStatus::RESTING) mk.status = OrdStatus::EXECUTED;
   if (!mk.street) settle(m, mk, q, yes_px, false, trade_id, op);
   if (!t.street) settle(m, t, q, yes_px, true, trade_id, op);
 
@@ -534,6 +597,8 @@ void Engine::execute(Market& m, Order& t, Order& mk, Qty q, Op& op) {
                {"ts", op.now / 1000},
                {"ts_ms", op.now}};
   events_.push_back(std::move(e));
+  public_trades_.push_back({trade_id, m.spec.ticker, outcome(t.side), yes_px, q, op.now});
+  if (public_trades_.size() > 50000) public_trades_.pop_front();
   m.last_px = yes_px;
   m.last_size = q;
   m.volume += q;
@@ -583,8 +648,13 @@ void Engine::settle(Market& m, Order& o, Qty q, Px yes_px, bool taker, const std
     p.pos += bid ? open : -open;
     p.cost += notional(paid, open);
   }
-  const Micros fee = charge_fee(revenue, model_fee(m.spec.fee_type, m.spec.fee_mult_milli, taker, q, yes_px),
-                                cfg_.balance_precision, o.fee_acc);
+  // Polymarket's fee is whole cents already and its cash is not aligned; a maker's rebate is a
+  // negative fee, credited here
+  const Micros fee =
+      m.spec.fee_type == FeeType::POLY
+          ? poly_fee(m.spec.poly_coeff_micro, m.spec.poly_rebate_micro, taker, q, yes_px)
+          : charge_fee(revenue, model_fee(m.spec.fee_type, m.spec.fee_mult_milli, taker, q, yes_px),
+                       cfg_.balance_precision, o.fee_acc);
   cash_[{o.subaccount, shard}] += revenue - fee;
   cash_updated_ms_ = op.now;
   p.fees += fee;
@@ -747,7 +817,9 @@ CreateResult Engine::create(const NewOrder& n, std::int64_t now_ms) {
       return r;
     }
     if (g->triggered) {
-      r.err = refuse(400, "invalid_order", "invalid order", "order group triggered");
+      // what demo answered an order into its triggered group, verbatim (demo checks, 2026-10-13)
+      r.err = refuse(400, "exceeded_order_group_contracts_limit",
+                     "placing this order would exceed your the order group contracts limit");
       return r;
     }
   }
@@ -771,7 +843,7 @@ CreateResult Engine::create(const NewOrder& n, std::int64_t now_ms) {
     probe.remaining = n.count;
     if (n.reduce_only) probe.remaining = std::min(n.count, reducible(n.subaccount, n.ticker, n.side));
     const Micros need = reserve_for(n.subaccount, *m, n.side, &probe) - reserve_for(n.subaccount, *m, n.side, nullptr) +
-                        (n.post_only ? 0 : model_fee(m->spec.fee_type, m->spec.fee_mult_milli, true, probe.remaining, n.price));
+                        (n.post_only ? 0 : taker_fee(m->spec, probe.remaining, n.price));
     if (need > available(n.subaccount, shard)) {
       r.err = refuse(400, "insufficient_balance", "insufficient balance");
       return r;
@@ -920,6 +992,21 @@ Qty Engine::street_hit(const std::string& order_id, Qty qty, std::int64_t now_ms
   return q;
 }
 
+Qty Engine::street_pull_touch(const std::string& ticker, Side side, Px yes_limit, Qty qty, std::int64_t now_ms) {
+  Market* m = market(ticker);
+  if (!m || m->state != Market::State::OPEN || qty < 0) return 0;
+  const auto& opp = side == Side::BID ? m->no : m->yes;
+  if (opp.empty()) return 0;
+  const Px touch = opp.rbegin()->first;
+  const Px maker_yes = side == Side::BID ? kDollar - touch : touch;
+  if (side == Side::BID ? maker_yes > yes_limit : maker_yes < yes_limit) return 0;  // it would take nothing
+  Op op;
+  op.now = now_ms;
+  const Qty pulled = remove_street(*m, side == Side::BID, touch, qty ? qty : std::numeric_limits<Qty>::max(), op);
+  flush(op);
+  return pulled;
+}
+
 // ---- order groups -----------------------------------------------------------------------------
 
 Group* Engine::find_group(const std::string& id, int sub, int shard) {
@@ -1054,24 +1141,32 @@ void Engine::street_remove(const std::string& ticker, bool no_side, Px px, Qty q
     if (d->second.first == 0) m->debt.erase(d);
   }
   auto& side = no_side ? m->no : m->yes;
-  auto it = side.find(px);
-  if (it == side.end() || qty <= 0) return;
+  if (!side.count(px) || qty <= 0) return;
   Op op;
   op.now = now_ms;
+  remove_street(*m, no_side, px, qty, op);
+  flush(op);
+}
+
+Qty Engine::remove_street(Market& m, bool no_side, Px px, Qty qty, Op& op) {
+  auto& side = no_side ? m.no : m.yes;
+  auto it = side.find(px);
+  if (it == side.end()) return 0;
   // Street orders only, from the back of the queue (StreetCancel::BACK_FIRST: the queue ahead of
   // ours never moves up for a cancel we cannot place) or from the front.
   std::vector<Order*> street;
   for (Order* o : it->second.q)
     if (o->street) street.push_back(o);
   if (cfg_.street_cancel == StreetCancel::BACK_FIRST) std::reverse(street.begin(), street.end());
+  Qty left = qty;
   for (Order* o : street) {
-    if (qty <= 0) break;
-    const Qty take = std::min(qty, o->remaining);
-    qty -= take;
-    unrest(*m, *o, take, op, "", 0);  // may erase the level: `it` is not used again
+    if (left <= 0) break;
+    const Qty take = std::min(left, o->remaining);
+    left -= take;
+    unrest(m, *o, take, op, "", 0);  // may erase the level: `it` is not used again
     if (o->remaining == 0) erase_street(o);
   }
-  flush(op);
+  return qty - left;
 }
 
 Qty Engine::street_take(const std::string& ticker, Side side, Px yes_limit, Qty qty, std::int64_t now_ms) {

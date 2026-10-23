@@ -1,0 +1,6 @@
+{"type":"market_lifecycle_v2","sid":7,"seq":1,"msg":{"market_ticker":"KXNCAAWBGAME-26NOV05UCONNSC-UCONN","event_type":"created","open_ts":1793750400,"close_ts":1795046400,"additional_metadata":{"name":"UConn wins","title":"South Carolina at UConn"}}}
+{"type":"market_lifecycle_v2","sid":7,"seq":2,"msg":{"market_ticker":"KXNCAAWBGAME-26NOV05UCONNSC-UCONN","event_type":"close_date_updated","close_ts":1793926800}}
+{"type":"market_lifecycle_v2","sid":7,"seq":3,"msg":{"market_ticker":"KXNCAAWBGAME-26NOV05UCONNSC-UCONN","event_type":"determined","result":"yes","determination_ts":1793927100}}
+{"type":"market_lifecycle_v2","sid":7,"seq":4,"msg":{"market_ticker":"KXNCAAWBGAME-26NOV05UCONNSC-UCONN","event_type":"settled","settled_ts":1793927400}}
+{"type":"market_lifecycle_v2","sid":7,"seq":5,"msg":{"market_ticker":"KXNCAAWBGAME-26NOV05UCONNSC-SC","event_type":"deactivated","is_deactivated":true}}
+{"type":"event_lifecycle","sid":7,"seq":6,"msg":{"event_ticker":"KXNCAAWBGAME-26NOV07IOWADRKE","title":"Iowa at Drake","series_ticker":"KXNCAAWBGAME"}}

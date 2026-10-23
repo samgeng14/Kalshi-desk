@@ -6,6 +6,9 @@
 <meta name="color-scheme" content="dark">
 <!-- the backend writes its per-start X-Desk token here when it serves the page; empty on disk -->
 <meta name="desk-token" content="">
+<!-- the header's PAPER/LIVE switch: the other desk's page and this desk's venue (demo, prod, sim) -->
+<meta name="desk-peer" content="">
+<meta name="desk-venue" content="">
 <link rel="icon" href="data:,">
 <title>Desk</title>
 <link rel="stylesheet" href="desk.css">
@@ -47,7 +50,7 @@
   <div class="hh" id="h-gw">GW -</div>
   <div class="hh" id="h-srv">SRV -</div>
   <div class="hh" id="h-clk">CLK -</div>
-  <div class="hc" id="hc-mode"><span class="tag dim" id="h-mode"></span></div>
+  <div class="hc" id="hc-mode"><span class="tag dim" id="h-mode"></span><span class="tag hide" id="h-mode-b"></span></div>
   <div class="hclock" id="h-clock"></div>
   <button id="kill" type="button">KILL</button>
 </header>

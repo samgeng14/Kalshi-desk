@@ -50,6 +50,16 @@
 //   - Kalshi nets one position per market: buying YES while holding NO closes pairs, each worth
 //     $1 at once (plan section 4, "Kalshi nets one position per market").
 //
+// For the fake Polymarket US, two settings the Kalshi routes never set. A market whose fee_type is
+// POLY charges a taker coeff x C x P x (1 - P), coeff the market's own feeCoefficient, and pays a
+// maker 0.0125 x C x P x (1 - P). Each fill is rounded to the cent, half to even, and charged or
+// credited as it is: none of Kalshi's balance alignment or accumulator (ui/desk/js/core.js
+// Desk.fees.pmFill, as deskd's gw/fees.h has it; core.js also caps an order's taker fills at its
+// rounded exact total, which the fake does not). The venue has confirmed none of this: the
+// coefficient, the rate, the rounding, or per fill against per order. The venue lists no
+// self-trade prevention ("Self-trade n/a", plan section 3), so its orders carry Stp::NONE: an
+// order of ours that crosses our own resting order trades with it.
+//
 // The fake's own choices where the venue documents nothing, so deskd must not rely on them: the
 // error `code` strings other than invalid_order and the 429 body; the collateral rule (an order
 // reserves the cost of the part its opposite position cannot close, plus the worst taker fee
@@ -98,12 +108,18 @@ std::vector<PriceRange> linear_cent();
 std::vector<PriceRange> tapered_deci_cent();
 bool on_grid(const std::vector<PriceRange>& g, Px p);
 
-enum class FeeType { QUADRATIC, QUADRATIC_WITH_MAKER_FEES, QUADRATIC_WITH_COMBO_MAKER_FEES };
+// POLY: a Polymarket US market (poly_fee), never a Kalshi series
+enum class FeeType { QUADRATIC, QUADRATIC_WITH_MAKER_FEES, QUADRATIC_WITH_COMBO_MAKER_FEES, POLY };
 const char* fee_type_name(FeeType t);
 
 // The model fee for one fill, rounded up to $0.000001. mult_milli: the series' fee_multiplier in
-// thousandths (1000 = 1, 500 = 0.5, 0 = fee-free).
+// thousandths (1000 = 1, 500 = 0.5, 0 = fee-free). Kalshi's types only: 0 for POLY.
 Micros model_fee(FeeType type, int mult_milli, bool taker, Qty q, Px yes_px);
+
+// Polymarket US's fee for one fill: a taker pays coeff x C x P x (1 - P), a maker is paid
+// rate x C x P x (1 - P) (a negative fee), rounded to the cent, half to even. coeff_micro and
+// rate_micro in millionths (0.06 = 60,000).
+Micros poly_fee(int coeff_micro, int rate_micro, bool taker, Qty q, Px yes_px);
 
 // fee_rounding.md for one fill: `revenue` is the fill's cash change before fees, `trade_fee` the
 // model fee. Returns what the fill is charged (trade fee + rounding fee - rebate) and updates the
@@ -119,12 +135,33 @@ struct MarketSpec {
   std::string price_level_structure = "linear_cent";
   FeeType fee_type = FeeType::QUADRATIC;
   int fee_mult_milli = 1000;
+  // POLY only, in millionths: the taker feeCoefficient the market lists (0.06 in the old desk's
+  // fixtures and docs/polymarket.md, 0.0695 in core.js) and the maker rebate rate
+  int poly_coeff_micro = 60000, poly_rebate_micro = 12500;
   std::int64_t close_ms = 0;    // 0: never closes on its own
+  bool fractional = false;      // fractional_trading_enabled (listed only; the engine does not refuse)
+  std::int64_t open_ms = 0;     // open_time; 0: left out
+  // strike_type, floor_strike, cap_strike as listed ("" / nullopt: left out); the engine never
+  // settles on them
+  std::string strike_type;
+  std::optional<double> floor_strike, cap_strike;
+  std::string yes_sub_title;    // what YES is (a bracket: "79 to 80"); "": left out
+};
+
+// An event (GET /events/{event_ticker}, get-event.md): its markets are the listed markets whose
+// event_ticker names it. The fake's own choice: a mutually_exclusive left nullopt is left out of the
+// body, though the docs list it as required, so a test can show deskd an event whose flag is unknown.
+struct EventSpec {
+  std::string event_ticker;
+  std::string series_ticker;    // default: the event ticker up to its first '-'
+  std::string title, sub_title, category;
+  std::optional<bool> mutually_exclusive;
+  std::string collateral_return_type;   // "": left out
 };
 
 enum class Side { BID, ASK };  // the order's book side, YES terms
 enum class Tif { FOK, GTC, IOC };
-enum class Stp { TAKER_AT_CROSS, MAKER };
+enum class Stp { TAKER_AT_CROSS, MAKER, NONE };  // NONE: Polymarket's, ours trade with ours
 enum class OrdStatus { RESTING, CANCELED, EXECUTED };
 enum class StreetCancel { BACK_FIRST, FRONT_FIRST };
 enum class PostOnlyCross { REFUSE_400, CANCEL };
@@ -251,6 +288,8 @@ struct Market {
   Micros dollar_volume = 0;
   json last_ticker;             // the last ticker message's fields, to send only on change
   std::map<std::pair<bool, Px>, std::pair<Qty, std::int64_t>> debt;  // (no side?, px) -> (qty, since)
+  bool settled = false;         // settle_market: closed, determined and paid out
+  std::string result;           // "yes" or "no" once settled
 };
 
 struct EngineConfig {
@@ -289,6 +328,15 @@ class Engine {
   void pause(const std::string& ticker, std::int64_t now_ms);  // "" pauses every market
   void resume(const std::string& ticker, std::int64_t now_ms);
   void close(const std::string& ticker, std::int64_t now_ms);
+  // Closes the market (if open) and settles it: each position pays $1 a contract on the winning
+  // side into its shard's cash, realizes against its cost and goes to 0; the market lists as
+  // status "settled" with its result.
+  void settle_market(const std::string& ticker, bool yes, std::int64_t now_ms);
+
+  // ---- events: a new event, or a new spec for one that exists. Markets join an event by their
+  // own event_ticker, before or after it is added; GET /events/{t} answers 404 until it is.
+  const EventSpec& add_event(EventSpec spec);
+  const std::map<std::string, EventSpec>& events() const { return event_specs_; }
 
   // ---- time: expiries, closes, group windows and tape debts
   void tick(std::int64_t now_ms);
@@ -313,6 +361,24 @@ class Engine {
   const Order* order(const std::string& order_id) const;
   const std::vector<const Order*>& user_orders() const { return user_orders_; }
   const std::vector<Fill>& fills() const { return fills_; }
+  // every public print, oldest first (the last 50,000): GET /markets/trades
+  struct PublicTrade {
+    std::string trade_id, ticker, taker_side;   // taker_side "yes" | "no"
+    Px yes_px = 0;
+    Qty qty = 0;
+    std::int64_t ts_ms = 0;
+  };
+  const std::deque<PublicTrade>& public_trades() const { return public_trades_; }
+  // the incentive programs GET /incentive_programs lists (scripts/incentive_audit.py's fields): a
+  // liquidity program pays `reward` (1/10,000 $) over [start, end) to resting quotes near the best
+  struct Incentive {
+    std::string ticker, type = "liquidity";
+    std::int64_t start_ms = 0, end_ms = 0, reward = 0;
+    Qty target = 0;
+    int discount_bps = 0;
+  };
+  void add_incentive(Incentive i) { incentives_.push_back(std::move(i)); }
+  const std::vector<Incentive>& incentives() const { return incentives_; }
   const std::map<std::pair<int, std::string>, Position>& positions() const { return positions_; }
 
   // ---- order groups
@@ -346,6 +412,11 @@ class Engine {
   // A cancel that loses a race with a fill (plan section 8: "a fill during a cancel"): the street
   // takes `qty` of the order first, then the cancel runs. Used by the server's fault plan.
   Qty street_hit(const std::string& order_id, Qty qty, std::int64_t now_ms);
+  // Liquidity that leaves just before an order reaches it (the server's PULL_TOUCH): the street
+  // pulls `qty` (0: all it has there) from the best level on the other side, if an order on `side`
+  // up to `yes_limit` would take it; returns what left. Ours stay. The tape never saw this pull,
+  // so it pays no tape debt: the tape's own removals later still meet theirs.
+  Qty street_pull_touch(const std::string& ticker, Side side, Px yes_limit, Qty qty, std::int64_t now_ms);
 
  private:
   struct Op;  // one call's bookkeeping: touched orders, positions and markets
@@ -369,11 +440,14 @@ class Engine {
   Qty reducible(int subaccount, const std::string& ticker, Side side) const;
   Group* find_group(const std::string& id, int subaccount, int shard);
   void erase_street(Order* o);
+  // Street quantity leaves one level, by street_cancel's rule; returns what left.
+  Qty remove_street(Market& m, bool no_side, Px side_px, Qty qty, Op& op);
 
   EngineConfig cfg_;
   std::mt19937_64 rng_;
   std::uint64_t next_seq_ = 1;
   std::map<std::string, Market> markets_;
+  std::map<std::string, EventSpec> event_specs_;
   std::unordered_map<std::uint64_t, std::unique_ptr<Order>> pool_;
   std::unordered_map<std::string, Order*> by_id_;
   std::vector<const Order*> user_orders_;
@@ -391,6 +465,8 @@ class Engine {
   std::int64_t cash_updated_ms_ = 0;
   std::map<std::string, Group> groups_;
   std::vector<Event> events_;
+  std::deque<PublicTrade> public_trades_;
+  std::vector<Incentive> incentives_;
   std::int64_t last_cancel_all_ms_ = std::numeric_limits<std::int64_t>::min() / 2;
   bool tape_debts_ = false;
   std::uint64_t transfers_ = 0;
