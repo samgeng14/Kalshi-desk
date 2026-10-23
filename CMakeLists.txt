@@ -516,7 +516,9 @@ endif()
 #                markets, books, balances, positions, activities, open orders, one order) over the
 #                engine's books, orders and cash, paging, auth with a real Ed25519 signature (a key
 #                made in the test) and the 30 s window, the wire log, TLS, the idle close, and
-#                fake-kalshi --poly
+#                fake-kalshi --poly; its writes (an asynchronous create and its delayed executions,
+#                a synchronous one, every refusal, GTD and its expiry, post-only refused or
+#                cancelled, no self-trade prevention, cancel, cancel-all, preview)
 fake_kalshi_test(engine)
 fake_kalshi_test(wire)
 add_dependencies(deskd-test-fake-wire fake-kalshi)  # it starts the binary once

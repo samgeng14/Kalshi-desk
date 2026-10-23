@@ -2,7 +2,9 @@
 // read routes and their shapes (the old desk's mock, tests/test_poly.cpp), the engine's books,
 // orders, positions and cash as those routes list them, paging, auth with a real Ed25519 signature
 // (a key made here, never a real one) and its 30 s window, the wire log, TLS, and fake-kalshi
-// --poly. Nothing here talks to anything but 127.0.0.1.
+// --poly. Then the writes: an asynchronous create and its delayed executions, a synchronous one,
+// GTD and its expiry, post-only in both modes, cancels, cancel-all and preview. Nothing here talks
+// to anything but 127.0.0.1.
 #include <openssl/evp.h>
 #include <openssl/ssl.h>
 #include <openssl/x509v3.h>
@@ -575,6 +577,356 @@ void test_auth() {
   }
 }
 
+// ---- the writes ---------------------------------------------------------------------------------
+
+const std::string BUY = "ORDER_ACTION_BUY", SELL = "ORDER_ACTION_SELL";
+const std::string IOC = "TIME_IN_FORCE_IMMEDIATE_OR_CANCEL", FOK = "TIME_IN_FORCE_FILL_OR_KILL",
+                  GTC = "TIME_IN_FORCE_GOOD_TILL_CANCEL", GTD = "TIME_IN_FORCE_GOOD_TILL_DATE";
+
+// A create as deskd sends it: the old desk's body (src/poly.cpp poly_order_body), asynchronous
+json order_body(const std::string& slug, const std::string& action, const std::string& px, const json& qty,
+                const std::string& tif = IOC, bool manual = true) {
+  return json{{"marketSlug", slug},
+              {"type", "ORDER_TYPE_LIMIT"},
+              {"price", money(px)},
+              {"quantity", qty},
+              {"tif", tif},
+              {"outcomeSide", "OUTCOME_SIDE_YES"},
+              {"action", action},
+              {"manualOrderIndicator", manual ? "MANUAL_ORDER_INDICATOR_MANUAL" : "MANUAL_ORDER_INDICATOR_AUTOMATIC"}};
+}
+// A GTD post-only expiring at `exp` (RFC 3339), AUTOMATIC as a Systematic order goes
+json post_body(const std::string& slug, const std::string& action, const std::string& px, const json& qty,
+               const std::string& exp) {
+  json b = order_body(slug, action, px, qty, GTD, false);
+  b["participateDontInitiate"] = true;
+  b["expireTime"] = exp;
+  return b;
+}
+
+// A signed POST (any signature passes PRESENCE)
+HttpResult post(HttpConn& c, const std::string& path, const json& body) {
+  return c.request("POST", path, body.dump(), pm_auth("POST", path, wall_ms()));
+}
+HttpResult post_raw(HttpConn& c, const std::string& path, const std::string& body) {
+  return c.request("POST", path, body, pm_auth("POST", path, wall_ms()));
+}
+json order_of(HttpConn& c, const std::string& id) { return get(c, "/v1/order/" + id).j["order"]; }
+std::size_t engine_orders(FakePoly& f) {
+  return f.with_engine([](Engine& e, std::int64_t) { return e.user_orders().size(); });
+}
+
+FakePolyConfig manual_clock() {
+  FakePolyConfig cfg;
+  cfg.manual_clock = true;
+  cfg.start_ms = T0;
+  cfg.auth_max_skew_ms = 0;  // the fake's clock is T0; the client signs with the wall clock
+  return cfg;
+}
+
+void test_create() {
+  FakePolyConfig cfg = manual_clock();
+  cfg.async_delay_ms = 200;
+  Venue v(cfg);
+  CHECK(v.ok);
+  HttpConn c(v.port());
+  // BUY 5 at 0.385 IOC: accepted, and nothing yet: no execution, no book change, no trade
+  auto r = post(c, "/v1/orders", order_body(NE, BUY, "0.385", 5));
+  CHECK(r.status() == 200 && keys(r.j) == std::set<std::string>({"id", "executions"}) && r.j["executions"] == json::array());
+  const std::string ioc = r.j["id"].get<std::string>();
+  CHECK(ioc.size() == 36 && v.f.engine_id(ioc).empty() && engine_orders(v.f) == 0);
+  json o = order_of(c, ioc);
+  CHECK((keys(o) == std::set<std::string>{"id", "marketSlug", "type", "side", "tif", "state", "price", "quantity",
+                                          "cumQuantity", "leavesQuantity", "commissionNotionalTotalCollected",
+                                          "createTime", "updateTime"}));
+  CHECK(o["id"] == ioc && o["marketSlug"] == NE && o["side"] == "ORDER_SIDE_BUY" && o["tif"] == IOC);
+  CHECK(o["state"] == "ORDER_STATE_PENDING_NEW" && o["price"] == money("0.3850") && o["quantity"] == 5 &&
+        o["cumQuantity"] == 0 && o["leavesQuantity"] == 5 && o["createTime"] == "2026-10-06T15:30:00.000000Z");
+  r = get(c, "/v1/orders/open");
+  CHECK(r.j["orders"].size() == 1 && r.j["orders"][0] == o);
+  r = c.request("GET", "/v1/markets/" + NE + "/book");
+  CHECK(r.j["marketData"]["asks"][0] == json::parse(R"({"px":{"value":"0.3850","currency":"USD"},"qty":"9.00"})"));
+  CHECK(get(c, "/v1/portfolio/activities").j["activities"].size() == 1);  // the deposit
+  // the engine takes it 200 ms on: 5 of the 9 offered and a 7c fee, the trade at the take
+  v.f.advance_ms(199);
+  CHECK(order_of(c, ioc)["state"] == "ORDER_STATE_PENDING_NEW");
+  v.f.advance_ms(1);
+  o = order_of(c, ioc);
+  CHECK(o["id"] == ioc && o["state"] == "ORDER_STATE_FILLED" && o["cumQuantity"] == 5 && o["leavesQuantity"] == 0);
+  CHECK(o["avgPx"] == money("0.3850") && o["commissionNotionalTotalCollected"] == money("0.0700"));
+  CHECK(o["createTime"] == "2026-10-06T15:30:00.000000Z" && o["updateTime"] == "2026-10-06T15:30:00.200000Z");
+  const std::string eid = v.f.engine_id(ioc);
+  CHECK(!eid.empty() && eid != ioc);
+  CHECK(get(c, "/v1/order/" + eid).status() == 404);  // the engine's id is not the venue's
+  r = get(c, "/v1/portfolio/activities");
+  CHECK(r.j["activities"].size() == 2 && r.j["activities"][0]["trade"]["qtyDecimal"] == "5" &&
+        r.j["activities"][0]["trade"]["isAggressor"] == true &&
+        r.j["activities"][0]["trade"]["createTime"] == "2026-10-06T15:30:00.200000Z");
+  CHECK(get(c, "/v1/orders/open").j["orders"].empty());
+  // what was sent is kept, as it came
+  CHECK(v.f.sent(ioc) == order_body(NE, BUY, "0.385", 5) && v.f.sent("nope").is_null());
+
+  // a GTD post rests until its expireTime, then expires
+  v.f.set_async_delay_ms(0);
+  r = post(c, "/v1/orders", post_body(NE, BUY, "0.370", "3", "2026-10-06T15:31:00Z"));
+  CHECK(r.status() == 200 && r.j["executions"].empty());
+  const std::string gtd = r.j["id"].get<std::string>();
+  o = order_of(c, gtd);  // no delay: the engine took it before the reply
+  CHECK(o["state"] == "ORDER_STATE_NEW" && o["tif"] == GTD && o["quantity"] == 3 && o["leavesQuantity"] == 3);
+  CHECK(v.f.sent(gtd)["manualOrderIndicator"] == "MANUAL_ORDER_INDICATOR_AUTOMATIC" &&
+        v.f.sent(gtd)["participateDontInitiate"] == true);
+  r = c.request("GET", "/v1/markets/" + NE + "/book");
+  CHECK(r.j["marketData"]["bids"].size() == 3 &&
+        r.j["marketData"]["bids"][2] == json::parse(R"({"px":{"value":"0.3700","currency":"USD"},"qty":"3.00"})"));
+  v.f.advance_ms(59799);  // 15:30:59.999
+  CHECK(order_of(c, gtd)["state"] == "ORDER_STATE_NEW");
+  v.f.advance_ms(1);
+  o = order_of(c, gtd);
+  CHECK(o["state"] == "ORDER_STATE_EXPIRED" && o["leavesQuantity"] == 0 && get(c, "/v1/orders/open").j["orders"].empty());
+
+  // synchronous: taken at once, the reply's executions as the old desk read them, one per fill,
+  // each tradeId its trade activity's id: 4 at 0.385 (6c) and 2 at 0.390 (3c)
+  json sync = order_body(NE, BUY, "0.390", 6.0);
+  sync["synchronousExecution"] = true;
+  sync["maxBlockTime"] = "3";
+  r = post(c, "/v1/orders", sync);
+  CHECK(r.status() == 200 && r.j["executions"].size() == 2);
+  json ex = r.j["executions"];
+  CHECK((keys(ex[0]) == std::set<std::string>{"tradeId", "lastShares", "lastPx", "commissionNotionalCollected", "order"}));
+  CHECK(ex[0]["lastShares"] == "4.00" && ex[0]["lastPx"] == money("0.3850") &&
+        ex[0]["commissionNotionalCollected"] == money("0.0600") && ex[0]["order"] == json({{"state", "ORDER_STATE_FILLED"}}));
+  CHECK(ex[1]["lastShares"] == "2.00" && ex[1]["lastPx"] == money("0.3900") &&
+        ex[1]["commissionNotionalCollected"] == money("0.0300"));
+  r = get(c, "/v1/portfolio/activities?limit=2");
+  CHECK(r.j["activities"][0]["trade"]["id"] == ex[1]["tradeId"] && r.j["activities"][1]["trade"]["id"] == ex[0]["tradeId"]);
+  // FOK: 20 wanted, 3 offered: nothing
+  r = post(c, "/v1/orders", order_body(NE, BUY, "0.390", "20", FOK));
+  o = order_of(c, r.j["id"].get<std::string>());
+  CHECK(o["state"] == "ORDER_STATE_CANCELED" && o["cumQuantity"] == 0 && o["tif"] == FOK);
+
+  // no self-trade prevention: our SELL meets our resting BUY, two trades of ours
+  r = post(c, "/v1/orders", order_body(DAL, BUY, "0.600", 2, GTC));
+  const std::string bid = r.j["id"].get<std::string>();
+  CHECK(order_of(c, bid)["state"] == "ORDER_STATE_NEW" && order_of(c, bid)["tif"] == GTC);
+  r = post(c, "/v1/orders", order_body(DAL, SELL, "0.600", 2));
+  CHECK(order_of(c, r.j["id"].get<std::string>())["state"] == "ORDER_STATE_FILLED" &&
+        order_of(c, bid)["state"] == "ORDER_STATE_FILLED");
+  r = get(c, "/v1/portfolio/activities?limit=2");
+  json t0 = r.j["activities"][0]["trade"], t1 = r.j["activities"][1]["trade"];
+  CHECK(t0["marketSlug"] == DAL && t1["marketSlug"] == DAL && t0["id"] != t1["id"] &&
+        t0["isAggressor"] != t1["isAggressor"]);
+  CHECK(!get(c, "/v1/portfolio/positions").j["positions"].contains(DAL));
+
+  // what the engine refuses when it takes the order: REJECTED, never open
+  v.f.set_async_delay_ms(100);
+  r = post(c, "/v1/orders", order_body(NE, BUY, "0.380", 500, GTC));  // $190 against some $95
+  const std::string broke = r.j["id"].get<std::string>();
+  CHECK(r.status() == 200 && order_of(c, broke)["state"] == "ORDER_STATE_PENDING_NEW");
+  r = post(c, "/v1/orders", order_body(DAL, BUY, "0.300", 1, GTC));
+  const std::string paused = r.j["id"].get<std::string>();
+  v.f.with_engine([](Engine& e, std::int64_t now) { e.pause(DAL, now); });
+  v.f.advance_ms(100);
+  o = order_of(c, broke);
+  CHECK(o["state"] == "ORDER_STATE_REJECTED" && o["cumQuantity"] == 0 && o["leavesQuantity"] == 0 &&
+        o["updateTime"] == "2026-10-06T15:31:00.100000Z");
+  CHECK(order_of(c, paused)["state"] == "ORDER_STATE_REJECTED" && v.f.engine_id(paused).empty());
+  CHECK(get(c, "/v1/orders/open").j["orders"].empty());
+  CHECK(logged(v.f, "http 200 POST /v1/orders (signed)"));
+}
+
+void test_create_refusals() {
+  FakePolyConfig cfg = manual_clock();
+  cfg.engine.min_expiry_lead_s = 60;  // the GTD minimum lead tools/poly_checks reads off the venue
+  Venue v(cfg);
+  CHECK(v.ok);
+  HttpConn c(v.port());
+  auto refused = [&](const json& b, int status, const std::string& message) {
+    const auto r = post(c, "/v1/orders", b);
+    const bool ok = r.status() == status && r.j == json({{"code", status == 404 ? 5 : 3}, {"message", message}});
+    if (!ok) std::fprintf(stderr, "refusal: %d %s\n", r.status(), r.res.body.c_str());
+    return ok;
+  };
+  const json good = order_body(NE, BUY, "0.385", 1);
+  auto with = [&](const char* k, const json& val) {
+    json b = good;
+    b[k] = val;
+    return b;
+  };
+  auto without = [&](const char* k) {
+    json b = good;
+    b.erase(k);
+    return b;
+  };
+  CHECK(post_raw(c, "/v1/orders", "{\"marketSlug\":").status() == 400);
+  CHECK(post_raw(c, "/v1/orders", "{\"marketSlug\":").j == json({{"code", 3}, {"message", "the body is not JSON"}}));
+  CHECK(refused(json(), 400, "the order must be a JSON object") && refused(json::array({good}), 400, "the order must be a JSON object"));
+  CHECK(refused(with("participateDontInitate", true), 400, "unknown field participateDontInitate"));
+  CHECK(refused(without("marketSlug"), 400, "marketSlug is required") && refused(with("marketSlug", 5), 400, "marketSlug is required"));
+  CHECK(refused(with("marketSlug", "nope"), 404, "market not found"));
+  CHECK(refused(with("type", "ORDER_TYPE_MARKET"), 400, "type must be ORDER_TYPE_LIMIT"));
+  CHECK(refused(with("action", "BUY"), 400, "action must be ORDER_ACTION_BUY or ORDER_ACTION_SELL"));
+  CHECK(refused(without("outcomeSide"), 400, "outcomeSide must be OUTCOME_SIDE_YES") &&
+        refused(with("outcomeSide", "OUTCOME_SIDE_NO"), 400, "outcomeSide must be OUTCOME_SIDE_YES"));
+  CHECK(refused(without("manualOrderIndicator"), 400,
+                "manualOrderIndicator must be MANUAL_ORDER_INDICATOR_MANUAL or MANUAL_ORDER_INDICATOR_AUTOMATIC"));
+  CHECK(refused(with("synchronousExecution", "false"), 400, "synchronousExecution must be true or false"));
+  CHECK(refused(with("maxBlockTime", json::array()), 400, "maxBlockTime must be a number of seconds"));
+  const std::string tifs = "tif must be TIME_IN_FORCE_IMMEDIATE_OR_CANCEL, _FILL_OR_KILL, _GOOD_TILL_CANCEL or _GOOD_TILL_DATE";
+  CHECK(refused(without("tif"), 400, tifs) && refused(with("tif", "IOC"), 400, tifs));
+  // GTD and its expireTime, both or neither; RFC 3339 in UTC, a whole second, the lead
+  CHECK(refused(with("expireTime", "2026-10-06T15:32:00Z"), 400, "expireTime goes only with TIME_IN_FORCE_GOOD_TILL_DATE"));
+  CHECK(refused(with("tif", GTD), 400, "expireTime is required with TIME_IN_FORCE_GOOD_TILL_DATE"));
+  for (const json& bad : {json("2026-10-06T15:32:00.5Z"), json("2026-10-06 15:32:00Z"), json("2026-10-06T15:32:00+00:00"),
+                          json("2026-10-06T15:32:00"), json("2026-13-06T15:32:00Z"), json(1791300720), json("1791300720")}) {
+    json b = post_body(NE, BUY, "0.370", 1, "");
+    b["expireTime"] = bad;
+    CHECK(refused(b, 400, "expireTime must be RFC 3339 in UTC, a whole second"));
+  }
+  CHECK(refused(post_body(NE, BUY, "0.370", 1, "2026-10-06T15:31:00Z"), 400, "expireTime must be more than 60 s ahead"));
+  CHECK(refused(with("participateDontInitiate", true), 400,
+                "participateDontInitiate goes only with TIME_IN_FORCE_GOOD_TILL_CANCEL or _GOOD_TILL_DATE"));
+  // the price: {value, currency USD}, in (0, 1) on the market's 0.005 grid
+  const std::string prices = "price must be {value, currency USD}, the value a decimal string";
+  CHECK(refused(with("price", "0.385"), 400, prices) && refused(with("price", 0.385), 400, prices) &&
+        refused(with("price", json{{"value", "0.385"}}), 400, prices) &&
+        refused(with("price", json{{"value", "0.385"}, {"currency", "EUR"}}), 400, prices) &&
+        refused(with("price", money("0.38500")), 400, prices) && refused(with("price", money("-0.385")), 400, prices));
+  for (const char* px : {"0.3875", "0", "1", "1.000", "0.996"})
+    CHECK(refused(with("price", money(px)), 400, "price must be between 0 and 1 on the market's tick"));
+  // whole contracts, at least one
+  CHECK(refused(with("quantity", true), 400, "quantity must be a number") && refused(with("quantity", "x"), 400, "quantity must be a number") &&
+        refused(without("quantity"), 400, "quantity must be a number") && refused(with("quantity", 1.005), 400, "quantity must be a number"));
+  for (const json& q : {json(2.5), json("2.5"), json(0), json(-1), json("-3")})
+    CHECK(refused(with("quantity", q), 400, "quantity must be whole contracts, at least the market's minimumTradeQty"));
+  // nothing placed by any of them; POST only
+  CHECK(engine_orders(v.f) == 0 && get(c, "/v1/orders/open").j["orders"].empty());
+  auto r = get(c, "/v1/orders");
+  CHECK(r.status() == 405 && r.j == json({{"code", 12}, {"message", "POST only"}}));
+  // what passes: the quantity as a string or a float, the lead met, MANUAL post-only GTC
+  CHECK(post(c, "/v1/orders", with("quantity", "2.00")).status() == 200 && post(c, "/v1/orders", with("quantity", 2.0)).status() == 200);
+  r = post(c, "/v1/orders", post_body(NE, BUY, "0.370", 1, "2026-10-06T15:31:01.000000Z"));
+  CHECK(r.status() == 200 && order_of(c, r.j["id"].get<std::string>())["state"] == "ORDER_STATE_NEW");
+  json gtc = order_body(NE, SELL, "0.400", "1", GTC);
+  gtc["participateDontInitiate"] = false;
+  CHECK(post(c, "/v1/orders", gtc).status() == 200 && get(c, "/v1/orders/open").j["orders"].size() == 2);
+}
+
+void test_post_only() {
+  // REFUSE_400, the engine's default: refused when synchronous, REJECTED when not
+  {
+    Venue v(manual_clock());
+    HttpConn c(v.port());
+    auto r = post(c, "/v1/orders", post_body(NE, BUY, "0.385", 2, "2026-10-06T15:31:00Z"));  // the best offer
+    CHECK(r.status() == 200 && order_of(c, r.j["id"].get<std::string>())["state"] == "ORDER_STATE_REJECTED");
+    json sync = post_body(NE, SELL, "0.380", 2, "2026-10-06T15:31:00Z");  // the best bid
+    sync["synchronousExecution"] = true;
+    r = post(c, "/v1/orders", sync);
+    CHECK(r.status() == 400 && r.j == json({{"code", 3}, {"message", "post only cross"}}));
+    r = post(c, "/v1/orders", post_body(NE, BUY, "0.380", 2, "2026-10-06T15:31:00Z"));  // joins the bid
+    CHECK(order_of(c, r.j["id"].get<std::string>())["state"] == "ORDER_STATE_NEW");
+    CHECK(engine_orders(v.f) == 1 && get(c, "/v1/portfolio/activities").j["activities"].size() == 1);
+  }
+  // CANCEL: taken, then cancelled at once, either way
+  {
+    FakePolyConfig cfg = manual_clock();
+    cfg.engine.post_only_cross = PostOnlyCross::CANCEL;
+    Venue v(cfg);
+    HttpConn c(v.port());
+    auto r = post(c, "/v1/orders", post_body(NE, BUY, "0.390", 2, "2026-10-06T15:31:00Z"));
+    json o = order_of(c, r.j["id"].get<std::string>());
+    CHECK(o["state"] == "ORDER_STATE_CANCELED" && o["cumQuantity"] == 0 && o["leavesQuantity"] == 0);
+    json sync = post_body(NE, BUY, "0.385", 2, "2026-10-06T15:31:00Z");
+    sync["synchronousExecution"] = true;
+    r = post(c, "/v1/orders", sync);
+    CHECK(r.status() == 200 && r.j["executions"].empty() &&
+          order_of(c, r.j["id"].get<std::string>())["state"] == "ORDER_STATE_CANCELED");
+    CHECK(get(c, "/v1/orders/open").j["orders"].empty() && get(c, "/v1/portfolio/activities").j["activities"].size() == 1);
+    r = c.request("GET", "/v1/markets/" + NE + "/book");
+    CHECK(r.j["marketData"]["asks"][0]["qty"] == "9.00");
+  }
+}
+
+void test_cancel() {
+  Venue v(manual_clock());
+  CHECK(v.ok);
+  HttpConn c(v.port());
+  auto r = post(c, "/v1/orders", order_body(NE, BUY, "0.350", 2, GTC));
+  const std::string a = r.j["id"].get<std::string>();
+  const std::string cancel_a = "/v1/order/" + a + "/cancel";
+  // its market by slug, required and right
+  r = post(c, cancel_a, json::object());
+  CHECK(r.status() == 400 && r.j == json({{"code", 3}, {"message", "marketSlug is required"}}));
+  CHECK(post_raw(c, cancel_a, "").status() == 400 && post_raw(c, cancel_a, "{").j["message"] == "the body is not JSON");
+  r = post(c, cancel_a, {{"marketSlug", DAL}});
+  CHECK(r.status() == 404 && r.j == json({{"code", 5}, {"message", "order not found"}}));
+  r = post(c, cancel_a, {{"marketSlug", NE}});
+  CHECK(r.status() == 200 && r.j == json::object());
+  json o = order_of(c, a);
+  CHECK(o["state"] == "ORDER_STATE_CANCELED" && o["leavesQuantity"] == 0 && get(c, "/v1/orders/open").j["orders"].empty());
+  CHECK(post(c, cancel_a, {{"marketSlug", NE}}).status() == 404);  // no longer open
+  CHECK(post(c, "/v1/order/nope/cancel", {{"marketSlug", NE}}).status() == 404);
+  CHECK(c.request("GET", cancel_a, "", pm_auth("GET", cancel_a, wall_ms())).status() == 405);
+  // a filled order is not open either
+  r = post(c, "/v1/orders", order_body(NE, BUY, "0.385", 1));
+  CHECK(post(c, "/v1/order/" + r.j["id"].get<std::string>() + "/cancel", {{"marketSlug", NE}}).status() == 404);
+
+  // one the engine has not taken is cancelled before it is: it never trades
+  v.f.set_async_delay_ms(500);
+  r = post(c, "/v1/orders", order_body(NE, BUY, "0.390", 3));
+  const std::string b = r.j["id"].get<std::string>();
+  CHECK(post(c, "/v1/order/" + b + "/cancel", {{"marketSlug", DAL}}).status() == 404);  // not in that market
+  CHECK(order_of(c, b)["state"] == "ORDER_STATE_PENDING_NEW");
+  CHECK(post(c, "/v1/order/" + b + "/cancel", {{"marketSlug", NE}}).status() == 200);
+  v.f.advance_ms(500);
+  o = order_of(c, b);
+  CHECK(o["state"] == "ORDER_STATE_CANCELED" && o["cumQuantity"] == 0 && v.f.engine_id(b).empty());
+  CHECK(get(c, "/v1/portfolio/activities").j["activities"].size() == 2);  // the deposit and the 1 at 0.385
+
+  // cancel-all: every open order of ours, oldest first, the one not taken yet and one made
+  // in the engine by hand among them; the street's stay
+  v.f.set_async_delay_ms(0);
+  const std::string g1 = post(c, "/v1/orders", order_body(NE, BUY, "0.300", 1, GTC)).j["id"].get<std::string>();
+  v.f.advance_ms(1);
+  const std::string g2 = post(c, "/v1/orders", post_body(DAL, SELL, "0.700", 2, "2026-10-06T15:40:00Z")).j["id"].get<std::string>();
+  v.f.advance_ms(1);
+  const std::string by_hand = create(v.f, NE, Side::BID, 100, 3100, Tif::GTC);
+  v.f.advance_ms(1);
+  v.f.set_async_delay_ms(500);
+  const std::string later = post(c, "/v1/orders", order_body(NE, BUY, "0.320", 1, GTC)).j["id"].get<std::string>();
+  r = get(c, "/v1/orders/open");
+  CHECK(r.j["orders"].size() == 4 && r.j["orders"][0]["id"] == g1 && r.j["orders"][1]["id"] == g2 &&
+        r.j["orders"][2]["id"] == by_hand && r.j["orders"][3]["id"] == later &&
+        r.j["orders"][3]["state"] == "ORDER_STATE_PENDING_NEW");
+  r = post(c, "/v1/orders/open/cancel", json::object());
+  CHECK(r.status() == 200 && r.j == json({{"canceledOrderIds", {g1, g2, by_hand, later}}}));
+  CHECK(get(c, "/v1/orders/open").j["orders"].empty());
+  for (const std::string& id : {g1, g2, by_hand, later}) CHECK(order_of(c, id)["state"] == "ORDER_STATE_CANCELED");
+  v.f.advance_ms(500);
+  CHECK(order_of(c, later)["state"] == "ORDER_STATE_CANCELED" && v.f.engine_id(later).empty());
+  r = c.request("GET", "/v1/markets/" + NE + "/book");
+  CHECK(r.j["marketData"]["bids"].size() == 2 && r.j["marketData"]["bids"][0]["qty"] == "10.00");
+  // again: none; no body is a body; anything but an object is not
+  r = post_raw(c, "/v1/orders/open/cancel", "");
+  CHECK(r.status() == 200 && r.j == json({{"canceledOrderIds", json::array()}}));
+  CHECK(post_raw(c, "/v1/orders/open/cancel", "[]").status() == 400);
+  // one made in the engine by hand is cancelled by the engine's id, which is its own
+  const std::string hand2 = create(v.f, DAL, Side::ASK, 100, 7000, Tif::GTC);
+  CHECK(v.f.engine_id(hand2) == hand2 && post(c, "/v1/order/" + hand2 + "/cancel", {{"marketSlug", DAL}}).status() == 200);
+  CHECK(logged(v.f, "http 200 POST /v1/orders/open/cancel (signed)") && logged(v.f, "http 200 POST " + cancel_a + " (signed)"));
+
+  // preview: checked as a create is, nothing placed
+  const std::size_t before = engine_orders(v.f);
+  r = post(c, "/v1/order/preview", {{"request", order_body(NE, BUY, "0.385", 2)}});
+  CHECK(r.status() == 200 && r.j == json({{"order", {{"id", ""}, {"commissionsBasisPoints", "600"}}}}));
+  r = post(c, "/v1/order/preview", {{"request", order_body(HOU, SELL, "0.41", 2)}});
+  CHECK(r.status() == 200 && r.j["order"]["commissionsBasisPoints"] == "695");
+  r = post(c, "/v1/order/preview", {{"request", order_body(HOU, SELL, "0.415", 2)}});
+  CHECK(r.status() == 400 && r.j["message"] == "price must be between 0 and 1 on the market's tick");
+  CHECK(post(c, "/v1/order/preview", order_body(NE, BUY, "0.385", 2)).status() == 400);
+  CHECK(post(c, "/v1/order/preview", {{"request", order_body("nope", BUY, "0.385", 2)}}).status() == 404);
+  CHECK(engine_orders(v.f) == before && get(c, "/v1/order/preview").status() == 404);
+}
+
 // ---- TLS, kept-open connections ----------------------------------------------------------------
 
 // One GET over TLS on a connection of its own, trusting `ca` for 127.0.0.1: the reply, or "".
@@ -736,6 +1088,10 @@ int main() {
   test_markets();
   test_account();
   test_auth();
+  test_create();
+  test_create_refusals();
+  test_post_only();
+  test_cancel();
   test_tls();
   test_binary();
   return finish("deskd-fake-poly");

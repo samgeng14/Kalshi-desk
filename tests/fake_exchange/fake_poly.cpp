@@ -4,10 +4,14 @@
 #include <openssl/evp.h>
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <climits>
+#include <cmath>
 #include <cstdlib>
 #include <ctime>
+#include <optional>
+#include <set>
 
 #include "rest.h"
 
@@ -54,6 +58,74 @@ std::string error_body(int status, const std::string& message) {
     case 405: code = 12; break;  // UNIMPLEMENTED
   }
   return json{{"code", code}, {"message", message}}.dump();
+}
+
+const char* tif_wire(Tif t, bool gtd) {
+  return t == Tif::IOC ? "TIME_IN_FORCE_IMMEDIATE_OR_CANCEL"
+         : t == Tif::FOK ? "TIME_IN_FORCE_FILL_OR_KILL"
+         : gtd           ? "TIME_IN_FORCE_GOOD_TILL_DATE"
+                         : "TIME_IN_FORCE_GOOD_TILL_CANCEL";
+}
+
+// A create's price, {value: "0.385", currency: "USD"}: up to four places. nullopt otherwise.
+std::optional<Px> read_price(const json& v) {
+  if (!v.is_object() || v.size() != 2 || !v.contains("value") || !v["value"].is_string() || v.value("currency", "") != "USD")
+    return std::nullopt;
+  return parse_fixed(v["value"].get<std::string>(), 4, false);
+}
+
+// A create's quantity: a number (5, 5.0) or a decimal string ("5", "5.00"), to the hundredth.
+// nullopt for anything else; whether it is whole and positive is the caller's.
+std::optional<Qty> read_qty(const json& v) {
+  if (v.is_number_integer()) {
+    const long long n = v.get<long long>();
+    if (n < -1000000000LL || n > 1000000000LL) return std::nullopt;
+    return static_cast<Qty>(n) * kContract;
+  }
+  if (v.is_number_float()) {
+    const double c = v.get<double>() * kContract;
+    if (!(std::fabs(c) < 1e11) || std::fabs(c - std::round(c)) > 1e-6) return std::nullopt;
+    return static_cast<Qty>(std::llround(c));
+  }
+  if (v.is_string()) return parse_fixed(v.get<std::string>(), 2, true);
+  return std::nullopt;
+}
+
+// expireTime: "2026-10-06T15:31:00Z", or with a fraction of zeros, in UTC: whole seconds since the
+// epoch. false for anything else, a time between two seconds among it.
+bool read_whole_second(const std::string& s, std::int64_t* out) {
+  static const char kShape[] = "dddd-dd-ddTdd:dd:dd";
+  if (s.size() < 20) return false;
+  for (std::size_t i = 0; i < 19; ++i)
+    if (kShape[i] == 'd' ? !std::isdigit(static_cast<unsigned char>(s[i])) : s[i] != kShape[i]) return false;
+  std::size_t i = 19;
+  if (s[i] == '.') {
+    const std::size_t from = ++i;
+    while (i < s.size() && s[i] == '0') ++i;
+    if (i == from) return false;
+  }
+  if (i + 1 != s.size() || s[i] != 'Z') return false;
+  auto num = [&](std::size_t at, std::size_t n) { return std::atoi(s.substr(at, n).c_str()); };
+  std::tm tm{};
+  tm.tm_year = num(0, 4) - 1900;
+  tm.tm_mon = num(5, 2) - 1;
+  tm.tm_mday = num(8, 2);
+  tm.tm_hour = num(11, 2);
+  tm.tm_min = num(14, 2);
+  tm.tm_sec = num(17, 2);
+  if (tm.tm_mon < 0 || tm.tm_mon > 11 || tm.tm_mday < 1 || tm.tm_mday > 31 || tm.tm_hour > 23 || tm.tm_min > 59 ||
+      tm.tm_sec > 59)
+    return false;
+  *out = static_cast<std::int64_t>(timegm(&tm));
+  return true;
+}
+
+// The fields of a create the fake knows (src/poly.cpp poly_order_body, and expireTime for GTD)
+const std::set<std::string>& create_fields() {
+  static const std::set<std::string> f = {"marketSlug", "type", "price", "quantity", "tif", "outcomeSide", "action",
+                                          "manualOrderIndicator", "participateDontInitiate", "synchronousExecution",
+                                          "maxBlockTime", "expireTime"};
+  return f;
 }
 
 // /v1/orders, /v1/order/{id}, /v1/portfolio/... and /v1/account/... are api.polymarket.us's: signed
@@ -171,7 +243,9 @@ void FakePoly::tick_loop() {
     {
       std::lock_guard<std::mutex> lk(mu_);
       if (!cfg_.manual_clock) {
-        engine_.tick(now_locked());
+        const std::int64_t now = now_locked();
+        take_due_locked(now);
+        engine_.tick(now);
         drain_locked();
       }
     }
@@ -182,7 +256,9 @@ void FakePoly::tick_loop() {
 void FakePoly::advance_ms(std::int64_t d) {
   std::lock_guard<std::mutex> lk(mu_);
   manual_now_ += d;
-  engine_.tick(now_locked());
+  const std::int64_t now = now_locked();
+  take_due_locked(now);
+  engine_.tick(now);
   drain_locked();
 }
 
@@ -230,6 +306,49 @@ void FakePoly::drain_locked() {
   }
 }
 
+std::string FakePoly::engine_id(const std::string& id) const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return engine_id_locked(id);
+}
+std::string FakePoly::engine_id_locked(const std::string& id) const {
+  auto it = submitted_.find(id);
+  if (it != submitted_.end()) return it->second.engine_id;
+  return by_engine_.count(id) || !engine_.order(id) ? "" : id;  // ours go by our id
+}
+
+json FakePoly::sent(const std::string& id) const {
+  std::lock_guard<std::mutex> lk(mu_);
+  auto it = submitted_.find(id);
+  return it == submitted_.end() ? json() : it->second.sent;
+}
+
+void FakePoly::take_due_locked(std::int64_t now) {
+  // in the order accepted; a delay changed meanwhile can make a later one due first
+  for (std::size_t i = 0; i < pending_.size();) {
+    Submitted& s = submitted_.at(pending_[i]);
+    if (s.due_ms > now) {
+      ++i;
+      continue;
+    }
+    take_locked(s, now);  // out of pending_
+  }
+}
+
+CreateResult FakePoly::take_locked(Submitted& s, std::int64_t now) {
+  pending_.erase(std::remove(pending_.begin(), pending_.end(), s.id), pending_.end());
+  const CreateResult r = engine_.create(s.order, now);
+  s.updated_ms = now;
+  if (r.err) {
+    s.state = Submitted::State::REJECTED;
+  } else {
+    s.state = Submitted::State::TAKEN;
+    s.engine_id = r.order_id;
+    by_engine_[r.order_id] = s.id;
+  }
+  drain_locked();
+  return r;
+}
+
 Micros FakePoly::held_value_locked(const std::string& slug, Qty pos) const {
   const auto lv = engine_.levels(slug, pos < 0);  // the held side's bids, best last
   return lv.empty() ? 0 : notional(lv.back().first, pos < 0 ? -pos : pos);
@@ -249,6 +368,13 @@ std::vector<std::string> FakePoly::wire_log() const {
 void FakePoly::clear_wire_log() {
   std::lock_guard<std::mutex> lk(log_mu_);
   wire_.clear();
+}
+
+// ---- settings -----------------------------------------------------------------------------------
+
+void FakePoly::set_async_delay_ms(int ms) {
+  std::lock_guard<std::mutex> lk(mu_);
+  cfg_.async_delay_ms = ms;
 }
 
 // ---- one connection -----------------------------------------------------------------------------
@@ -279,12 +405,18 @@ void FakePoly::serve(int fd) {
       (void)value;
       if (name.compare(0, 5, "x-pm-") == 0) signed_req = true;
     }
+    const json body = req.body.empty() ? json() : json::parse(req.body, nullptr, false);
     Reply rep;
     {
       std::lock_guard<std::mutex> lk(mu_);
       const std::int64_t now = now_locked();
       const std::string denied = private_path(req.path) ? auth_refusal(req, now) : std::string();
-      rep = denied.empty() ? route_locked(req, req.path, now) : Reply{401, error_body(401, denied)};
+      if (!denied.empty()) {
+        rep = Reply{401, error_body(401, denied)};
+      } else {
+        rep = route_locked(req, req.path, body, now);
+        drain_locked();
+      }
     }
     const std::string data = net::response_head(rep.status, {{"Content-Type", "application/json"},
                                                              {"Date", http_date()},
@@ -328,9 +460,16 @@ std::string FakePoly::auth_refusal(const net::Request& req, std::int64_t now) co
 
 // ---- routes -------------------------------------------------------------------------------------
 
-FakePoly::Reply FakePoly::route_locked(const net::Request& req, const std::string& path, std::int64_t now) {
+FakePoly::Reply FakePoly::route_locked(const net::Request& req, const std::string& path, const json& body,
+                                       std::int64_t now) {
   const std::vector<std::string> seg = segments(path);
   auto get = [&](auto&& f) { return req.method == "GET" ? f() : Reply{405, error_body(405, "GET only")}; };
+  // a write's body is JSON, or nothing
+  auto post = [&](auto&& f) {
+    if (req.method != "POST") return Reply{405, error_body(405, "POST only")};
+    if (body.is_discarded()) return Reply{400, error_body(400, "the body is not JSON")};
+    return f();
+  };
   if (seg.size() == 4 && seg[0] == "v2" && seg[1] == "leagues" && seg[3] == "events")
     return get([&] { return league_events_locked(req, seg[2], now); });
   if (seg.size() >= 2 && seg[0] == "v1") {
@@ -342,7 +481,14 @@ FakePoly::Reply FakePoly::route_locked(const net::Request& req, const std::strin
     if (seg[1] == "portfolio" && seg.size() == 3 && seg[2] == "activities")
       return get([&] { return activities_locked(req); });
     if (seg[1] == "orders" && seg.size() == 3 && seg[2] == "open") return get([&] { return open_orders_locked(); });
+    if (seg[1] == "order" && seg.size() == 3 && seg[2] == "preview" && req.method == "POST")
+      return post([&] { return preview_locked(body, now); });
     if (seg[1] == "order" && seg.size() == 3) return get([&] { return order_locked(seg[2]); });
+    if (seg[1] == "orders" && seg.size() == 2) return post([&] { return create_locked(body, now); });
+    if (seg[1] == "order" && seg.size() == 4 && seg[3] == "cancel")
+      return post([&] { return cancel_locked(seg[2], body, now); });
+    if (seg[1] == "orders" && seg.size() == 4 && seg[2] == "open" && seg[3] == "cancel")
+      return post([&] { return cancel_all_locked(body, now); });
   }
   return Reply{404, error_body(404, "no such route")};
 }
@@ -466,15 +612,208 @@ FakePoly::Reply FakePoly::activities_locked(const net::Request& req) {
 
 FakePoly::Reply FakePoly::open_orders_locked() {
   json out = json::array();
-  for (const Order* o : engine_.user_orders())
-    if (o->status == OrdStatus::RESTING) out.push_back(order_json(*o));
+  for (const std::string& id : open_ids_locked()) out.push_back(order_view_locked(id));
   return Reply{200, json{{"orders", out}}.dump()};
 }
 
 FakePoly::Reply FakePoly::order_locked(const std::string& id) {
-  const Order* o = engine_.order(id);
-  if (!o) return Reply{404, error_body(404, "order not found")};  // the street's orders have no id
-  return Reply{200, json{{"order", order_json(*o)}}.dump()};
+  json o = order_view_locked(id);
+  if (o.is_null()) return Reply{404, error_body(404, "order not found")};
+  return Reply{200, json{{"order", std::move(o)}}.dump()};
+}
+
+// ---- writes -------------------------------------------------------------------------------------
+
+std::string FakePoly::read_create_locked(const json& b, std::int64_t now, NewOrder* out, bool* sync, int* status) const {
+  *status = 400;
+  if (!b.is_object()) return "the order must be a JSON object";
+  for (auto it = b.begin(); it != b.end(); ++it)
+    if (!create_fields().count(it.key())) return "unknown field " + it.key();
+  auto str = [&](const char* k) { return b.contains(k) && b[k].is_string() ? b[k].get<std::string>() : std::string(); };
+  const std::string slug = str("marketSlug"), tif = str("tif"), action = str("action"),
+                    manual = str("manualOrderIndicator");
+  if (slug.empty()) return "marketSlug is required";
+  if (str("type") != "ORDER_TYPE_LIMIT") return "type must be ORDER_TYPE_LIMIT";
+  if (action != "ORDER_ACTION_BUY" && action != "ORDER_ACTION_SELL")
+    return "action must be ORDER_ACTION_BUY or ORDER_ACTION_SELL";
+  if (str("outcomeSide") != "OUTCOME_SIDE_YES") return "outcomeSide must be OUTCOME_SIDE_YES";
+  if (manual != "MANUAL_ORDER_INDICATOR_MANUAL" && manual != "MANUAL_ORDER_INDICATOR_AUTOMATIC")
+    return "manualOrderIndicator must be MANUAL_ORDER_INDICATOR_MANUAL or MANUAL_ORDER_INDICATOR_AUTOMATIC";
+  for (const char* k : {"participateDontInitiate", "synchronousExecution"})
+    if (b.contains(k) && !b[k].is_boolean()) return std::string(k) + " must be true or false";
+  if (b.contains("maxBlockTime") && !b["maxBlockTime"].is_string() && !b["maxBlockTime"].is_number())
+    return "maxBlockTime must be a number of seconds";
+  NewOrder o;
+  if (tif == "TIME_IN_FORCE_IMMEDIATE_OR_CANCEL")
+    o.tif = Tif::IOC;
+  else if (tif == "TIME_IN_FORCE_FILL_OR_KILL")
+    o.tif = Tif::FOK;
+  else if (tif == "TIME_IN_FORCE_GOOD_TILL_CANCEL" || tif == "TIME_IN_FORCE_GOOD_TILL_DATE")
+    o.tif = Tif::GTC;
+  else
+    return "tif must be TIME_IN_FORCE_IMMEDIATE_OR_CANCEL, _FILL_OR_KILL, _GOOD_TILL_CANCEL or _GOOD_TILL_DATE";
+  const bool gtd = tif == "TIME_IN_FORCE_GOOD_TILL_DATE";
+  if (b.contains("expireTime") != gtd)
+    return gtd ? "expireTime is required with TIME_IN_FORCE_GOOD_TILL_DATE" : "expireTime goes only with TIME_IN_FORCE_GOOD_TILL_DATE";
+  o.post_only = b.value("participateDontInitiate", false);
+  if (o.post_only && o.tif != Tif::GTC)
+    return "participateDontInitiate goes only with TIME_IN_FORCE_GOOD_TILL_CANCEL or _GOOD_TILL_DATE";
+  const std::optional<Px> px = b.contains("price") ? read_price(b["price"]) : std::nullopt;
+  if (!px) return "price must be {value, currency USD}, the value a decimal string";
+  const std::optional<Qty> q = b.contains("quantity") ? read_qty(b["quantity"]) : std::nullopt;
+  if (!q) return "quantity must be a number";
+  auto it = listing_.find(slug);
+  const Market* m = engine_.market(slug);
+  if (it == listing_.end() || !m) {
+    *status = 404;
+    return "market not found";
+  }
+  if (!on_grid(m->spec.ticks, *px)) return "price must be between 0 and 1 on the market's tick";
+  if (*q <= 0 || *q % kContract != 0 || *q < it->second.min_qty)
+    return "quantity must be whole contracts, at least the market's minimumTradeQty";
+  if (gtd) {
+    std::int64_t exp_s = 0;
+    if (!b["expireTime"].is_string() || !read_whole_second(b["expireTime"].get<std::string>(), &exp_s))
+      return "expireTime must be RFC 3339 in UTC, a whole second";
+    // the engine's own test, made here so that it is a 400 and not a REJECTED order
+    const std::int64_t lead_s = engine_.config().min_expiry_lead_s;
+    if (exp_s * 1000 <= now + lead_s * 1000)
+      return lead_s > 0 ? "expireTime must be more than " + std::to_string(lead_s) + " s ahead" : "expireTime must be ahead";
+    o.expiration_s = exp_s;
+  }
+  o.ticker = slug;
+  o.side = action == "ORDER_ACTION_BUY" ? Side::BID : Side::ASK;
+  o.count = *q;
+  o.price = *px;
+  o.stp = Stp::NONE;  // the venue lists no self-trade prevention
+  *sync = b.value("synchronousExecution", false);
+  *out = o;
+  return "";
+}
+
+FakePoly::Reply FakePoly::create_locked(const json& body, std::int64_t now) {
+  Submitted sub;
+  int status = 400;
+  const std::string why = read_create_locked(body, now, &sub.order, &sub.sync, &status);
+  if (!why.empty()) return Reply{status, error_body(status, why)};
+  sub.id = uuid4(rng_);
+  sub.sent = body;
+  sub.created_ms = sub.updated_ms = now;
+  sub.due_ms = sub.sync ? now : now + cfg_.async_delay_ms;
+  const std::string id = sub.id;
+  Submitted& s = submitted_.emplace(id, std::move(sub)).first->second;
+  if (!s.sync) {
+    pending_.push_back(id);
+    take_due_locked(now);  // no delay: the engine has it before the reply, which still says nothing of it
+    return Reply{200, json{{"id", id}, {"executions", json::array()}}.dump()};
+  }
+  // synchronous: the engine's answer is the reply's
+  const std::size_t before = engine_.fills().size();
+  const CreateResult r = take_locked(s, now);
+  if (r.err) {
+    submitted_.erase(id);
+    return Reply{r.err.http, error_body(r.err.http, r.err.details.empty() ? r.err.message : r.err.details)};
+  }
+  const Order* o = engine_.order(r.order_id);
+  const json state = o ? order_json(*o)["state"] : json("ORDER_STATE_NEW");
+  json executions = json::array();
+  const std::vector<Fill>& fills = engine_.fills();
+  for (std::size_t i = before; i < fills.size(); ++i) {
+    const Fill& f = fills[i];
+    if (f.order_id != r.order_id) continue;  // the maker of a self-trade is another order
+    executions.push_back(json{{"tradeId", f.fill_id},
+                              {"lastShares", qty_str(f.count)},
+                              {"lastPx", price(f.yes_px)},
+                              {"commissionNotionalCollected", money(f.fee)},
+                              {"order", {{"state", state}}}});
+  }
+  return Reply{200, json{{"id", id}, {"executions", executions}}.dump()};
+}
+
+FakePoly::Reply FakePoly::preview_locked(const json& body, std::int64_t now) {
+  if (!body.is_object() || body.size() != 1 || !body.contains("request"))
+    return Reply{400, error_body(400, "the body must be {request: <order>}")};
+  NewOrder o;
+  bool sync = false;
+  int status = 400;
+  const std::string why = read_create_locked(body["request"], now, &o, &sync, &status);
+  if (!why.empty()) return Reply{status, error_body(status, why)};
+  const int bps = listing_.at(o.ticker).coeff_micro / 100;  // 0.06 -> 600
+  return Reply{200, json{{"order", {{"id", ""}, {"commissionsBasisPoints", std::to_string(bps)}}}}.dump()};
+}
+
+FakePoly::Reply FakePoly::cancel_locked(const std::string& id, const json& body, std::int64_t now) {
+  if (!body.is_object() || !body.contains("marketSlug") || !body["marketSlug"].is_string())
+    return Reply{400, error_body(400, "marketSlug is required")};
+  const std::string slug = body["marketSlug"].get<std::string>();
+  const Reply gone{404, error_body(404, "order not found")};
+  std::string eid = id;
+  auto it = submitted_.find(id);
+  if (it != submitted_.end()) {
+    Submitted& s = it->second;
+    if (s.order.ticker != slug) return gone;
+    if (s.state == Submitted::State::PENDING) {  // the engine never sees it
+      s.state = Submitted::State::CANCELED;
+      s.updated_ms = now;
+      pending_.erase(std::remove(pending_.begin(), pending_.end(), id), pending_.end());
+      return Reply{200, "{}"};
+    }
+    if (s.state != Submitted::State::TAKEN) return gone;
+    eid = s.engine_id;
+  } else if (by_engine_.count(id)) {
+    return gone;  // ours go by our id
+  }
+  const Order* o = engine_.order(eid);
+  if (!o || o->ticker != slug) return gone;
+  const CancelResult r = engine_.cancel(eid, slug, -2, 0, now);  // a filled or cancelled order: 404
+  if (r.err) return Reply{r.err.http, error_body(r.err.http, r.err.message)};
+  return Reply{200, "{}"};
+}
+
+FakePoly::Reply FakePoly::cancel_all_locked(const json& body, std::int64_t now) {
+  if (!body.is_null() && !body.is_object()) return Reply{400, error_body(400, "the body must be a JSON object")};
+  json ids = json::array();
+  for (const std::string& id : open_ids_locked()) ids.push_back(id);
+  for (const std::string& id : pending_) {
+    Submitted& s = submitted_.at(id);
+    s.state = Submitted::State::CANCELED;
+    s.updated_ms = now;
+  }
+  pending_.clear();
+  engine_.cancel_all(0, now);
+  return Reply{200, json{{"canceledOrderIds", ids}}.dump()};
+}
+
+std::vector<std::string> FakePoly::open_ids_locked() const {
+  std::vector<std::pair<std::int64_t, std::string>> open;  // (created, id)
+  for (const Order* o : engine_.user_orders()) {
+    if (o->status != OrdStatus::RESTING) continue;
+    auto it = by_engine_.find(o->order_id);
+    if (it == by_engine_.end())
+      open.emplace_back(o->created_ms, o->order_id);
+    else
+      open.emplace_back(submitted_.at(it->second).created_ms, it->second);
+  }
+  for (const std::string& id : pending_) open.emplace_back(submitted_.at(id).created_ms, id);
+  std::stable_sort(open.begin(), open.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+  std::vector<std::string> out;
+  for (auto& [ms, id] : open) {
+    (void)ms;
+    out.push_back(std::move(id));
+  }
+  return out;
+}
+
+json FakePoly::order_view_locked(const std::string& id) const {
+  auto it = submitted_.find(id);
+  if (it != submitted_.end()) {
+    if (it->second.state != Submitted::State::TAKEN) return submitted_json(it->second);
+    const Order* o = engine_.order(it->second.engine_id);
+    return o ? order_json(*o) : json();
+  }
+  if (by_engine_.count(id)) return json();  // ours go by our id
+  const Order* o = engine_.order(id);       // the street's orders have no id
+  return o ? order_json(*o) : json();
 }
 
 json FakePoly::market_json(const PolyMarketSpec& s, std::int64_t now) const {
@@ -514,26 +853,25 @@ json FakePoly::market_json(const PolyMarketSpec& s, std::int64_t now) const {
 
 json FakePoly::order_json(const Order& o) const {
   const bool buy = o.side == Side::BID, resting = o.status == OrdStatus::RESTING;
-  const char* tif = o.tif == Tif::IOC   ? "TIME_IN_FORCE_IMMEDIATE_OR_CANCEL"
-                    : o.tif == Tif::FOK ? "TIME_IN_FORCE_FILL_OR_KILL"
-                    : o.expiration_s > 0 ? "TIME_IN_FORCE_GOOD_TILL_DATE"
-                                         : "TIME_IN_FORCE_GOOD_TILL_CANCEL";
+  // one made over the wire goes by our id, and was created when the venue accepted it
+  auto ours = by_engine_.find(o.order_id);
+  const Submitted* sub = ours == by_engine_.end() ? nullptr : &submitted_.at(ours->second);
   const char* state = resting ? (o.filled > 0 ? "ORDER_STATE_PARTIALLY_FILLED" : "ORDER_STATE_NEW")
                       : o.status == OrdStatus::EXECUTED ? "ORDER_STATE_FILLED"
                       : o.reason == "ExpiryCancel"      ? "ORDER_STATE_EXPIRED"
                                                         : "ORDER_STATE_CANCELED";
-  json j{{"id", o.order_id},
+  json j{{"id", sub ? sub->id : o.order_id},
          {"marketSlug", o.ticker},
          {"type", "ORDER_TYPE_LIMIT"},
          {"side", buy ? "ORDER_SIDE_BUY" : "ORDER_SIDE_SELL"},
-         {"tif", tif},
+         {"tif", tif_wire(o.tif, o.expiration_s > 0)},
          {"state", state},
          {"price", price(o.price)},
          {"quantity", qty_num(o.initial)},
          {"cumQuantity", qty_num(o.filled)},
          {"leavesQuantity", qty_num(resting ? o.remaining : 0)},
          {"commissionNotionalTotalCollected", money(o.taker_fees + o.maker_fees)},
-         {"createTime", rfc3339(o.created_ms)},
+         {"createTime", rfc3339(sub ? sub->created_ms : o.created_ms)},
          {"updateTime", rfc3339(o.updated_ms)}};
   if (o.filled > 0) {
     // the engine keeps what the side bought cost: a SELL bought NO at 1 - p
@@ -541,6 +879,26 @@ json FakePoly::order_json(const Order& o) const {
     j["avgPx"] = money(buy ? per : kMicrosPerDollar - per);
   }
   return j;
+}
+
+json FakePoly::submitted_json(const Submitted& s) const {
+  const bool pending = s.state == Submitted::State::PENDING;
+  const char* state = pending                                    ? "ORDER_STATE_PENDING_NEW"
+                      : s.state == Submitted::State::REJECTED    ? "ORDER_STATE_REJECTED"
+                                                                 : "ORDER_STATE_CANCELED";
+  return json{{"id", s.id},
+              {"marketSlug", s.order.ticker},
+              {"type", "ORDER_TYPE_LIMIT"},
+              {"side", s.order.side == Side::BID ? "ORDER_SIDE_BUY" : "ORDER_SIDE_SELL"},
+              {"tif", tif_wire(s.order.tif, s.order.expiration_s > 0)},
+              {"state", state},
+              {"price", price(s.order.price)},
+              {"quantity", qty_num(s.order.count)},
+              {"cumQuantity", 0},
+              {"leavesQuantity", qty_num(pending ? s.order.count : 0)},
+              {"commissionNotionalTotalCollected", money(0)},
+              {"createTime", rfc3339(s.created_ms)},
+              {"updateTime", rfc3339(s.updated_ms)}};
 }
 
 }  // namespace fakex

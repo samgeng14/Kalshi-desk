@@ -37,17 +37,27 @@
 //                                                  {type ACTIVITY_TYPE_ACCOUNT_DEPOSIT | _WITHDRAWAL,
 //                                                  accountBalanceChange:{transactionId, amount,
 //                                                  updateTime}} for each deposit()
-//   GET /v1/orders/open                            {orders:[order]}, oldest first
+//   GET /v1/orders/open                            {orders:[order]}, oldest first, the creates the
+//                                                  engine has not taken yet among them
 //   GET /v1/order/{id}                             {order}; 404 unknown
+// Write routes (signed):
+//   POST /v1/orders                                create: 200 {id, executions}; see Writes
+//   POST /v1/order/{id}/cancel {marketSlug}        200 {}; 404 an order that is not open, or not
+//                                                  in that market; 400 without marketSlug
+//   POST /v1/orders/open/cancel {}                 cancel-all: 200 {canceledOrderIds:[id]}, every
+//                                                  open order of ours, the ones not taken yet too
+//   POST /v1/order/preview {request:<create>}      200 {order:{id "", commissionsBasisPoints}}: the
+//                                                  create checked as POST /v1/orders checks it,
+//                                                  nothing placed
 // market: {slug, question, sportsMarketType, orderPriceMinTickSize, minimumTradeQty,
 //   feeCoefficient, active, closed, bestBidQuote, bestAskQuote, gameStartTime, endDate, updatedAt,
 //   marketSides:[{description, long, team:{abbreviation, name, safeName, alias, league}, price}]};
 //   a quote with no level on its side is left out, as is a side's price.
 // order: {id, marketSlug, type ORDER_TYPE_LIMIT, side ORDER_SIDE_BUY | _SELL, tif
 //   TIME_IN_FORCE_GOOD_TILL_CANCEL | _GOOD_TILL_DATE | _IMMEDIATE_OR_CANCEL | _FILL_OR_KILL, state
-//   ORDER_STATE_NEW | _PARTIALLY_FILLED | _FILLED | _CANCELED | _EXPIRED, price, quantity,
-//   cumQuantity, leavesQuantity, avgPx (once filled), commissionNotionalTotalCollected, createTime,
-//   updateTime}.
+//   ORDER_STATE_PENDING_NEW | _NEW | _PARTIALLY_FILLED | _FILLED | _CANCELED | _EXPIRED | _REJECTED,
+//   price, quantity, cumQuantity, leavesQuantity, avgPx (once filled),
+//   commissionNotionalTotalCollected, createTime, updateTime}.
 // Prices and money are {value, currency USD} with the value a decimal string (four places, six
 // when a money amount needs them); quantities are numbers, or decimal strings where the field's
 // name says Decimal. Errors are {code, message}: the gRPC status code beside the HTTP one, as the
@@ -57,8 +67,34 @@
 // p, a SELL its ask. A SELL with nothing held opens a short, which the engine holds as NO at 1 - p,
 // so it posts $1 - p a contract (docs/polymarket.md: "SELL YES; margin = $1 - price"). The
 // engine's ticker is the slug, its event ticker the event slug. One account: the engine's
-// subaccount 0 on shard 0. The write routes (create, cancel, cancel-all) and their async fills are
-// not served yet: a test makes its orders with with_engine().
+// subaccount 0 on shard 0. An order made over the wire has an id of the fake's own, which the
+// engine's id stands behind once the engine has the order (engine_id()); one a test makes with
+// with_engine() goes by the engine's id.
+//
+// Writes. A create's body is the old desk's (src/poly.cpp poly_order_body) without its synchronous
+// fields, plus GTD: {marketSlug, type ORDER_TYPE_LIMIT, price:{value, currency USD}, quantity
+// (whole contracts, at least minimumTradeQty: a number, or a decimal string), tif, outcomeSide
+// OUTCOME_SIDE_YES, action ORDER_ACTION_BUY | _SELL, manualOrderIndicator
+// MANUAL_ORDER_INDICATOR_MANUAL | _AUTOMATIC; participateDontInitiate (post-only, GTC or GTD
+// only), synchronousExecution and maxBlockTime (read, never waited on) when wanted; expireTime
+// with GTD and only with it: RFC 3339 in UTC, a whole second}. A field the fake does not know, a
+// wrong type or enum, a price outside (0, 1) or off the market's grid, is a 400 and places
+// nothing; an unlisted slug is a 404. Every order carries Stp::NONE: ours trade with ours.
+//   Asynchronous (synchronousExecution false or left out, as deskd sends it): the venue answers
+//   {id, executions: []} and the engine takes the order async_delay_ms later. Until then it is
+//   ORDER_STATE_PENDING_NEW, listed as open and in no book, and its executions show only after: in
+//   GET /v1/order/{id}, /v1/orders/open and the trade activities. What the engine refuses when it
+//   takes the order (buying power, a market closed or paused, its expiry passed) ends it
+//   ORDER_STATE_REJECTED. With async_delay_ms 0 the engine takes it before the reply is written.
+//   Synchronous (synchronousExecution true): the engine takes it at once, a refusal is a 400, and
+//   the reply lists the order's fills as the old desk read them: executions:[{tradeId (its trade
+//   activity's id), lastShares, lastPx, commissionNotionalCollected, order:{state}}].
+//   Post-only that would cross, by EngineConfig::post_only_cross: REFUSE_400 refuses it (a 400
+//   when synchronous, ORDER_STATE_REJECTED when not); CANCEL takes it and cancels it at once,
+//   ORDER_STATE_CANCELED.
+//   GTD rests until expireTime, then ORDER_STATE_EXPIRED. An expireTime no more than
+//   EngineConfig::min_expiry_lead_s ahead is a 400: the venue's minimum lead is not known
+//   (tools/poly_checks records it; Q1 waits on it, decisions 3).
 //
 // Auth (docs/polymarket.md "Wire"): X-PM-Access-Key, X-PM-Timestamp (ms) and X-PM-Signature on
 // /v1/orders, /v1/order/*, /v1/portfolio and /v1/account. AuthMode::VERIFY checks the Ed25519
@@ -73,7 +109,11 @@
 // 100; cursor, nextCursor and eof); a trade's id, one for each fill of ours, so a self-trade's two
 // fills differ; cashValue, a position marked at the held side's best bid (a short at the NO bid,
 // 1 - the YES ask), with assetNotional and assetAvailable their sum; qtyAvailableDecimal, the
-// whole position; the gRPC codes and messages; the 404s; and both hosts on one port.
+// whole position; the gRPC codes and messages; the 404s; and both hosts on one port. On the write
+// side (tools/poly_checks reads the venue's): the async reply {id, executions:[]}; GTD's field
+// expireTime and its format; refusing a field it does not know; what is refused at once and what
+// is REJECTED later; a pending create listed as open; the cancel's {} and the cancel-all's ids; a
+// cancel of an order no longer open answered 404; and preview's reply.
 //
 // The wire log: "http <status> <METHOD> <path>", the path without its query, then " (signed)" when
 // the request carried any X-PM-* header, valid or not (md-pm never signs a public read).
@@ -142,6 +182,8 @@ struct FakePolyConfig {
   bool manual_clock = false;           // time moves only by advance_ms
   std::int64_t start_ms = 0;           // the manual clock's first reading; 0: the wall clock now
   int tick_ms = 5;                     // the venue's timers (expiry, close) on the wall clock
+  // An asynchronous create waits this long for the engine (ORDER_STATE_PENDING_NEW meanwhile).
+  int async_delay_ms = 0;
 };
 
 class FakePoly {
@@ -182,6 +224,15 @@ class FakePoly {
   }
   // Cash into the account (a deposit) or, negative, out of it (a withdrawal): an activity of its own.
   void deposit(Micros amount);
+  // The engine's id for order `id`: "" while the engine has not taken it, or never did. An order
+  // made with with_engine() is its own.
+  std::string engine_id(const std::string& id) const;
+  // The body of the create that made order `id`, as it arrived (null for one the wire never saw):
+  // what deskd sent, manualOrderIndicator and participateDontInitiate among it.
+  json sent(const std::string& id) const;
+
+  // ---- settings
+  void set_async_delay_ms(int ms);
 
   // ---- what happened on the wire, in the order it was written: "http 200 GET /v1/markets",
   // "http 401 GET /v1/account/balances (signed)", "http idle-close", "tls handshake-failed"
@@ -201,6 +252,16 @@ class FakePoly {
     std::uint64_t seq = 0;
     json body;
   };
+  // An order made by POST /v1/orders, by the fake's id. The engine has it from TAKEN on.
+  struct Submitted {
+    enum class State { PENDING, TAKEN, REJECTED, CANCELED };  // CANCELED: before it was taken
+    std::string id, engine_id;
+    NewOrder order;
+    json sent;
+    bool sync = false;
+    State state = State::PENDING;
+    std::int64_t created_ms = 0, due_ms = 0, updated_ms = 0;
+  };
 
   std::int64_t now_locked() const;
   void tick_loop();
@@ -213,7 +274,11 @@ class FakePoly {
   Micros held_value_locked(const std::string& slug, Qty pos) const;
 
   std::string auth_refusal(const net::Request& req, std::int64_t now) const;
-  Reply route_locked(const net::Request& req, const std::string& path, std::int64_t now);
+  // Every accepted create whose time has come goes to the engine, in the order accepted.
+  void take_due_locked(std::int64_t now);
+  // One accepted create goes to the engine now: it trades, rests, or is refused (REJECTED).
+  CreateResult take_locked(Submitted& s, std::int64_t now);
+  Reply route_locked(const net::Request& req, const std::string& path, const json& body, std::int64_t now);
   Reply league_events_locked(const net::Request& req, const std::string& league, std::int64_t now);
   Reply markets_locked(const net::Request& req, std::int64_t now);
   Reply book_locked(const std::string& slug);
@@ -222,8 +287,19 @@ class FakePoly {
   Reply activities_locked(const net::Request& req);
   Reply open_orders_locked();
   Reply order_locked(const std::string& id);
+  // A create's body read: "" and *out, or why not (*status 400, or 404 for a slug not listed).
+  std::string read_create_locked(const json& body, std::int64_t now, NewOrder* out, bool* sync, int* status) const;
+  Reply create_locked(const json& body, std::int64_t now);
+  Reply preview_locked(const json& body, std::int64_t now);
+  Reply cancel_locked(const std::string& id, const json& body, std::int64_t now);
+  Reply cancel_all_locked(const json& body, std::int64_t now);
   json market_json(const PolyMarketSpec& s, std::int64_t now) const;
   json order_json(const Order& o) const;
+  json submitted_json(const Submitted& s) const;   // one the engine does not have
+  // An order by the fake's id: the engine's, one it has not got, or null when there is none.
+  json order_view_locked(const std::string& id) const;
+  std::vector<std::string> open_ids_locked() const;  // our open orders, oldest first
+  std::string engine_id_locked(const std::string& id) const;
 
   FakePolyConfig cfg_;
   mutable std::mutex mu_;
@@ -233,7 +309,10 @@ class FakePoly {
   std::vector<Activity> activities_;   // oldest first
   std::size_t fills_seen_ = 0;         // engine fills already in activities_
   std::uint64_t next_activity_ = 1;
-  std::mt19937_64 rng_;               // deposit ids
+  std::mt19937_64 rng_;               // deposit and order ids
+  std::map<std::string, Submitted> submitted_;   // by our id
+  std::map<std::string, std::string> by_engine_; // the engine's id -> ours
+  std::deque<std::string> pending_;    // accepted creates the engine has not taken, in that order
   std::int64_t manual_now_ = 0;
   mutable std::int64_t clock_ms_ = 0;  // never goes back (fake_kalshi.h)
   void* pubkey_ = nullptr;             // EVP_PKEY*, VERIFY
