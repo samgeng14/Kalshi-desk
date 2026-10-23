@@ -354,6 +354,7 @@ add_library(deskd_core STATIC
   src/deskd/gw/reject.cpp
   src/deskd/gw/fees.cpp
   src/deskd/gw/event_risk.cpp
+  src/deskd/gw/poly_sign.cpp
   src/deskd/strat/strat.cpp
   src/deskd/strat/terminal_price.cpp
   src/deskd/strat/fair.cpp
@@ -590,6 +591,8 @@ deskd_fake_test(runtime_arb)
 deskd_fake_test(pyth)
 # fees: gw/fees.h against the fake's model_fee and charge_fee, at the fake's own balance precision, and its Polymarket fee and rebate
 deskd_fake_test(fees)
+# poly_wire: gw/poly_sign, Polymarket US's signer: a known answer, 32- and 64-byte secrets, the secret file's mode
+deskd_pure_test(poly_wire)
 # sys_gate: gw's lane gates, retirement (LaneMarkout, why RETIRED, deskctl lane-reset) and event cap
 deskd_fake_test(sys_gate)
 add_dependencies(deskd-test-sender deskctl)   # its deskctl kill --direct case runs the binary
