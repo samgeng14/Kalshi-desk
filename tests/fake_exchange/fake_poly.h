@@ -61,7 +61,8 @@
 // Prices and money are {value, currency USD} with the value a decimal string (four places, six
 // when a money amount needs them); quantities are numbers, or decimal strings where the field's
 // name says Decimal. Errors are {code, message}: the gRPC status code beside the HTTP one, as the
-// old mock's 401 {"code":16,"message":"unauthenticated"} had it (400 3, 401 16, 404 5, 405 12).
+// old mock's 401 {"code":16,"message":"unauthenticated"} had it (400 3, 401 16, 404 5, 405 12,
+// 429 8, 500 13, 503 14).
 //
 // The engine's terms. Polymarket US quotes the long side (YES): a BUY at p is the engine's bid at
 // p, a SELL its ask. A SELL with nothing held opens a short, which the engine holds as NO at 1 - p,
@@ -95,6 +96,17 @@
 //   GTD rests until expireTime, then ORDER_STATE_EXPIRED. An expireTime no more than
 //   EngineConfig::min_expiry_lead_s ahead is a 400: the venue's minimum lead is not known
 //   (tools/poly_checks records it; Q1 waits on it, decisions 3).
+// The rate limit: requests_per_s over every route and both hosts (decisions 3: 20 a second until
+// tools/poly_checks says otherwise), holding one second's worth; past it a 429 with Retry-After,
+// and nothing processed. A maintenance window (set_maintenance; the venue's is Thursday 02:00-06:00
+// ET) answers every request 503, before auth; the engine runs on, so resting orders stay and
+// expire on time.
+// Faults: fake_kalshi.h's HttpFault, matched by method, a prefix of the path ("/v1/orders",
+// "/v1/order/") and the body's marketSlug where it names a ticker (poly_fault()). Each kind does
+// what it does there, in the venue's shapes. FILL_BEFORE_REPLY and HIT_AFTER_REST have the engine
+// take the create before the reply, whatever async_delay_ms says: its fills are in the account
+// before the client hears of the order. FILL_DURING_CANCEL is a cancel's. private_order means
+// nothing here: the fake has no socket.
 //
 // Auth (docs/polymarket.md "Wire"): X-PM-Access-Key, X-PM-Timestamp (ms) and X-PM-Signature on
 // /v1/orders, /v1/order/*, /v1/portfolio and /v1/account. AuthMode::VERIFY checks the Ed25519
@@ -113,10 +125,14 @@
 // side (tools/poly_checks reads the venue's): the async reply {id, executions:[]}; GTD's field
 // expireTime and its format; refusing a field it does not know; what is refused at once and what
 // is REJECTED later; a pending create listed as open; the cancel's {} and the cancel-all's ids; a
-// cancel of an order no longer open answered 404; and preview's reply.
+// cancel of an order no longer open answered 404; preview's reply; one rate pool for both hosts,
+// the 429's body and Retry-After; and the 503 during maintenance.
 //
 // The wire log: "http <status> <METHOD> <path>", the path without its query, then " (signed)" when
-// the request carried any X-PM-* header, valid or not (md-pm never signs a public read).
+// the request carried any X-PM-* header, valid or not (md-pm never signs a public read). Faults
+// log as on the fake Kalshi: "http 429 POST /v1/orders (signed) (fault)", "http drop-before-reply
+// ...", "http drop-after-accept 200 ...", "http cut 200 ...", "http 200 ... (chunked)", "http
+// pull-touch <slug> <qty>".
 //
 // Threads: one per connection (two with TLS, listener.h), a timer. The engine sits behind one
 // mutex. Nothing here talks to anything but 127.0.0.1.
@@ -141,6 +157,10 @@ namespace fakex {
 
 // The engine as Polymarket US runs it: no cancel-all echo, which is Kalshi's documented minute.
 EngineConfig poly_engine_config();
+
+// A fault for the fake Polymarket US, on its create unless told otherwise (HttpFault's own path is
+// the fake Kalshi's).
+HttpFault poly_fault(HttpFault::Kind kind, const std::string& method = "POST", const std::string& path = "/v1/orders");
 
 // One team of a market's side, as /v2/leagues/{league}/events lists it.
 struct PolyTeam {
@@ -184,6 +204,11 @@ struct FakePolyConfig {
   int tick_ms = 5;                     // the venue's timers (expiry, close) on the wall clock
   // An asynchronous create waits this long for the engine (ORDER_STATE_PENDING_NEW meanwhile).
   int async_delay_ms = 0;
+  // requests_per_s on every route, holding one second's worth; past it a 429 with Retry-After
+  // retry_after_s (0: no header).
+  bool rate_limits = true;
+  double requests_per_s = 20;
+  int retry_after_s = 1;
 };
 
 class FakePoly {
@@ -231,8 +256,16 @@ class FakePoly {
   // what deskd sent, manualOrderIndicator and participateDontInitiate among it.
   json sent(const std::string& id) const;
 
-  // ---- settings
+  // ---- faults and settings
+  void add_fault(HttpFault f);
+  void clear_faults();
+  std::size_t faults_pending() const;
+  void set_rate_limits(bool on, double requests_per_s = 20);
   void set_async_delay_ms(int ms);
+  // Every request from from_ms until to_ms on the fake's clock is answered 503; (0, 0) ends it.
+  void set_maintenance(std::int64_t from_ms, std::int64_t to_ms);
+  // Every kept-open connection closed under its client: the next request on it gets nothing back.
+  void drop_http_connections();
 
   // ---- what happened on the wire, in the order it was written: "http 200 GET /v1/markets",
   // "http 401 GET /v1/account/balances (signed)", "http idle-close", "tls handshake-failed"
@@ -274,11 +307,17 @@ class FakePoly {
   Micros held_value_locked(const std::string& slug, Qty pos) const;
 
   std::string auth_refusal(const net::Request& req, std::int64_t now) const;
+  bool take_fault_locked(const net::Request& req, const json& body, HttpFault* f);
+  bool rate_ok_locked(std::int64_t now);
+  bool in_maintenance_locked(std::int64_t now) const;
+  void pull_touch_locked(const json& create, Qty qty, std::int64_t now);   // PULL_TOUCH
   // Every accepted create whose time has come goes to the engine, in the order accepted.
   void take_due_locked(std::int64_t now);
   // One accepted create goes to the engine now: it trades, rests, or is refused (REJECTED).
   CreateResult take_locked(Submitted& s, std::int64_t now);
-  Reply route_locked(const net::Request& req, const std::string& path, const json& body, std::int64_t now);
+  // `created` gets the id of an order this request made (the faults that act on it).
+  Reply route_locked(const net::Request& req, const std::string& path, const json& body, std::int64_t now,
+                     std::string* created);
   Reply league_events_locked(const net::Request& req, const std::string& league, std::int64_t now);
   Reply markets_locked(const net::Request& req, std::int64_t now);
   Reply book_locked(const std::string& slug);
@@ -289,7 +328,7 @@ class FakePoly {
   Reply order_locked(const std::string& id);
   // A create's body read: "" and *out, or why not (*status 400, or 404 for a slug not listed).
   std::string read_create_locked(const json& body, std::int64_t now, NewOrder* out, bool* sync, int* status) const;
-  Reply create_locked(const json& body, std::int64_t now);
+  Reply create_locked(const json& body, std::int64_t now, std::string* created);
   Reply preview_locked(const json& body, std::int64_t now);
   Reply cancel_locked(const std::string& id, const json& body, std::int64_t now);
   Reply cancel_all_locked(const json& body, std::int64_t now);
@@ -313,6 +352,10 @@ class FakePoly {
   std::map<std::string, Submitted> submitted_;   // by our id
   std::map<std::string, std::string> by_engine_; // the engine's id -> ours
   std::deque<std::string> pending_;    // accepted creates the engine has not taken, in that order
+  std::deque<HttpFault> faults_;
+  double tokens_ = 0;                  // the rate limit's bucket, at tokens_ms_
+  std::int64_t tokens_ms_ = 0;
+  std::int64_t maintenance_from_ = 0, maintenance_to_ = 0;
   std::int64_t manual_now_ = 0;
   mutable std::int64_t clock_ms_ = 0;  // never goes back (fake_kalshi.h)
   void* pubkey_ = nullptr;             // EVP_PKEY*, VERIFY

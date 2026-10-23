@@ -518,7 +518,8 @@ endif()
 #                made in the test) and the 30 s window, the wire log, TLS, the idle close, and
 #                fake-kalshi --poly; its writes (an asynchronous create and its delayed executions,
 #                a synchronous one, every refusal, GTD and its expiry, post-only refused or
-#                cancelled, no self-trade prevention, cancel, cancel-all, preview)
+#                cancelled, no self-trade prevention, cancel, cancel-all, preview), each fault, the
+#                rate limit and a maintenance window
 fake_kalshi_test(engine)
 fake_kalshi_test(wire)
 add_dependencies(deskd-test-fake-wire fake-kalshi)  # it starts the binary once

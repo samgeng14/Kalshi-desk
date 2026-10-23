@@ -11,9 +11,9 @@
 // DIR/ca.pem for loopback only.
 //
 // --poly also starts the fake Polymarket US (fake_poly.h) on a port of its own, with the same
-// --auth, --tls, --no-close-notify and --idle-close-ms, and prints its base ("POLY"), the one
-// address of both its hosts. Its account starts with a deposit of --poly-cash (default $100); it
-// lists no market.
+// --auth, --no-rate-limits (its own 20 a second otherwise), --tls, --no-close-notify and
+// --idle-close-ms, and prints its base ("POLY"), the one address of both its hosts. Its account
+// starts with a deposit of --poly-cash (default $100); it lists no market.
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
@@ -112,6 +112,7 @@ int main(int argc, char** argv) {
     return 1;
   }
   pcfg.auth = cfg.auth;
+  pcfg.rate_limits = cfg.rate_limits;
   pcfg.idle_close_ms = cfg.idle_close_ms;
   pcfg.tls_close_notify = cfg.tls_close_notify;
   const auto pm_cash = parse_fixed(poly_cash, 6, false);

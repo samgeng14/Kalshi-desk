@@ -56,6 +56,9 @@ std::string error_body(int status, const std::string& message) {
     case 401: code = 16; break;  // UNAUTHENTICATED
     case 404: code = 5; break;   // NOT_FOUND
     case 405: code = 12; break;  // UNIMPLEMENTED
+    case 429: code = 8; break;   // RESOURCE_EXHAUSTED
+    case 500: code = 13; break;  // INTERNAL
+    case 503: code = 14; break;  // UNAVAILABLE
   }
   return json{{"code", code}, {"message", message}}.dump();
 }
@@ -182,6 +185,14 @@ EngineConfig poly_engine_config() {
   return c;
 }
 
+HttpFault poly_fault(HttpFault::Kind kind, const std::string& method, const std::string& path) {
+  HttpFault f;
+  f.kind = kind;
+  f.method = method;
+  f.path = path;
+  return f;
+}
+
 FakePoly::FakePoly(FakePolyConfig cfg)
     : cfg_(std::move(cfg)),
       engine_(cfg_.engine),
@@ -189,6 +200,8 @@ FakePoly::FakePoly(FakePolyConfig cfg)
       listener_(ListenerConfig{cfg_.port, cfg_.tls_cert_file, cfg_.tls_key_file, cfg_.tls_close_notify,
                                cfg_.tls_handshake_ms}) {
   manual_now_ = cfg_.start_ms ? cfg_.start_ms : wall_ms();
+  tokens_ = cfg_.requests_per_s;
+  tokens_ms_ = now_locked();
   if (cfg_.auth == AuthMode::VERIFY) {
     const std::string pub = net::unbase64(cfg_.public_key_b64);
     if (pub.size() == 32)
@@ -370,11 +383,76 @@ void FakePoly::clear_wire_log() {
   wire_.clear();
 }
 
-// ---- settings -----------------------------------------------------------------------------------
+// ---- faults and settings ------------------------------------------------------------------------
 
+void FakePoly::add_fault(HttpFault f) {
+  std::lock_guard<std::mutex> lk(mu_);
+  faults_.push_back(std::move(f));
+}
+void FakePoly::clear_faults() {
+  std::lock_guard<std::mutex> lk(mu_);
+  faults_.clear();
+}
+std::size_t FakePoly::faults_pending() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return faults_.size();
+}
+void FakePoly::set_rate_limits(bool on, double requests_per_s) {
+  std::lock_guard<std::mutex> lk(mu_);
+  cfg_.rate_limits = on;
+  cfg_.requests_per_s = requests_per_s;
+  tokens_ = requests_per_s;
+  tokens_ms_ = now_locked();
+}
 void FakePoly::set_async_delay_ms(int ms) {
   std::lock_guard<std::mutex> lk(mu_);
   cfg_.async_delay_ms = ms;
+}
+void FakePoly::set_maintenance(std::int64_t from_ms, std::int64_t to_ms) {
+  std::lock_guard<std::mutex> lk(mu_);
+  maintenance_from_ = from_ms;
+  maintenance_to_ = to_ms;
+}
+void FakePoly::drop_http_connections() { listener_.drop_http(); }
+
+bool FakePoly::take_fault_locked(const net::Request& req, const json& body, HttpFault* f) {
+  const std::string slug = body.is_object() && body.contains("marketSlug") && body["marketSlug"].is_string()
+                               ? body["marketSlug"].get<std::string>()
+                               : "";
+  for (auto it = faults_.begin(); it != faults_.end(); ++it) {
+    if (it->method != req.method || req.path.compare(0, it->path.size(), it->path) != 0) continue;
+    if (!it->ticker.empty() && it->ticker != slug) continue;
+    *f = *it;
+    if (--it->times <= 0) faults_.erase(it);
+    return true;
+  }
+  return false;
+}
+
+bool FakePoly::rate_ok_locked(std::int64_t now) {
+  if (!cfg_.rate_limits) return true;
+  if (now > tokens_ms_)
+    tokens_ = std::min(cfg_.requests_per_s, tokens_ + cfg_.requests_per_s * static_cast<double>(now - tokens_ms_) / 1000.0);
+  tokens_ms_ = std::max(tokens_ms_, now);
+  if (tokens_ < 1) return false;
+  tokens_ -= 1;
+  return true;
+}
+
+bool FakePoly::in_maintenance_locked(std::int64_t now) const {
+  return now >= maintenance_from_ && now < maintenance_to_;
+}
+
+void FakePoly::pull_touch_locked(const json& create, Qty qty, std::int64_t now) {
+  auto str = [&](const char* k) {
+    return create.is_object() && create.contains(k) && create[k].is_string() ? create[k].get<std::string>() : "";
+  };
+  const std::string slug = str("marketSlug"), action = str("action");
+  const std::optional<Px> px = create.is_object() && create.contains("price") ? read_price(create["price"]) : std::nullopt;
+  Qty pulled = 0;
+  if (px && (action == "ORDER_ACTION_BUY" || action == "ORDER_ACTION_SELL"))  // else refused as it would be anyway
+    pulled = engine_.street_pull_touch(slug, action == "ORDER_ACTION_BUY" ? Side::BID : Side::ASK, *px, qty, now);
+  log_wire("http pull-touch " + slug + " " + qty_str(pulled));
 }
 
 // ---- one connection -----------------------------------------------------------------------------
@@ -405,29 +483,98 @@ void FakePoly::serve(int fd) {
       (void)value;
       if (name.compare(0, 5, "x-pm-") == 0) signed_req = true;
     }
+    const std::string what = req.method + " " + req.path + (signed_req ? " (signed)" : "");
+    // the head of a reply: a 429 says when to come back
+    auto head = [&](int status, std::vector<std::pair<std::string, std::string>> h) {
+      if (status == 429 && cfg_.retry_after_s > 0) h.emplace_back("Retry-After", std::to_string(cfg_.retry_after_s));
+      return net::response_head(status, h);
+    };
+
     const json body = req.body.empty() ? json() : json::parse(req.body, nullptr, false);
+    HttpFault f;
+    bool faulted;
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      faulted = take_fault_locked(req, body, &f);
+    }
+    using K = HttpFault::Kind;
+    auto is = [&](K k) { return faulted && f.kind == k; };
+    if (is(K::RATE_LIMIT)) {
+      const std::string e = error_body(429, "too many requests");
+      net::write_all(fd, head(429, {{"Content-Type", "application/json"}, {"Content-Length", std::to_string(e.size())}}) + e);
+      log_wire("http 429 " + what + " (fault)");
+      if (!req.keep_alive) return;
+      continue;
+    }
+    if (is(K::DROP_BEFORE_REPLY)) {
+      log_wire("http drop-before-reply " + what);
+      return;
+    }
+    if (is(K::STALL_BEFORE)) std::this_thread::sleep_for(std::chrono::milliseconds(f.stall_ms));
+
     Reply rep;
     {
       std::lock_guard<std::mutex> lk(mu_);
       const std::int64_t now = now_locked();
       const std::string denied = private_path(req.path) ? auth_refusal(req, now) : std::string();
-      if (!denied.empty()) {
+      if (in_maintenance_locked(now)) {
+        rep = Reply{503, error_body(503, "the exchange is down for maintenance")};
+      } else if (!denied.empty()) {
         rep = Reply{401, error_body(401, denied)};
+      } else if (!rate_ok_locked(now)) {
+        rep = Reply{429, error_body(429, "too many requests")};
       } else {
-        rep = route_locked(req, req.path, body, now);
+        // the street's fill lands before the cancel does; a pull of the touch before the create
+        if (is(K::FILL_DURING_CANCEL) && req.method == "POST") {
+          const std::vector<std::string> seg = segments(req.path);
+          const std::string eid = seg.size() == 4 ? engine_id_locked(seg[2]) : "";
+          if (!eid.empty()) engine_.street_hit(eid, f.qty, now);
+        }
+        if (is(K::PULL_TOUCH) && req.method == "POST") pull_touch_locked(body, f.qty, now);
+        std::string created;
+        rep = route_locked(req, req.path, body, now, &created);
+        // the engine takes the create before the reply: its fills are in the account first
+        if ((is(K::FILL_BEFORE_REPLY) || is(K::HIT_AFTER_REST)) && !created.empty()) {
+          Submitted& s = submitted_.at(created);
+          if (s.state == Submitted::State::PENDING) take_locked(s, now);
+          const Order* o = s.engine_id.empty() ? nullptr : engine_.order(s.engine_id);
+          if (is(K::HIT_AFTER_REST) && o && o->in_book) engine_.street_hit(s.engine_id, f.qty, now);
+        }
         drain_locked();
       }
     }
-    const std::string data = net::response_head(rep.status, {{"Content-Type", "application/json"},
-                                                             {"Date", http_date()},
-                                                             {"Content-Length", std::to_string(rep.body.size())},
-                                                             {"Connection", req.keep_alive ? "keep-alive" : "close"}}) +
-                             rep.body;
+    if (is(K::STALL_AFTER)) std::this_thread::sleep_for(std::chrono::milliseconds(f.stall_ms));
+    if (is(K::STATUS_AFTER_ACCEPT)) rep = Reply{f.status, error_body(f.status, "internal server error")};
+
+    const bool close_after = !req.keep_alive || is(K::CLOSE_AFTER_REPLY) || is(K::CUT_BODY) || is(K::DROP_AFTER_ACCEPT);
+    if (is(K::DROP_AFTER_ACCEPT)) {
+      log_wire("http drop-after-accept " + std::to_string(rep.status) + " " + what);
+      return;
+    }
+    std::vector<std::pair<std::string, std::string>> h = {{"Content-Type", "application/json"}, {"Date", http_date()}};
+    if (is(K::CHUNKED))
+      h.emplace_back("Transfer-Encoding", "chunked");
+    else
+      h.emplace_back("Content-Length", std::to_string(rep.body.size()));
+    h.emplace_back("Connection", close_after ? "close" : "keep-alive");
+    std::string data = head(rep.status, std::move(h));
+    std::string label = "http " + std::to_string(rep.status) + " " + what;
+    if (is(K::CHUNKED)) {
+      data += net::chunked_body(rep.body, f.chunk_bytes);
+      label += " (chunked)";
+    } else if (is(K::CUT_BODY)) {
+      const std::size_t cut = f.cut_bytes ? std::min(f.cut_bytes, rep.body.size() ? rep.body.size() - 1 : 0)
+                                          : rep.body.size() / 2;
+      data += rep.body.substr(0, cut);
+      label = "http cut " + std::to_string(rep.status) + " " + what;
+    } else {
+      data += rep.body;
+    }
     // logged before the write, as on the fake Kalshi: a client that has its reply never sees the
     // entry arrive late
-    log_wire("http " + std::to_string(rep.status) + " " + req.method + " " + req.path + (signed_req ? " (signed)" : ""));
+    log_wire(label);
     net::write_all(fd, data);
-    if (!req.keep_alive) return;
+    if (close_after) return;
   }
 }
 
@@ -461,7 +608,7 @@ std::string FakePoly::auth_refusal(const net::Request& req, std::int64_t now) co
 // ---- routes -------------------------------------------------------------------------------------
 
 FakePoly::Reply FakePoly::route_locked(const net::Request& req, const std::string& path, const json& body,
-                                       std::int64_t now) {
+                                       std::int64_t now, std::string* created) {
   const std::vector<std::string> seg = segments(path);
   auto get = [&](auto&& f) { return req.method == "GET" ? f() : Reply{405, error_body(405, "GET only")}; };
   // a write's body is JSON, or nothing
@@ -484,7 +631,7 @@ FakePoly::Reply FakePoly::route_locked(const net::Request& req, const std::strin
     if (seg[1] == "order" && seg.size() == 3 && seg[2] == "preview" && req.method == "POST")
       return post([&] { return preview_locked(body, now); });
     if (seg[1] == "order" && seg.size() == 3) return get([&] { return order_locked(seg[2]); });
-    if (seg[1] == "orders" && seg.size() == 2) return post([&] { return create_locked(body, now); });
+    if (seg[1] == "orders" && seg.size() == 2) return post([&] { return create_locked(body, now, created); });
     if (seg[1] == "order" && seg.size() == 4 && seg[3] == "cancel")
       return post([&] { return cancel_locked(seg[2], body, now); });
     if (seg[1] == "orders" && seg.size() == 4 && seg[2] == "open" && seg[3] == "cancel")
@@ -691,7 +838,7 @@ std::string FakePoly::read_create_locked(const json& b, std::int64_t now, NewOrd
   return "";
 }
 
-FakePoly::Reply FakePoly::create_locked(const json& body, std::int64_t now) {
+FakePoly::Reply FakePoly::create_locked(const json& body, std::int64_t now, std::string* created) {
   Submitted sub;
   int status = 400;
   const std::string why = read_create_locked(body, now, &sub.order, &sub.sync, &status);
@@ -704,6 +851,7 @@ FakePoly::Reply FakePoly::create_locked(const json& body, std::int64_t now) {
   Submitted& s = submitted_.emplace(id, std::move(sub)).first->second;
   if (!s.sync) {
     pending_.push_back(id);
+    *created = id;
     take_due_locked(now);  // no delay: the engine has it before the reply, which still says nothing of it
     return Reply{200, json{{"id", id}, {"executions", json::array()}}.dump()};
   }
@@ -714,6 +862,7 @@ FakePoly::Reply FakePoly::create_locked(const json& body, std::int64_t now) {
     submitted_.erase(id);
     return Reply{r.err.http, error_body(r.err.http, r.err.details.empty() ? r.err.message : r.err.details)};
   }
+  *created = id;
   const Order* o = engine_.order(r.order_id);
   const json state = o ? order_json(*o)["state"] : json("ORDER_STATE_NEW");
   json executions = json::array();

@@ -3,8 +3,8 @@
 // orders, positions and cash as those routes list them, paging, auth with a real Ed25519 signature
 // (a key made here, never a real one) and its 30 s window, the wire log, TLS, and fake-kalshi
 // --poly. Then the writes: an asynchronous create and its delayed executions, a synchronous one,
-// GTD and its expiry, post-only in both modes, cancels, cancel-all and preview. Nothing here talks
-// to anything but 127.0.0.1.
+// GTD and its expiry, post-only in both modes, cancels and cancel-all, preview, every fault, the
+// rate limit and a maintenance window. Nothing here talks to anything but 127.0.0.1.
 #include <openssl/evp.h>
 #include <openssl/ssl.h>
 #include <openssl/x509v3.h>
@@ -19,6 +19,7 @@
 #include <memory>
 #include <set>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "check.h"
@@ -84,12 +85,18 @@ void list_games(FakePoly& f) {
   f.list_market(hou);
 }
 
+FakePolyConfig unlimited(FakePolyConfig cfg) {
+  cfg.rate_limits = false;
+  return cfg;
+}
+
 // One test's venue on a free port: the three games, NE's street book YES 0.380 x10 and 0.375 x20
-// bid, 0.385 x9 and 0.390 x5 offered (NO bids at 0.615 and 0.610), and $100 deposited.
+// bid, 0.385 x9 and 0.390 x5 offered (NO bids at 0.615 and 0.610), and $100 deposited. Its rate
+// limit is off (test_rate_limit turns it on).
 struct Venue {
   FakePoly f;
   bool ok = false;
-  explicit Venue(FakePolyConfig cfg = {}) : f(std::move(cfg)) {
+  explicit Venue(FakePolyConfig cfg = {}) : f(unlimited(std::move(cfg))) {
     list_games(f);
     f.with_engine([](Engine& e, std::int64_t now) {
       e.street_add(NE, false, 3800, 1000, now);
@@ -927,6 +934,241 @@ void test_cancel() {
   CHECK(engine_orders(v.f) == before && get(c, "/v1/order/preview").status() == 404);
 }
 
+void test_faults() {
+  Venue v;  // the wall clock: stalls are real
+  CHECK(v.ok);
+  using K = HttpFault::Kind;
+  auto rest2 = [](const std::string& px) { return order_body(DAL, BUY, px, 2, GTC); };
+  auto open_now = [&] {
+    HttpConn c(v.port());
+    return get(c, "/v1/orders/open").j["orders"].size();
+  };
+  std::size_t open = 0;
+  {  // 429: nothing processed, and the connection stays up
+    HttpConn c(v.port());
+    v.f.add_fault(poly_fault(K::RATE_LIMIT));
+    CHECK(v.f.faults_pending() == 1);
+    auto r = post(c, "/v1/orders", rest2("0.300"));
+    CHECK(r.status() == 429 && r.j == json({{"code", 8}, {"message", "too many requests"}}) &&
+          r.res.headers["retry-after"] == "1" && open_now() == open);
+    CHECK(post(c, "/v1/orders", rest2("0.300")).status() == 200 && open_now() == ++open && v.f.faults_pending() == 0);
+    CHECK(logged(v.f, "http 429 POST /v1/orders (signed) (fault)"));
+  }
+  {  // dropped before the reply: nothing placed
+    HttpConn c(v.port());
+    v.f.add_fault(poly_fault(K::DROP_BEFORE_REPLY));
+    auto r = post(c, "/v1/orders", rest2("0.300"));
+    CHECK(r.dropped && r.status() == 0 && open_now() == open);
+  }
+  {  // dropped after accepting: the order exists and the client heard nothing (UNKNOWN)
+    HttpConn c(v.port());
+    v.f.add_fault(poly_fault(K::DROP_AFTER_ACCEPT));
+    auto r = post(c, "/v1/orders", rest2("0.300"));
+    CHECK(r.dropped && open_now() == ++open && logged(v.f, "http drop-after-accept 200 POST /v1/orders (signed)"));
+  }
+  for (const int status : {500, 503}) {  // 5xx after accepting
+    HttpConn c(v.port());
+    HttpFault f = poly_fault(K::STATUS_AFTER_ACCEPT);
+    f.status = status;
+    v.f.add_fault(f);
+    auto r = post(c, "/v1/orders", rest2("0.300"));
+    CHECK(r.status() == status && r.j == json({{"code", status == 500 ? 13 : 14}, {"message", "internal server error"}}) &&
+          open_now() == ++open);
+  }
+  {  // a body cut mid-way: the head promised more
+    HttpConn c(v.port());
+    HttpFault f = poly_fault(K::CUT_BODY);
+    f.cut_bytes = 10;
+    v.f.add_fault(f);
+    auto r = post(c, "/v1/orders", rest2("0.300"));
+    CHECK(r.cut && r.status() == 200 && r.res.body.size() == 10 && r.j.is_discarded() && !r.res.complete);
+    CHECK(std::stoul(r.res.headers["content-length"]) > 10 && open_now() == ++open);
+    CHECK(logged(v.f, "http cut 200 POST /v1/orders (signed)"));
+  }
+  {  // chunked, and the connection still in step after
+    HttpConn c(v.port());
+    HttpFault f = poly_fault(K::CHUNKED);
+    f.chunk_bytes = 7;
+    v.f.add_fault(f);
+    auto r = post(c, "/v1/orders", rest2("0.300"));
+    CHECK(r.status() == 200 && r.res.chunked && r.res.complete && r.j["id"].is_string() && open_now() == ++open);
+    CHECK(logged(v.f, "http 200 POST /v1/orders (signed) (chunked)") && get(c, "/v1/account/balances").status() == 200);
+  }
+  {  // a stall before: the order is placed only after it
+    HttpConn c(v.port());
+    HttpFault f = poly_fault(K::STALL_BEFORE);
+    f.stall_ms = 300;
+    v.f.add_fault(f);
+    const std::int64_t t = wall_ms();
+    auto r = post(c, "/v1/orders", rest2("0.300"));
+    CHECK(r.status() == 200 && r.ms >= 290);
+    const std::string eid = v.f.engine_id(r.j["id"].get<std::string>());
+    CHECK(v.f.with_engine([&](Engine& e, std::int64_t) { return e.order(eid)->created_ms; }) >= t + 290);
+    ++open;
+  }
+  {  // a stall after: the order rests at once, and a cancel on another connection lands before
+     // the reply (plan section 8: "cancel before the ack")
+    HttpConn a(v.port()), b(v.port());
+    HttpFault f = poly_fault(K::STALL_AFTER);
+    f.stall_ms = 600;
+    v.f.add_fault(f);
+    HttpResult ra;
+    std::thread th([&] { ra = post(a, "/v1/orders", rest2("0.290")); });
+    std::string id;
+    for (int i = 0; i < 100 && id.empty(); ++i) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      const json orders = get(b, "/v1/orders/open").j["orders"];
+      for (const auto& o : orders)
+        if (o["price"] == money("0.2900")) id = o["id"].get<std::string>();
+    }
+    CHECK(!id.empty() && post(b, "/v1/order/" + id + "/cancel", {{"marketSlug", DAL}}).status() == 200);
+    th.join();
+    CHECK(ra.status() == 200 && ra.j["id"] == id && ra.ms >= 590 && order_of(b, id)["state"] == "ORDER_STATE_CANCELED");
+  }
+  {  // closed after the reply
+    HttpConn c(v.port());
+    v.f.add_fault(poly_fault(K::CLOSE_AFTER_REPLY, "GET", "/v1/account"));
+    auto r = get(c, "/v1/account/balances");
+    CHECK(r.status() == 200 && r.res.headers["connection"] == "close" && c.closed_by_server());
+  }
+  {  // a fill during a cancel: the street takes 1 of 3 first; the cancel ends the rest
+    HttpConn c(v.port());
+    const std::string id = post(c, "/v1/orders", order_body(DAL, BUY, "0.280", 3, GTC)).j["id"].get<std::string>();
+    HttpFault f = poly_fault(K::FILL_DURING_CANCEL, "POST", "/v1/order/");
+    f.qty = 100;
+    v.f.add_fault(f);
+    auto r = post(c, "/v1/order/" + id + "/cancel", {{"marketSlug", DAL}});
+    CHECK(r.status() == 200 && r.j == json::object());
+    json o = order_of(c, id);
+    CHECK(o["state"] == "ORDER_STATE_CANCELED" && o["cumQuantity"] == 1 && o["leavesQuantity"] == 0 &&
+          o["avgPx"] == money("0.2800"));
+    json t = get(c, "/v1/portfolio/activities?limit=1").j["activities"][0]["trade"];
+    CHECK(t["marketSlug"] == DAL && t["qtyDecimal"] == "1" && t["isAggressor"] == false);
+  }
+  {  // the fill before the ack: with a delay the engine would wait out, the order is taken and
+     // hit before the reply; and an IOC taken and filled before it
+    HttpConn c(v.port());
+    v.f.set_async_delay_ms(5000);
+    HttpFault f = poly_fault(K::HIT_AFTER_REST);
+    f.qty = 100;
+    v.f.add_fault(f);
+    auto r = post(c, "/v1/orders", order_body(DAL, BUY, "0.270", 2, GTC));
+    CHECK(r.status() == 200 && r.j["executions"].empty());
+    json o = order_of(c, r.j["id"].get<std::string>());
+    CHECK(o["state"] == "ORDER_STATE_PARTIALLY_FILLED" && o["cumQuantity"] == 1 && o["leavesQuantity"] == 1);
+    v.f.add_fault(poly_fault(K::FILL_BEFORE_REPLY));
+    r = post(c, "/v1/orders", order_body(NE, BUY, "0.385", 1));
+    CHECK(r.status() == 200 && r.j["executions"].empty() && order_of(c, r.j["id"].get<std::string>())["state"] == "ORDER_STATE_FILLED");
+    r = post(c, "/v1/orders", order_body(NE, BUY, "0.385", 1));  // no fault: it waits
+    CHECK(order_of(c, r.j["id"].get<std::string>())["state"] == "ORDER_STATE_PENDING_NEW");
+    CHECK(post(c, "/v1/order/" + r.j["id"].get<std::string>() + "/cancel", {{"marketSlug", NE}}).status() == 200);
+    v.f.set_async_delay_ms(0);
+  }
+  {  // the touch pulled just before a create that would take it; logged
+    HttpConn c(v.port());
+    v.f.with_engine([](Engine& e, std::int64_t now) { e.street_add(DAL, true, 6000, 500, now); });  // 0.400 offered
+    v.f.add_fault(poly_fault(K::PULL_TOUCH));
+    auto r = post(c, "/v1/orders", order_body(DAL, BUY, "0.400", 2));
+    json o = order_of(c, r.j["id"].get<std::string>());
+    CHECK(o["state"] == "ORDER_STATE_CANCELED" && o["cumQuantity"] == 0 && logged(v.f, "http pull-touch " + DAL + " 5.00"));
+  }
+  {  // a fault naming a market passes over another market's creates; one on the cancel path
+     // passes over the creates
+    HttpConn c(v.port());
+    HttpFault f = poly_fault(K::STATUS_AFTER_ACCEPT);
+    f.ticker = NE;
+    v.f.add_fault(f);
+    v.f.add_fault(poly_fault(K::DROP_BEFORE_REPLY, "POST", "/v1/order/"));
+    CHECK(post(c, "/v1/orders", rest2("0.200")).status() == 200);
+    CHECK(post(c, "/v1/orders", order_body(NE, BUY, "0.300", 1, GTC)).status() == 500 && v.f.faults_pending() == 1);
+    v.f.clear_faults();
+    CHECK(v.f.faults_pending() == 0);
+  }
+  {  // every kept-open connection dropped under its client
+    HttpConn c(v.port());
+    CHECK(get(c, "/v1/orders/open").status() == 200);
+    v.f.drop_http_connections();
+    CHECK(get(c, "/v1/orders/open").status() == 0);
+    HttpConn d(v.port());
+    CHECK(get(d, "/v1/orders/open").status() == 200);
+  }
+}
+
+void test_rate_limit() {
+  Venue v(manual_clock());
+  CHECK(v.ok);
+  v.f.set_rate_limits(true);  // 20 a second, holding a second's worth
+  HttpConn c(v.port());
+  int ok = 0;
+  for (int i = 0; i < 20; ++i) ok += c.request("GET", "/v1/markets?slug=" + NE).status() == 200;
+  CHECK(ok == 20);
+  auto r = c.request("GET", "/v2/leagues/nfl/events");
+  CHECK(r.status() == 429 && r.j == json({{"code", 8}, {"message", "too many requests"}}) && r.res.headers["retry-after"] == "1");
+  // one pool for both hosts: a signed create is refused too, and places nothing
+  r = post(c, "/v1/orders", order_body(NE, BUY, "0.385", 1));
+  CHECK(r.status() == 429 && engine_orders(v.f) == 0 && logged(v.f, "http 429 POST /v1/orders (signed)"));
+  v.f.advance_ms(50);  // one back
+  CHECK(post(c, "/v1/orders", order_body(NE, BUY, "0.385", 1)).status() == 200 && engine_orders(v.f) == 1);
+  CHECK(get(c, "/v1/account/balances").status() == 429);
+  v.f.advance_ms(5000);  // never more than a second's worth
+  ok = 0;
+  for (int i = 0; i < 25; ++i) ok += get(c, "/v1/account/balances").status() == 200;
+  CHECK(ok == 20);
+  // another rate
+  v.f.set_rate_limits(true, 5);
+  ok = 0;
+  for (int i = 0; i < 6; ++i) ok += c.request("GET", "/v1/markets").status() == 200;
+  CHECK(ok == 5);
+  v.f.set_rate_limits(false);
+  ok = 0;
+  for (int i = 0; i < 50; ++i) ok += c.request("GET", "/v1/markets").status() == 200;
+  CHECK(ok == 50);
+  // a venue made without a Retry-After
+  FakePolyConfig cfg = manual_clock();
+  cfg.retry_after_s = 0;
+  FakePoly f(cfg);  // its limit on: Venue's is off
+  std::string err;
+  CHECK(f.start(&err));
+  HttpConn d(f.port());
+  for (int i = 0; i < 20; ++i) d.request("GET", "/v1/markets");
+  r = d.request("GET", "/v1/markets");
+  CHECK(r.status() == 429 && !r.res.headers.count("retry-after"));
+}
+
+void test_maintenance() {
+  Venue v(manual_clock());
+  CHECK(v.ok);
+  HttpConn c(v.port());
+  const std::string id = post(c, "/v1/orders", post_body(NE, BUY, "0.370", 2, "2026-10-06T15:33:00Z")).j["id"].get<std::string>();
+  v.f.set_maintenance(T0 + 1000, T0 + 61000);
+  v.f.advance_ms(999);
+  CHECK(c.request("GET", "/v1/markets").status() == 200);
+  v.f.advance_ms(1);
+  // every request, either host, signed or not, before auth: 503, and nothing done
+  const std::string down = json({{"code", 14}, {"message", "the exchange is down for maintenance"}}).dump();
+  auto r = c.request("GET", "/v1/markets/" + NE + "/book");
+  CHECK(r.status() == 503 && r.res.body == down);
+  CHECK(get(c, "/v1/account/balances").status() == 503 && c.request("GET", "/v1/account/balances").status() == 503);
+  CHECK(post(c, "/v1/orders", order_body(NE, BUY, "0.385", 1)).status() == 503);
+  CHECK(post(c, "/v1/order/" + id + "/cancel", {{"marketSlug", NE}}).status() == 503);
+  CHECK(post(c, "/v1/orders/open/cancel", json::object()).status() == 503);
+  CHECK(logged(v.f, "http 503 GET /v1/markets/" + NE + "/book") && logged(v.f, "http 503 POST /v1/orders (signed)"));
+  // the engine runs on: the post still rests, and nothing new is in it
+  const std::string eid = v.f.engine_id(id);
+  CHECK(v.f.with_engine([&](Engine& e, std::int64_t) { return e.user_orders().size() == 1 && e.order(eid)->status == OrdStatus::RESTING; }));
+  v.f.advance_ms(59999);
+  CHECK(c.request("GET", "/v1/markets").status() == 503);
+  v.f.advance_ms(1);
+  CHECK(c.request("GET", "/v1/markets").status() == 200 && order_of(c, id)["state"] == "ORDER_STATE_NEW");
+  // it expires on time in a window, and is seen expired after
+  v.f.set_maintenance(T0 + 61000, T0 + 300000);
+  v.f.advance_ms(120000);  // 15:33:01
+  CHECK(v.f.with_engine([&](Engine& e, std::int64_t) { return e.order(eid)->reason == "ExpiryCancel"; }));
+  CHECK(get(c, "/v1/orders/open").status() == 503);
+  v.f.set_maintenance(0, 0);
+  CHECK(order_of(c, id)["state"] == "ORDER_STATE_EXPIRED");
+}
+
 // ---- TLS, kept-open connections ----------------------------------------------------------------
 
 // One GET over TLS on a connection of its own, trusting `ca` for 127.0.0.1: the reply, or "".
@@ -1046,12 +1288,16 @@ void test_binary() {
   CHECK(r.status() == 200 && r.j["events"].empty());
   r = get(c, "/v1/portfolio/activities");
   CHECK(r.j["activities"].size() == 1 && r.j["activities"][0]["type"] == "ACTIVITY_TYPE_ACCOUNT_DEPOSIT");
+  // --no-rate-limits reaches it too: past its 20 a second
+  int ok = 0;
+  for (int i = 0; i < 25; ++i) ok += c.request("GET", "/v1/markets").status() == 200;
+  CHECK(ok == 25);
   c.close();
   ::kill(pid, SIGTERM);
   int st = 0;
   ::waitpid(pid, &st, 0);
   CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);
-  CHECK(read_until(out, "connections\n", 2000).find("POLY stopped after 4 requests on 1 connections") != std::string::npos);
+  CHECK(read_until(out, "connections\n", 2000).find("POLY stopped after 29 requests on 1 connections") != std::string::npos);
   ::close(out);
   // --auth and --tls apply to both venues: $100 by default, unsigned, over TLS
   TempDir dir;
@@ -1092,6 +1338,9 @@ int main() {
   test_create_refusals();
   test_post_only();
   test_cancel();
+  test_faults();
+  test_rate_limit();
+  test_maintenance();
   test_tls();
   test_binary();
   return finish("deskd-fake-poly");
